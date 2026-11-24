@@ -266,3 +266,81 @@ fn maps_a_title_dll_the_title_loads_itself() {
     assert!(load("absent.dll", &|_| true).is_empty());
     assert!(load("late.dll", &|_| false).is_empty());
 }
+
+fn enable_case_sensitive_dir(path: &Path) -> bool {
+    let ok = Command::new("fsutil")
+        .args(["file", "setCaseSensitiveInfo"])
+        .arg(path)
+        .arg("enable")
+        .output()
+        .is_ok_and(|out| out.status.success());
+    if !ok {
+        return false;
+    }
+    let probe = path.join("CaseProbe");
+    std::fs::write(&probe, b"x").unwrap();
+    let sensitive = !path.join("caseprobe").exists();
+    std::fs::remove_file(&probe).unwrap();
+    sensitive
+}
+
+#[test]
+fn maps_mixed_case_title_dlls_in_case_sensitive_folders() {
+    let title_dir = tempfile::tempdir().unwrap();
+    let cache = tempfile::tempdir().unwrap();
+    let case_sensitive = enable_case_sensitive_dir(title_dir.path());
+
+    std::fs::copy(
+        r"C:\Windows\System32\version.dll",
+        title_dir.path().join("Late.dll"),
+    )
+    .unwrap();
+    if case_sensitive {
+        // A directory whose name differs only by case must not hide the DLL file.
+        std::fs::create_dir(title_dir.path().join("LATE.DLL")).unwrap();
+    }
+
+    for spelling in ["Late.dll", "LATE.DLL", "late.dll", "lAtE.dLl"] {
+        let dlls =
+            victory_loader::load_title_dll(spelling, title_dir.path(), cache.path(), &|_| true)
+                .unwrap();
+        assert_eq!(dlls.len(), 1, "spelling {spelling}");
+        assert_eq!(dlls[0].0, "late.dll");
+        assert!(dlls[0].1.export("GetFileVersionInfoW").is_some());
+        for (_, img) in dlls {
+            // SAFETY: test image was never attached or called.
+            unsafe { img.unload() };
+        }
+    }
+
+    // `load_title_dlls` also resolves mixed-case files imported at startup.
+    let probe_dll = build_probe();
+    let prepared = prepare(&std::fs::read(&probe_dll).unwrap()).unwrap();
+    let boot_dir = tempfile::tempdir().unwrap();
+    let boot_sensitive = enable_case_sensitive_dir(boot_dir.path());
+    std::fs::copy(
+        r"C:\Windows\System32\version.dll",
+        boot_dir.path().join("VIctory-Probe-Title.DLL"),
+    )
+    .unwrap();
+    if boot_sensitive {
+        std::fs::create_dir(boot_dir.path().join("victory-probe-title.dll")).unwrap();
+    }
+    let boot_dlls =
+        victory_loader::load_title_dlls(&prepared.info, boot_dir.path(), cache.path(), &|_| true)
+            .unwrap();
+    assert_eq!(boot_dlls.len(), 1);
+    assert_eq!(boot_dlls[0].0, "victory-probe-title.dll");
+    for (_, img) in boot_dlls {
+        // SAFETY: test image was never attached or called.
+        unsafe { img.unload() };
+    }
+
+    // A matched file that is not a valid PE fails with its real filename instead of being skipped.
+    std::fs::write(title_dir.path().join("BrokenMod.DLL"), b"not a pe").unwrap();
+    let err =
+        victory_loader::load_title_dll("brokenmod.dll", title_dir.path(), cache.path(), &|_| true)
+            .unwrap_err();
+    let msg = format!("{err:#}");
+    assert!(msg.contains("BrokenMod.DLL"), "unexpected error: {msg}");
+}

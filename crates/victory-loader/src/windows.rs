@@ -146,17 +146,37 @@ fn map_dll(
     seen: &mut HashSet<String>,
     loaded: &mut Vec<(String, LoadedImage)>,
 ) -> Result<()> {
-    let name = name.to_ascii_lowercase();
-    let path = dirs.0.join(&name);
-    if !seen.insert(name.clone()) || !wanted(&name) || !path.is_file() {
+    let key = name.to_ascii_lowercase();
+    if !seen.insert(key.clone()) || !wanted(&key) {
         return Ok(());
     }
+    let Some(path) = find_dll_file(dirs.0, name) else {
+        return Ok(());
+    };
     let original = std::fs::read(&path).with_context(|| format!("reading {}", path.display()))?;
     let prepared = prepare(&original).with_context(|| format!("preparing {}", path.display()))?;
     let image = load(&prepared, dirs.1).with_context(|| format!("loading {}", path.display()))?;
     map_imports(&image.info, dirs, wanted, seen, loaded)?;
-    loaded.push((name, image));
+    loaded.push((key, image));
     Ok(())
+}
+
+fn find_dll_file(dir: &Path, name: &str) -> Option<PathBuf> {
+    let exact = dir.join(name);
+    if exact.is_file() {
+        return Some(exact);
+    }
+    scan_dll_file(dir, name)
+}
+
+fn scan_dll_file(dir: &Path, name: &str) -> Option<PathBuf> {
+    let entries = std::fs::read_dir(dir).ok()?;
+    entries.flatten().map(|entry| entry.path()).find(|path| {
+        path.file_name()
+            .and_then(|file| file.to_str())
+            .is_some_and(|file| file.eq_ignore_ascii_case(name))
+            && path.is_file()
+    })
 }
 
 /// Resolves through `inner`, then through the exports of the title's DLLs.
@@ -428,5 +448,35 @@ impl LoadedImage {
         crate::threads::unmapped(self.base());
         // SAFETY: guaranteed by the caller.
         unsafe { FreeLibrary(self.module) };
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn directory_scan_matches_files_ignoring_ascii_case_and_skips_folders() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::create_dir(dir.path().join("SubDir.dll")).unwrap();
+        let real = dir.path().join("MixedCase.DLL");
+        std::fs::write(&real, b"placeholder").unwrap();
+
+        for query in [
+            "MixedCase.DLL",
+            "mixedcase.dll",
+            "MIXEDCASE.DLL",
+            "mIxEdCaSe.DlL",
+        ] {
+            assert_eq!(
+                scan_dll_file(dir.path(), query).as_deref(),
+                Some(real.as_path())
+            );
+            let found = find_dll_file(dir.path(), query).expect("matched file");
+            assert_eq!(std::fs::read(found).unwrap(), b"placeholder");
+        }
+        assert_eq!(scan_dll_file(dir.path(), "subdir.dll"), None);
+        assert_eq!(find_dll_file(dir.path(), "subdir.dll"), None);
+        assert_eq!(find_dll_file(dir.path(), "absent.dll"), None);
     }
 }
