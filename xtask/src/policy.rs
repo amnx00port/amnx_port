@@ -15,6 +15,8 @@ const MAX_ENCODED_RUN: usize = 512;
 
 const ALLOWED_EXTENSIONS: &[&str] = &[
     "rs", "toml", "md", "txt", "lock", "yml", "yaml", "json", "hlsl", "hlsli", "ps1", "cmd", "sh",
+    // Guest test fixtures built with clang-cl (tests/fixtures/seh-probe).
+    "cpp",
 ];
 const ALLOWED_NAMES: &[&str] = &[
     ".gitignore",

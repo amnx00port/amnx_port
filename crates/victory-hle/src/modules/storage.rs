@@ -50,20 +50,17 @@ fn folder() -> Option<String> {
     if storage.as_os_str().is_empty() {
         return None;
     }
-    #[cfg(windows)]
-    return super::files::mount(&storage).map(|letter| format!("{letter}:\\"));
-    #[cfg(not(windows))]
-    None
+    super::files::mount(&storage).map(|letter| format!("{letter}:\\"))
 }
 
-extern "system" fn path_size(_: This, out: *mut usize) -> HRESULT {
+extern "win64" fn path_size(_: This, out: *mut usize) -> HRESULT {
     match folder() {
         Some(path) => put(out, path.len() + 1),
         None => NOT_SUPPORTED,
     }
 }
 
-extern "system" fn path(_: This, size: usize, buffer: *mut u8, used: *mut usize) -> HRESULT {
+extern "win64" fn path(_: This, size: usize, buffer: *mut u8, used: *mut usize) -> HRESULT {
     match folder() {
         Some(path) => put_string(&path, size, buffer, used),
         None => NOT_SUPPORTED,
@@ -117,6 +114,19 @@ pub(crate) fn disk_free(dir: &Path) -> u64 {
             return free;
         }
     }
+    #[cfg(target_os = "linux")]
+    {
+        use std::os::unix::ffi::OsStrExt;
+        let Ok(path) = std::ffi::CString::new(dir.as_os_str().as_bytes()) else {
+            return u64::MAX;
+        };
+        // SAFETY: plain data; zero is a valid value.
+        let mut info: libc::statvfs = unsafe { std::mem::zeroed() };
+        // SAFETY: a NUL-terminated path and a writable result.
+        if unsafe { libc::statvfs(path.as_ptr(), &mut info) } == 0 {
+            return (info.f_bavail as u64).saturating_mul(info.f_frsize as u64);
+        }
+    }
     let _ = dir;
     u64::MAX
 }
@@ -134,7 +144,7 @@ fn space() -> SpaceInfo {
     }
 }
 
-extern "system" fn space_info(_: This, out: *mut SpaceInfo) -> HRESULT {
+extern "win64" fn space_info(_: This, out: *mut SpaceInfo) -> HRESULT {
     put(out, space())
 }
 
@@ -142,7 +152,7 @@ extern "system" fn space_info(_: This, out: *mut SpaceInfo) -> HRESULT {
 static PROMPT: u8 = 0;
 
 /// There is nobody to ask: granted when the quota has room, else declined.
-extern "system" fn prompt_for_space(_: This, bytes: u64, block: *mut AsyncBlock) -> HRESULT {
+extern "win64" fn prompt_for_space(_: This, bytes: u64, block: *mut AsyncBlock) -> HRESULT {
     let hr = if bytes <= space().total_free {
         S_OK
     } else {
@@ -151,7 +161,7 @@ extern "system" fn prompt_for_space(_: This, bytes: u64, block: *mut AsyncBlock)
     xasync::finished(block, (&raw const PROMPT).cast(), hr)
 }
 
-extern "system" fn prompt_result(_: This, block: *mut AsyncBlock) -> HRESULT {
+extern "win64" fn prompt_result(_: This, block: *mut AsyncBlock) -> HRESULT {
     let none = std::ptr::null_mut();
     xasync::XAsyncGetResult(block, (&raw const PROMPT).cast(), 0, none, none.cast())
 }
@@ -174,11 +184,11 @@ mod tests {
 
     #[test]
     fn serves_a_drive_over_the_title_folder_and_its_quota() {
-        type Size = extern "system" fn(This, *mut usize) -> HRESULT;
-        type Get = extern "system" fn(This, usize, *mut u8, *mut usize) -> HRESULT;
-        type Space = extern "system" fn(This, *mut SpaceInfo) -> HRESULT;
-        type Prompt = extern "system" fn(This, u64, *mut AsyncBlock) -> HRESULT;
-        type Result = extern "system" fn(This, *mut AsyncBlock) -> HRESULT;
+        type Size = extern "win64" fn(This, *mut usize) -> HRESULT;
+        type Get = extern "win64" fn(This, usize, *mut u8, *mut usize) -> HRESULT;
+        type Space = extern "win64" fn(This, *mut SpaceInfo) -> HRESULT;
+        type Prompt = extern "win64" fn(This, u64, *mut AsyncBlock) -> HRESULT;
+        type Result = extern "win64" fn(This, *mut AsyncBlock) -> HRESULT;
         let this: This = &OBJECT;
         let dir = tempfile::tempdir().unwrap();
         std::fs::write(dir.path().join("save.dat"), [0u8; 100]).unwrap();
@@ -207,6 +217,8 @@ mod tests {
             get_attributes(wide.as_ptr(), 0, attributes.as_mut_ptr().cast()),
             0
         );
+        // What the host disk has free is known.
+        assert!(disk_free(dir.path()) < u64::MAX);
 
         let mut info = SpaceInfo {
             available_free: 0,

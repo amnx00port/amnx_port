@@ -77,16 +77,15 @@
 
 mod bitcode;
 mod container;
-#[cfg(all(test, windows))]
+#[cfg(test)]
 mod diff_tests;
-#[cfg(all(windows, any(test, feature = "host")))]
+#[cfg(any(test, feature = "host"))]
 pub mod host;
 mod lower;
 mod sampler;
 mod shader;
-#[cfg(windows)]
 pub mod validator;
-#[cfg(all(test, windows))]
+#[cfg(test)]
 mod valu_tests;
 mod wave;
 
@@ -476,7 +475,6 @@ mod tests {
     }
 
     #[test]
-    #[cfg(windows)]
     fn stub_pipeline_is_created() {
         let Ok(host) = super::host::Host::new(false) else {
             eprintln!("no SM 6.6 device; skipped");
@@ -513,7 +511,10 @@ mod tests {
         host.pipeline(&vs, &ps).unwrap();
         // The runtime checks the container hash: no hash or a wrong one is
         // refused. (Recent runtimes also take sixteen 0x01 bytes, a bypass
-        // value; ours works with older ones too.)
+        // value; ours works with older ones too.) vkd3d-proton does not.
+        if cfg!(not(windows)) {
+            return;
+        }
         let mut wrong = ps.dxil[4..20].to_vec();
         wrong[0] ^= 1;
         for digest in [&[0u8; 16][..], &wrong] {
@@ -527,12 +528,11 @@ mod tests {
     }
 
     #[test]
-    #[cfg(windows)]
     fn constant_color_validates() {
         let mut c = constant_color();
         let path = super::validator::Validator::default_path();
         let Ok(mut v) = super::validator::Validator::load(path.as_deref()) else {
-            eprintln!("no dxil.dll; skipped");
+            eprintln!("no DXIL validator; skipped");
             return;
         };
         let ours = c[4..20].to_vec();
