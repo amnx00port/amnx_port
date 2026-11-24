@@ -451,6 +451,9 @@ fn work(scheduler: &'static Scheduler) {
         drop(lanes);
         let started = std::time::Instant::now();
         let result = execute(&job.request);
+        if victory_profile::on() {
+            profile_load(&job.request, started.elapsed());
+        }
         lanes = scheduler.lock();
         lanes.finish(&job, result);
         lanes.count(&job, started);
@@ -459,6 +462,25 @@ fn work(scheduler: &'static Scheduler) {
         }
         scheduler.finished.notify_all();
     }
+}
+
+/// For `VICTORY_PROFILE`: a finished request as a load, by what it
+/// decodes, under the title's name for it.
+fn profile_load(request: &Request, took: std::time::Duration) {
+    let kind = if request.options & BCPACK != 0 {
+        "dstorage bcpack"
+    } else if request.options & ZLIB != 0 {
+        "dstorage zlib"
+    } else if request.options & MEMORY_SOURCE != 0 {
+        "dstorage memory"
+    } else {
+        "dstorage"
+    };
+    let name = || match text(request.name) {
+        name if name.is_empty() => format!("offset {:#x}", request.offset),
+        name => name,
+    };
+    victory_profile::load(kind, name, u64::from(request.destination_size), took);
 }
 
 impl Lanes {

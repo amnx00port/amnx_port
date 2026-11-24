@@ -537,6 +537,7 @@ fn pump(context: Context, voice: &mut Voice) {
 /// Decodes the next frame of the current input into `voice.pcm`; false
 /// when there is nothing left to decode.
 fn decode(context: Context, voice: &mut Voice) -> bool {
+    victory_profile::scope!("audio", "xma frame");
     if voice.ended {
         return false;
     }

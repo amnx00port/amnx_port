@@ -127,9 +127,63 @@ cargo build --profile diag -p victory --features diagnostics   # target\diag\vic
 | `VICTORY_SHADER_LOOP_LIMIT=<n>` | translated shader loops stop after `n` iterations per lane instead of 2^20 (own shader cache entries); if a lower `n` makes world frames much faster, loops hitting the limit are what makes them slow |
 | `VICTORY_AUDIO_CAPTURE=<file.wav>` | records what the title plays (our process only) |
 | `VICTORY_XMA_DUMP=<dir>` | saves the first 32 XMA voices' context and input |
+| `VICTORY_PROFILE=1` or `=<dir>` | any build: frame times, memory, caches and loads; see [Profiling](#profiling) |
+| `VICTORY_PROFILE_OVERLAY=1` | any build: the same with an on-screen panel, F3 to hide and show it; see [Profiling](#profiling) |
 
 Every build appends crashes and host GPU failures to `crashes.log` in the
 title's data folder.
+
+## Profiling
+
+Any build, release included, profiles a run with `VICTORY_PROFILE` set;
+unset, it costs one flag test per hook.
+
+| Variable | Effect |
+|----------|--------|
+| `VICTORY_PROFILE=1` | a summary in the log (target `victory_profile`) every 5 s |
+| `VICTORY_PROFILE=<dir>` | the same, plus `<dir>\frames.csv` and `<dir>\trace.json` (outside the repository) |
+| `VICTORY_PROFILE_OVERLAY=1` or `VICTORY_PROFILE=overlay` | the summaries, plus a panel in the window's top left corner (with `VICTORY_PROFILE=<dir>`, the files too) |
+| `VICTORY_PROFILE_INTERVAL=<seconds>` | time between summaries |
+| `VICTORY_PROFILE_HITCH_MS=<ms>` | a frame interval above this is a hitch (default 50) |
+| `VICTORY_PROFILE_TRACE_US=<us>` | timed scopes shorter than this are counted, not traced (default 100) |
+| `VICTORY_PROFILE_DUMP=30,90` | a full report at those seconds (with every thread's stack in a diagnostics build); one is also logged when the host GPU fails |
+
+A summary has the frame rate and 1% low, frame interval avg, p50, p95,
+p99 and max, hitches and stutters (over twice the median); per frame, the
+time preparing submissions, waiting for the GPU and presenting, and the
+submissions, draws and dispatches; process memory, video memory and its
+budget, and resident bytes (GPU memory, host textures, shader containers,
+the default allocator); cache hits and misses (shader containers, the
+shader disk cache, host pipelines, detiled textures); the timed scopes that took longest
+(shader translation, host pipelines, `ReadFile`, `XMemAlloc`, audio
+decoding...); and loads (file reads, DirectStorage requests) with the
+biggest and slowest of the period.
+
+`frames.csv` has one row per presented frame. Its `frame` column is the
+present count `VICTORY_CAPTURE` names its files by, so a captured frame
+finds its row. `trace.json` opens in <https://ui.perfetto.dev> or
+`chrome://tracing`: a row of frames, each thread's timed scopes and loads,
+and counters for frame times and memory. It stays readable when a run
+ends abruptly. Timing a new place is one line:
+
+```rust
+victory_profile::scope!("gpu", "my pass", bytes); // times the rest of the block
+```
+
+The overlay shows, redrawn four times a second: the frame rate, average
+frame time, 1% low and longest frame of the last 120 frames, with a
+graph of them (newest at the right, red above `VICTORY_PROFILE_HITCH_MS`,
+a line at it); the GPU wait, draws and submissions per frame; the
+process's working set and commit; video memory used, its budget and
+shared memory; each cache's hit rate (shader containers, the shader disk
+cache, host pipelines, detiled textures); and file and DirectStorage
+read rates in MB/s over the last second. F3, while the window has focus,
+hides and shows it; the title sees the key as well. It is copied into the
+back buffer after the frame (no shaders), so `VICTORY_CAPTURE` images do
+not have it, and it scales with the window: twice as big from 1440 lines.
+
+`victory_profile`'s documentation lists the other hooks (`count!`,
+`cache!`, `resident!`, `load`).
 
 ## License
 

@@ -78,9 +78,16 @@ static SHADERS: Mutex<Option<HashMap<[u8; 32], Arc<Shader>>>> = Mutex::new(None)
 fn shader(stage: &'static str, bytes: &[u8]) -> Arc<Shader> {
     let full = blake3::hash(bytes);
     let mut shaders = SHADERS.lock().unwrap_or_else(|e| e.into_inner());
-    shaders
+    let entry = shaders
         .get_or_insert_with(HashMap::new)
-        .entry(*full.as_bytes())
+        .entry(*full.as_bytes());
+    if matches!(entry, std::collections::hash_map::Entry::Occupied(_)) {
+        victory_profile::cache!("shader", "containers", Hit);
+    } else {
+        victory_profile::cache!("shader", "containers", Miss);
+        victory_profile::resident!("shader", "containers", bytes.len());
+    }
+    entry
         .or_insert_with(|| {
             Arc::new(Shader {
                 stage,
@@ -107,6 +114,7 @@ impl Shader {
     pub(crate) fn translated(&self) -> Option<&Translated> {
         self.translated
             .get_or_init(|| {
+                victory_profile::scope!("shader", "translate", self.container.len());
                 let done = translate(&self.container);
                 match &done {
                     Ok(t) => tracing::info!(
@@ -198,7 +206,15 @@ pub(crate) fn host_pipeline<'a>(this: This) -> Option<&'a host::HostPipeline> {
     if this.is_null() {
         return None;
     }
-    make::ready(&pipeline(this).host)
+    let p = pipeline(this);
+    if victory_profile::on() {
+        if make::is_made(&p.host) {
+            victory_profile::cache!("gpu", "host pipelines", Hit);
+        } else {
+            victory_profile::cache!("gpu", "host pipelines", Miss);
+        }
+    }
+    make::ready(&p.host)
 }
 
 /// Host pipelines queued and not made yet.

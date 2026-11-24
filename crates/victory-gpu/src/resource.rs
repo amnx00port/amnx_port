@@ -620,6 +620,7 @@ impl Memory {
             NonNull::new(alloc(layout.size(), attributes).cast::<u8>()).ok_or(E_OUTOFMEMORY)?;
         // SAFETY: the allocator handed out `size` bytes.
         unsafe { ptr.as_ptr().write_bytes(0, layout.size()) };
+        victory_profile::resident!("gpu", "memory", layout.size());
         Ok(Memory {
             ptr,
             layout,
@@ -645,6 +646,7 @@ impl Memory {
             .ok_or(E_INVALIDARG)?;
         // SAFETY: the size is non-zero.
         let ptr = NonNull::new(unsafe { alloc_zeroed(layout) }).ok_or(E_OUTOFMEMORY)?;
+        victory_profile::resident!("gpu", "memory", layout.size());
         Ok(Memory {
             ptr,
             layout,
@@ -655,6 +657,7 @@ impl Memory {
 
 impl Drop for Memory {
     fn drop(&mut self) {
+        victory_profile::resident!("gpu", "memory", -(self.layout.size() as i64));
         match (self.attributes, ALLOCATOR.get()) {
             (Some(attributes), Some(&(_, free))) => free(self.ptr.as_ptr().cast(), attributes),
             // SAFETY: allocated in `new` with this layout.
@@ -761,6 +764,16 @@ struct Resource {
 pub(crate) struct HostTexture {
     pub(crate) texture: windows::Win32::Graphics::Direct3D12::ID3D12Resource,
     pub(crate) state: std::sync::atomic::AtomicU32,
+    /// Its console footprint, as an estimate of its host size, for
+    /// `VICTORY_PROFILE`.
+    bytes: u64,
+}
+
+#[cfg(windows)]
+impl Drop for HostTexture {
+    fn drop(&mut self) {
+        victory_profile::resident!("gpu", "host textures (estimated)", -(self.bytes as i64));
+    }
 }
 
 /// Moves the host texture to `wanted` (a host texture state); the host
@@ -938,9 +951,12 @@ fn hand_out_resource(
         #[cfg(windows)]
         host: host.map(|texture| {
             let state = crate::host::legal_state(&texture, crate::host::texture_state(state));
+            let bytes = footprint(&desc).map_or(0, |info| info.size);
+            victory_profile::resident!("gpu", "host textures (estimated)", bytes);
             std::sync::Arc::new(HostTexture {
                 texture,
                 state: state.into(),
+                bytes,
             })
         }),
     });

@@ -315,6 +315,7 @@ pub extern "system" fn XApuEnqueueCommand(
 /// Decodes one packet into the command's output buffer, keeping the frames
 /// from `first_frame` on, at most `frame_count` of them.
 fn process(decoder: &mut OpusDecoder, options: u32, command: &Process, result: &mut ApuResult) {
+    victory_profile::scope!("audio", "opus packet", command.input_length);
     let channels = decoder.channels();
     let (input, input_length) = (command.input, command.input_length);
     let (output, output_length) = (command.output, command.output_length);

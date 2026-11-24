@@ -179,6 +179,7 @@ impl Staging {
         let preparing = &crate::host::PREPARING;
         preparing[2].fetch_add(started.elapsed().as_micros() as u64, Relaxed);
         preparing[3].fetch_add(read as u64, Relaxed);
+        victory_profile::record!("gpu", "texture refresh", read, started.elapsed());
     }
 
     /// Returns the bytes of title memory read.
@@ -189,8 +190,10 @@ impl Staging {
         let last = &mut *last;
         if let Some((now, written)) = crate::watch::writes(start, start + size, false) {
             if last.asked != 0 && written.iter().all(|&(_, w)| w <= last.asked) {
+                victory_profile::cache!("gpu", "detiled textures", Hit);
                 return 0;
             }
+            victory_profile::cache!("gpu", "detiled textures", Miss);
             last.asked = now;
             // Read through the copy, which stands unmapped pages: memory of
             // big pools is too slow to ask page by page.
@@ -217,8 +220,10 @@ impl Staging {
         #[cfg(feature = "diagnostics")]
         crate::copystat::add(crate::copystat::C::TexHashed, size as u64);
         if last.hash == Some(hash) {
+            victory_profile::cache!("gpu", "detiled textures", Hit);
             return size;
         }
+        victory_profile::cache!("gpu", "detiled textures", Miss);
         last.hash = Some(hash);
         self.detile(tiled);
         #[cfg(feature = "diagnostics")]

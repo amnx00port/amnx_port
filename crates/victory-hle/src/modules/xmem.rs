@@ -91,6 +91,7 @@ pub extern "system" fn XMemVirtualAlloc(
     flags: u64,
     protect: u32,
 ) -> *mut c_void {
+    victory_profile::count!("xmem", "XMemVirtualAlloc", size);
     let (lowest, highest) = address_range(flags);
     let mut requirements = MEM_ADDRESS_REQUIREMENTS {
         LowestStartingAddress: lowest as *mut c_void,
@@ -253,6 +254,7 @@ fn hooks() -> [usize; 2] {
 /// The title's general allocator, for middleware too: its hook if it has
 /// one, else [`XMemAllocDefault`].
 pub extern "system" fn XMemAlloc(size: usize, attributes: u64) -> *mut c_void {
+    victory_profile::scope!("hle", "XMemAlloc", size);
     match hooks()[0] {
         0 => XMemAllocDefault(size, attributes),
         hook => {
@@ -265,6 +267,7 @@ pub extern "system" fn XMemAlloc(size: usize, attributes: u64) -> *mut c_void {
 
 /// See [`XMemAlloc`].
 pub extern "system" fn XMemFree(address: *mut c_void, attributes: u64) {
+    victory_profile::scope!("hle", "XMemFree");
     match hooks()[1] {
         0 => XMemFreeDefault(address, attributes),
         hook => {
@@ -298,6 +301,7 @@ pub extern "system" fn XMemAllocDefault(size: usize, attributes: u64) -> *mut c_
     if block.is_null() {
         return block.cast();
     }
+    victory_profile::resident!("xmem", "default allocator", layout.size());
     // SAFETY: the block holds the alignment (at least the header) and then
     // `size` bytes.
     unsafe {
@@ -323,6 +327,7 @@ pub extern "system" fn XMemFreeDefault(address: *mut c_void, attributes: u64) {
         }
         let user = address.cast::<u8>();
         let [size, align] = user.sub(HEADER).cast::<[usize; 2]>().read();
+        victory_profile::resident!("xmem", "default allocator", -(size as i64));
         dealloc(
             user.sub(align),
             Layout::from_size_align_unchecked(size, align),

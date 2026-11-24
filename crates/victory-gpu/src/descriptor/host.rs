@@ -133,6 +133,12 @@ impl HostHeap {
             tracing::warn!(error = %e, "host descriptor heap not made null");
         }
         tracing::debug!(ms = started.elapsed().as_millis(), "host descriptor heap made null");
+        // One statistic per call site, so one site per name.
+        if sampler {
+            victory_profile::record!("gpu", "sampler heap", count + extra, started.elapsed());
+        } else {
+            victory_profile::record!("gpu", "view heap", count + extra, started.elapsed());
+        }
         Some(h)
     }
 

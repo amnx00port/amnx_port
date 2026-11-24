@@ -521,14 +521,37 @@ pub extern "system" fn ReadFile(
     overlapped: *mut c_void,
 ) -> i32 {
     victory_gpu::kernel_will_write(buffer as usize, len as usize);
-    host!("kernel32.dll", "ReadFile": extern "system" fn(*mut c_void, *mut u8, u32, *mut u32, *mut c_void) -> i32)(
+    let started = victory_profile::on().then(std::time::Instant::now);
+    let done = host!("kernel32.dll", "ReadFile": extern "system" fn(*mut c_void, *mut u8, u32, *mut u32, *mut c_void) -> i32)(
         file, buffer, len, read, overlapped,
-    )
+    );
+    if let Some(started) = started {
+        let took = started.elapsed();
+        victory_profile::record!("hle", "ReadFile", len, took);
+        // Big or slow reads are loads worth naming.
+        if len >= 1 << 20 || took >= std::time::Duration::from_millis(5) {
+            victory_profile::load("file", || handle_path(file), u64::from(len), took);
+        }
+    }
+    done
+}
+
+/// For `VICTORY_PROFILE`: the path of an open file.
+fn handle_path(file: *mut c_void) -> String {
+    use windows_sys::Win32::Storage::FileSystem::GetFinalPathNameByHandleW;
+    let mut path = vec![0u16; 1024];
+    // SAFETY: a handle the title passed; a buffer of that length.
+    let n = unsafe { GetFinalPathNameByHandleW(file, path.as_mut_ptr(), path.len() as u32, 0) };
+    match usize::try_from(n) {
+        Ok(n) if n > 0 && n < path.len() => String::from_utf16_lossy(&path[..n]),
+        _ => format!("file handle {file:p}"),
+    }
 }
 
 /// The host CRT reads large requests straight into the caller's buffer.
 pub extern "C" fn fread(buffer: *mut u8, size: usize, count: usize, stream: File) -> usize {
     victory_gpu::kernel_will_write(buffer as usize, size.saturating_mul(count));
+    victory_profile::scope!("hle", "fread", size.saturating_mul(count));
     host!("ucrtbase.dll", "fread": extern "C" fn(*mut u8, usize, usize, File) -> usize)(
         buffer, size, count, stream,
     )
