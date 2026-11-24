@@ -100,6 +100,20 @@ const VERBATIM: [u16; 4] = [b'\\' as u16, b'\\' as u16, b'?' as u16, b'\\' as u1
 /// host's MAX_PATH limit (248 characters for a directory, 260 for a file).
 const LONG: usize = 248;
 
+fn normalize_parts<'a>(tail: &'a [u16]) -> Vec<&'a [u16]> {
+    let dot = u16::from(b'.');
+    let mut parts: Vec<&'a [u16]> = Vec::new();
+    for part in tail.split(|c| SEPARATORS.contains(c)) {
+        match part {
+            [] => {}
+            [d] if *d == dot => {}
+            [d, e] if [*d, *e] == [dot; 2] => drop(parts.pop()),
+            _ => parts.push(part),
+        }
+    }
+    parts
+}
+
 /// `root` and the title's `tail` as a `\\?\` path. That form turns off the
 /// host's own clean-up, so `/` becomes `\` and `.` and `..` are resolved
 /// here (`..` stops at the root).
@@ -118,17 +132,7 @@ fn verbatim(root: &[u16], tail: &[u16]) -> Vec<u16> {
     while out.last() == Some(&backslash) {
         out.pop();
     }
-    let dot = u16::from(b'.');
-    let mut parts: Vec<&[u16]> = Vec::new();
-    for part in tail.split(|c| SEPARATORS.contains(c)) {
-        match part {
-            [] => {}
-            [d] if *d == dot => {}
-            [d, e] if [*d, *e] == [dot; 2] => drop(parts.pop()),
-            _ => parts.push(part),
-        }
-    }
-    for part in parts {
+    for part in normalize_parts(tail) {
         out.push(backslash);
         out.extend_from_slice(part);
     }
@@ -155,6 +159,24 @@ pub(crate) fn translate(path: &[u16]) -> Option<Vec<u16>> {
     let tail = &rest[2..];
     if prefix.is_empty() && root.len() + tail.len() >= LONG {
         let mut out = verbatim(root, tail);
+        out.push(0);
+        return Some(out);
+    }
+    let dot = u16::from(b'.');
+    let has_traversal = tail
+        .split(|c| SEPARATORS.contains(c))
+        .any(|part| part == [dot, dot]);
+    if has_traversal {
+        let backslash = u16::from(b'\\');
+        let mut out = prefix.to_vec();
+        out.extend_from_slice(root);
+        let parts = normalize_parts(tail);
+        for part in parts {
+            if out.last() != Some(&backslash) {
+                out.push(backslash);
+            }
+            out.extend_from_slice(part);
+        }
         out.push(0);
         return Some(out);
     }

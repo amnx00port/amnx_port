@@ -179,6 +179,9 @@ mod tests {
 
     #[test]
     fn serves_a_drive_over_the_title_folder_and_its_quota() {
+        let _guard = crate::runtime::TEST_TITLE_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
         type Size = extern "system" fn(This, *mut usize) -> HRESULT;
         type Get = extern "system" fn(This, usize, *mut u8, *mut usize) -> HRESULT;
         type Space = extern "system" fn(This, *mut SpaceInfo) -> HRESULT;
@@ -236,5 +239,225 @@ mod tests {
             assert_eq!(xasync::XAsyncGetStatus(&mut block, true), expect);
             assert_eq!(result(this, &mut block), expect, "{bytes} bytes");
         }
+        runtime::set_title(runtime::Title::default());
+    }
+
+    #[test]
+    fn path_traversal_cannot_escape_storage_root() {
+        let _guard = crate::runtime::TEST_TITLE_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        type Get = extern "system" fn(This, usize, *mut u8, *mut usize) -> HRESULT;
+        let this: This = &OBJECT;
+        let parent = tempfile::tempdir().unwrap();
+        let storage = parent.path().join("storage_root");
+        std::fs::create_dir(&storage).unwrap();
+        let outside = parent.path().join("secret_outside.dat");
+        std::fs::write(&outside, b"sensitive host data").unwrap();
+        let inside = storage.join("inside.dat");
+        std::fs::write(&inside, b"game save data").unwrap();
+        let sub = storage.join("sub");
+        std::fs::create_dir(&sub).unwrap();
+        std::fs::write(sub.join("nested.dat"), b"nested").unwrap();
+
+        runtime::set_title(runtime::Title {
+            id: 200,
+            storage: storage.clone(),
+            storage_bytes: 10_000,
+            ..Default::default()
+        });
+
+        let (mut buffer, mut used) = ([0u8; 4], 0);
+        let get = method::<Get>(&OBJECT, 0x20);
+        assert_eq!(get(this, 4, buffer.as_mut_ptr(), &mut used), S_OK);
+        let drive = std::str::from_utf8(&buffer[..3]).unwrap();
+
+        let get_attributes = super::super::files::GetFileAttributesExW;
+        let mut attributes = [0u8; 36];
+
+        // 1. Attempts to traverse outside the virtual drive root must NOT reach outside file:
+        let traversal_attempts = [
+            format!("{drive}..\\secret_outside.dat\0"),
+            format!("{drive}..\\..\\secret_outside.dat\0"),
+            format!("{drive}sub\\..\\..\\secret_outside.dat\0"),
+            format!("{drive}/../secret_outside.dat\0"),
+            format!("{drive}sub/../../secret_outside.dat\0"),
+        ];
+
+        for attempt in &traversal_attempts {
+            let wide: Vec<u16> = attempt.encode_utf16().collect();
+            // GetFileAttributesExW returns 0 (fails) because the file does not exist inside storage_root
+            let res = get_attributes(wide.as_ptr(), 0, attributes.as_mut_ptr().cast());
+            assert_eq!(res, 0, "path traversal attempt '{attempt}' escaped storage root");
+        }
+
+        // 2. Intra-folder traversal within storage root must succeed:
+        let valid_traversals = [
+            format!("{drive}sub\\..\\inside.dat\0"),
+            format!("{drive}sub/../inside.dat\0"),
+            format!("{drive}.\\inside.dat\0"),
+            format!("{drive}sub/./nested.dat\0"),
+        ];
+        for valid in &valid_traversals {
+            let wide: Vec<u16> = valid.encode_utf16().collect();
+            let res = get_attributes(wide.as_ptr(), 0, attributes.as_mut_ptr().cast());
+            assert_ne!(res, 0, "intra-folder relative path '{valid}' failed to resolve");
+        }
+        runtime::set_title(runtime::Title::default());
+    }
+
+    #[test]
+    fn mixed_path_separators_resolve_correctly() {
+        let _guard = crate::runtime::TEST_TITLE_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        type Get = extern "system" fn(This, usize, *mut u8, *mut usize) -> HRESULT;
+        let this: This = &OBJECT;
+        let dir = tempfile::tempdir().unwrap();
+        let nested_dir = dir.path().join("folder").join("nested");
+        std::fs::create_dir_all(&nested_dir).unwrap();
+        std::fs::write(nested_dir.join("file.bin"), b"binary data").unwrap();
+
+        runtime::set_title(runtime::Title {
+            id: 201,
+            storage: dir.path().to_owned(),
+            storage_bytes: 10_000,
+            ..Default::default()
+        });
+
+        let (mut buffer, mut used) = ([0u8; 4], 0);
+        let get = method::<Get>(&OBJECT, 0x20);
+        assert_eq!(get(this, 4, buffer.as_mut_ptr(), &mut used), S_OK);
+        let drive = std::str::from_utf8(&buffer[..3]).unwrap();
+
+        let get_attributes = super::super::files::GetFileAttributesExW;
+        let mut attributes = [0u8; 36];
+
+        let separator_variants = [
+            format!("{drive}folder/nested/file.bin\0"),
+            format!("{drive}folder\\nested\\file.bin\0"),
+            format!("{drive}folder/nested\\file.bin\0"),
+            format!("{drive}folder\\nested/file.bin\0"),
+            format!("{drive}/folder/nested/file.bin\0"),
+            format!("{drive}\\folder\\nested\\file.bin\0"),
+            format!("{drive}/folder\\nested/file.bin\0"),
+        ];
+
+        for variant in &separator_variants {
+            let wide: Vec<u16> = variant.encode_utf16().collect();
+            let res = get_attributes(wide.as_ptr(), 0, attributes.as_mut_ptr().cast());
+            assert_ne!(res, 0, "failed to open path with separator variant '{variant}'");
+        }
+        runtime::set_title(runtime::Title::default());
+    }
+
+    #[test]
+    fn storage_quota_enforcement_and_overflow() {
+        let _guard = crate::runtime::TEST_TITLE_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        type Space = extern "system" fn(This, *mut SpaceInfo) -> HRESULT;
+        type Prompt = extern "system" fn(This, u64, *mut AsyncBlock) -> HRESULT;
+        let this: This = &OBJECT;
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("existing.dat"), [0u8; 300]).unwrap();
+
+        runtime::set_title(runtime::Title {
+            id: 202,
+            storage: dir.path().to_owned(),
+            storage_bytes: 1_000,
+            ..Default::default()
+        });
+
+        let mut info = SpaceInfo {
+            available_free: 0,
+            total_free: 0,
+            used: 0,
+            total: 0,
+        };
+        assert_eq!(method::<Space>(&OBJECT, 0x28)(this, &mut info), S_OK);
+        assert_eq!((info.used, info.total_free, info.total), (300, 700, 1_000));
+
+        let prompt = method::<Prompt>(&OBJECT, 0x30);
+        let mut block = AsyncBlock {
+            queue: std::ptr::null(),
+            context: std::ptr::null_mut(),
+            callback: None,
+            internal: [0; 4],
+        };
+
+        // Allowed up to remaining free quota:
+        assert_eq!(prompt(this, 700, &mut block), S_OK);
+        assert_eq!(xasync::XAsyncGetStatus(&mut block, true), S_OK);
+
+        // Exceeding remaining quota returns E_ABORT:
+        assert_eq!(prompt(this, 701, &mut block), S_OK);
+        assert_eq!(xasync::XAsyncGetStatus(&mut block, true), E_ABORT);
+
+        // Extreme overflow (u64::MAX) safely rejected:
+        assert_eq!(prompt(this, u64::MAX, &mut block), S_OK);
+        assert_eq!(xasync::XAsyncGetStatus(&mut block, true), E_ABORT);
+
+        // Simulate file writes that exceed the configured quota (e.g. 1500 bytes used with quota 1000):
+        std::fs::write(dir.path().join("large.dat"), [0u8; 1_200]).unwrap();
+        assert_eq!(method::<Space>(&OBJECT, 0x28)(this, &mut info), S_OK);
+        assert_eq!(info.used, 1_500);
+        assert_eq!(info.total_free, 0, "saturating_sub must prevent underflow");
+        assert_eq!(info.available_free, 0);
+
+        // Any non-zero prompt fails when quota is exceeded:
+        assert_eq!(prompt(this, 1, &mut block), S_OK);
+        assert_eq!(xasync::XAsyncGetStatus(&mut block, true), E_ABORT);
+
+        // 0-byte prompt succeeds:
+        assert_eq!(prompt(this, 0, &mut block), S_OK);
+        assert_eq!(xasync::XAsyncGetStatus(&mut block, true), S_OK);
+        runtime::set_title(runtime::Title::default());
+    }
+
+    #[test]
+    fn unmounted_and_nonexistent_drive_access() {
+        let _guard = crate::runtime::TEST_TITLE_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        type Size = extern "system" fn(This, *mut usize) -> HRESULT;
+        type Get = extern "system" fn(This, usize, *mut u8, *mut usize) -> HRESULT;
+        type Space = extern "system" fn(This, *mut SpaceInfo) -> HRESULT;
+        let this: This = &OBJECT;
+
+        // Non-existent drive access via files::translate (drive B: is reserved and never mounted):
+        let nonexistent = "B:\\nonexistent\\file.dat\0".encode_utf16().collect::<Vec<u16>>();
+        let translated = crate::modules::files::translate(&nonexistent[..nonexistent.len() - 1]);
+        assert!(translated.is_none(), "unmounted drive B: must not translate");
+
+        let invalid = "1:\\invalid\\file.dat\0".encode_utf16().collect::<Vec<u16>>();
+        assert!(crate::modules::files::translate(&invalid[..invalid.len() - 1]).is_none());
+
+        let get_attributes = super::super::files::GetFileAttributesExW;
+        let mut attributes = [0u8; 36];
+        assert_eq!(
+            get_attributes(nonexistent.as_ptr(), 0, attributes.as_mut_ptr().cast()),
+            0,
+            "querying nonexistent drive must fail"
+        );
+
+        // Empty storage configuration:
+        runtime::set_title(runtime::Title {
+            id: 203,
+            storage: std::path::PathBuf::new(),
+            storage_bytes: 0,
+            ..Default::default()
+        });
+
+        let mut size = 0;
+        assert_eq!(method::<Size>(&OBJECT, 0x18)(this, &mut size), NOT_SUPPORTED);
+
+        let (mut buffer, mut used) = ([0u8; 4], 0);
+        assert_eq!(method::<Get>(&OBJECT, 0x20)(this, 4, buffer.as_mut_ptr(), &mut used), NOT_SUPPORTED);
+
+        // Null pointer handling when storage is unconfigured:
+        assert_eq!(method::<Size>(&OBJECT, 0x18)(this, std::ptr::null_mut()), NOT_SUPPORTED);
+        assert_eq!(method::<Space>(&OBJECT, 0x28)(this, std::ptr::null_mut()), xasync::E_INVALIDARG);
+        runtime::set_title(runtime::Title::default());
     }
 }

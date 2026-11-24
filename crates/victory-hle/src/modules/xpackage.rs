@@ -202,6 +202,9 @@ extern "system" fn estimate_download(
     if !is_ours(id) {
         return NO_PACKAGE;
     }
+    if bytes.is_null() {
+        return xasync::E_INVALIDARG;
+    }
     if !confirm.is_null() {
         // SAFETY: checked non-null.
         unsafe { confirm.write(false) };
@@ -367,5 +370,211 @@ mod tests {
             S_OK
         );
         assert_eq!(xasync::XAsyncGetStatus(&mut block, true), NO_PACKAGE);
+    }
+
+    #[test]
+    fn truncated_and_corrupted_package_identifiers_are_rejected() {
+        let _guard = crate::runtime::TEST_TITLE_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let this: This = &OBJECT;
+        runtime::set_title(runtime::Title {
+            id: 0x639AA8DD,
+            ..Default::default()
+        });
+        assert_eq!(identifier(), "639AA8DD");
+
+        let corrupted_ids = [
+            std::ptr::null(),
+            c"".as_ptr(),
+            c"639".as_ptr(),
+            c"639AA8D".as_ptr(),
+            c"639AA8DE".as_ptr(),
+            c"639AA8DD_OVERFLOW".as_ptr(),
+            c"dlc_package_pack_01".as_ptr(),
+            c"\xff\xfe\xfd".as_ptr(),
+        ];
+
+        type CreateMonitor = extern "system" fn(
+            This,
+            *const c_char,
+            u32,
+            *const c_void,
+            u32,
+            *const c_void,
+            *mut *const c_void,
+        ) -> HRESULT;
+        type Find =
+            extern "system" fn(This, *const c_char, u32, *const c_void, *mut u32) -> HRESULT;
+        type ChangeOrder =
+            extern "system" fn(This, *const c_char, u32, *const c_void) -> HRESULT;
+        type EstimateDownload =
+            extern "system" fn(This, *const c_char, u32, *const c_void, *mut u64, *mut bool) -> HRESULT;
+        type UninstallChunks =
+            extern "system" fn(This, *const c_char, u32, *const c_void) -> HRESULT;
+        type MountAsync =
+            extern "system" fn(This, *const c_char, *mut AsyncBlock) -> HRESULT;
+
+        let create_mon = method::<CreateMonitor>(&OBJECT, 0x28);
+        let find = method::<Find>(&OBJECT, 0x60);
+        let change = method::<ChangeOrder>(&OBJECT, 0x70);
+        let estimate = method::<EstimateDownload>(&OBJECT, 0x90);
+        let uninstall = method::<UninstallChunks>(&OBJECT, 0x98);
+        let mount_async = method::<MountAsync>(&OBJECT, 0x128);
+
+        for bad_id in corrupted_ids {
+            let mut mon_out = std::ptr::null();
+            assert_eq!(
+                create_mon(this, bad_id, 0, std::ptr::null(), 0, std::ptr::null(), &mut mon_out),
+                NO_PACKAGE
+            );
+
+            let mut avail = 99;
+            assert_eq!(
+                find(this, bad_id, 0, std::ptr::null(), &mut avail),
+                NO_PACKAGE
+            );
+
+            assert_eq!(
+                change(this, bad_id, 0, std::ptr::null()),
+                NO_PACKAGE
+            );
+
+            let mut bytes = 999;
+            let mut confirm = true;
+            assert_eq!(
+                estimate(this, bad_id, 0, std::ptr::null(), &mut bytes, &mut confirm),
+                NO_PACKAGE
+            );
+            assert_eq!(bytes, 999, "bytes must not be modified on error");
+
+            assert_eq!(
+                uninstall(this, bad_id, 0, std::ptr::null()),
+                NO_PACKAGE
+            );
+
+            let mut block = AsyncBlock {
+                queue: std::ptr::null(),
+                context: std::ptr::null_mut(),
+                callback: None,
+                internal: [0; 4],
+            };
+            assert_eq!(mount_async(this, bad_id, &mut block), S_OK);
+            assert_eq!(xasync::XAsyncGetStatus(&mut block, true), NO_PACKAGE);
+        }
+        runtime::set_title(runtime::Title::default());
+    }
+
+    #[test]
+    fn invalid_data_sizes_and_null_buffers_are_safely_handled() {
+        let _guard = crate::runtime::TEST_TITLE_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let this: This = &OBJECT;
+        runtime::set_title(runtime::Title {
+            id: 0x639AA8DD,
+            ..Default::default()
+        });
+
+        type Id = extern "system" fn(This, usize, *mut u8) -> HRESULT;
+        let get_id = method::<Id>(&OBJECT, 0x18);
+
+        // Zero size or null buffer:
+        assert_eq!(get_id(this, 0, std::ptr::null_mut()), xasync::E_NOT_SUFFICIENT_BUFFER);
+        let mut buf = [0xAAu8; 16];
+        assert_eq!(get_id(this, 0, buf.as_mut_ptr()), xasync::E_NOT_SUFFICIENT_BUFFER);
+        assert_eq!(buf[0], 0xAA, "buffer must remain untouched on error");
+
+        // Buffer shorter than identifier + NUL (8 chars + 1 NUL = 9 bytes):
+        for short_size in 1..=8 {
+            assert_eq!(get_id(this, short_size, buf.as_mut_ptr()), xasync::E_NOT_SUFFICIENT_BUFFER);
+            assert_eq!(buf[0], 0xAA);
+        }
+
+        // Exact buffer size succeeds:
+        assert_eq!(get_id(this, 9, buf.as_mut_ptr()), S_OK);
+        assert_eq!(&buf[..9], b"639AA8DD\0");
+
+        // Null out parameters for methods with our valid ID:
+        let ours = format!("{}\0", identifier());
+        type CreateMonitor = extern "system" fn(
+            This,
+            *const c_char,
+            u32,
+            *const c_void,
+            u32,
+            *const c_void,
+            *mut *const c_void,
+        ) -> HRESULT;
+        assert_eq!(
+            method::<CreateMonitor>(&OBJECT, 0x28)(
+                this,
+                ours.as_ptr().cast(),
+                0,
+                std::ptr::null(),
+                0,
+                std::ptr::null(),
+                std::ptr::null_mut(),
+            ),
+            xasync::E_INVALIDARG
+        );
+
+        type Find =
+            extern "system" fn(This, *const c_char, u32, *const c_void, *mut u32) -> HRESULT;
+        assert_eq!(
+            method::<Find>(&OBJECT, 0x60)(
+                this,
+                ours.as_ptr().cast(),
+                0,
+                std::ptr::null(),
+                std::ptr::null_mut(),
+            ),
+            xasync::E_INVALIDARG
+        );
+
+        type RegProgress = extern "system" fn(
+            This,
+            *const c_void,
+            *mut c_void,
+            *const c_void,
+            *mut u64,
+        ) -> HRESULT;
+        assert_eq!(
+            method::<RegProgress>(&OBJECT, 0x48)(
+                this,
+                monitor(),
+                std::ptr::null_mut(),
+                std::ptr::null(),
+                std::ptr::null_mut(),
+            ),
+            xasync::E_INVALIDARG
+        );
+
+        type EstimateDownload =
+            extern "system" fn(This, *const c_char, u32, *const c_void, *mut u64, *mut bool) -> HRESULT;
+        let mut confirm = true;
+        assert_eq!(
+            method::<EstimateDownload>(&OBJECT, 0x90)(
+                this,
+                ours.as_ptr().cast(),
+                0,
+                std::ptr::null(),
+                std::ptr::null_mut(),
+                &mut confirm,
+            ),
+            xasync::E_INVALIDARG
+        );
+        assert!(confirm, "confirm must not be mutated when bytes is null");
+
+        // mount_path always rejects invalid arguments:
+        type MountPath = extern "system" fn(This, *const c_void, usize, *mut u8) -> HRESULT;
+        assert_eq!(
+            method::<MountPath>(&OBJECT, 0xc8)(this, std::ptr::null(), 0, std::ptr::null_mut()),
+            xasync::E_INVALIDARG
+        );
+
+        type UninstallPkg = extern "system" fn(This, *const c_char) -> bool;
+        assert!(!method::<UninstallPkg>(&OBJECT, 0x110)(this, ours.as_ptr().cast()));
+        runtime::set_title(runtime::Title::default());
     }
 }
