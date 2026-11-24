@@ -17,15 +17,22 @@
 #![allow(non_snake_case)]
 #![allow(clippy::not_unsafe_ptr_arg_deref)]
 
-use std::borrow::Cow;
+use std::cell::Cell;
 use std::collections::{BTreeMap, BTreeSet, HashMap, VecDeque};
 use std::ffi::{CStr, c_char, c_void};
-use std::os::windows::fs::FileExt;
-use std::os::windows::io::FromRawHandle;
+use std::os::windows::io::{AsRawHandle, FromRawHandle, OwnedHandle};
 use std::sync::atomic::{AtomicBool, AtomicI32, AtomicU32, AtomicU64, Ordering};
 use std::sync::{Condvar, Mutex, MutexGuard, OnceLock};
 
 use victory_formats::bcpack::{self, Tables};
+use windows_sys::Win32::Foundation::{
+    CloseHandle, ERROR_HANDLE_EOF, ERROR_IO_PENDING, GetLastError, HANDLE, INVALID_HANDLE_VALUE,
+};
+use windows_sys::Win32::Storage::FileSystem::{FILE_FLAG_OVERLAPPED, ReadFile};
+use windows_sys::Win32::System::IO::{GetOverlappedResult, OVERLAPPED};
+use windows_sys::Win32::System::Threading::{
+    CreateEventW, GetCurrentThread, SetThreadPriority, THREAD_PRIORITY_BELOW_NORMAL,
+};
 
 use super::xasync::{E_INVALIDARG, E_NOTIMPL, E_PENDING};
 use super::xgameruntime::{Guid, HRESULT, Methods, Object, S_OK, add_ref, missing, put};
@@ -102,18 +109,23 @@ fn iid_text(iid: *const Guid) -> String {
     unsafe { iid.as_ref() }.map_or_else(|| "null".into(), Guid::to_string)
 }
 
+/// `HRESULT_FROM_WIN32` of a Win32 error code.
+fn from_win32_code(code: u32) -> HRESULT {
+    (0x8007_0000 | (code & 0xffff)) as i32
+}
+
 /// `HRESULT_FROM_WIN32` of a host error.
 fn from_win32(error: &std::io::Error) -> HRESULT {
     error
         .raw_os_error()
-        .map_or(E_INVALIDARG, |e| (0x8007_0000 | (e as u32 & 0xffff)) as i32)
+        .map_or(E_INVALIDARG, |e| from_win32_code(e as u32))
 }
 
 // The factory.
 
 type Factory = *const Object;
 
-/// Opens `path` for reading; the file object owns the handle.
+/// Opens `path` for overlapped reading; the file object owns the handle.
 extern "system" fn open_file(_: Factory, path: *const u16, iid: *const Guid, out: Out) -> HRESULT {
     const GENERIC_READ: u32 = 0x8000_0000;
     const FILE_SHARE_READ: u32 = 1;
@@ -122,13 +134,15 @@ extern "system" fn open_file(_: Factory, path: *const u16, iid: *const Guid, out
         return E_INVALIDARG;
     }
     // Goes through `files`, so paths on our virtual drives work too.
+    // `FILE_FLAG_OVERLAPPED` lets worker threads issue concurrent positioned
+    // reads on the same handle without serializing on the kernel's file lock.
     let handle = super::files::CreateFileW(
         path,
         GENERIC_READ,
         FILE_SHARE_READ,
         std::ptr::null(),
         OPEN_EXISTING,
-        0,
+        FILE_FLAG_OVERLAPPED,
         std::ptr::null_mut(),
     );
     // SAFETY: the title passes a NUL-terminated path.
@@ -136,15 +150,15 @@ extern "system" fn open_file(_: Factory, path: *const u16, iid: *const Guid, out
         let len = (0..).take_while(|&i| *path.add(i) != 0).count();
         String::from_utf16_lossy(std::slice::from_raw_parts(path, len))
     };
-    if handle as isize == -1 {
+    if handle == INVALID_HANDLE_VALUE {
         let error = std::io::Error::last_os_error();
         tracing::warn!(path = name, %error, "dstorage: opening a file failed");
         return from_win32(&error);
     }
     tracing::info!(path = name, iid = iid_text(iid), "dstorage: file opened");
     // SAFETY: a handle we just opened and nobody else owns.
-    let file = unsafe { std::fs::File::from_raw_handle(handle) };
-    let file = Instance::create(Object::new("dstorage file", &FILE_VTABLE), File { file });
+    let handle = unsafe { OwnedHandle::from_raw_handle(handle) };
+    let file = Instance::create(Object::new("dstorage file", &FILE_VTABLE), File { handle });
     put(out, file)
 }
 
@@ -257,7 +271,7 @@ static FACTORY_VTABLE: Methods<16> = Methods([
 // Files.
 
 struct File {
-    file: std::fs::File,
+    handle: OwnedHandle,
 }
 
 static FILE_VTABLE: Methods<8> = Methods([
@@ -338,6 +352,12 @@ struct Lanes {
     next_id: u64,
     /// Submission order over all queues.
     next_seq: u64,
+    /// Total submitted reads waiting across all lanes.
+    queued_reads: usize,
+    /// Threads currently waiting on `Scheduler::finished` (full queues or `close`).
+    finished_waiters: usize,
+    /// Number of worker threads started in the pool.
+    workers: usize,
     /// Bytes of staging held by running requests, and the limit.
     staged: u64,
     staging: u64,
@@ -403,6 +423,9 @@ fn scheduler() -> Option<&'static Scheduler> {
                     lanes: HashMap::new(),
                     next_id: 0,
                     next_seq: 0,
+                    queued_reads: 0,
+                    finished_waiters: 0,
+                    workers: 0,
                     staged: 0,
                     staging: STAGING,
                     starved: false,
@@ -429,6 +452,7 @@ fn scheduler() -> Option<&'static Scheduler> {
                     .is_ok()
             })
             .count();
+        scheduler.lock().workers = started;
         tracing::info!(workers = started, "dstorage: workers");
     });
     Some(scheduler)
@@ -438,26 +462,65 @@ impl Scheduler {
     fn lock(&self) -> MutexGuard<'_, Lanes> {
         self.lanes.lock().unwrap_or_else(|e| e.into_inner())
     }
+
+    /// Wakes only as many sleeping workers as there are newly runnable reads,
+    /// avoiding thundering-herd wakeups on small batches.
+    fn notify_work(&self, count: usize, workers: usize) {
+        if count == 0 {
+            return;
+        }
+        if count == 1 {
+            self.work.notify_one();
+        } else if workers > 0 && count >= workers {
+            self.work.notify_all();
+        } else {
+            for _ in 0..count {
+                self.work.notify_one();
+            }
+        }
+    }
+
+    /// Wakes threads blocked on a full or closing queue only when present.
+    fn notify_finished(&self, waiters: usize) {
+        match waiters {
+            0 => {}
+            1 => self.finished.notify_one(),
+            _ => self.finished.notify_all(),
+        }
+    }
 }
 
 /// A worker: runs the next read of the most deserving queue.
 fn work(scheduler: &'static Scheduler) {
+    // Keep background streaming below normal priority so live open-world
+    // asset loads do not starve render or simulation threads.
+    // SAFETY: pseudo-handle to the current thread and a valid priority level.
+    unsafe {
+        SetThreadPriority(GetCurrentThread(), THREAD_PRIORITY_BELOW_NORMAL);
+    }
+    let mut scratch = Scratch::default();
     let mut lanes = scheduler.lock();
     loop {
         let Some(job) = lanes.start() else {
-            lanes = scheduler.work.wait(lanes).unwrap_or_else(|e| e.into_inner());
+            lanes = scheduler
+                .work
+                .wait(lanes)
+                .unwrap_or_else(|e| e.into_inner());
             continue;
         };
         drop(lanes);
         let started = std::time::Instant::now();
-        let result = execute(&job.request);
+        let result = execute(&job.request, &mut scratch);
+        scratch.trim();
         lanes = scheduler.lock();
         lanes.finish(&job, result);
         lanes.count(&job, started);
         if std::mem::take(&mut lanes.starved) {
-            scheduler.work.notify_all();
+            // This worker itself immediately loops to pick up one waiting read,
+            // so wake other workers only for any additional waiting reads.
+            scheduler.notify_work(lanes.queued_reads.saturating_sub(1), lanes.workers);
         }
-        scheduler.finished.notify_all();
+        scheduler.notify_finished(lanes.finished_waiters);
     }
 }
 
@@ -484,7 +547,8 @@ impl Lanes {
                 reading_workers = format_args!("{:.2}", reading / elapsed.as_secs_f64()),
                 staging_waits = std::mem::take(&mut self.refused),
                 bcpack_mb = self.bcpack.0 / 1_000_000,
-                bcpack_workers = format_args!("{:.2}", self.bcpack.1.as_secs_f64() / elapsed.as_secs_f64()),
+                bcpack_workers =
+                    format_args!("{:.2}", self.bcpack.1.as_secs_f64() / elapsed.as_secs_f64()),
                 waiting,
                 "dstorage: last {:.1} s",
                 elapsed.as_secs_f64()
@@ -515,6 +579,7 @@ impl Lanes {
         }
         lane.reads.pop_front();
         lane.running.insert(seq);
+        self.queued_reads -= 1;
         self.staged += staging;
         let size = u64::from(request.destination_size.max(request.source_size)).max(1);
         self.now = self.clock[class];
@@ -540,10 +605,11 @@ impl Lanes {
         }
     }
 
-    /// Moves a queue's enqueued commands to the workers.
-    fn submit(&mut self, id: u64) {
+    /// Moves a queue's enqueued commands to the workers, returning how many
+    /// read requests were queued.
+    fn submit(&mut self, id: u64) -> usize {
         let Some(class) = self.lanes.get(&id).map(|l| l.class) else {
-            return;
+            return 0;
         };
         // A class that had nothing waiting starts from now, not from the
         // credit it left behind.
@@ -555,20 +621,26 @@ impl Lanes {
             self.clock[class] = self.clock[class].max(self.now);
         }
         let Some(lane) = self.lanes.get_mut(&id) else {
-            return;
+            return 0;
         };
         if lane.reads.is_empty() {
             lane.clock = lane.clock.max(self.lane_now[class]);
         }
+        let mut added = 0;
         for command in std::mem::take(&mut lane.unsubmitted) {
             let seq = self.next_seq;
             self.next_seq += 1;
             match command {
-                Command::Read(request) => lane.reads.push_back((seq, request)),
+                Command::Read(request) => {
+                    lane.reads.push_back((seq, request));
+                    added += 1;
+                }
                 Command::Status(status) => lane.statuses.push_back((seq, status)),
             }
         }
         lane.flush();
+        self.queued_reads += added;
+        added
     }
 }
 
@@ -596,7 +668,11 @@ impl Lane {
     fn flush(&mut self) {
         while let Some(&(seq, _)) = self.statuses.front() {
             let waiting = self.reads.front().map(|r| r.0);
-            if waiting.into_iter().chain(self.running.first().copied()).any(|s| s < seq) {
+            if waiting
+                .into_iter()
+                .chain(self.running.first().copied())
+                .any(|s| s < seq)
+            {
                 return;
             }
             let Some((_, status)) = self.statuses.pop_front() else {
@@ -637,16 +713,20 @@ fn close_lane(id: u64) {
     };
     lane.closed = true;
     lane.unsubmitted.clear();
+    let dropped_reads = lane.reads.len();
     lane.reads.clear();
     lane.statuses.clear(); // releases their arrays
+    lanes.queued_reads -= dropped_reads;
     while lanes.lanes.get(&id).is_some_and(|l| !l.running.is_empty()) {
+        lanes.finished_waiters += 1;
         lanes = scheduler
             .finished
             .wait(lanes)
             .unwrap_or_else(|e| e.into_inner());
+        lanes.finished_waiters -= 1;
     }
     lanes.lanes.remove(&id);
-    scheduler.finished.notify_all();
+    scheduler.notify_finished(lanes.finished_waiters);
 }
 
 /// A read request as the title builds it, 0x48 bytes.
@@ -688,7 +768,6 @@ enum Command {
     Read(Request),
     Status(Status),
 }
-
 
 /// A status entry to write, holding a reference on its array.
 struct Status {
@@ -748,18 +827,20 @@ fn queue(this: QueueRef, command: Command) {
         if lane.entries() + 1 < lane.capacity.max(2) {
             break;
         }
+        lanes.finished_waiters += 1;
         lanes = scheduler
             .finished
             .wait(lanes)
             .unwrap_or_else(|e| e.into_inner());
+        lanes.finished_waiters -= 1;
     }
     let Some(lane) = lanes.lanes.get_mut(&id) else {
         return;
     };
     lane.unsubmitted.push(command);
     if lane.unsubmitted.len() >= (lane.capacity / 2).max(1) {
-        lanes.submit(id);
-        scheduler.work.notify_all();
+        let added = lanes.submit(id);
+        scheduler.notify_work(added, lanes.workers);
     }
 }
 
@@ -772,8 +853,8 @@ extern "system" fn submit(this: QueueRef) {
     let mut lanes = scheduler.lock();
     let pending = lanes.lanes.get(&id).map_or(0, |l| l.unsubmitted.len());
     tracing::debug!(commands = pending, "dstorage: submit");
-    lanes.submit(id);
-    scheduler.work.notify_all();
+    let added = lanes.submit(id);
+    scheduler.notify_work(added, lanes.workers);
 }
 
 /// Ends the queue whatever its reference count: what was not started never
@@ -784,8 +865,43 @@ extern "system" fn close(this: QueueRef) {
     close_lane(unsafe { &*this }.state.id);
 }
 
+/// Maximum per-buffer capacity retained across requests on a worker thread.
+const MAX_SCRATCH_CAP: usize = 8 << 20;
+
+/// Reusable per-worker buffers so streaming requests avoid repeated zero-filled
+/// heap allocations and page faults.
+#[derive(Default)]
+struct Scratch {
+    source: Vec<u8>,
+    intermediate: Vec<u8>,
+    destination: Vec<u8>,
+}
+
+impl Scratch {
+    fn ensure_len(buf: &mut Vec<u8>, len: usize) -> &mut [u8] {
+        if buf.len() < len {
+            buf.resize(len, 0);
+        }
+        &mut buf[..len]
+    }
+
+    /// Drops oversized buffers after unusually large requests so worker threads
+    /// do not permanently pin excessive memory.
+    fn trim(&mut self) {
+        for buf in [
+            &mut self.source,
+            &mut self.intermediate,
+            &mut self.destination,
+        ] {
+            if buf.capacity() > MAX_SCRATCH_CAP {
+                *buf = Vec::new();
+            }
+        }
+    }
+}
+
 /// Reads, inflates and/or unpacks, and writes one request.
-fn execute(request: &Request) -> Result<(), HRESULT> {
+fn execute(request: &Request, scratch: &mut Scratch) -> Result<(), HRESULT> {
     let options = request.options;
     let fail = |hr: HRESULT, why: &str| {
         tracing::warn!(
@@ -814,26 +930,40 @@ fn execute(request: &Request) -> Result<(), HRESULT> {
             return Err(fail(E_INVALIDARG, "source larger than destination"));
         }
         let size = request.source_size as usize;
-        return into_destination(request, size, |out| read_into(request, out).map(|()| size))
-            .map_err(|hr| fail(hr, "copying"));
+        return into_destination(request, size, &mut scratch.destination, |out| {
+            read_into(request, out).map(|()| size)
+        })
+        .map_err(|hr| fail(hr, "copying"));
     }
-    let tables = if bc != 0 { Some(bcpack_tables()?) } else { None };
-    let source = read_source(request).map_err(|hr| fail(hr, "reading the source"))?;
+    let tables = if bc != 0 {
+        Some(bcpack_tables()?)
+    } else {
+        None
+    };
+    let source =
+        read_source(request, &mut scratch.source).map_err(|hr| fail(hr, "reading the source"))?;
     // The console's order: zlib first, then BCPack.
-    let source = if bc != 0 && options & ZLIB != 0 {
-        let mut packed = vec![0; request.intermediate_size as usize];
-        let n = inflate(&source, &mut packed).map_err(|hr| fail(hr, "zlib"))?;
-        packed.truncate(n);
-        Cow::Owned(packed)
+    let payload = if bc != 0 && options & ZLIB != 0 {
+        let packed = Scratch::ensure_len(
+            &mut scratch.intermediate,
+            request.intermediate_size as usize,
+        );
+        let n = inflate(source, packed).map_err(|hr| fail(hr, "zlib"))?;
+        &packed[..n]
     } else {
         source
     };
-    into_destination(request, size, |out| match tables {
-        Some(tables) => bcpack::decode(bc, &source, out, tables)
-            .map(|()| out.len())
-            .map_err(|e| fail(INVALID_DATA, &e.to_string())),
-        None => inflate(&source, out).map_err(|hr| fail(hr, "zlib")),
-    })?;
+    into_destination(
+        request,
+        size,
+        &mut scratch.destination,
+        |out| match tables {
+            Some(tables) => bcpack::decode(bc, payload, out, tables)
+                .map(|()| out.len())
+                .map_err(|e| fail(INVALID_DATA, &e.to_string())),
+            None => inflate(payload, out).map_err(|hr| fail(hr, "zlib")),
+        },
+    )?;
     tracing::trace!(
         options = format_args!("{options:#x}"),
         offset = request.offset,
@@ -889,51 +1019,144 @@ fn use_bcpack_tables(dir: std::path::PathBuf) {
 
 #[cfg(test)]
 fn load_bcpack_tables() -> Result<Tables, String> {
-    let dir = BCPACK_DIR.get().ok_or("no folder set for the test tables")?;
+    let dir = BCPACK_DIR
+        .get()
+        .ok_or("no folder set for the test tables")?;
     let bytes = std::fs::read(dir.join("tables.bin")).map_err(|e| e.to_string())?;
     Tables::parse(&bytes).map_err(|e| e.to_string())
 }
 
 /// A compressed request's source: borrowed from memory, or read from the
-/// file.
-fn read_source(request: &Request) -> Result<Cow<'static, [u8]>, HRESULT> {
+/// file into the worker's reusable scratch buffer.
+fn read_source<'a>(request: &Request, scratch: &'a mut Vec<u8>) -> Result<&'a [u8], HRESULT> {
     let size = request.source_size as usize;
     if request.options & MEMORY_SOURCE != 0 {
         // SAFETY: the title's source holds `size` bytes until completion.
         let bytes = unsafe { std::slice::from_raw_parts(request.source.cast(), size) };
-        return Ok(Cow::Borrowed(bytes));
+        return Ok(bytes);
     }
-    let mut bytes = vec![0; size];
-    read_into(request, &mut bytes)?;
-    Ok(Cow::Owned(bytes))
+    let buf = Scratch::ensure_len(scratch, size);
+    read_into(request, buf)?;
+    Ok(&*buf)
 }
 
 /// Nanoseconds workers spent reading files, for the debug summary.
 static READING: AtomicU64 = AtomicU64::new(0);
 
+/// Thread-local manual-reset Win32 event for overlapped positioned reads.
+struct ThreadIoEvent(Cell<HANDLE>);
+
+impl ThreadIoEvent {
+    const fn new() -> Self {
+        Self(Cell::new(std::ptr::null_mut()))
+    }
+
+    fn get(&self) -> Result<HANDLE, std::io::Error> {
+        let handle = self.0.get();
+        if !handle.is_null() {
+            return Ok(handle);
+        }
+        // SAFETY: manual-reset, initially non-signaled, unnamed event.
+        let handle = unsafe { CreateEventW(std::ptr::null(), 1, 0, std::ptr::null()) };
+        if handle.is_null() {
+            return Err(std::io::Error::last_os_error());
+        }
+        self.0.set(handle);
+        Ok(handle)
+    }
+}
+
+impl Drop for ThreadIoEvent {
+    fn drop(&mut self) {
+        let handle = self.0.get();
+        if !handle.is_null() {
+            // SAFETY: event handle created by `CreateEventW` and owned by this thread-local.
+            unsafe { CloseHandle(handle) };
+        }
+    }
+}
+
+thread_local! {
+    static IO_EVENT: ThreadIoEvent = const { ThreadIoEvent::new() };
+}
+
+/// Performs a positioned overlapped read of `out.len()` bytes from `handle`
+/// starting at `offset`, looping over partial reads until filled or EOF/error.
+fn read_overlapped(handle: HANDLE, mut offset: u64, out: &mut [u8]) -> Result<(), HRESULT> {
+    if out.is_empty() {
+        return Ok(());
+    }
+    let event = IO_EVENT
+        .with(ThreadIoEvent::get)
+        .map_err(|error| from_win32(&error))?;
+    let mut done = 0;
+    while done < out.len() {
+        let chunk = (out.len() - done).min(i32::MAX as usize) as u32;
+        // SAFETY: `OVERLAPPED` is a plain Win32 C struct where all-zero is valid.
+        let mut overlapped: OVERLAPPED = unsafe { std::mem::zeroed() };
+        overlapped.Anonymous.Anonymous.Offset = offset as u32;
+        overlapped.Anonymous.Anonymous.OffsetHigh = (offset >> 32) as u32;
+        overlapped.hEvent = event;
+        // SAFETY: `handle` is an overlapped file handle kept open by the caller,
+        // `out[done..done + chunk]` is a valid writable buffer, and `overlapped`
+        // remains alive until `GetOverlappedResult(..., 1)` completes below.
+        let ok = unsafe {
+            ReadFile(
+                handle,
+                out.as_mut_ptr().add(done),
+                chunk,
+                std::ptr::null_mut(),
+                &mut overlapped,
+            )
+        };
+        if ok == 0 {
+            // SAFETY: reads the current thread's last Win32 error code.
+            let err = unsafe { GetLastError() };
+            if err == ERROR_HANDLE_EOF {
+                return Err(END_OF_FILE);
+            }
+            if err != ERROR_IO_PENDING {
+                return Err(from_win32_code(err));
+            }
+        }
+        let mut transferred = 0u32;
+        // SAFETY: `overlapped` was just submitted to `ReadFile` on `handle` and
+        // `bWait = 1` waits until the I/O finishes before `overlapped` or `out`
+        // can be reused or dropped.
+        let waited = unsafe { GetOverlappedResult(handle, &overlapped, &mut transferred, 1) };
+        if waited == 0 {
+            // SAFETY: reads the current thread's last Win32 error code.
+            let err = unsafe { GetLastError() };
+            if err == ERROR_HANDLE_EOF {
+                return Err(END_OF_FILE);
+            }
+            return Err(from_win32_code(err));
+        }
+        if transferred == 0 {
+            return Err(END_OF_FILE);
+        }
+        done += transferred as usize;
+        offset += u64::from(transferred);
+    }
+    Ok(())
+}
+
 /// Fills `out` (the source size) from the request's file or memory.
 fn read_into(request: &Request, out: &mut [u8]) -> Result<(), HRESULT> {
     if request.options & MEMORY_SOURCE != 0 {
         // SAFETY: the title's source holds `out.len()` bytes until completion.
-        out.copy_from_slice(unsafe { std::slice::from_raw_parts(request.source.cast(), out.len()) });
+        out.copy_from_slice(unsafe {
+            std::slice::from_raw_parts(request.source.cast(), out.len())
+        });
         return Ok(());
     }
     // SAFETY: a file object we created; the title keeps it open.
-    let file = &unsafe { &*request.source.cast::<Instance<File>>() }
+    let handle = unsafe { &*request.source.cast::<Instance<File>>() }
         .state
-        .file;
+        .handle
+        .as_raw_handle();
     let started = std::time::Instant::now();
-    let mut done = 0;
-    let result = loop {
-        if done == out.len() {
-            break Ok(());
-        }
-        match file.seek_read(&mut out[done..], request.offset + done as u64) {
-            Ok(0) => break Err(END_OF_FILE),
-            Ok(n) => done += n,
-            Err(error) => break Err(from_win32(&error)),
-        }
-    };
+    let result = read_overlapped(handle, request.offset, out);
     READING.fetch_add(started.elapsed().as_nanos() as u64, Ordering::Relaxed);
     result
 }
@@ -942,10 +1165,11 @@ fn read_into(request: &Request, out: &mut [u8]) -> Result<(), HRESULT> {
 /// many it produced. GPU-visible destinations are host memory like the
 /// rest (GPU address = CPU address), so an address is written in place;
 /// physical pages are too when they are consecutive pages of one
-/// allocation, and otherwise go through a buffer.
+/// allocation, and otherwise go through a reusable scratch buffer.
 fn into_destination(
     request: &Request,
     len: usize,
+    scratch: &mut Vec<u8>,
     fill: impl FnOnce(&mut [u8]) -> Result<usize, HRESULT>,
 ) -> Result<(), HRESULT> {
     if request.options & PAGE_DESTINATION == 0 {
@@ -967,12 +1191,12 @@ fn into_destination(
         )
     };
     // Consecutive pages of one allocation (the usual case): written in
-    // place through one view.
+    // place through the section's persistent view.
     if let Some(mut window) = super::xmem::page_window(pages, offset, len) {
         return fill(window.bytes()).map(drop);
     }
-    let mut data = vec![0; len];
-    let n = fill(&mut data)?;
+    let data = Scratch::ensure_len(scratch, len);
+    let n = fill(data)?;
     if super::xmem::write_physical(pages, offset, &data[..n]) {
         Ok(())
     } else {
@@ -1205,7 +1429,8 @@ mod tests {
         // Requests in flight together run in any order, so none of them
         // shares a destination (failed ones leave theirs undefined).
         let mut buffers = [[0u8; 16]; 5];
-        let [failed, failed_too, out, other, bcpack] = buffers.each_mut().map(|b| b.as_mut_ptr().cast());
+        let [failed, failed_too, out, other, bcpack] =
+            buffers.each_mut().map(|b| b.as_mut_ptr().cast());
 
         // Segment 0: a read past the end, then a bad stream; the first wins.
         enqueue(queue, &request(0, failed, 16, file, 4090, 16));
@@ -1257,6 +1482,9 @@ mod tests {
             lanes: HashMap::new(),
             next_id: 0,
             next_seq: 0,
+            queued_reads: 0,
+            finished_waiters: 0,
+            workers: 0,
             staged: 0,
             staging,
             starved: false,
@@ -1288,7 +1516,9 @@ mod tests {
                 read(&mut l, id, 0, 4096);
             }
         }
-        (0..3).for_each(|id| l.submit(id));
+        for id in 0..3 {
+            l.submit(id);
+        }
         let mut started = [0u32; 3];
         for _ in 0..330 {
             let job = l.start().unwrap();
@@ -1421,7 +1651,10 @@ mod tests {
         let (_dir, file) = file_with(&contents);
         let (queue, array) = (new_queue(0), status_array(1));
         let mut out = [0u8; 16];
-        enqueue(queue, &request(4 << 1, out.as_mut_ptr().cast(), 16, file, 100, 88));
+        enqueue(
+            queue,
+            &request(4 << 1, out.as_mut_ptr().cast(), 16, file, 100, 88),
+        );
         enqueue_status(queue, array, 0);
         void(queue, 0x30);
         assert_eq!(wait(array, 0), S_OK);
@@ -1541,5 +1774,123 @@ mod tests {
         }
         assert_eq!(xmem::XMemFreePhysicalPages(3, a.as_ptr()), 1);
         assert_eq!(xmem::XMemFreePhysicalPages(1, b.as_ptr()), 1);
+    }
+
+    #[test]
+    fn concurrent_overlapped_reads_from_same_handle() {
+        let total = 2 * 1024 * 1024 + 137;
+        let contents = pattern(total);
+        let (_dir, file) = file_with(&contents);
+        // SAFETY: `file` is an `Instance<File>` opened by `open_file`.
+        let raw_handle = unsafe { &*file.cast::<Instance<File>>() }
+            .state
+            .handle
+            .as_raw_handle() as usize;
+
+        // Exercise direct concurrent overlapped reads from many threads sharing
+        // the exact same HANDLE at varied offsets and sizes.
+        let contents_ref = &contents;
+        std::thread::scope(|scope| {
+            for tid in 0..8usize {
+                scope.spawn(move || {
+                    let handle = raw_handle as HANDLE;
+                    let mut buf = Vec::new();
+                    for iter in 0..32usize {
+                        let offset = ((tid * 37_397 + iter * 65_521) % (total - 4096)) as u64;
+                        let len = ((tid * 13 + iter * 7 + 1) * 1024 + (iter % 97))
+                            .min(total - offset as usize);
+                        buf.resize(len, 0);
+                        assert_eq!(read_overlapped(handle, offset, &mut buf), Ok(()));
+                        assert_eq!(buf, contents_ref[offset as usize..offset as usize + len]);
+                    }
+                    // Zero-length read succeeds immediately.
+                    assert_eq!(read_overlapped(handle, 0, &mut []), Ok(()));
+                    // Reading past EOF returns END_OF_FILE.
+                    let mut tail = [0u8; 64];
+                    assert_eq!(
+                        read_overlapped(handle, (total - 16) as u64, &mut tail),
+                        Err(END_OF_FILE)
+                    );
+                    assert_eq!(
+                        read_overlapped(handle, total as u64 + 1024, &mut tail),
+                        Err(END_OF_FILE)
+                    );
+                });
+            }
+        });
+
+        // Also exercise the worker pool with a multi-request batch on the same
+        // overlapped handle (raw + zlib requests interleaved).
+        let packed = miniz_oxide::deflate::compress_to_vec_zlib(&contents[..131_072], 6);
+        let mut archive = contents.clone();
+        let packed_offset = archive.len() as u64;
+        archive.extend_from_slice(&packed);
+        let (_dir2, archive_file) = file_with(&archive);
+
+        let (queue, array) = (new_queue(0), status_array(1));
+        let mut raw_outs: Vec<(u64, Vec<u8>)> = (0..24usize)
+            .map(|i| ((i * 53_117) as u64, vec![0u8; 32_768 + i * 19]))
+            .collect();
+        let mut zlib_outs: Vec<Vec<u8>> = (0..8).map(|_| vec![0u8; 131_072]).collect();
+        for (offset, buf) in &mut raw_outs {
+            enqueue(
+                queue,
+                &request(
+                    0,
+                    buf.as_mut_ptr().cast(),
+                    buf.len(),
+                    archive_file,
+                    *offset,
+                    buf.len(),
+                ),
+            );
+        }
+        for buf in &mut zlib_outs {
+            enqueue(
+                queue,
+                &request(
+                    ZLIB,
+                    buf.as_mut_ptr().cast(),
+                    buf.len(),
+                    archive_file,
+                    packed_offset,
+                    packed.len(),
+                ),
+            );
+        }
+        enqueue_status(queue, array, 0);
+        void(queue, 0x30);
+        assert_eq!(wait(array, 0), S_OK);
+        for (offset, buf) in &raw_outs {
+            let start = *offset as usize;
+            assert_eq!(buf.as_slice(), &archive[start..start + buf.len()]);
+        }
+        for buf in &zlib_outs {
+            assert_eq!(buf.as_slice(), &contents[..131_072]);
+        }
+        void(queue, 0x40);
+        release(file.cast::<Instance<File>>());
+        release(archive_file.cast::<Instance<File>>());
+    }
+
+    #[test]
+    fn scratch_reuses_and_trims_oversized_buffers() {
+        let mut scratch = Scratch::default();
+        let first_ptr = Scratch::ensure_len(&mut scratch.source, 64 * 1024).as_ptr();
+        scratch.trim();
+        let second_ptr = Scratch::ensure_len(&mut scratch.source, 32 * 1024).as_ptr();
+        assert_eq!(
+            first_ptr, second_ptr,
+            "normal buffer reused without realloc"
+        );
+
+        let _ = Scratch::ensure_len(&mut scratch.intermediate, MAX_SCRATCH_CAP + 4096);
+        assert!(scratch.intermediate.capacity() > MAX_SCRATCH_CAP);
+        scratch.trim();
+        assert_eq!(
+            scratch.intermediate.capacity(),
+            0,
+            "oversized buffer trimmed"
+        );
     }
 }
