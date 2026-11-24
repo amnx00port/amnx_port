@@ -68,14 +68,38 @@ unsafe impl<const N: usize> Sync for Table<N> {}
 
 pub(crate) extern "system" fn add_ref(this: This) -> u32 {
     // SAFETY: `this` is one of our objects.
-    unsafe { &*this }.refs.fetch_add(1, Ordering::Relaxed) + 1
+    let refs = &unsafe { &*this }.refs;
+    // A saturated count must never wrap to zero while references are still
+    // out, or the object could be released with callers holding it.
+    match refs.fetch_update(Ordering::Relaxed, Ordering::Relaxed, |n| n.checked_add(1)) {
+        Ok(previous) => previous + 1,
+        Err(saturated) => saturated,
+    }
+}
+
+/// One `Release` from `n`: zero stays zero, and saturation stays saturated,
+/// so a reference handed out at the limit cannot make the object look dead.
+fn decrement(n: u32) -> Option<u32> {
+    if n == u32::MAX {
+        Some(n)
+    } else {
+        n.checked_sub(1)
+    }
+}
+
+fn after_release(previous: u32) -> u32 {
+    match previous {
+        0 | u32::MAX => previous,
+        n => n - 1,
+    }
 }
 
 pub(crate) extern "system" fn release(this: This) -> u32 {
     // SAFETY: `this` is one of our objects.
     let refs = &unsafe { &*this }.refs;
-    let _ = refs.fetch_update(Ordering::Relaxed, Ordering::Relaxed, |n| n.checked_sub(1));
-    refs.load(Ordering::Relaxed)
+    match refs.fetch_update(Ordering::Relaxed, Ordering::Relaxed, decrement) {
+        Ok(previous) | Err(previous) => after_release(previous),
+    }
 }
 
 /// Answers an interface query (or any call handing out an object): a new
@@ -131,15 +155,21 @@ pub(crate) fn hand_out<T>(
 pub(crate) fn release_boxed<T>(this: This) -> u32 {
     // SAFETY: `this` is the header of a boxed `T`.
     let refs = &unsafe { &*this }.refs;
-    match refs.fetch_update(Ordering::AcqRel, Ordering::Acquire, |n| n.checked_sub(1)) {
-        Ok(1) => {
+    let previous = match refs.fetch_update(Ordering::AcqRel, Ordering::Acquire, decrement) {
+        Ok(previous) | Err(previous) => previous,
+    };
+    match previous {
+        // A saturated object is never freed: `add_ref` handed out a
+        // reference it could not count at the limit.
+        u32::MAX => u32::MAX,
+        0 => 0,
+        1 => {
             private_data().retain(|&(object, _), _| object != this as usize);
             // SAFETY: that was the last reference to a `Box<T>`.
             drop(unsafe { Box::from_raw(this.cast_mut().cast::<T>()) });
             0
         }
-        Ok(n) => n - 1,
-        Err(_) => 0,
+        n => n - 1,
     }
 }
 
@@ -380,5 +410,62 @@ mod tests {
         );
         assert_eq!(g[..4], [0xf1, 0x19, 0x98, 0x18]);
         assert_eq!(guid_text(&g), "189819f1-1db6-4b57-be54-1821339b85f7");
+    }
+
+    static TABLE: Table<3> = Table([add_ref as *const (), release as *const (), std::ptr::null()]);
+
+    #[test]
+    fn add_ref_saturates_at_u32_max() {
+        let o = Object::new(&TABLE);
+
+        o.refs.store(u32::MAX, Ordering::Relaxed);
+        assert_eq!(add_ref(&o), u32::MAX);
+        assert_eq!(o.refs.load(Ordering::Relaxed), u32::MAX);
+        // The uncounted reference must not be released away: saturation is
+        // permanent in both `release` paths.
+        assert_eq!(release(&o), u32::MAX);
+        assert_eq!(o.refs.load(Ordering::Relaxed), u32::MAX);
+
+        o.refs.store(7, Ordering::Relaxed);
+        assert_eq!(add_ref(&o), 8);
+        assert_eq!(release(&o), 7);
+        assert_eq!(o.refs.load(Ordering::Relaxed), 7);
+
+        o.refs.store(0, Ordering::Relaxed);
+        assert_eq!(release(&o), 0);
+    }
+
+    #[repr(C)]
+    struct Tracked {
+        object: Object,
+        dropped: &'static AtomicBool,
+    }
+
+    impl Drop for Tracked {
+        fn drop(&mut self) {
+            self.dropped.store(true, Ordering::Relaxed);
+        }
+    }
+
+    #[test]
+    fn release_boxed_keeps_a_saturated_object_alive() {
+        static DROPPED: AtomicBool = AtomicBool::new(false);
+        let tracked = Box::new(Tracked {
+            object: Object::new(&TABLE),
+            dropped: &DROPPED,
+        });
+        let this = &tracked.object as *const Object;
+        let owned = Box::into_raw(tracked);
+
+        // SAFETY: `owned` is a live `Box<Tracked>` until the last release.
+        unsafe { (*owned).object.refs.store(u32::MAX, Ordering::Relaxed) };
+        assert_eq!(release_boxed::<Tracked>(this), u32::MAX);
+        assert!(!DROPPED.load(Ordering::Relaxed));
+
+        // Ordinary releases below saturation still free the object.
+        // SAFETY: `owned` is still a live `Box<Tracked>`.
+        unsafe { (*owned).object.refs.store(1, Ordering::Relaxed) };
+        assert_eq!(release_boxed::<Tracked>(this), 0);
+        assert!(DROPPED.load(Ordering::Relaxed));
     }
 }
