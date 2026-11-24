@@ -213,6 +213,11 @@ fn reference_draw(params: bool) {
         size: (16, 16),
         mesh_groups: 0,
     };
+    // Two GPU tests dispatching at once can crash the WARP adapter, as on
+    // CI: take the same lock as the other dispatching tests.
+    let _one = super::valu_tests::ONE_AT_A_TIME
+        .lock()
+        .unwrap_or_else(|e| e.into_inner());
     for warp in [false, true] {
         let backend = if warp { "WARP" } else { "the default adapter" };
         let Ok(host) = host::Host::new(warp) else {
