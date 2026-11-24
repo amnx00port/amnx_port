@@ -21,7 +21,7 @@ use std::borrow::Cow;
 use std::collections::{BTreeMap, BTreeSet, HashMap, VecDeque};
 use std::ffi::{CStr, c_char, c_void};
 use std::os::windows::fs::FileExt;
-use std::os::windows::io::FromRawHandle;
+use std::os::windows::io::{FromRawHandle, IntoRawHandle};
 use std::sync::atomic::{AtomicBool, AtomicI32, AtomicU32, AtomicU64, Ordering};
 use std::sync::{Condvar, Mutex, MutexGuard, OnceLock};
 
@@ -126,11 +126,10 @@ extern "system" fn open_file(_: Factory, path: *const u16, iid: *const Guid, out
         let len = (0..).take_while(|&i| *path.add(i) != 0).count();
         String::from_utf16_lossy(std::slice::from_raw_parts(path, len))
     };
-    let file = if let Some(file) = super::files::controller_diagram(&name) {
-        file
-    } else {
+    let handle = match super::files::controller_diagram(&name) {
+        Some(file) => file.into_raw_handle(),
         // Goes through `files`, so paths on our virtual drives work too.
-        let handle = super::files::CreateFileW(
+        None => super::files::CreateFileW(
             path,
             GENERIC_READ,
             FILE_SHARE_READ,
@@ -138,16 +137,16 @@ extern "system" fn open_file(_: Factory, path: *const u16, iid: *const Guid, out
             OPEN_EXISTING,
             0,
             std::ptr::null_mut(),
-        );
-        if handle as isize == -1 {
-            let error = std::io::Error::last_os_error();
-            tracing::warn!(path = name, %error, "dstorage: opening a file failed");
-            return from_win32(&error);
-        }
-        // SAFETY: a handle we just opened and nobody else owns.
-        unsafe { std::fs::File::from_raw_handle(handle) }
+        ),
     };
+    if handle as isize == -1 {
+        let error = std::io::Error::last_os_error();
+        tracing::warn!(path = name, %error, "dstorage: opening a file failed");
+        return from_win32(&error);
+    }
     tracing::info!(path = name, iid = iid_text(iid), "dstorage: file opened");
+    // SAFETY: a handle we just opened and nobody else owns.
+    let file = unsafe { std::fs::File::from_raw_handle(handle) };
     let file = Instance::create(Object::new("dstorage file", &FILE_VTABLE), File { file });
     put(out, file)
 }
