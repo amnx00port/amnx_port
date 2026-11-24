@@ -112,4 +112,3 @@ Every build appends crashes and host GPU failures to `crashes.log` in the title'
 
 GPL-3.0-or-later. See `LICENSE`.
 
-Based on VIctory by Marvisak - https://github.com/Marvisak/VIctory - GPL-3.0-or-later.
