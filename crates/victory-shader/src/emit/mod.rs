@@ -218,6 +218,7 @@ pub fn emit(
     io: &io::Io,
     res: &resource::Resources,
 ) -> Result<HostShader, ShaderError> {
+    lds_fits(native, p)?;
     let sig = |fourcc| -> Result<Vec<container::SigElement>, ShaderError> {
         match c.part(fourcc) {
             Some(part) => signature(part.data),
@@ -297,6 +298,39 @@ pub fn emit(
         root_cbvs: l.root_cbvs,
         root_srvs: l.root_srvs,
     })
+}
+
+/// The console gives a thread group up to 64 KiB of LDS; D3D12 gives its
+/// group shared memory 32 KiB in a compute shader and 28 KiB in a mesh
+/// shader. A program asking for more is refused here, by name, rather than
+/// by the validator or the pipeline later. A compute program declares its
+/// LDS only when it reads or writes it (a swizzle or permute does not), so
+/// one that never does is left alone; a mesh program always declares it.
+fn lds_fits(native: &NativeProgram, p: &ir::Program) -> Result<(), ShaderError> {
+    let (bytes, limit, what) = match &native.io {
+        crate::native::StageIo::Cs(cs) => {
+            let uses_lds = p.blocks.iter().flat_map(|b| &b.insts).any(|i| {
+                matches!(i.fields, crate::gfx10::Fields::Ds { .. })
+                    && !(i.name().starts_with("ds_swizzle") || i.name().contains("permute"))
+            });
+            if !uses_lds {
+                return Ok(());
+            }
+            (
+                cs.lds_bytes(),
+                32 << 10,
+                "compute LDS over the host's 32 KiB",
+            )
+        }
+        crate::native::StageIo::Ms(ms) => {
+            (ms.lds_bytes, 28 << 10, "mesh LDS over the host's 28 KiB")
+        }
+        _ => return Ok(()),
+    };
+    if bytes > limit {
+        return Err(ShaderError::Unsupported { offset: 0, what });
+    }
+    Ok(())
 }
 
 /// The rows of an `ISG1`/`OSG1` part.
@@ -444,6 +478,67 @@ mod tests {
         if let Err(e) = emit(&c, &native, &p, &st, &io, &res) {
             assert!(e.to_string().contains("its own value"), "{e}");
         }
+    }
+
+    /// A program asking for more LDS than the host gives a group is refused
+    /// by name, through `emit`; one asking for exactly that much, or a
+    /// compute program that never reads or writes its LDS, is not.
+    #[test]
+    fn lds_past_the_host_limit_is_refused_by_name() {
+        // ds_read_b32 v1, v0; s_endpgm
+        let reads_lds = [0xD8D8_0000u32, 0x0100_0000, 0xBF81_0000];
+        let ends = [0xBF81_0000u32];
+        let compute = |granules: u32, words: &[u32]| NativeProgram {
+            stage: HwStage::Cs,
+            wave64: false,
+            vgprs: 2,
+            layout: vec![],
+            used: vec![],
+            io: StageIo::Cs(ComputeIo {
+                rsrc2: granules << 15,
+                threads: [64, 1, 1],
+            }),
+            code: words.iter().flat_map(|w| w.to_le_bytes()).collect(),
+        };
+        let refusal = |native: &NativeProgram| {
+            let p = ir::build(&native.patched_code(), native.wave64, native.vgprs).unwrap();
+            let res = resource::track(&p, &native.layout, native.stage).unwrap();
+            let io = io::raise(&p, native).unwrap();
+            let st = structure::structure(&p).unwrap();
+            let container = crate::dxbc::build(&[]);
+            let c = Container::parse(&container).unwrap();
+            emit(&c, native, &p, &st, &io, &res)
+                .err()
+                .map(|e| e.to_string())
+                .filter(|e| e.contains("KiB"))
+        };
+        let err = refusal(&compute(65, &reads_lds)).expect("refused");
+        assert!(err.contains("compute LDS over the host's 32 KiB"), "{err}");
+        assert_eq!(refusal(&compute(64, &reads_lds)), None, "32 KiB fits");
+        assert_eq!(refusal(&compute(65, &ends)), None, "no LDS access");
+
+        let lds_fits = |native: &NativeProgram| {
+            let p = ir::build(&native.patched_code(), native.wave64, native.vgprs).unwrap();
+            lds_fits(native, &p)
+        };
+        let compute = |granules| compute(granules, &ends);
+
+        let mesh = |lds_bytes: u32| NativeProgram {
+            stage: HwStage::Ms,
+            io: StageIo::Ms(crate::native::MeshIo {
+                outputs: vec![],
+                clip_cntl: 0,
+                threads: 64,
+                max_vertices: 64,
+                max_primitives: 64,
+                topology: 2,
+                lds_bytes,
+            }),
+            ..compute(0)
+        };
+        let err = lds_fits(&mesh((28 << 10) + 4)).unwrap_err();
+        assert!(err.to_string().contains("28 KiB"), "{err}");
+        assert!(lds_fits(&mesh(28 << 10)).is_ok(), "28 KiB fits");
     }
 
     /// A pixel shader writing a constant colour.
