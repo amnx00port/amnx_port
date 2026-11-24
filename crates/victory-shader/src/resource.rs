@@ -1727,6 +1727,24 @@ pub(crate) fn inline(code: u8) -> Option<u32> {
     }
 }
 
+/// The value of an inline constant in a 64-bit operand: integers
+/// sign-extend, floats are the f64 bits (LLVM getInlineImmVal64).
+pub(crate) fn inline64(code: u8) -> Option<u64> {
+    let float = |f: f64| Some(f.to_bits());
+    match code {
+        240 => float(0.5),
+        241 => float(-0.5),
+        242 => float(1.0),
+        243 => float(-1.0),
+        244 => float(2.0),
+        245 => float(-2.0),
+        246 => float(4.0),
+        247 => float(-4.0),
+        248 => Some(0x3FC4_5F30_6DC9_C882),
+        _ => inline(code).map(|x| i64::from(x as i32) as u64),
+    }
+}
+
 #[cfg(test)]
 pub(crate) mod tests {
     use super::*;

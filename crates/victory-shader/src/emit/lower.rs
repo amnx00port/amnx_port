@@ -2352,18 +2352,20 @@ impl<'a> Lower<'a> {
             l.operand(inst, op)
         };
         let sext16 = |l: &mut Self| l.s.m.i32(i32::from(imm.unwrap_or(0) as i16) as u32);
-        // Dword `h` of 64-bit source `k` (inline constants sign-extend).
+        // Dword `h` of 64-bit source `k` (inline integers sign-extend, inline
+        // floats are f64).
         let half = |l: &mut Self, k: usize, h: u8| -> Result<V, Why> {
             match src.get(k) {
                 Some(&Operand::Scalar { code, .. }) if code != NULL => {
                     let v = inst.read(Reg::S(code + h)).ok_or("an unread operand")?;
                     l.i32_of(v)
                 }
-                Some(op) if h == 0 => l.operand(inst, op),
-                Some(Operand::Const(k)) => {
-                    let x = crate::resource::inline(*k).ok_or("a special operand")?;
-                    Ok(l.s.m.i32(if (x as i32) < 0 { u32::MAX } else { 0 }))
+                Some(&Operand::Const(k)) => {
+                    let x = crate::resource::inline64(k)
+                        .ok_or("a special operand (vccz, execz, scc, lds_direct)")?;
+                    Ok(l.s.m.i32((x >> (32 * h)) as u32))
                 }
+                Some(op) if h == 0 => l.operand(inst, op),
                 _ => Ok(l.s.m.i32(0)),
             }
         };
@@ -4260,7 +4262,8 @@ impl<'a> Lower<'a> {
         }
     }
 
-    /// A 64-bit source (a register pair; inline constants sign-extend).
+    /// A 64-bit source (a register pair; inline integers sign-extend, inline
+    /// floats are f64).
     fn src64(&mut self, inst: &Inst, k: usize) -> Result<V, Why> {
         let Fields::Valu(v) = &inst.fields else {
             unreachable!()
@@ -4286,9 +4289,10 @@ impl<'a> Lower<'a> {
             Operand::Scalar { code, .. } if code != NULL => {
                 pair(self, Reg::S(code), Reg::S(code + 1))
             }
-            Operand::Const(k @ 128..=208) => {
-                let x = crate::resource::inline(k).ok_or("a special operand")?;
-                Ok(self.s.m.int_const(i64t, i64::from(x as i32)))
+            Operand::Const(k) => {
+                let x = crate::resource::inline64(k)
+                    .ok_or("a special operand (vccz, execz, scc, lds_direct)")?;
+                Ok(self.s.m.int_const(i64t, x as i64))
             }
             _ => {
                 // Literals and the null register: zero-extended.

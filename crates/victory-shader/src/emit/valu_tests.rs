@@ -19,6 +19,11 @@ const fn s_mov_b32(sdst: u8, src0: u8) -> u32 {
     0xBE80_0000 | (sdst as u32) << 16 | 0x03 << 8 | src0 as u32
 }
 
+/// SOP1 `s_mov_b64 s[sdst:sdst+1], src0`.
+const fn s_mov_b64(sdst: u8, src0: u8) -> u32 {
+    0xBE80_0000 | (sdst as u32) << 16 | 0x04 << 8 | src0 as u32
+}
+
 /// SOP2 `op sdst, src0, src1`.
 const fn sop2(op: u8, sdst: u8, src0: u8, src1: u8) -> u32 {
     0x8000_0000
@@ -936,4 +941,61 @@ fn v_cmp_class_f16_matches_rdna2() {
             inp[0], inp[1],
         );
     });
+}
+
+#[test]
+fn inline_float_constant_in_a_64_bit_operand_is_the_f64_value() {
+    // A 64-bit operand reads codes 240..=248 as f64 bit patterns (LLVM
+    // getInlineImmVal64); 248 is 1/(2 pi), 0x3FC45F30_6DC9C882 per LLVM.
+    let mut want: Vec<(u8, u64)> = [0.5, -0.5, 1.0, -1.0, 2.0, -2.0, 4.0, -4.0]
+        .iter()
+        .zip(240u8..)
+        .map(|(&f, c)| (c, f64::to_bits(f)))
+        .collect();
+    want.push((248, 0x3FC4_5F30_6DC9_C882));
+    // Inline integers still sign-extend: 64 and -16.
+    want.extend([(192, 64), (208, (-16i64) as u64)]);
+
+    let mut cases: Vec<(String, Vec<u32>, [u32; 4], u32)> = Vec::new();
+    for &(c, bits) in &want {
+        let (lo, hi) = (bits as u32, (bits >> 32) as u32);
+        for (h, part) in [(0u8, lo), (1, hi)] {
+            // s_mov_b64 s[12:13], c; v_mov_b32 v0, s(12 + h)
+            let body = vec![s_mov_b64(12, c), vop1(0x001, 0, sgpr(12 + h))];
+            cases.push((format!("s_mov_b64 {c}, dword {h}"), body, [0; 4], part));
+        }
+        // The other ops share the same paths: a few codes are enough.
+        if ![243, 248, 208].contains(&c) {
+            continue;
+        }
+        // s_and_b64 s[12:13], -1, c; v_mov_b32 v0, s13
+        let body = vec![sop2(0x0F, 12, 193, c), vop1(0x001, 0, sgpr(13))];
+        cases.push((format!("s_and_b64 -1, {c}"), body, [0; 4], hi));
+        // v_lshrrev_b64 v[0:1], 32, c (VOP3 opcode 0x300)
+        let body = vop3(0x300, 0, 128 + 32, u16::from(c), 128).to_vec();
+        cases.push((format!("v_lshrrev_b64 32, {c}"), body, [0; 4], hi));
+        // v_cmp_eq_u64 vcc, c, v[1:2] (VOP3 opcode 0x0E2) with the 64-bit
+        // value in v[1:2]; v_cndmask_b32 v0, 0, 1, vcc (VOP3 opcode 0x101).
+        let mut body = vop3(0x0E2, 106, u16::from(c), vgpr(1), 128).to_vec();
+        body.extend(vop3(0x101, 0, 128, 129, 106));
+        cases.push((
+            format!("v_cmp_eq_u64 {c}, {bits:#018x}"),
+            body,
+            [lo, hi, 0, 0],
+            1,
+        ));
+    }
+
+    let mut wrong = Vec::new();
+    for (what, body, inputs, want) in cases {
+        let shader = build_valu_cs(&body);
+        run_cases(&shader, &[inputs], |backend, _, _, got| {
+            if got != want {
+                wrong.push(format!(
+                    "{backend}: {what} = {got:#010x}, want {want:#010x}"
+                ));
+            }
+        });
+    }
+    assert!(wrong.is_empty(), "{}", wrong.join("\n"));
 }
