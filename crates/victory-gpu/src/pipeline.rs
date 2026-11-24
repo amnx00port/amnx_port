@@ -100,32 +100,182 @@ pub(crate) struct Translated {
     pub(crate) used: Vec<victory_shader::UsedResource>,
 }
 
+#[cfg(all(windows, feature = "diagnostics"))]
+mod timing {
+    use std::sync::atomic::{AtomicU64, Ordering};
+    use std::sync::OnceLock;
+    use std::time::Instant;
+
+    #[derive(Default)]
+    pub(super) struct Counter {
+        calls: AtomicU64,
+        us: AtomicU64,
+    }
+
+    impl Counter {
+        pub(super) fn record(&self, us: u64) {
+            self.us.fetch_add(us, Ordering::Relaxed);
+            self.calls.fetch_add(1, Ordering::Relaxed);
+        }
+
+        fn snapshot(&self) -> (u64, u64) {
+            (self.calls.load(Ordering::Relaxed), self.us.load(Ordering::Relaxed))
+        }
+    }
+
+    pub(super) static INITIALIZE: Counter = Counter {
+        calls: AtomicU64::new(0),
+        us: AtomicU64::new(0),
+    };
+    pub(super) static WAIT: Counter = Counter {
+        calls: AtomicU64::new(0),
+        us: AtomicU64::new(0),
+    };
+    pub(super) static HOST: Counter = Counter {
+        calls: AtomicU64::new(0),
+        us: AtomicU64::new(0),
+    };
+    pub(super) static WORK: Counter = Counter {
+        calls: AtomicU64::new(0),
+        us: AtomicU64::new(0),
+    };
+
+    // Only the caller whose initializer executes owns initialization time.
+    // A racing completion may make the measured wait effectively zero.
+    fn lookup<'a, T>(
+        cell: &'a OnceLock<T>,
+        initialize: impl FnOnce() -> T,
+        init: &Counter,
+        wait: &Counter,
+    ) -> &'a T {
+        if let Some(value) = cell.get() {
+            return value;
+        }
+        let started = Instant::now();
+        let mut initialized = false;
+        let result = cell.get_or_init(|| {
+            initialized = true;
+            initialize()
+        });
+        let elapsed_us = started.elapsed().as_micros() as u64;
+        if initialized {
+            init.record(elapsed_us);
+        } else {
+            wait.record(elapsed_us);
+        }
+        result
+    }
+
+    pub(super) fn shader_lookup<T>(
+        cell: &OnceLock<T>,
+        initialize: impl FnOnce() -> T,
+    ) -> &T {
+        lookup(cell, initialize, &INITIALIZE, &WAIT)
+    }
+
+    // Cumulative process totals; snapshots are approximate while work is active.
+    pub(super) fn report() {
+        let (initializations, initialization_us) = INITIALIZE.snapshot();
+        let (dependency_lookups, dependency_lookup_us) = WAIT.snapshot();
+        let (host_attempts, host_us) = HOST.snapshot();
+        let (worker_jobs, worker_job_us) = WORK.snapshot();
+        tracing::info!(
+            initializations,
+            initialization_us,
+            dependency_lookups,
+            dependency_lookup_us,
+            host_attempts,
+            host_us,
+            worker_jobs,
+            worker_job_us,
+            "cumulative pipeline timing"
+        );
+    }
+
+    #[cfg(test)]
+    mod tests {
+        use super::*;
+
+        #[test]
+        fn completed_and_failed_initializations_are_not_counted_twice() {
+            let cell = OnceLock::new();
+            let init = Counter::default();
+            let wait = Counter::default();
+            assert_eq!(*lookup(&cell, || None::<u32>, &init, &wait), None);
+            assert_eq!(*lookup(&cell, || panic!("must not retry"), &init, &wait), None);
+            assert_eq!(init.snapshot().0, 1);
+            assert_eq!(wait.snapshot(), (0, 0));
+        }
+
+        #[test]
+        fn shared_initialization_runs_only_once() {
+            let cell = OnceLock::new();
+            let init = Counter::default();
+            let wait = Counter::default();
+            let barrier = std::sync::Barrier::new(4);
+            std::thread::scope(|scope| {
+                for _ in 0..4 {
+                    scope.spawn(|| {
+                        barrier.wait();
+                        assert_eq!(*lookup(&cell, || 42, &init, &wait), 42);
+                    });
+                }
+            });
+            assert_eq!(init.snapshot().0, 1);
+            assert!(wait.snapshot().0 <= 3);
+        }
+
+        #[test]
+        fn successful_cached_lookup_does_not_record_a_wait() {
+            let cell = OnceLock::new();
+            let init = Counter::default();
+            let wait = Counter::default();
+            assert_eq!(*lookup(&cell, || 42, &init, &wait), 42);
+            let before = init.snapshot();
+            assert_eq!(*lookup(&cell, || panic!("must not retry"), &init, &wait), 42);
+            assert_eq!(init.snapshot(), before);
+            assert_eq!(wait.snapshot(), (0, 0));
+        }
+
+        #[test]
+        fn counter_accumulates_samples() {
+            let counter = Counter::default();
+            counter.record(7);
+            counter.record(13);
+            assert_eq!(counter.snapshot(), (2, 20));
+        }
+    }
+}
+
 #[cfg(windows)]
 impl Shader {
     /// The translation, made on first use; a shader that does not
     /// translate is logged once.
     pub(crate) fn translated(&self) -> Option<&Translated> {
-        self.translated
-            .get_or_init(|| {
-                let done = translate(&self.container);
-                match &done {
-                    Ok(t) => tracing::info!(
-                        stage = self.stage,
-                        hash = %self.hash,
-                        user_data = t.host.user_data.len(),
-                        samplers = t.host.samplers.len(),
-                        "shader translated"
-                    ),
-                    Err(e) => tracing::warn!(
-                        stage = self.stage,
-                        hash = %self.hash,
-                        error = %e,
-                        "shader does not translate; its pipelines' draws are dropped"
-                    ),
-                }
-                done.ok()
-            })
-            .as_ref()
+        let initialize = || {
+            let done = translate(&self.container);
+            match &done {
+                Ok(t) => tracing::info!(
+                    stage = self.stage,
+                    hash = %self.hash,
+                    user_data = t.host.user_data.len(),
+                    samplers = t.host.samplers.len(),
+                    "shader translated"
+                ),
+                Err(e) => tracing::warn!(
+                    stage = self.stage,
+                    hash = %self.hash,
+                    error = %e,
+                    "shader does not translate; its pipelines' draws are dropped"
+                ),
+            }
+            done.ok()
+        };
+        #[cfg(feature = "diagnostics")]
+        let result = timing::shader_lookup(&self.translated, initialize);
+        #[cfg(not(feature = "diagnostics"))]
+        let result = self.translated.get_or_init(initialize);
+        result.as_ref()
     }
 }
 
