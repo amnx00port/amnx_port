@@ -846,6 +846,7 @@ fn host_texture(
         Type: D3D12_HEAP_TYPE_DEFAULT,
         ..Default::default()
     };
+    let host_state = crate::host::legal_for(d.flags, crate::host::texture_state(state));
     let mut texture: Option<ID3D12Resource> = None;
     // SAFETY: the description has the host layout (checked size, same
     // fields); the out pointer is ours.
@@ -854,16 +855,21 @@ fn host_texture(
             &heap,
             D3D12_HEAP_FLAG_NONE,
             (&raw const d).cast(),
-            D3D12_RESOURCE_STATES(
-                crate::host::legal_for(d.flags, crate::host::texture_state(state)) as i32,
-            ),
+            D3D12_RESOURCE_STATES(host_state as i32),
             // The same layout: format, then color or depth and stencil.
             clear_value.as_ref().map(|v| std::ptr::from_ref(v).cast()),
             &mut texture,
         )
     };
     if let Err(e) = made {
-        tracing::warn!(error = %e, desc = ?d, "no host texture");
+        tracing::warn!(
+            error = %e,
+            desc = ?d,
+            host_state = format_args!("{host_state:#x}"),
+            title_state = format_args!("{state:#x}"),
+            clear_format = ?clear_value.map(|value| value[0]),
+            "no host texture"
+        );
     }
     if let Some(t) = &texture {
         crate::host::name(t, || {
