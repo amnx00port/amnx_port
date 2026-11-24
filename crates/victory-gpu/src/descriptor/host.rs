@@ -328,6 +328,14 @@ impl HostHeap {
         }
     }
 
+    pub(crate) fn gpu(&self, index: u32) -> D3D12_GPU_DESCRIPTOR_HANDLE {
+        // SAFETY: this heap is shader-visible and the caller found a mirrored slot.
+        let start = unsafe { self.heap.GetGPUDescriptorHandleForHeapStart() };
+        D3D12_GPU_DESCRIPTOR_HANDLE {
+            ptr: start.ptr + u64::from(index) * u64::from(self.step),
+        }
+    }
+
     /// Makes host slot `index` from the record the title has at `handle`
     /// if it changed since, and returns the view recorded there. Buffer
     /// views are made only for draws (`for_draw`), which also copy their
@@ -621,6 +629,16 @@ fn fits(texture: &ID3D12Resource, mut format: Option<&mut DXGI_FORMAT>, unordere
     true
 }
 
+/// The same host UAV description for the shader-visible mirror and the
+/// CPU-only descriptor used by a clear.
+pub(crate) fn texture_uav_desc(
+    texture: &ID3D12Resource,
+    words: Option<&[u32; 10]>,
+) -> Option<Option<D3D12_UNORDERED_ACCESS_VIEW_DESC>> {
+    let mut desc = words.map(uav_desc);
+    fits(texture, desc.as_mut().map(|d| &mut d.Format), true).then_some(desc)
+}
+
 /// Makes the host descriptor for `view` at `at`: the host resource it
 /// views, or `None` if it cannot.
 fn make(view: &View, at: D3D12_CPU_DESCRIPTOR_HANDLE) -> Option<Kept> {
@@ -679,10 +697,7 @@ fn make(view: &View, at: D3D12_CPU_DESCRIPTOR_HANDLE) -> Option<Kept> {
                     _ => None,
                 };
             };
-            let mut desc = desc.as_ref().map(uav_desc);
-            if !fits(texture, desc.as_mut().map(|d| &mut d.Format), true) {
-                return None;
-            }
+            let desc = texture_uav_desc(texture, desc.as_ref())?;
             // SAFETY: a live texture and a slot of our heap.
             unsafe {
                 device.CreateUnorderedAccessView(
