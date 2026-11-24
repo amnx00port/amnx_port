@@ -11,6 +11,7 @@ pub fn run(
     strict: bool,
     execute: bool,
     console: Console,
+    title_args: Vec<String>,
 ) -> Result<()> {
     use std::sync::Arc;
     use victory_hle::{HleResolver, HostPolicy};
@@ -65,6 +66,9 @@ pub fn run(
         Console::SeriesS => victory_hle::console::Console::SeriesS,
     });
     println!("console        {}", victory_hle::console::current().name());
+    if !title_args.is_empty() {
+        println!("title args     {}", title_args.join(" "));
+    }
     let dlls = victory_loader::load_title_dlls(image.info(), title_dir, &images, &wanted)?;
     for (name, dll) in &dlls {
         println!("title dll      {name} at {:#x}", dll.base());
@@ -333,6 +337,6 @@ mod tests {
 }
 
 #[cfg(not(windows))]
-pub fn run(_: &Path, _: Unimplemented, _: bool, _: bool, _: Console) -> Result<()> {
+pub fn run(_: &Path, _: Unimplemented, _: bool, _: bool, _: Console, _: Vec<String>) -> Result<()> {
     anyhow::bail!("running titles requires Windows")
 }

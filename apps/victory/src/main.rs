@@ -159,8 +159,8 @@ fn main() -> Result<()> {
             strict,
             execute,
             console,
-            title_args: _,
-        } => run::run(&exe, unimplemented, strict, execute, console),
+            title_args,
+        } => run::run(&exe, unimplemented, strict, execute, console, title_args),
         Command::Config => show_config(),
     }
 }
@@ -209,4 +209,47 @@ pub(crate) fn default_paths(paths: Vec<PathBuf>) -> Result<Vec<PathBuf>> {
         "no paths given and none configured (see victory.example.toml)"
     );
     Ok(all)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn run_parses_title_args_after_separator() {
+        let cli = Cli::try_parse_from([
+            "victory",
+            "run",
+            "game.exe",
+            "--console",
+            "series-x",
+            "--",
+            "-profile=1",
+            "-verbose",
+        ])
+        .unwrap();
+        match cli.command {
+            Command::Run {
+                exe, title_args, ..
+            } => {
+                assert_eq!(exe, PathBuf::from("game.exe"));
+                assert_eq!(title_args, vec!["-profile=1", "-verbose"]);
+            }
+            _ => panic!("expected Command::Run"),
+        }
+    }
+
+    #[test]
+    fn run_without_title_args_defaults_to_empty() {
+        let cli = Cli::try_parse_from(["victory", "run", "game.exe"]).unwrap();
+        match cli.command {
+            Command::Run {
+                exe, title_args, ..
+            } => {
+                assert_eq!(exe, PathBuf::from("game.exe"));
+                assert!(title_args.is_empty());
+            }
+            _ => panic!("expected Command::Run"),
+        }
+    }
 }
