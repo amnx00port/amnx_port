@@ -129,14 +129,17 @@ fn best_of<T>(rounds: usize, mut f: impl FnMut() -> T) -> Duration {
 #[ignore = "timing; run with --ignored --nocapture"]
 fn translation_stages_by_size() {
     println!(
-        "\n{:>7} {:>10} {:>10} {:>10} {:>10} {:>10} {:>10}",
-        "body", "ir.build", "structure", "resource", "io", "lower", "total"
+        "\n{:>7} {:>9} {:>10} {:>10} {:>10} {:>10} {:>10} {:>10}",
+        "body", "decode", "ir.build", "structure", "resource", "io", "lower", "total"
     );
     for body in [256usize, 1024, 4096, 16384] {
         let native = synthetic(body);
         let ninst = body as f64 + 8.0;
         let rounds = if body >= 8192 { 5 } else { 11 };
 
+        let t_dec = best_of(rounds, || {
+            crate::gfx10::decode(&native.code).expect("decode")
+        });
         let t_ir = best_of(rounds, || {
             ir::build(&native.code, native.wave64, native.vgprs).expect("ir::build")
         });
@@ -184,8 +187,9 @@ fn translation_stages_by_size() {
             fnv = fnv.wrapping_mul(0x1000_0000_01b3);
         }
         println!(
-            "{:>7} {:>10.0} {:>10.0} {:>10.0} {:>10.0} {:>10.0} {:>10.0}   dxil={} bytes fnv={:016x}",
+            "{:>7} {:>9.0} {:>10.0} {:>10.0} {:>10.0} {:>10.0} {:>10.0} {:>10.0}   dxil={} bytes fnv={:016x}",
             body,
+            ns(t_dec),
             ns(t_ir),
             ns(t_st),
             ns(t_res),
