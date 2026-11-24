@@ -18,10 +18,11 @@ use windows_sys::Win32::Foundation::{
 };
 use windows_sys::Win32::System::Memory::{
     CreateFileMappingW, MEM_ADDRESS_REQUIREMENTS, MEM_COMMIT, MEM_EXTENDED_PARAMETER,
-    MEM_PRESERVE_PLACEHOLDER, MEM_RELEASE, MEM_REPLACE_PLACEHOLDER, MEM_RESERVE,
+    MEM_PRESERVE_PLACEHOLDER, MEM_PRIVATE, MEM_RELEASE, MEM_REPLACE_PLACEHOLDER, MEM_RESERVE,
     MEM_RESERVE_PLACEHOLDER, MEMORY_BASIC_INFORMATION, MEMORY_MAPPED_VIEW_ADDRESS, MapViewOfFile3,
     MemExtendedParameterAddressRequirements, PAGE_NOACCESS, PAGE_READWRITE, SEC_COMMIT,
-    SEC_RESERVE, UnmapViewOfFile2, VirtualAlloc, VirtualAlloc2, VirtualFree, VirtualQueryEx,
+    SEC_RESERVE, UnmapViewOfFile2, VirtualAlloc, VirtualAlloc2, VirtualFree, VirtualQuery,
+    VirtualQueryEx,
 };
 use windows_sys::Win32::System::ProcessStatus::{
     K32GetPerformanceInfo, K32GetProcessMemoryInfo, PERFORMANCE_INFORMATION,
@@ -153,6 +154,20 @@ pub extern "system" fn XMemVirtualAlloc(
             constrained.into(),
         )
     };
+    if at.is_null() {
+        let error = std::io::Error::last_os_error();
+        if kind & MEM_COMMIT != 0 {
+            commit_refused(size, "virtual memory", error);
+        } else {
+            tracing::warn!(
+                size,
+                kind = format_args!("{kind:#x}"),
+                flags = format_args!("{flags:#x}"),
+                %error,
+                "XMemVirtualAlloc refused"
+            );
+        }
+    }
     if base.is_null() {
         tracing::debug!(
             size,
@@ -296,6 +311,7 @@ pub extern "system" fn XMemAllocDefault(size: usize, attributes: u64) -> *mut c_
     // SAFETY: the layout has a non-zero size.
     let block = unsafe { alloc(layout) };
     if block.is_null() {
+        tracing::warn!(size, "XMemAllocDefault: the host heap is out of memory");
         return block.cast();
     }
     // SAFETY: the block holds the alignment (at least the header) and then
@@ -608,7 +624,7 @@ pub extern "system" fn XMemMapPhysicalPages(
             tracing::warn!(page = pages[i], "XMemMapPhysicalPages: unknown page");
             return std::ptr::null_mut();
         };
-        // One view per run of consecutive slices of one section.
+        // One mapping per run of consecutive slices of one section.
         let run = 1 + pages[i + 1..]
             .iter()
             .zip(1..)
@@ -689,17 +705,55 @@ pub fn map_alias(to: u64, from: u64, len: u64) -> bool {
 }
 
 /// Maps `slice` and the slices after it over `[base, base + len)`, which
-/// must lie in one placeholder.
+/// must be placeholders. A view replaces exactly one placeholder, and a
+/// reservation is often several by now (each mapping splits it at its
+/// ends, unmapping does not join the pieces, titles split their own), so
+/// the range is split at its two ends and each placeholder in it gets a
+/// view of its part. Placeholders are never joined: that would also join
+/// separate reservations, or pieces the title split, for good. All or
+/// nothing: if a view fails, those made before it are placeholders again.
 fn map(physical: &mut Physical, base: usize, len: usize, slice: Slice) -> bool {
-    // SAFETY: splits the placeholder around the range (failing harmlessly
-    // when the range is the whole placeholder), then maps the section
-    // there; both act only on placeholders.
+    let end = base + len;
+    split_at(base);
+    split_at(end);
+    let mut made: Vec<(usize, usize, Slice)> = Vec::new();
+    let mut at = base;
+    while at < end {
+        // What is not a placeholder fails in `map_view`.
+        let next = placeholder(at).map_or(end, |(_, stop)| stop.min(end));
+        let offset = at - base;
+        let part = Slice {
+            index: slice.index + offset / PAGE,
+            section: slice.section.clone(),
+        };
+        // A view must start on a page of the run to show its slice.
+        if !offset.is_multiple_of(PAGE) || !map_view(at, next - at, &part) {
+            for &(view, _, _) in &made {
+                let view = MEMORY_MAPPED_VIEW_ADDRESS {
+                    Value: view as *mut c_void,
+                };
+                // SAFETY: a view made above, back to its placeholder.
+                unsafe { UnmapViewOfFile2(GetCurrentProcess(), view, MEM_PRESERVE_PLACEHOLDER) };
+            }
+            return false;
+        }
+        made.push((at, next - at, part));
+        at = next;
+    }
+    for (at, len, part) in made {
+        // New contents, read-write: the GPU side's copies no longer guard it.
+        victory_gpu::title_memory_remapped(at, len);
+        physical.views.insert(at, (len, part));
+    }
+    true
+}
+
+/// Replaces the placeholder `[base, base + len)` with a view of `slice` and
+/// the slices after it, committed.
+fn map_view(base: usize, len: usize, slice: &Slice) -> bool {
+    // SAFETY: replaces the placeholder `[base, base + len)` with a view of
+    // the section; the host refuses anything that is not that placeholder.
     let view = unsafe {
-        VirtualFree(
-            base as *mut c_void,
-            len,
-            MEM_RELEASE | MEM_PRESERVE_PLACEHOLDER,
-        );
         MapViewOfFile3(
             slice.section.0,
             GetCurrentProcess(),
@@ -726,10 +780,46 @@ fn map(physical: &mut Physical, base: usize, len: usize, slice: Slice) -> bool {
         unsafe { UnmapViewOfFile2(GetCurrentProcess(), view, MEM_PRESERVE_PLACEHOLDER) };
         return false;
     }
-    // New contents, read-write: the GPU side's copies no longer guard it.
-    victory_gpu::title_memory_remapped(base, len);
-    physical.views.insert(base, (len, slice));
     true
+}
+
+/// The start and end of the placeholder holding `at`, if it may be one
+/// (other reserved memory looks the same, but the host refuses to split it
+/// or map over it).
+fn placeholder(at: usize) -> Option<(usize, usize)> {
+    // SAFETY: plain data; zero is a valid value.
+    let mut info: MEMORY_BASIC_INFORMATION = unsafe { std::mem::zeroed() };
+    let size = size_of::<MEMORY_BASIC_INFORMATION>();
+    // SAFETY: a query of our own address space into `info`.
+    let found = unsafe { VirtualQuery(at as *const c_void, &mut info, size) } == size;
+    (found && info.State == MEM_RESERVE && info.Type == MEM_PRIVATE).then(|| {
+        (
+            info.AllocationBase as usize,
+            info.BaseAddress as usize + info.RegionSize,
+        )
+    })
+}
+
+/// Splits the placeholder holding `at` in two there, if it starts below.
+/// The same call frees reserved memory that replaced a placeholder back to
+/// one, committed pages and all, so everything below `at` in it must be
+/// reserved: nothing committed is ever freed here.
+fn split_at(at: usize) {
+    if let Some((start, _)) = placeholder(at)
+        && start < at
+        && placeholder(start).is_some_and(|(_, stop)| stop >= at)
+    {
+        // SAFETY: `[start, at)` is reserved and holds no data; the host
+        // fails the call on anything but a placeholder or memory that
+        // replaced one, and then changes nothing.
+        unsafe {
+            VirtualFree(
+                start as *mut c_void,
+                at - start,
+                MEM_RELEASE | MEM_PRESERVE_PLACEHOLDER,
+            )
+        };
+    }
 }
 
 /// Commits the section pages a view shows (once per page, whichever view).
@@ -741,7 +831,14 @@ fn commit(base: usize, len: usize) -> bool {
     if !unsafe { VirtualAlloc(base as *const c_void, len, MEM_COMMIT, PAGE_READWRITE) }.is_null() {
         return true;
     }
-    let error = std::io::Error::last_os_error();
+    commit_refused(len, "physical pages", std::io::Error::last_os_error());
+    false
+}
+
+/// Reports memory the host would not give: at the Windows commit limit to
+/// `crashes.log`, since the title usually faults soon after on the null it
+/// gets; otherwise as a warning.
+fn commit_refused(len: usize, what: &str, error: std::io::Error) {
     if error.raw_os_error() == Some(ERROR_COMMITMENT_LIMIT as i32) {
         let mut info = PERFORMANCE_INFORMATION {
             cb: size_of::<PERFORMANCE_INFORMATION>() as u32,
@@ -749,20 +846,25 @@ fn commit(base: usize, len: usize) -> bool {
         };
         // SAFETY: the buffer and size describe a writable PERFORMANCE_INFORMATION.
         let queried = unsafe { K32GetPerformanceInfo(&mut info, info.cb) } != 0;
-        victory_loader::log_crash(&commit_limit_message(len, &error, queried.then_some(&info)));
+        victory_loader::log_crash(&commit_limit_message(
+            len,
+            what,
+            &error,
+            queried.then_some(&info),
+        ));
     } else {
-        tracing::warn!(len, %error, "committing physical pages failed");
+        tracing::warn!(len, %error, "committing {what} failed");
     }
-    false
 }
 
 fn commit_limit_message(
     len: usize,
+    what: &str,
     error: &std::io::Error,
     info: Option<&PERFORMANCE_INFORMATION>,
 ) -> String {
     let mut message = format!(
-        "VIctory: Windows commit limit reached while committing {len} bytes of physical pages: {error}.\n"
+        "VIctory: Windows commit limit reached while committing {len} bytes of {what}: {error}.\n"
     );
     if let Some(info) = info {
         use std::fmt::Write;
@@ -1024,10 +1126,11 @@ mod tests {
             PageSize: 4096,
             ..Default::default()
         };
-        let report = commit_limit_message(4 * MIB, &error, Some(&info));
-        assert!(report.contains("4194304 bytes"));
+        let report = commit_limit_message(4 * MIB, "physical pages", &error, Some(&info));
+        assert!(report.contains("4194304 bytes of physical pages"));
         assert!(report.contains("2 MiB of 3 MiB in use"));
-        let fallback = commit_limit_message(4 * MIB, &error, None);
+        let fallback = commit_limit_message(4 * MIB, "virtual memory", &error, None);
+        assert!(fallback.contains("4194304 bytes of virtual memory"));
         for report in [&report, &fallback] {
             assert!(report.contains("os error 1455"));
             assert!(report.contains("Windows paging file size"));
@@ -1238,5 +1341,138 @@ mod tests {
         assert!(page_window(&[a[0], b[0]], 0, PAGE).is_some());
         assert_eq!(XMemFreePhysicalPages(3, a.as_ptr()), 1);
         assert_eq!(XMemFreePhysicalPages(1, b.as_ptr()), 1);
+    }
+
+    /// `n` physical pages (consecutive slices of one section) and a
+    /// reservation of `n` 64 KiB pages for them.
+    fn pages_and_reservation(n: usize) -> (Vec<usize>, *mut c_void) {
+        let mut pages = vec![0usize; n];
+        let mut count = n;
+        assert_eq!(
+            XMemAllocatePhysicalPages(0, &mut count, pages.as_mut_ptr()),
+            1
+        );
+        let reservation = XMemVirtualAlloc(
+            std::ptr::null_mut(),
+            n * PAGE,
+            MEM_RESERVE | PAGES_64K,
+            0,
+            PAGE_READWRITE,
+        );
+        assert!(!reservation.is_null());
+        (pages, reservation)
+    }
+
+    /// Unmapping part of a run leaves the range as several host
+    /// placeholders; mapping a run over all of them again works, and the
+    /// pages keep what was written through the first mapping.
+    #[test]
+    fn a_run_maps_again_after_a_partial_unmap() {
+        let (pages, a) = pages_and_reservation(3);
+        let at = |page: usize| a.wrapping_byte_add(page * PAGE);
+        assert_eq!(XMemMapPhysicalPages(a, 3, pages.as_ptr()), a);
+        // SAFETY: mapped read-write.
+        unsafe {
+            for page in 0..3 {
+                at(page).cast::<u8>().write(10 + page as u8);
+            }
+        }
+        assert_eq!(XMemMapPhysicalPages(at(1), 1, std::ptr::null()), at(1));
+        assert_eq!(query(at(1)).host.State, MEM_RESERVE);
+
+        assert_eq!(XMemMapPhysicalPages(a, 3, pages.as_ptr()), a);
+        for page in 0..3 {
+            assert_eq!(query(at(page)).host.State, MEM_COMMIT, "page {page}");
+            // SAFETY: mapped read-write.
+            assert_eq!(unsafe { at(page).cast::<u8>().read() }, 10 + page as u8);
+        }
+        assert_eq!(XMemMapPhysicalPages(a, 3, std::ptr::null()), a);
+        assert_eq!(query(a).host.State, MEM_RESERVE);
+        assert_eq!(XMemFreePhysicalPages(3, pages.as_ptr()), 1);
+    }
+
+    /// A run that starts inside one host placeholder and ends inside the
+    /// next (left by an earlier, shorter run) maps, and the pages around it
+    /// stay unmapped.
+    #[test]
+    fn a_run_maps_across_two_placeholders() {
+        let (pages, a) = pages_and_reservation(4);
+        let at = |page: usize| a.wrapping_byte_add(page * PAGE);
+        // Mapping and unmapping pages 0-1 splits the reservation in two.
+        assert_eq!(XMemMapPhysicalPages(a, 2, pages.as_ptr()), a);
+        assert_eq!(XMemMapPhysicalPages(a, 2, std::ptr::null()), a);
+
+        assert_eq!(XMemMapPhysicalPages(at(1), 2, pages[1..].as_ptr()), at(1));
+        assert_eq!(query(a).host.State, MEM_RESERVE);
+        assert_eq!(query(at(1)).host.State, MEM_COMMIT);
+        assert_eq!(query(at(2)).host.State, MEM_COMMIT);
+        assert_eq!(query(at(3)).host.State, MEM_RESERVE);
+        // Page 3, split off by the run, still takes a mapping: the run's
+        // last page shows there too.
+        // SAFETY: mapped read-write.
+        unsafe {
+            at(2).cast::<u8>().write(42);
+            assert_eq!(XMemMapPhysicalPages(at(3), 1, pages[2..].as_ptr()), at(3));
+            assert_eq!(at(3).cast::<u8>().read(), 42);
+        }
+        assert_eq!(XMemMapPhysicalPages(a, 4, std::ptr::null()), a);
+        assert_eq!(XMemFreePhysicalPages(4, pages.as_ptr()), 1);
+    }
+
+    /// Placeholders a run spans are never joined: a piece the title split
+    /// off itself is still its own after the run is unmapped, so the title
+    /// can release it.
+    #[test]
+    fn a_run_keeps_the_placeholders_it_spans() {
+        let (pages, a) = pages_and_reservation(4);
+        let at = |page: usize| a.wrapping_byte_add(page * PAGE);
+        // SAFETY: splits the reservation's placeholder, as a title does.
+        let split = unsafe { VirtualFree(a, 2 * PAGE, MEM_RELEASE | MEM_PRESERVE_PLACEHOLDER) };
+        assert_ne!(split, 0);
+        assert_eq!(XMemMapPhysicalPages(a, 4, pages.as_ptr()), a);
+        assert_eq!(XMemMapPhysicalPages(a, 4, std::ptr::null()), a);
+        let info = query(at(2)).host;
+        assert_eq!((info.AllocationBase, info.RegionSize), (at(2), 2 * PAGE));
+        // SAFETY: the title's own piece, unmapped.
+        assert_ne!(unsafe { VirtualFree(at(2), 0, MEM_RELEASE) }, 0);
+        assert_eq!(XMemFreePhysicalPages(4, pages.as_ptr()), 1);
+    }
+
+    /// A run whose second part is no placeholder (memory committed in place
+    /// of one) fails: its first part is unmapped again, and the committed
+    /// memory, which the run ends inside, keeps its data.
+    #[test]
+    fn a_failed_run_leaves_no_view() {
+        let (pages, a) = pages_and_reservation(3);
+        let at = |page: usize| a.wrapping_byte_add(page * PAGE);
+        // SAFETY: splits the placeholder, makes pages 1-2 an ordinary
+        // allocation in place and commits page 1 of it.
+        unsafe {
+            assert_ne!(
+                VirtualFree(a, PAGE, MEM_RELEASE | MEM_PRESERVE_PLACEHOLDER),
+                0
+            );
+            let p = VirtualAlloc2(
+                GetCurrentProcess(),
+                at(1),
+                2 * PAGE,
+                MEM_RESERVE | MEM_REPLACE_PLACEHOLDER,
+                PAGE_READWRITE,
+                std::ptr::null_mut(),
+                0,
+            );
+            assert_eq!(p, at(1));
+            assert!(!VirtualAlloc(at(1), PAGE, MEM_COMMIT, PAGE_READWRITE).is_null());
+            at(1).cast::<u8>().write(99);
+        }
+        assert!(XMemMapPhysicalPages(a, 2, pages.as_ptr()).is_null());
+        assert_eq!(query(a).host.State, MEM_RESERVE);
+        assert_eq!(query(at(1)).host.State, MEM_COMMIT);
+        // SAFETY: still committed.
+        assert_eq!(unsafe { at(1).cast::<u8>().read() }, 99);
+        // Page 0 is a placeholder again: it takes a mapping.
+        assert_eq!(XMemMapPhysicalPages(a, 1, pages.as_ptr()), a);
+        assert_eq!(XMemMapPhysicalPages(a, 1, std::ptr::null()), a);
+        assert_eq!(XMemFreePhysicalPages(3, pages.as_ptr()), 1);
     }
 }
