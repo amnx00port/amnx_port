@@ -6192,6 +6192,26 @@ impl<'a> Lower<'a> {
             Some("cmpswap") => Some(u32::MAX),
             Some(_) => return Err(name),
         };
+        // A byte or a halfword at the byte address, zero- or sign-extended (RDNA2
+        // ISA, MUBUF: `buffer_load_{u,s}byte`, `buffer_load_{u,s}short`); the `_d16`
+        // forms put it in one half of the register and keep the other half.
+        // (width, signed, Some(high half) for `_d16`.)
+        let sub = name.strip_prefix("buffer_load_").and_then(|n| {
+            let (base, half) = match (n.strip_suffix("_d16_hi"), n.strip_suffix("_d16")) {
+                (Some(b), _) => (b, Some(true)),
+                (_, Some(b)) => (b, Some(false)),
+                _ => (n, None),
+            };
+            let (width, signed) = match (base, half) {
+                ("ubyte", _) => (8, false),
+                ("sbyte", _) => (8, true),
+                ("ushort", None) => (16, false),
+                ("sshort", None) => (16, true),
+                ("short", Some(_)) => (16, false),
+                _ => return None,
+            };
+            Some((width, signed, half))
+        });
         // d16: two 16-bit channels per VGPR, low half first.
         let d16 = name.starts_with("buffer_") && name.contains("_format_d16_");
         let plain = name.replace("_format_d16_", "_format_");
@@ -6200,7 +6220,7 @@ impl<'a> Lower<'a> {
             .or(plain.strip_prefix("buffer_store_"))
             .or(plain.strip_prefix("tbuffer_load_"))
         {
-            _ if atomic.is_some() => (false, 1),
+            _ if atomic.is_some() || sub.is_some() => (false, 1),
             Some("dword") => (false, 1),
             Some("dwordx2") => (false, 2),
             Some("dwordx3") => (false, 3),
@@ -6244,6 +6264,9 @@ impl<'a> Lower<'a> {
         }
         if let Some(x) = extra {
             off = self.s.m.bin(c, Bin::Add, off, x);
+        }
+        if sub.is_some() && used.is_some_and(|u| u.kind == ResourceType::Cbv) {
+            return Err("a sub-dword read of a constant buffer");
         }
         if used.is_some_and(|u| u.kind == ResourceType::Cbv) && !typed {
             // A constant buffer read per lane (a dynamically indexed array).
@@ -6320,6 +6343,96 @@ impl<'a> Lower<'a> {
             if returns {
                 self.write(inst, Reg::V(reg), r, None);
             }
+            return Ok(());
+        }
+        if let Some((width, signed, half)) = sub {
+            let Some(Operand::Vector { reg, .. }) = *data else {
+                return Err("a buffer result");
+            };
+            let (h, lead) = match index {
+                Some(index) => {
+                    let stride = used.map_or(0, |u| u.stride);
+                    if stride < 4 || !stride.is_multiple_of(4) {
+                        return Err("a structured buffer of unknown stride");
+                    }
+                    (
+                        self.handle(site, src, false, (12 | u, stride))?,
+                        Some(index),
+                    )
+                }
+                None => (self.handle(site, src, false, (11 | u, 0))?, None),
+            };
+            let word = |l: &mut Self, at: V| -> V {
+                let (cur, mask, align) = (l.cur, l.s.m.i8(1), l.s.m.i32(4));
+                let args = match lead {
+                    Some(i) => [h, i, at, mask, align],
+                    None => [h, at, iu, mask, align],
+                };
+                let r = l.s.op(
+                    cur,
+                    "rawBufferLoad.f32",
+                    Attr::ReadOnly,
+                    l.s.t.res_ret,
+                    139,
+                    &args,
+                );
+                let x = l.s.m.extract(cur, r, 0);
+                l.as_int(x)
+            };
+            // The dword the address is in, shifted down to the field.
+            let (not3, three) = (self.s.m.i32(!3), self.s.m.i32(3));
+            let at = self.s.m.bin(c, Bin::And, off, not3);
+            let w = word(self, at);
+            let byte = self.s.m.bin(c, Bin::And, off, three);
+            let sh = self.s.m.bin(c, Bin::Shl, byte, three);
+            let mut x = self.s.m.bin(c, Bin::LShr, w, sh);
+            if width == 16 {
+                // A halfword at byte 3 of a dword takes its high byte from the next
+                // dword: read it only for the lanes that cross, so the others never
+                // touch memory past their field.
+                let mut crosses = self.s.m.cmp(c, pred::EQ, byte, three);
+                if let Some(g) = guard {
+                    crosses = self.s.m.bin(c, Bin::And, crosses, g);
+                }
+                let br = self.begin_guarded(Some(crosses));
+                let (cur, four, eight) = (self.cur, self.s.m.i32(4), self.s.m.i32(8));
+                let next = self.s.m.bin(cur, Bin::Add, at, four);
+                let hi = word(self, next);
+                let hi = self.s.m.bin(cur, Bin::Shl, hi, eight);
+                let both = self.s.m.bin(cur, Bin::Or, x, hi);
+                x = self.end_guarded(br, &[(both, x)])[0];
+            }
+            let c = self.cur;
+            let left = self.s.m.i32(32 - width);
+            let x = self.s.m.bin(c, Bin::Shl, x, left);
+            let mut x = self
+                .s
+                .m
+                .bin(c, if signed { Bin::AShr } else { Bin::LShr }, x, left);
+            if let Some(high) = half {
+                // One half of the register, the other as it was.
+                let k16 = self.s.m.i32(16);
+                let old = match inst.read(Reg::V(reg)) {
+                    Some(v) => self.i32_of(v)?,
+                    None => self.s.m.i32(0),
+                };
+                let (keep, field) = if high {
+                    let low = self.s.m.i32(0xFFFF);
+                    (
+                        self.s.m.bin(c, Bin::And, old, low),
+                        self.s.m.bin(c, Bin::Shl, x, k16),
+                    )
+                } else {
+                    let up = self.s.m.i32(0xFFFF_0000);
+                    let low = self.s.m.i32(0xFFFF);
+                    (
+                        self.s.m.bin(c, Bin::And, old, up),
+                        self.s.m.bin(c, Bin::And, x, low),
+                    )
+                };
+                x = self.s.m.bin(c, Bin::Or, keep, field);
+            }
+            self.write(inst, Reg::V(reg), x, guard);
             return Ok(());
         }
         if store {

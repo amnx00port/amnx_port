@@ -199,7 +199,7 @@ fn run_cases(
                     &pso,
                     &Dispatch {
                         roots: vec![(0, Root::Constants(ud))],
-                        views: &[View::RawUav(1)],
+                        views: &[View::RawUav(4)],
                         samplers: &[],
                         groups: [1, 1, 1],
                     },
@@ -866,6 +866,71 @@ fn bfe_signed_and_unsigned_match_rdna2() {
             inp[0], inp[1], inp[2],
         );
     });
+}
+
+/// MUBUF `buffer_load_* vdata, vaddr, s[srsrc:srsrc+3], 0 offen offset:byte_off`.
+const fn buffer_load_offen(op: u8, vdata: u8, vaddr: u8, srsrc: u8, byte_off: u16) -> [u32; 2] {
+    [
+        0x38 << 26 | (op as u32) << 18 | 1 << 12 | (byte_off as u32 & 0xFFF),
+        0x80 << 24 | ((srsrc as u32 >> 2) & 0x1F) << 16 | (vdata as u32) << 8 | vaddr as u32,
+    ]
+}
+
+/// RDNA2 ISA, MUBUF: `buffer_load_ubyte`, `_sbyte`, `_ushort` and `_sshort` read the field at
+/// the byte address and zero- or sign-extend it (an address 3 mod 4 puts a halfword across two
+/// dwords); `_ubyte_d16`, `_sbyte_d16`, `_short_d16` and their `_hi` forms put it in one half
+/// of the register and keep the other half.
+#[test]
+fn sub_dword_buffer_loads_read_the_field_at_the_byte_address() {
+    // (opcode, width, signed, Some(high half) for the d16 forms)
+    let loads: [(u8, u32, bool, Option<bool>); 10] = [
+        (0x08, 8, false, None),
+        (0x09, 8, true, None),
+        (0x0A, 16, false, None),
+        (0x0B, 16, true, None),
+        (0x20, 8, false, Some(false)),
+        (0x21, 8, false, Some(true)),
+        (0x22, 8, true, Some(false)),
+        (0x23, 8, true, Some(true)),
+        (0x24, 16, false, Some(false)),
+        (0x25, 16, false, Some(true)),
+    ];
+    let (d1, d2, old) = (0x84F2_81C3u32, 0x7A9B_6D5Eu32, 0xA5B6_C7D8u32);
+    let bytes: Vec<u8> = [0, d1, d2].iter().flat_map(|d| d.to_le_bytes()).collect();
+    for (op, width, signed, half) in loads {
+        // v1 = byte address, v2 and v3 the dwords stored at bytes 4 and 8, v4 the old v0.
+        let mut body = vec![vop1(0x001, 0, vgpr(4))];
+        body.extend_from_slice(&buffer_store_dword(2, 8, 4));
+        body.extend_from_slice(&buffer_store_dword(3, 8, 8));
+        body.extend_from_slice(&buffer_load_offen(op, 0, 1, 8, 0));
+        let shader = build_valu_cs(&body);
+        // Every byte of dwords 1 and 2; a halfword at 7 crosses them.
+        let addresses: Vec<u32> = (4..=if width == 8 { 11 } else { 10 }).collect();
+        let cases: Vec<[u32; 4]> = addresses.iter().map(|&a| [a, d1, d2, old]).collect();
+        run_cases(&shader, &cases, |backend, i, _, got| {
+            let at = addresses[i] as usize;
+            let raw = if width == 8 {
+                u32::from(bytes[at])
+            } else {
+                u32::from(bytes[at]) | u32::from(bytes[at + 1]) << 8
+            };
+            let shift = 32 - width;
+            let field = if signed {
+                ((raw << shift) as i32 >> shift) as u32
+            } else {
+                raw
+            };
+            let want = match half {
+                None => field,
+                Some(false) => old & 0xFFFF_0000 | field & 0xFFFF,
+                Some(true) => old & 0xFFFF | field << 16,
+            };
+            assert_eq!(
+                got, want,
+                "{backend}: op {op:#x} at byte {at}: {got:#010x}, want {want:#010x}"
+            );
+        });
+    }
 }
 
 #[test]
