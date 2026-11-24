@@ -82,7 +82,14 @@ pub fn load(prepared: &PreparedImage, dir: &Path) -> Result<LoadedImage> {
     // A DLL indexes its TLS properly; only an exe assumes index 0.
     if !loaded.info.is_dll() {
         // SAFETY: just mapped, and no title code has run.
-        unsafe { crate::tls::redirect(loaded.base(), &loaded.info) }?;
+        if let Err(error) = unsafe { crate::tls::redirect(loaded.base(), &loaded.info) } {
+            // Nothing has seen this module yet (`threads::mapped` is below),
+            // so a failed load must not leave it mapped for the life of the
+            // process.
+            // SAFETY: no title code has run and the module is not registered.
+            unsafe { FreeLibrary(module) };
+            return Err(error);
+        }
     }
     tracing::info!(
         base = format_args!("{:#x}", loaded.base()),
@@ -287,10 +294,20 @@ impl LoadedImage {
     /// Protects and restores each slot on its own: import tables can sit in
     /// sections with different protections (delay-load tables in `.didat`).
     fn write_slots(&self, slots: &[(u32, usize)]) -> Result<()> {
+        // The RVAs come from the image's own tables, which `victory-pe`
+        // checks when it parses them. Check again before touching memory:
+        // an RVA past the image would write into whatever the loader mapped
+        // next, and no `VirtualProtect` failure would necessarily stop it.
+        let size = u64::from(self.info.size_of_image);
+        for &(rva, _) in slots {
+            if u64::from(rva) + 8 > size {
+                bail!("IAT slot {rva:#x} is outside the image ({size:#x} bytes)");
+            }
+        }
         for &(rva, address) in slots {
             let slot = (self.base() + rva as usize) as *mut u64;
             let mut old = 0;
-            // SAFETY: the parser only yields slots inside the image.
+            // SAFETY: the checked slot lies inside the image.
             if unsafe { VirtualProtect(slot as *const c_void, 8, PAGE_READWRITE, &mut old) } == 0 {
                 bail!(
                     "VirtualProtect(IAT slot {rva:#x}) failed: {}",
@@ -320,8 +337,18 @@ impl LoadedImage {
     unsafe fn tls_callbacks(&self, reason: u32, reserved: *mut c_void) {
         let Some(tls) = &self.info.tls else { return };
         for &rva in &tls.callback_rvas {
+            // A callback is code inside the image; RVA 0 is the header, and
+            // anything past the image belongs to another mapping. Calling
+            // either would run memory the image does not own.
+            if rva == 0 || u64::from(rva) >= u64::from(self.info.size_of_image) {
+                tracing::warn!(
+                    rva = format_args!("{rva:#x}"),
+                    "TLS callback outside the image, skipped"
+                );
+                continue;
+            }
             type TlsCallback = unsafe extern "system" fn(*mut c_void, u32, *mut c_void);
-            // SAFETY: the RVA came from the image's own TLS directory.
+            // SAFETY: the RVA is inside the image and came from its TLS directory.
             let callback: TlsCallback = unsafe { std::mem::transmute(self.base() + rva as usize) };
             // SAFETY: the caller guarantees imports are bound.
             unsafe { callback(self.module, reason, reserved) };
@@ -373,8 +400,19 @@ impl LoadedImage {
         if !dll_main || !self.info.is_dll() || self.info.entry_rva == 0 {
             return None;
         }
+        // An entry point outside the image cannot be this image's `DllMain`.
+        // Report it the way a `DllMain` that refuses the process does,
+        // rather than call into whatever is mapped past the image.
+        if u64::from(self.info.entry_rva) >= u64::from(self.info.size_of_image) {
+            tracing::error!(
+                entry = format_args!("{:#x}", self.info.entry_rva),
+                size = format_args!("{:#x}", self.info.size_of_image),
+                "DllMain outside the image"
+            );
+            return Some(0);
+        }
         type DllMain = unsafe extern "system" fn(*mut c_void, u32, *mut c_void) -> i32;
-        // SAFETY: the entry RVA came from the original image header.
+        // SAFETY: the entry RVA is inside the image and came from its header.
         let main: DllMain =
             unsafe { std::mem::transmute(self.base() + self.info.entry_rva as usize) };
         // SAFETY: forwarded from the caller.
@@ -394,6 +432,12 @@ impl LoadedImage {
     ) -> Result<std::thread::JoinHandle<Result<u32>>> {
         if self.info.entry_rva == 0 {
             bail!("image has no entry point");
+        }
+        if u64::from(self.info.entry_rva) >= u64::from(self.info.size_of_image) {
+            bail!(
+                "entry point {:#x} is outside the image",
+                self.info.entry_rva
+            );
         }
         let stack = usize::try_from(self.info.stack_reserve)
             .unwrap_or(usize::MAX)
@@ -428,5 +472,549 @@ impl LoadedImage {
         crate::threads::unmapped(self.base());
         // SAFETY: guaranteed by the caller.
         unsafe { FreeLibrary(self.module) };
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::sync::atomic::Ordering;
+
+    use victory_pe::{ImportEntry, ImportModule, ImportSymbol, TlsInfo};
+    use windows_sys::Win32::System::LibraryLoader::GetModuleHandleW;
+    use windows_sys::Win32::System::Memory::{
+        MEM_COMMIT, MEM_RELEASE, MEM_RESERVE, MEMORY_BASIC_INFORMATION, PAGE_EXECUTE_READWRITE,
+        PAGE_READONLY, PAGE_READWRITE, VirtualAlloc, VirtualFree, VirtualQuery,
+    };
+
+    use super::*;
+    use crate::{disable_thread_calls, unimplemented_call_count};
+
+    const PAGE: usize = 0x1000;
+
+    /// A committed scratch block standing in for a mapped image.
+    fn alloc(pages: usize, protect: u32) -> usize {
+        // SAFETY: a fresh anonymous allocation, freed once by `free`.
+        let at = unsafe {
+            VirtualAlloc(
+                std::ptr::null(),
+                pages * PAGE,
+                MEM_COMMIT | MEM_RESERVE,
+                protect,
+            )
+        } as usize;
+        assert_ne!(at, 0, "VirtualAlloc failed");
+        at
+    }
+
+    fn free(at: usize) {
+        // SAFETY: `at` is a live block from `alloc`, freed once.
+        unsafe { VirtualFree(at as *mut c_void, 0, MEM_RELEASE) };
+    }
+
+    fn protection(at: usize) -> u32 {
+        // SAFETY: a zeroed output buffer of the type the call fills.
+        let mut info: MEMORY_BASIC_INFORMATION = unsafe { std::mem::zeroed() };
+        // SAFETY: `at` is inside a live allocation; `info` is sized for the call.
+        let n = unsafe { VirtualQuery(at as *const c_void, &mut info, size_of_val(&info)) };
+        assert_ne!(n, 0, "VirtualQuery failed");
+        info.Protect
+    }
+
+    fn put(at: usize, code: &[u8]) {
+        // SAFETY: callers pass a range inside a live executable allocation.
+        unsafe { std::ptr::copy_nonoverlapping(code.as_ptr(), at as *mut u8, code.len()) };
+    }
+
+    /// `mov rax, <counter>; inc qword ptr [rax]; ret`.
+    fn bump(counter: &'static AtomicU64) -> Vec<u8> {
+        let mut code = vec![0x48, 0xB8];
+        code.extend_from_slice(&(counter as *const AtomicU64 as u64).to_le_bytes());
+        code.extend_from_slice(&[0x48, 0xFF, 0x00]);
+        code.push(0xC3);
+        code
+    }
+
+    /// `mov eax, <value>; ret`.
+    fn ret(value: u32) -> Vec<u8> {
+        let mut code = vec![0xB8];
+        code.extend_from_slice(&value.to_le_bytes());
+        code.push(0xC3);
+        code
+    }
+
+    fn import(dll: &str, rva: u32) -> ImportModule {
+        ImportModule {
+            dll: dll.to_owned(),
+            entries: vec![ImportEntry {
+                symbol: ImportSymbol::Name {
+                    hint: 0,
+                    name: format!("f{rva:x}"),
+                },
+                iat_slot_rva: rva,
+            }],
+        }
+    }
+
+    fn info(size_of_image: u32) -> ImageInfo {
+        ImageInfo {
+            machine: victory_pe::MACHINE_AMD64,
+            characteristics: victory_pe::layout::file_flags::DLL,
+            timestamp: 0,
+            subsystem: victory_pe::layout::subsystem::WINDOWS_CUI,
+            dll_characteristics: 0,
+            image_base: 0,
+            size_of_image,
+            entry_rva: 0,
+            stack_reserve: 0,
+            stack_commit: 0,
+            sections: Vec::new(),
+            imports: Vec::new(),
+            delay_imports: Vec::new(),
+            exports: Vec::new(),
+            tls: None,
+            has_relocations: false,
+            has_exception_table: false,
+            has_load_config: false,
+            codeview: None,
+        }
+    }
+
+    /// A `LoadedImage` whose `module` is a scratch allocation, not a real PE.
+    fn image_at(base: usize, info: ImageInfo) -> LoadedImage {
+        LoadedImage {
+            module: base as *mut c_void,
+            path: PathBuf::new(),
+            info,
+        }
+    }
+
+    fn slot(image: &LoadedImage, rva: u32) -> u64 {
+        // SAFETY: every slot the tests read lies inside a live allocation.
+        unsafe { ((image.base() + rva as usize) as *const u64).read_volatile() }
+    }
+
+    fn found(address: usize) -> Resolution {
+        Resolution::Found {
+            address,
+            provenance: Provenance::Hle,
+        }
+    }
+
+    fn prepared_own() -> PreparedImage {
+        let original = std::fs::read(std::env::current_exe().unwrap()).unwrap();
+        prepare(&original).unwrap()
+    }
+
+    fn module_by_name(name: &str) -> usize {
+        let wide: Vec<u16> = name.encode_utf16().chain(Some(0)).collect();
+        // SAFETY: a NUL-terminated UTF-16 name; the query takes no reference.
+        unsafe { GetModuleHandleW(wide.as_ptr()) as usize }
+    }
+
+    struct Fixed(Resolution);
+
+    impl ImportResolver for Fixed {
+        fn resolve(&self, _: &str, _: &ImportSymbol) -> Resolution {
+            self.0
+        }
+    }
+
+    /// Provenance per DLL name, as a title's imports arrive.
+    struct ByDll;
+
+    impl ImportResolver for ByDll {
+        fn resolve(&self, dll: &str, _: &ImportSymbol) -> Resolution {
+            let found = match dll.to_ascii_lowercase().as_str() {
+                "hle.dll" => Some((0x1111, Provenance::Hle)),
+                "host.dll" => Some((0x2222, Provenance::Host)),
+                "title.dll" => Some((0x3333, Provenance::Title)),
+                _ => None,
+            };
+            found.map_or(Resolution::Missing, |(address, provenance)| {
+                Resolution::Found {
+                    address,
+                    provenance,
+                }
+            })
+        }
+    }
+
+    #[test]
+    fn maps_and_unloads_a_prepared_copy() {
+        let prepared = prepared_own();
+        let dir = tempfile::tempdir().unwrap();
+        let image = load(&prepared, dir.path()).unwrap();
+        assert_ne!(image.base(), 0);
+        assert_eq!(image.base() % PAGE, 0, "the loader page-aligns the mapping");
+        assert_eq!(image.info().import_count(), prepared.info.import_count());
+        assert_eq!(
+            std::fs::read(dir.path().join(prepared.file_name())).unwrap(),
+            prepared.bytes
+        );
+        // The prepared copy is registered as mapped, and keeps its static TLS.
+        assert_eq!(disable_thread_calls(image.base()), Some(false));
+        // SAFETY: never attached, and no pointer into it outlives this test.
+        unsafe { image.unload() };
+    }
+
+    #[test]
+    fn write_if_changed_rewrites_only_when_the_bytes_differ() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("victory-image-test.dll");
+        write_if_changed(&path, b"one").unwrap();
+        let read_only = |on: bool| {
+            let mut permissions = std::fs::metadata(&path).unwrap().permissions();
+            permissions.set_readonly(on);
+            std::fs::set_permissions(&path, permissions).unwrap();
+        };
+        // Identical bytes: no write happens, so even a read-only file is fine
+        // (replacing a read-only file on Windows fails).
+        read_only(true);
+        write_if_changed(&path, b"one").unwrap();
+        read_only(false);
+        write_if_changed(&path, b"two").unwrap();
+        assert_eq!(std::fs::read(&path).unwrap(), b"two");
+        assert!(
+            !path.with_extension("tmp").exists(),
+            "the temporary file is renamed, not left behind"
+        );
+    }
+
+    #[test]
+    fn binds_imports_and_delay_imports_by_provenance() {
+        let base = alloc(1, PAGE_READONLY);
+        let mut info = info(PAGE as u32);
+        info.imports = vec![
+            import("hle.dll", 0x100),
+            import("host.dll", 0x108),
+            import("title.dll", 0x110),
+        ];
+        info.delay_imports = vec![import("missing.dll", 0x118)];
+        let image = image_at(base, info);
+        let report = image
+            .bind_imports(&ByDll, UnimplementedPolicy::ReturnZero)
+            .unwrap();
+        assert_eq!((report.hle, report.host, report.title), (1, 1, 1));
+        assert_eq!(report.missing.len(), 1);
+        assert_eq!(report.missing[0].dll, "missing.dll");
+        assert_eq!(report.missing[0].symbol, "f118");
+        assert_eq!(slot(&image, 0x100), 0x1111);
+        assert_eq!(slot(&image, 0x108), 0x2222);
+        assert_eq!(slot(&image, 0x110), 0x3333);
+        assert_ne!(slot(&image, 0x118), 0, "the delay-import slot got a stub");
+        assert_eq!(
+            protection(base + 0x100),
+            PAGE_READONLY,
+            "the slot's protection is restored"
+        );
+        free(base);
+    }
+
+    #[test]
+    fn binding_restores_the_protection_of_each_section() {
+        let base = alloc(2, PAGE_READWRITE);
+        let mut old = 0;
+        // SAFETY: the second page is inside the allocation.
+        let changed = unsafe {
+            VirtualProtect(
+                (base + PAGE) as *const c_void,
+                PAGE,
+                PAGE_READONLY,
+                &mut old,
+            )
+        };
+        assert_ne!(changed, 0);
+        let before = (protection(base + 0x100), protection(base + PAGE + 0x100));
+        assert_eq!(before, (PAGE_READWRITE, PAGE_READONLY));
+        let mut info = info((2 * PAGE) as u32);
+        info.imports = vec![import("a.dll", 0x100), import("b.dll", PAGE as u32 + 0x100)];
+        let image = image_at(base, info);
+        let report = image
+            .bind_imports(&Fixed(found(0x1234)), UnimplementedPolicy::ReturnZero)
+            .unwrap();
+        assert_eq!(report.hle, 2);
+        assert_eq!(slot(&image, 0x100), 0x1234);
+        assert_eq!(slot(&image, PAGE as u32 + 0x100), 0x1234);
+        assert_eq!(
+            (protection(base + 0x100), protection(base + PAGE + 0x100)),
+            before
+        );
+        free(base);
+    }
+
+    #[test]
+    fn binding_no_imports_does_nothing() {
+        let base = alloc(1, PAGE_READWRITE);
+        let image = image_at(base, info(PAGE as u32));
+        let report = image
+            .bind_imports(&Fixed(Resolution::Missing), UnimplementedPolicy::Trap)
+            .unwrap();
+        assert_eq!((report.hle, report.host, report.title), (0, 0, 0));
+        assert!(report.missing.is_empty());
+        free(base);
+    }
+
+    #[test]
+    fn unresolved_imports_get_a_callable_stub() {
+        let base = alloc(1, PAGE_READWRITE);
+        let mut info = info(PAGE as u32);
+        info.imports = vec![ImportModule {
+            dll: "missing.dll".into(),
+            entries: vec![
+                ImportEntry {
+                    symbol: ImportSymbol::Name {
+                        hint: 0,
+                        name: "one".into(),
+                    },
+                    iat_slot_rva: 0x100,
+                },
+                ImportEntry {
+                    symbol: ImportSymbol::Ordinal(7),
+                    iat_slot_rva: 0x108,
+                },
+            ],
+        }];
+        let image = image_at(base, info);
+        let report = image
+            .bind_imports(&Fixed(Resolution::Missing), UnimplementedPolicy::ReturnZero)
+            .unwrap();
+        assert_eq!(report.missing.len(), 2);
+        assert_eq!(report.missing[0].dll, "missing.dll");
+        assert_eq!(report.missing[0].symbol, "one");
+        assert_eq!(report.missing[1].symbol, "#7");
+        let before = unimplemented_call_count();
+        for rva in [0x100, 0x108] {
+            // SAFETY: the loader wrote a stub to this slot; the stub ignores
+            // its arguments and returns 0 under `ReturnZero`.
+            let stub: unsafe extern "system" fn() -> u64 =
+                unsafe { std::mem::transmute::<u64, _>(slot(&image, rva)) };
+            // SAFETY: as above.
+            assert_eq!(unsafe { stub() }, 0);
+        }
+        assert!(unimplemented_call_count() >= before + 2);
+        free(base);
+    }
+
+    #[test]
+    fn an_iat_slot_outside_the_image_is_refused_before_memory_is_touched() {
+        let base = alloc(2, PAGE_READWRITE);
+        const CANARY: u64 = 0xDEAD_BEEF_CAFE_F00D;
+        // SAFETY: the second page is inside the allocation.
+        unsafe { ((base + PAGE) as *mut u64).write(CANARY) };
+        for rva in [PAGE as u32, PAGE as u32 - 4] {
+            let mut info = info(PAGE as u32);
+            info.imports = vec![import("x.dll", rva)];
+            let image = image_at(base, info);
+            let error = image
+                .bind_imports(&Fixed(found(0x1111)), UnimplementedPolicy::ReturnZero)
+                .unwrap_err();
+            assert!(error.to_string().contains("outside the image"), "{error:#}");
+            // SAFETY: the canary is inside the allocation.
+            let canary = unsafe { ((base + PAGE) as *const u64).read() };
+            assert_eq!(
+                canary, CANARY,
+                "nothing past the image was written (slot {rva:#x})"
+            );
+        }
+        // The last slot that fits wholly inside the image is written.
+        let mut info = info(PAGE as u32);
+        info.imports = vec![import("x.dll", PAGE as u32 - 8)];
+        let image = image_at(base, info);
+        image
+            .bind_imports(&Fixed(found(0x1111)), UnimplementedPolicy::ReturnZero)
+            .unwrap();
+        assert_eq!(slot(&image, PAGE as u32 - 8), 0x1111);
+        free(base);
+    }
+
+    #[test]
+    fn a_failed_tls_redirect_unmaps_the_image() {
+        let mut original = std::fs::read(std::env::current_exe().unwrap()).unwrap();
+        // A unique build hash, so the module name belongs to this test alone.
+        original[16] ^= 0xFF;
+        let prepared = prepare(&original).unwrap();
+        assert!(!prepared.info.is_dll());
+        assert!(
+            prepared.info.tls.is_some(),
+            "the test binary uses static TLS"
+        );
+        let mut info = prepared.info.clone();
+        // The TLS thunk search refuses images this large, so `redirect` fails
+        // after `load` has already mapped the copy.
+        info.size_of_image = 1 << 30;
+        let prepared = PreparedImage {
+            info,
+            bytes: prepared.bytes.clone(),
+            original_hash: prepared.original_hash,
+        };
+        let name = prepared.file_name();
+        assert_eq!(module_by_name(&name), 0, "no module with this name yet");
+        let dir = tempfile::tempdir().unwrap();
+        let error = load(&prepared, dir.path()).unwrap_err();
+        let text = format!("{error:#}").to_ascii_lowercase();
+        assert!(
+            text.contains("tls"),
+            "expected the TLS redirect to fail: {text}"
+        );
+        assert_eq!(
+            module_by_name(&name),
+            0,
+            "a load that failed after mapping must unmap"
+        );
+    }
+
+    static HEADER_CALLS: AtomicU64 = AtomicU64::new(0);
+    static IMAGE_CALLS: AtomicU64 = AtomicU64::new(0);
+    static OUTSIDE_CALLS: AtomicU64 = AtomicU64::new(0);
+
+    #[test]
+    fn tls_callbacks_outside_the_image_are_not_called() {
+        let base = alloc(2, PAGE_EXECUTE_READWRITE);
+        put(base, &bump(&HEADER_CALLS));
+        put(base + 0x800, &bump(&IMAGE_CALLS));
+        put(base + PAGE, &bump(&OUTSIDE_CALLS));
+        let mut info = info(PAGE as u32);
+        info.tls = Some(TlsInfo {
+            directory_rva: 0,
+            callbacks_va: 0,
+            callback_rvas: vec![0, 0x800, PAGE as u32],
+        });
+        let image = image_at(base, info);
+        HEADER_CALLS.store(0, Ordering::SeqCst);
+        IMAGE_CALLS.store(0, Ordering::SeqCst);
+        OUTSIDE_CALLS.store(0, Ordering::SeqCst);
+        // SAFETY: the "callbacks" only bump a static counter and return.
+        unsafe { image.run_tls_callbacks(DLL_PROCESS_ATTACH) };
+        assert_eq!(
+            IMAGE_CALLS.load(Ordering::SeqCst),
+            1,
+            "the in-image callback runs"
+        );
+        assert_eq!(
+            HEADER_CALLS.load(Ordering::SeqCst),
+            0,
+            "the image header is not code"
+        );
+        assert_eq!(
+            OUTSIDE_CALLS.load(Ordering::SeqCst),
+            0,
+            "nothing past the image is called"
+        );
+        free(base);
+    }
+
+    #[test]
+    fn a_dll_main_outside_the_image_does_not_run() {
+        let base = alloc(2, PAGE_EXECUTE_READWRITE);
+        put(base + 0x800, &ret(7));
+        put(base + PAGE, &ret(7));
+        let mut info = info(PAGE as u32);
+        info.entry_rva = PAGE as u32;
+        let mut image = image_at(base, info.clone());
+        // SAFETY: the entry point (if it ran) only returns 7.
+        let outcome = unsafe { image.notify(DLL_PROCESS_ATTACH, true, std::ptr::null_mut()) };
+        assert_eq!(
+            outcome,
+            Some(0),
+            "an entry point outside the image is reported as DllMain failing"
+        );
+        info.entry_rva = 0x800;
+        image.info = info;
+        // SAFETY: as above; this entry point is inside the image.
+        let outcome = unsafe { image.notify(DLL_PROCESS_ATTACH, true, std::ptr::null_mut()) };
+        assert_eq!(outcome, Some(7));
+        free(base);
+    }
+
+    #[test]
+    fn spawn_main_refuses_an_entry_outside_the_image() {
+        let base = alloc(2, PAGE_EXECUTE_READWRITE);
+        put(base + PAGE, &ret(9));
+        let mut info = info(PAGE as u32);
+        info.characteristics = 0; // an exe, as the main image is
+        info.entry_rva = PAGE as u32;
+        let image = Arc::new(image_at(base, info));
+        // SAFETY: the entry point (if it ran) only returns 9.
+        match unsafe { image.spawn_main(Vec::new()) } {
+            Err(error) => assert!(error.to_string().contains("outside the image"), "{error:#}"),
+            Ok(thread) => {
+                let code = thread.join().unwrap();
+                free(base);
+                panic!("an entry point outside the image ran and returned {code:?}");
+            }
+        }
+        free(base);
+    }
+
+    #[test]
+    fn exports_are_looked_up_by_name() {
+        let title = tempfile::tempdir().unwrap();
+        std::fs::copy(
+            r"C:\Windows\System32\version.dll",
+            title.path().join("v.dll"),
+        )
+        .unwrap();
+        let loaded = load_title_dll("v.dll", title.path(), title.path(), &|_| true).unwrap();
+        assert_eq!(loaded.len(), 1);
+        let image = &loaded[0].1;
+        assert!(image.export("GetFileVersionInfoW").is_some());
+        assert!(image.export("NoSuchExport").is_none());
+        assert!(
+            image.export("Get\0FileVersionInfoW").is_none(),
+            "an interior NUL is refused"
+        );
+        assert!(
+            image.export("getfileversioninfow").is_none(),
+            "export names are case-sensitive"
+        );
+        assert!(
+            image
+                .export_symbol(&ImportSymbol::Name {
+                    hint: 0,
+                    name: "GetFileVersionInfoW".into(),
+                })
+                .is_some()
+        );
+        assert!(image.export_symbol(&ImportSymbol::Ordinal(0)).is_none());
+        for (_, dll) in loaded {
+            // SAFETY: never attached, and no pointer into it outlives the test.
+            unsafe { dll.unload() };
+        }
+    }
+
+    #[test]
+    fn title_dlls_are_mapped_once_and_named_in_lowercase() {
+        let title = tempfile::tempdir().unwrap();
+        let cache = tempfile::tempdir().unwrap();
+        std::fs::copy(
+            r"C:\Windows\System32\version.dll",
+            title.path().join("Late.dll"),
+        )
+        .unwrap();
+        let mut main = info(PAGE as u32);
+        main.imports = vec![import("Late.dll", 0), import("LATE.DLL", 0)];
+        main.delay_imports = vec![import("late.dll", 0)];
+        let dlls =
+            load_title_dlls(&main, title.path(), cache.path(), &|dll| dll == "late.dll").unwrap();
+        assert_eq!(dlls.len(), 1, "one mapping for three spellings");
+        assert_eq!(dlls[0].0, "late.dll");
+        assert!(dlls[0].1.export("GetFileVersionInfoW").is_some());
+        // `wanted` refuses it, or the folder has no such file: nothing maps.
+        assert!(
+            load_title_dlls(&main, title.path(), cache.path(), &|_| false)
+                .unwrap()
+                .is_empty()
+        );
+        let mut absent = info(PAGE as u32);
+        absent.imports = vec![import("absent.dll", 0)];
+        assert!(
+            load_title_dlls(&absent, title.path(), cache.path(), &|_| true)
+                .unwrap()
+                .is_empty()
+        );
+        for (_, dll) in dlls {
+            // SAFETY: never attached, and no pointer into it outlives the test.
+            unsafe { dll.unload() };
+        }
     }
 }
