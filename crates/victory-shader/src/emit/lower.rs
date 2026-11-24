@@ -59,9 +59,13 @@ enum Stop {
 }
 
 pub(crate) fn lower(parts: &Parts) -> Result<Lowered, ShaderError> {
+    lower_with_limit(parts, super::loop_limit())
+}
+
+pub(crate) fn lower_with_limit(parts: &Parts, loop_limit: u32) -> Result<Lowered, ShaderError> {
     let mut bad = HashMap::new();
     loop {
-        match Lower::new(parts, &bad).run() {
+        match Lower::new(parts, &bad, loop_limit).run() {
             Ok(l) => return Ok(l),
             Err(Stop::Retry(v, why)) => {
                 if bad.insert(v, why).is_some() {
@@ -140,6 +144,8 @@ struct Lower<'a> {
     cur: usize,
     bools: HashMap<(usize, Bool), V>,
     lane_bits: HashMap<Value, V>,
+    quad_bits: HashMap<Value, V>,
+    quad_visiting: HashSet<Value>,
     /// IR phi location by value.
     phi_at: HashMap<Value, (usize, usize)>,
     mask_phis: HashMap<Value, V>,
@@ -198,20 +204,32 @@ struct Lower<'a> {
     /// The program's constant table (the code from the first byte read
     /// through `s_getpc_b64` on): global, first byte, dwords.
     code_table: Option<(V, u32, u32)>,
-    /// Loop headers' iteration counters (see [`LOOP_LIMIT`]): the phi by
-    /// IR block, and its incoming (value, DXIL block) pairs.
-    counters: HashMap<usize, (V, Vec<(V, usize)>)>,
+    /// Per-invocation back-edge step budget (see [`LOOP_LIMIT`]).
+    loop_limit: u32,
+    /// Loop headers whose natural loop executes an active `s_barrier`:
+    /// these share `steps[1]` (group-uniform) instead of `steps[0]`.
+    barrier_loops: HashSet<usize>,
+    /// Function-wide step counters: `[lane_loops, barrier_loops]`.
+    steps: [Option<StepTrack>; 2],
     /// The block a loop stopped by [`LOOP_LIMIT`] leaves the program from.
     abort: Option<usize>,
 }
 
-/// Iterations after which a loop is left (per entry into it), unless
+/// SSA tracking for a function-wide loop step counter across IR blocks.
+struct StepTrack {
+    phis: Vec<Option<V>>,
+    incoming: Vec<Vec<(V, usize)>>,
+    cur_val: Option<V>,
+}
+
+/// Total back-edge steps per invocation after which loops are left, unless
 /// [`super::loop_limit`] says otherwise. The console runs a loop as long as
 /// its data says; data the host has not mirrored yet (a null view reads
 /// zeros) can make that four billion iterations, which hangs the host GPU
-/// until the driver resets it. A lane that reaches the limit leaves the
-/// program as killed (a pixel discards).
-// shortcut: a genuine loop of more iterations than this is cut short too.
+/// until the driver resets it. Sharing one step budget across all loops in
+/// the function prevents nested loops from multiplying the cap. A lane that
+/// reaches the limit leaves the program as killed (a pixel discards).
+// shortcut: a genuine shader taking more total loop steps than this is cut short too.
 pub(super) const LOOP_LIMIT: u32 = 1 << 20;
 
 /// Lane masks read as numbers (`s_bcnt1`, `s_ff1`, `v_mbcnt`, scalar
@@ -324,7 +342,7 @@ fn unsupported(offset: usize, what: Why) -> Stop {
 }
 
 impl<'a> Lower<'a> {
-    fn new(x: &'a Parts<'a>, bad: &'a HashMap<Value, Why>) -> Self {
+    fn new(x: &'a Parts<'a>, bad: &'a HashMap<Value, Why>, loop_limit: u32) -> Self {
         let p = x.p;
         let mut phi_at = HashMap::new();
         for (b, block) in p.blocks.iter().enumerate() {
@@ -376,7 +394,7 @@ impl<'a> Lower<'a> {
                     x.st.bools
                         .support(g)
                         .iter()
-                        .any(|a| matches!(a, Atom::Opaque(_) | Atom::Constant(_)))
+                        .any(|a| matches!(a, Atom::Opaque(_) | Atom::Constant(_) | Atom::Quad(..)))
                 })
             };
             let wave = if x.native.wave64 { 64 } else { 32 };
@@ -441,6 +459,8 @@ impl<'a> Lower<'a> {
             cur: 0,
             bools: HashMap::new(),
             lane_bits: HashMap::new(),
+            quad_bits: HashMap::new(),
+            quad_visiting: HashSet::new(),
             phi_at,
             mask_phis: HashMap::new(),
             pending_masks: Vec::new(),
@@ -494,7 +514,9 @@ impl<'a> Lower<'a> {
             sections: HashMap::new(),
             section_out: HashSet::new(),
             code_table: None,
-            counters: HashMap::new(),
+            loop_limit,
+            barrier_loops: HashSet::new(),
+            steps: [None, None],
             abort: None,
         }
     }
@@ -815,17 +837,60 @@ impl<'a> Lower<'a> {
                 self.s.m.new_block()
             });
         }
-        // Loop headers count iterations (`LOOP_LIMIT`).
-        for &b in &order {
-            let header = p.blocks[b]
+        // Function-wide step budgets (`LOOP_LIMIT`): non-barrier loops share
+        // `steps[0]`, and loops executing an active `s_barrier` share
+        // `steps[1]` so divergent earlier loops never desynchronise a barrier.
+        let mut has_lane_loops = false;
+        for &h in &order {
+            let back: Vec<usize> = p.blocks[h]
                 .preds
                 .iter()
-                .any(|&q| self.block[q].is_some() && self.rpo[b] <= self.rpo[q]);
-            if header {
-                let blk = self.block[b].expect("reachable");
-                let phi = self.s.m.phi(blk, self.s.t.i32);
-                self.counters.insert(b, (phi, Vec::new()));
+                .copied()
+                .filter(|&q| self.block[q].is_some() && self.rpo[h] <= self.rpo[q])
+                .collect();
+            if back.is_empty() {
+                continue;
             }
+            let mut in_loop = HashSet::from([h]);
+            let mut stack = back;
+            while let Some(u) = stack.pop() {
+                if in_loop.insert(u) {
+                    stack.extend(
+                        p.blocks[u]
+                            .preds
+                            .iter()
+                            .copied()
+                            .filter(|&q| self.block[q].is_some()),
+                    );
+                }
+            }
+            if in_loop.into_iter().any(|u| self.has_active_barrier(u)) {
+                self.barrier_loops.insert(h);
+            } else {
+                has_lane_loops = true;
+            }
+        }
+        for (kind, needed) in [(0, has_lane_loops), (1, !self.barrier_loops.is_empty())] {
+            if !needed {
+                continue;
+            }
+            let mut phis = vec![None; p.blocks.len()];
+            for &b in &order[1..] {
+                let incoming_count = p.blocks[b]
+                    .preds
+                    .iter()
+                    .filter(|&&q| self.block[q].is_some())
+                    .count();
+                if incoming_count >= 2 {
+                    let blk = self.block[b].expect("reachable");
+                    phis[b] = Some(self.s.m.phi(blk, self.s.t.i32));
+                }
+            }
+            self.steps[kind] = Some(StepTrack {
+                phis,
+                incoming: (0..p.blocks.len()).map(|_| Vec::new()).collect(),
+                cur_val: None,
+            });
         }
         self.cur = self.s.entry;
         self.find_sections();
@@ -837,6 +902,16 @@ impl<'a> Lower<'a> {
         for &b in &order {
             self.cur = self.block[b].expect("reachable");
             self.cur_ir = b;
+            let zero_step = (b == order[0]).then(|| self.s.m.i32(0));
+            for track in self.steps.iter_mut().flatten() {
+                track.cur_val = Some(if let Some(z) = zero_step {
+                    z
+                } else if let Some(phi) = track.phis[b] {
+                    phi
+                } else {
+                    track.incoming[b][0].0
+                });
+            }
             let preds: Vec<usize> = p.blocks[b]
                 .preds
                 .iter()
@@ -1551,10 +1626,7 @@ impl<'a> Lower<'a> {
                 self.pending_masks.push((v, b, i));
                 Ok(v)
             }
-            // shortcut: "some lane of the quad is set" is taken as true: the
-            // lanes it adds only feed derivatives, and exports keep their own
-            // masks. Wrong if such a section had a side effect.
-            Atom::Quad(_) => Ok(self.s.m.bool(true)),
+            Atom::Quad(lo, a) => self.quad_any(lo, a),
             // With console lanes, a mask held as a number is the console's:
             // the lane tests its own bit.
             Atom::Opaque(v) if self.console_lanes => {
@@ -1579,6 +1651,77 @@ impl<'a> Lower<'a> {
             Atom::Opaque(_) => Err("an opaque lane mask"),
             Atom::Constant(_) => Err("a constant lane mask"),
         }
+    }
+
+    /// `s_wqm` ("some lane of the quad holds `a`"), evaluated in the block
+    /// that defines `lo` so whole quads participate before any later branch.
+    fn quad_any(&mut self, lo: Value, a: Bool) -> Result<V, Why> {
+        if let Some(&v) = self.quad_bits.get(&lo) {
+            return Ok(v);
+        }
+        let at = match self.def_block.get(&lo) {
+            None => self.s.entry,
+            Some(&b) => match self.tail[b] {
+                Some(tb) => tb,
+                None if b == self.cur_ir => self.cur,
+                None => return Err("a quad mask written after its use"),
+            },
+        };
+        if !self.quad_visiting.insert(lo) {
+            return Err("a quad mask whose lanes depend on its own value");
+        }
+        let bit = self.boolean(a, at);
+        self.quad_visiting.remove(&lo);
+        let bit = bit?;
+        let i32t = self.s.t.i32;
+        let z = self.s.m.i32(0);
+        let q = if self.s.pixel
+            || self
+                .s
+                .mesh
+                .is_some_and(|_| self.s.threads.is_some_and(|t| t[0].is_multiple_of(4)))
+        {
+            self.s.flags |= flags::WAVE_OPS;
+            let x = self.s.m.cast(at, Cast::ZExt, bit, i32t);
+            let mut any = x;
+            for dir in 0..3u8 {
+                let op = self.s.m.i8(dir);
+                let other = self
+                    .s
+                    .op(at, "quadOp.i32", Attr::NoUnwind, i32t, 123, &[x, op]);
+                any = self.s.m.bin(at, Bin::Or, any, other);
+            }
+            self.s.m.cmp(at, pred::NE, any, z)
+        } else if self.s.mesh.is_none() && self.s.threads.is_some() && self.console_lanes {
+            self.s.flags |= flags::WAVE_OPS;
+            let x = self.s.m.cast(at, Cast::ZExt, bit, i32t);
+            let lane = self
+                .s
+                .op(at, "waveGetLaneIndex", Attr::ReadOnly, i32t, 111, &[]);
+            let not3 = self.s.m.i32(!3);
+            let base = self.s.m.bin(at, Bin::And, lane, not3);
+            let mut any = z;
+            for k in 0..4u32 {
+                let kk = self.s.m.i32(k);
+                let src = self.s.m.bin(at, Bin::Or, base, kk);
+                let other = self.s.op(
+                    at,
+                    "waveReadLaneAt.i32",
+                    Attr::NoUnwind,
+                    i32t,
+                    117,
+                    &[x, src],
+                );
+                any = self.s.m.bin(at, Bin::Or, any, other);
+            }
+            self.s.m.cmp(at, pred::NE, any, z)
+        } else if self.s.mesh.is_some() {
+            return Err("a cross-lane operation in a mesh shader");
+        } else {
+            return Err("a cross-lane operation outside compute");
+        };
+        self.quad_bits.insert(lo, q);
+        Ok(q)
     }
 
     /// This lane's bit of the mask `lo`, `hi` (wave64).
@@ -2068,16 +2211,21 @@ impl<'a> Lower<'a> {
             return Err("LDS the program does not allocate");
         }
         let a = self.vgprs(inst, addr.as_ref().ok_or("an LDS address")?, 1)?[0];
-        // shortcut: LDS addresses are taken as dword-aligned and in bounds
-        // (out-of-bounds console accesses read 0 and drop writes).
-        let dword = |l: &mut Self, bytes: u32| -> V {
+        // Out-of-bounds console LDS accesses read 0 and drop writes; clamping
+        // read indices also keeps inactive lanes with garbage VGPRs in bounds.
+        let index_and_bounds = |l: &mut Self, bytes: u32| -> (V, V) {
             let c = l.cur;
-            let o = l.s.m.i32(bytes);
-            let at = l.s.m.bin(c, Bin::Add, a, o);
+            let at = if bytes == 0 {
+                a
+            } else {
+                let o = l.s.m.i32(bytes);
+                l.s.m.bin(c, Bin::Add, a, o)
+            };
             let two = l.s.m.i32(2);
             let index = l.s.m.bin(c, Bin::LShr, at, two);
-            let lds = l.s.lds();
-            l.s.m.element(c, lds, index)
+            let limit = l.s.m.i32(l.s.lds_dwords);
+            let in_bounds = l.s.m.cmp(c, pred::IULT, index, limit);
+            (index, in_bounds)
         };
         let width = |n: &str| match n.rsplit('_').next() {
             Some("b64") => 2,
@@ -2107,8 +2255,14 @@ impl<'a> Lower<'a> {
             let mut n = 0;
             for (off, w) in elements {
                 for k in 0..w {
-                    let p = dword(self, off + 4 * k);
-                    let x = self.s.m.load(self.cur, p);
+                    let (index, in_bounds) = index_and_bounds(self, off + 4 * k);
+                    let c = self.cur;
+                    let zero = self.s.m.i32(0);
+                    let safe = self.s.m.select(c, in_bounds, index, zero);
+                    let lds = self.s.lds();
+                    let p = self.s.m.element(c, lds, safe);
+                    let loaded = self.s.m.load(c, p);
+                    let x = self.s.m.select(c, in_bounds, loaded, zero);
                     self.write(inst, Reg::V(reg + n), x, guard);
                     n += 1;
                 }
@@ -2130,12 +2284,29 @@ impl<'a> Lower<'a> {
                     stores.push((off + 4 * k as u32, x));
                 }
             }
-            let at = self.begin_guarded(guard);
-            for (off, x) in stores {
-                let p = dword(self, off);
+            if let [(off, x)] = stores[..] {
+                let (index, in_bounds) = index_and_bounds(self, off);
+                let cond = match guard {
+                    Some(g) => self.s.m.bin(self.cur, Bin::And, g, in_bounds),
+                    None => in_bounds,
+                };
+                let at = self.begin_guarded(Some(cond));
+                let lds = self.s.lds();
+                let p = self.s.m.element(self.cur, lds, index);
                 self.s.m.store(self.cur, p, x);
+                self.end_guarded(at, &[]);
+            } else {
+                let outer = self.begin_guarded(guard);
+                for (off, x) in stores {
+                    let (index, in_bounds) = index_and_bounds(self, off);
+                    let inner = self.begin_guarded(Some(in_bounds));
+                    let lds = self.s.lds();
+                    let p = self.s.m.element(self.cur, lds, index);
+                    self.s.m.store(self.cur, p, x);
+                    self.end_guarded(inner, &[]);
+                }
+                self.end_guarded(outer, &[]);
             }
-            self.end_guarded(at, &[]);
             return Ok(());
         }
         // Atomics: the old value returns with `_rtn`.
@@ -2168,8 +2339,20 @@ impl<'a> Lower<'a> {
             Some((_, v)) => self.i32_of(v).unwrap_or(self.s.m.i32(0)),
             None => self.s.m.i32(0),
         };
-        let p = dword(self, offset);
-        let at = self.begin_guarded(guard);
+        let (index, in_bounds) = index_and_bounds(self, offset);
+        let c = self.cur;
+        let zero = self.s.m.i32(0);
+        let fallback = match guard {
+            Some(g) => self.s.m.select(c, g, zero, outside),
+            None => zero,
+        };
+        let cond = match guard {
+            Some(g) => self.s.m.bin(c, Bin::And, g, in_bounds),
+            None => in_bounds,
+        };
+        let at = self.begin_guarded(Some(cond));
+        let lds = self.s.lds();
+        let p = self.s.m.element(self.cur, lds, index);
         let r = match rmw {
             Some(op) => self.s.m.atomic(self.cur, op, p, v0),
             // Compare with data0, store data1.
@@ -2178,7 +2361,7 @@ impl<'a> Lower<'a> {
                 .m
                 .cmpxchg(self.cur, p, v0, v1.ok_or("an LDS compare")?),
         };
-        let r = self.end_guarded(at, &[(r, outside)])[0];
+        let r = self.end_guarded(at, &[(r, fallback)])[0];
         if let Some(reg) = dst_reg {
             self.write(inst, Reg::V(reg), r, None);
         }
@@ -2475,6 +2658,15 @@ impl<'a> Lower<'a> {
                     }
                     Ok(())
                 }
+                "s_wqm_b64" => {
+                    let (a, b) = (half(self, 0, 0)?, half(self, 0, 1)?);
+                    let (rl, rh) = (self.scalar_wqm32(c, a), self.scalar_wqm32(c, b));
+                    self.set(lo, Val::I32(rl));
+                    self.set(hi, Val::I32(rh));
+                    let s = nonzero(self, rl, rh);
+                    self.set(scc, Val::Bit(s));
+                    Ok(())
+                }
                 _ => Err(name),
             };
         }
@@ -2635,6 +2827,10 @@ impl<'a> Lower<'a> {
                     (self.s.m.bin(c, Bin::And, old, nb), None)
                 }
             }
+            "s_wqm_b32" => {
+                let a = src32(self, 0)?;
+                (self.scalar_wqm32(c, a), None)
+            }
             "s_bfm_b32" => {
                 let (a, b) = (src32(self, 0)?, src32(self, 1)?);
                 let k31 = self.s.m.i32(31);
@@ -2699,6 +2895,21 @@ impl<'a> Lower<'a> {
             carry = self.s.m.bin(c, Bin::Or, carry, more);
         }
         (r, carry)
+    }
+
+    fn scalar_wqm32(&mut self, c: usize, x: V) -> V {
+        let (one, two, nibs, fifteen) = (
+            self.s.m.i32(1),
+            self.s.m.i32(2),
+            self.s.m.i32(0x1111_1111),
+            self.s.m.i32(0xF),
+        );
+        let s1 = self.s.m.bin(c, Bin::LShr, x, one);
+        let t = self.s.m.bin(c, Bin::Or, x, s1);
+        let s2 = self.s.m.bin(c, Bin::LShr, t, two);
+        let t = self.s.m.bin(c, Bin::Or, t, s2);
+        let t = self.s.m.bin(c, Bin::And, t, nibs);
+        self.s.m.bin(c, Bin::Mul, t, fifteen)
     }
 
     fn scc_in(&mut self, inst: &Inst) -> Result<V, Why> {
@@ -6365,19 +6576,33 @@ impl<'a> Lower<'a> {
         }
     }
 
+    fn has_active_barrier(&self, b: usize) -> bool {
+        !self.no_barrier.contains(&b)
+            && self.x.p.blocks[b]
+                .insts
+                .iter()
+                .any(|i| i.name() == "s_barrier")
+    }
+
+    fn is_back_edge(&self, from: usize, to: usize) -> bool {
+        self.rpo[to] <= self.rpo[from]
+    }
+
     fn exit(&mut self, b: usize) -> Result<(), Stop> {
         let offset = self.x.p.blocks[b]
             .insts
             .last()
             .map_or(self.x.p.blocks[b].offset, |i| i.machine.offset);
         let term = match self.x.st.exits[b] {
-            LaneExit::Jump(t) if self.counters.contains_key(&t) && self.rpo[t] <= self.rpo[b] => {
-                let ok = self.count_iteration(t, pred::IULT);
+            LaneExit::Jump(t) if self.is_back_edge(b, t) => {
+                let kind = usize::from(self.barrier_loops.contains(&t));
+                let (ok, next) = self.step_back_edge(kind, pred::IULT);
+                self.push_step_edge(t, self.cur, Some((kind, next)));
                 let abort = self.abort_block();
                 Term::CondBr(ok, self.block[t].expect("reachable"), abort)
             }
             LaneExit::Jump(t) => {
-                self.enter_loop(b, t, self.cur);
+                self.push_step_edge(t, self.cur, None);
                 Term::Br(self.block[t].expect("reachable"))
             }
             LaneExit::Branch {
@@ -6386,47 +6611,84 @@ impl<'a> Lower<'a> {
                 not_taken,
             } => {
                 // A negated condition branches the other way round.
-                let (cond, taken, not_taken) = match self.x.st.bools.node(when) {
+                let (mut cond, taken, not_taken, swapped) = match self.x.st.bools.node(when) {
                     Some((atom, Bool::TRUE, Bool::FALSE)) => {
                         let a = self
                             .atom(atom, self.cur)
                             .map_err(|w| unsupported(offset, w))?;
-                        (a, not_taken, taken)
+                        (a, not_taken, taken, true)
                     }
                     _ => {
                         let c = self
                             .boolean(when, self.cur)
                             .map_err(|w| unsupported(offset, w))?;
-                        (c, taken, not_taken)
+                        (c, taken, not_taken, false)
                     }
                 };
-                // A back edge is taken only below the iteration limit.
-                let back =
-                    |l: &Self, to: usize| l.counters.contains_key(&to) && l.rpo[to] <= l.rpo[b];
+                // Keep branches controlling an active `s_barrier` wave-uniform
+                // so individual lanes never diverge across `dx.op.barrier`.
+                let any_active_barrier = (0..self.x.p.blocks.len())
+                    .any(|u| self.block[u].is_some() && self.has_active_barrier(u));
+                if let Some(orig_all) = self.x.st.barrier_branches[b]
+                    && self.s.threads.is_some()
+                    && any_active_barrier
+                {
+                    let all = if swapped { !orig_all } else { orig_all };
+                    let (name, opcode) = if all {
+                        ("waveAllTrue", 114)
+                    } else {
+                        ("waveAnyTrue", 113)
+                    };
+                    self.s.flags |= flags::WAVE_OPS;
+                    cond = self
+                        .s
+                        .op(self.cur, name, Attr::NoUnwind, self.s.t.i1, opcode, &[cond]);
+                }
+                // A back edge is taken only below the invocation step budget.
+                let (bt, bf) = (self.is_back_edge(b, taken), self.is_back_edge(b, not_taken));
                 // (No `xor` of a compare: a loop exit testing one hung the
                 // AMD driver.)
-                let cond = if back(self, taken) {
-                    let ok = self.count_iteration(taken, pred::IULT);
-                    self.s.m.bin(self.cur, Bin::And, cond, ok)
-                } else if back(self, not_taken) {
-                    let stop = self.count_iteration(not_taken, pred::IUGE);
-                    self.s.m.bin(self.cur, Bin::Or, cond, stop)
+                let (cond, upd_t, upd_f) = if bt && bf {
+                    let kt = usize::from(self.barrier_loops.contains(&taken));
+                    let kf = usize::from(self.barrier_loops.contains(&not_taken));
+                    let (ok, ut, uf) = if kt == kf {
+                        let (ok, next) = self.step_back_edge(kt, pred::IULT);
+                        (ok, Some((kt, next)), Some((kt, next)))
+                    } else {
+                        let (ok_t, next_t) = self.step_back_edge(kt, pred::IULT);
+                        let (ok_f, next_f) = self.step_back_edge(kf, pred::IULT);
+                        let ok = self.s.m.select(self.cur, cond, ok_t, ok_f);
+                        (ok, Some((kt, next_t)), Some((kf, next_f)))
+                    };
+                    let cont = self.s.m.new_block();
+                    let abort = self.abort_block();
+                    self.s.m.terminate(self.cur, Term::CondBr(ok, cont, abort));
+                    self.cur = cont;
+                    self.tail[b] = Some(cont);
+                    (cond, ut, uf)
+                } else if bt {
+                    let kind = usize::from(self.barrier_loops.contains(&taken));
+                    let (ok, next) = self.step_back_edge(kind, pred::IULT);
+                    let cond = self.s.m.bin(self.cur, Bin::And, cond, ok);
+                    (cond, Some((kind, next)), Some((kind, next)))
+                } else if bf {
+                    let kind = usize::from(self.barrier_loops.contains(&not_taken));
+                    let (stop, next) = self.step_back_edge(kind, pred::IUGE);
+                    let cond = self.s.m.bin(self.cur, Bin::Or, cond, stop);
+                    (cond, Some((kind, next)), Some((kind, next)))
                 } else {
-                    cond
+                    (cond, None, None)
                 };
                 // Critical edges get a block of their own, so loops have
                 // dedicated exits and preheaders as DXC emits them.
                 let (t, f) = (self.edge(b, taken), self.edge(b, not_taken));
-                for (to, via) in [(taken, t), (not_taken, f)] {
-                    if !back(self, to) {
-                        // From an edge block, or from here.
-                        let from = if Some(via) == self.block[to] {
-                            self.cur
-                        } else {
-                            via
-                        };
-                        self.enter_loop(b, to, from);
-                    }
+                for (to, via, upd) in [(taken, t, upd_t), (not_taken, f, upd_f)] {
+                    let from = if Some(via) == self.block[to] {
+                        self.cur
+                    } else {
+                        via
+                    };
+                    self.push_step_edge(to, from, upd);
                 }
                 Term::CondBr(cond, t, f)
             }
@@ -6446,30 +6708,32 @@ impl<'a> Lower<'a> {
         Ok(())
     }
 
-    /// A forward edge into loop header `to` (from DXIL block `via`) starts
-    /// its count at 0.
-    fn enter_loop(&mut self, _from: usize, to: usize, via: usize) {
-        if let Some((_, incoming)) = self.counters.get_mut(&to) {
-            let z = self.s.m.i32(0);
-            incoming.push((z, via));
-        }
+    /// Increments step counter `kind` at a back-edge and compares against
+    /// [`Self::loop_limit`] by `p` (below: continue; at or above: stop).
+    fn step_back_edge(&mut self, kind: usize, p: u8) -> (V, V) {
+        let c = self.cur;
+        let cur = self.steps[kind]
+            .as_ref()
+            .and_then(|t| t.cur_val)
+            .expect("step counter");
+        let one = self.s.m.i32(1);
+        let next = self.s.m.bin(c, Bin::Add, cur, one);
+        let limit = self.s.m.i32(self.loop_limit);
+        let cmp = self.s.m.cmp(c, p, next, limit);
+        (cmp, next)
     }
 
-    /// A back edge to header `to` (a back edge keeps its block, no
-    /// critical-edge block): the count goes up; the result compares it with
-    /// [`LOOP_LIMIT`] by `p` (below: go on; at or above: stop).
-    fn count_iteration(&mut self, to: usize, p: u8) -> V {
-        let c = self.cur;
-        let (phi, _) = self.counters[&to];
-        let one = self.s.m.i32(1);
-        let next = self.s.m.bin(c, Bin::Add, phi, one);
-        let limit = self.s.m.i32(super::loop_limit());
-        self.counters
-            .get_mut(&to)
-            .expect("header")
-            .1
-            .push((next, c));
-        self.s.m.cmp(c, p, next, limit)
+    /// Records the outgoing step count on an edge to IR block `to` from DXIL
+    /// block `from`, overriding counter `upd.0` when the edge stepped a loop.
+    fn push_step_edge(&mut self, to: usize, from: usize, upd: Option<(usize, V)>) {
+        for (k, slot) in self.steps.iter_mut().enumerate() {
+            let Some(track) = slot else { continue };
+            let val = match upd {
+                Some((uk, next)) if uk == k => next,
+                _ => track.cur_val.expect("step counter"),
+            };
+            track.incoming[to].push((val, from));
+        }
     }
 
     /// The block a lane stopped by [`LOOP_LIMIT`] leaves through.
@@ -6534,8 +6798,13 @@ impl<'a> Lower<'a> {
             }
             self.s.m.set_phi(v, incoming);
         }
-        for (phi, incoming) in std::mem::take(&mut self.counters).into_values() {
-            self.s.m.set_phi(phi, incoming);
+        for track in self.steps.iter_mut().flatten() {
+            for (b, phi) in track.phis.iter().enumerate() {
+                if let Some(phi) = *phi {
+                    let incoming = std::mem::take(&mut track.incoming[b]);
+                    self.s.m.set_phi(phi, incoming);
+                }
+            }
         }
         while let Some((v, b, i)) = self.pending_masks.pop() {
             let phi = &p.blocks[b].phis[i];

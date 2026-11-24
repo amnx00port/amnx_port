@@ -43,7 +43,7 @@ pub enum Atom {
     /// A lane mask joined at a block entry, by its low dword's phi.
     Phi(Value),
     /// `s_wqm` result: some lane of the quad is in the source mask.
-    Quad(Value),
+    Quad(Value, Bool),
     /// A mask the pass cannot see into (loaded, built from scalars, an
     /// EXEC write it does not follow): the lane's bit of the register pair
     /// this value is a dword of.
@@ -314,7 +314,15 @@ pub struct Structured {
     /// they are written: every such lane reaches the writing block, so a
     /// ballot there gives the mask as data.
     pub active: HashSet<Value>,
+    /// Per block: for a closing branch that controls an `s_barrier` and whose
+    /// condition is not [`Atom::Uniform`]-only, `Some(true)` when the hardware
+    /// takes `taken` iff every lane satisfies `when` (`execz`, `vccz`, ...),
+    /// `Some(false)` when any lane suffices (`execnz`, `vccnz`, ...).
+    pub barrier_branches: Vec<Option<bool>>,
 }
+
+/// `s_sendmsg` id of a mesh or NGG stage's output allocation request.
+const GS_ALLOC_REQ: u16 = 9;
 
 /// Builds the per-lane form of `program`.
 pub fn structure(program: &Program) -> Result<Structured, ShaderError> {
@@ -537,6 +545,14 @@ impl<'a> Lanes<'a> {
         execs: &[Vec<Option<Bool>>],
         cond: &[Bool],
     ) -> Result<Structured, ShaderError> {
+        let barrier_branches = self.barrier_branches();
+        let reach;
+        let known = if barrier_branches.iter().any(Option::is_some) {
+            reach = self.paths_ignoring(&barrier_branches)?;
+            &reach[..]
+        } else {
+            cond
+        };
         let blocks = &self.p.blocks;
         let b = &mut self.b;
         let guards = blocks
@@ -552,8 +568,8 @@ impl<'a> Lanes<'a> {
                         | (_, Fields::Sop { .. } | Fields::Sopp { .. } | Fields::Smem { .. }) => {
                             None
                         }
-                        (&Some(e), _) if b.implies(cond[n], e) => None,
-                        (&Some(e), _) => Some(b.given(e, cond[n])),
+                        (&Some(e), _) if b.implies(known[n], e) => None,
+                        (&Some(e), _) => Some(b.given(e, known[n])),
                     })
                     .collect()
             })
@@ -566,7 +582,7 @@ impl<'a> Lanes<'a> {
                 Exit::End => LaneExit::End,
                 Exit::Indirect => LaneExit::Indirect,
                 Exit::Branch { taken, not_taken } => LaneExit::Branch {
-                    when: b.given(self.when[n].unwrap_or(Bool::FALSE), cond[n]),
+                    when: b.given(self.when[n].unwrap_or(Bool::FALSE), known[n]),
                     taken,
                     not_taken,
                 },
@@ -587,6 +603,7 @@ impl<'a> Lanes<'a> {
             bools: self.b,
             exits,
             guards,
+            barrier_branches,
         })
     }
 
@@ -794,10 +811,14 @@ impl<'a> Lanes<'a> {
             }
             "wqm" => {
                 let a = arg(0, self)?;
-                let lo = dst.or(exec_out)?.0;
-                let born = self.born(lo);
-                let q = self.b.atom(Atom::Quad(lo), born);
-                let r = self.b.or(a, q);
+                let r = if a == Bool::FALSE || a == Bool::TRUE {
+                    a
+                } else {
+                    let lo = dst.or(exec_out)?.0;
+                    let born = self.born(lo);
+                    let q = self.b.atom(Atom::Quad(lo, a), born);
+                    self.b.or(a, q)
+                };
                 (r, Some(r))
             }
             "cselect" => {
@@ -991,6 +1012,13 @@ impl<'a> Lanes<'a> {
     /// What a lane knows on entering each block, to a fixpoint. A loop
     /// header forgets what the back edge says about atoms the loop redefines.
     fn paths(&mut self) -> Result<Vec<Bool>, ShaderError> {
+        self.paths_ignoring(&[])
+    }
+
+    /// [`Self::paths`], without narrowing across branches in `wave_wide` (all
+    /// lanes of a wave follow a barrier-controlling branch together, so
+    /// inactive lanes still enter the chosen arm and keep their guards).
+    fn paths_ignoring(&mut self, wave_wide: &[Option<bool>]) -> Result<Vec<Bool>, ShaderError> {
         let n = self.p.blocks.len();
         let mut cond = vec![Bool::FALSE; n];
         if let Some(&entry) = self.order.first() {
@@ -1003,7 +1031,11 @@ impl<'a> Lanes<'a> {
                 let mut c = Bool::FALSE;
                 for k in 0..self.incoming[s].len() {
                     let (q, taken) = self.incoming[s][k];
-                    let mut e = self.edge(cond[q], q, taken);
+                    let mut e = if wave_wide.get(q).copied().flatten().is_some() {
+                        cond[q]
+                    } else {
+                        self.edge(cond[q], q, taken)
+                    };
                     if i <= self.index[q] {
                         e = self.b.forget(e, i, &mut Map::default());
                     }
@@ -1025,6 +1057,203 @@ impl<'a> Lanes<'a> {
             offset: 0,
             reason: "lane conditions do not settle",
         })
+    }
+
+    /// Non-uniform branches that control whether execution hits an `s_barrier`
+    /// before reconverging (see [`Structured::barrier_branches`]).
+    fn barrier_branches(&self) -> Vec<Option<bool>> {
+        let blocks = &self.p.blocks;
+        let n = blocks.len();
+        let mut out = vec![None; n];
+        let idom = crate::ir::idoms(blocks, &self.order, &self.index);
+        let alloc: Vec<usize> = self
+            .order
+            .iter()
+            .copied()
+            .filter(|&b| {
+                blocks[b].insts.iter().any(|i| {
+                    i.name() == "s_sendmsg"
+                        && matches!(i.fields, Fields::Sopp { imm } if imm & 0xF == GS_ALLOC_REQ)
+                })
+            })
+            .collect();
+        let mut has_barrier = vec![false; n];
+        for &b in &self.order {
+            if !blocks[b].insts.iter().any(|i| i.name() == "s_barrier") {
+                continue;
+            }
+            let mut d = b;
+            let dominated_by_alloc = loop {
+                if alloc.contains(&d) {
+                    break true;
+                }
+                if idom[d] == d || idom[d] == usize::MAX {
+                    break false;
+                }
+                d = idom[d];
+            };
+            has_barrier[b] = !dominated_by_alloc;
+        }
+        if !has_barrier.iter().any(|&x| x) {
+            return out;
+        }
+
+        // Immediate post-dominators over the reachable graph with a virtual exit.
+        let exit_node = n;
+        let mut fwd: Vec<Vec<usize>> = (0..=n).map(|_| Vec::new()).collect();
+        for &b in &self.order {
+            let succs: Vec<usize> = blocks[b]
+                .exit
+                .successors()
+                .into_iter()
+                .filter(|&s| self.index[s] != usize::MAX)
+                .collect();
+            if succs.is_empty() {
+                fwd[b].push(exit_node);
+            } else {
+                fwd[b] = succs;
+            }
+        }
+        // Closed loops without a natural exit still leave via `LOOP_LIMIT`.
+        loop {
+            let mut rev: Vec<Vec<usize>> = (0..=n).map(|_| Vec::new()).collect();
+            for (b, succs) in fwd.iter().enumerate().take(n) {
+                for &s in succs {
+                    rev[s].push(b);
+                }
+            }
+            let mut seen = vec![false; n + 1];
+            let mut stack = vec![exit_node];
+            seen[exit_node] = true;
+            while let Some(u) = stack.pop() {
+                for &p in &rev[u] {
+                    if !seen[p] {
+                        seen[p] = true;
+                        stack.push(p);
+                    }
+                }
+            }
+            match self.order.iter().rev().copied().find(|&b| !seen[b]) {
+                Some(latch) => fwd[latch].push(exit_node),
+                None => break,
+            }
+        }
+        let mut rev: Vec<Vec<usize>> = (0..=n).map(|_| Vec::new()).collect();
+        for (b, succs) in fwd.iter().enumerate().take(n) {
+            for &s in succs {
+                rev[s].push(b);
+            }
+        }
+        let mut seen = vec![false; n + 1];
+        let mut post = Vec::with_capacity(self.order.len() + 1);
+        let mut stack = vec![(exit_node, 0usize)];
+        seen[exit_node] = true;
+        while let Some(top) = stack.last_mut() {
+            let (u, k) = *top;
+            top.1 += 1;
+            match rev[u].get(k) {
+                Some(&p) if !seen[p] => {
+                    seen[p] = true;
+                    stack.push((p, 0));
+                }
+                Some(_) => {}
+                None => {
+                    post.push(u);
+                    stack.pop();
+                }
+            }
+        }
+        post.reverse();
+        let mut rindex = vec![usize::MAX; n + 1];
+        for (i, &u) in post.iter().enumerate() {
+            rindex[u] = i;
+        }
+        let mut ipdom = vec![usize::MAX; n + 1];
+        ipdom[exit_node] = exit_node;
+        let intersect = |ipdom: &[usize], mut a: usize, mut b: usize| {
+            while a != b {
+                while rindex[a] > rindex[b] {
+                    a = ipdom[a];
+                }
+                while rindex[b] > rindex[a] {
+                    b = ipdom[b];
+                }
+            }
+            a
+        };
+        let mut changed = true;
+        while changed {
+            changed = false;
+            for &u in &post[1..] {
+                let mut new = usize::MAX;
+                for &s in fwd[u].iter().filter(|&&s| ipdom[s] != usize::MAX) {
+                    new = if new == usize::MAX {
+                        s
+                    } else {
+                        intersect(&ipdom, s, new)
+                    };
+                }
+                if ipdom[u] != new {
+                    ipdom[u] = new;
+                    changed = true;
+                }
+            }
+        }
+
+        for &q in &self.order {
+            let Exit::Branch { taken, not_taken } = blocks[q].exit else {
+                continue;
+            };
+            let Some(when) = self.when[q] else { continue };
+            if self
+                .b
+                .support(when)
+                .iter()
+                .all(|a| matches!(a, Atom::Uniform(_)))
+            {
+                continue;
+            }
+            let stop = ipdom[q];
+            let mut visited = vec![false; n + 1];
+            let mut walk = vec![taken, not_taken];
+            let mut hits_barrier = false;
+            while let Some(u) = walk.pop() {
+                if u == stop || u == exit_node || visited[u] {
+                    continue;
+                }
+                visited[u] = true;
+                if has_barrier[u] {
+                    hits_barrier = true;
+                    break;
+                }
+                walk.extend(&fwd[u]);
+            }
+            if !hits_barrier {
+                continue;
+            }
+            let Some(last) = blocks[q].insts.last() else {
+                continue;
+            };
+            let all_true = match last.name() {
+                "s_cbranch_execz" | "s_cbranch_vccz" => true,
+                "s_cbranch_execnz" | "s_cbranch_vccnz" => false,
+                name => {
+                    let eq_mask = last
+                        .read(Reg::Scc)
+                        .and_then(|scc| self.defs.get(&scc).copied())
+                        .is_some_and(|(db, di)| {
+                            blocks[db].insts[di].name().starts_with("s_cmp_eq_u")
+                        });
+                    if name == "s_cbranch_scc1" {
+                        eq_mask
+                    } else {
+                        !eq_mask
+                    }
+                }
+            };
+            out[q] = Some(all_true);
+        }
+        out
     }
 }
 
@@ -1179,5 +1408,112 @@ mod tests {
         assert_eq!(p.blocks[0].exit.successors(), [2, 4]);
         assert_eq!(p.blocks[1].preds, [2]);
         assert!(structure(&p).is_ok());
+    }
+
+    #[test]
+    fn wqm_tracks_source_mask_and_folds_constants() {
+        // Entry `exec` is TRUE and `0` is FALSE: neither needs a Quad atom.
+        let p_const = build(
+            &[
+                0xBEFE_097E, // s_wqm_b32 exec_lo, exec_lo
+                0xBE80_0980, // s_wqm_b32 s0, 0
+                0xBEFE_0300, // s_mov_b32 exec_lo, s0
+                0xBF88_0001, // s_cbranch_execz -> 20
+                0x7E02_0281, // v_mov_b32 v1, 1
+                S_ENDPGM,    // 20
+            ],
+            false,
+        );
+        let s_const = structure(&p_const).unwrap();
+        let LaneExit::Branch { when, .. } = s_const.exits[0] else {
+            panic!("{:?}", s_const.exits)
+        };
+        assert_eq!(when, Bool::TRUE, "wqm(0) is FALSE so execz is always taken");
+
+        // Non-constant `s_wqm_b32 exec_lo, vcc_lo` keeps `Atom::Quad(lo, a)`
+        // with `a` referencing the compare's `Atom::Lane`.
+        let p = build(
+            &[
+                0x7D84_0080, // v_cmp_eq_u32 vcc_lo, 0, v0
+                0xBEFE_096A, // s_wqm_b32 exec_lo, vcc_lo
+                0xBF88_0001, // s_cbranch_execz -> 16
+                0x7E02_0281, // v_mov_b32 v1, 1
+                S_ENDPGM,    // 16
+            ],
+            false,
+        );
+        let s = structure(&p).unwrap();
+        let LaneExit::Branch { when, .. } = s.exits[0] else {
+            panic!("{:?}", s.exits)
+        };
+        let cmp = p.blocks[0].insts[0].write(Reg::S(VCC)).unwrap();
+        let wqm = p.blocks[0].insts[1].write(Reg::S(EXEC)).unwrap();
+        let support = s.bools.support(when);
+        assert_eq!(support.len(), 2, "{support:?}");
+        assert!(support.contains(&Atom::Lane(cmp)));
+        let Some(&Atom::Quad(lo, src)) = support.iter().find(|a| matches!(a, Atom::Quad(..)))
+        else {
+            panic!("expected Atom::Quad in {support:?}");
+        };
+        assert_eq!(lo, wqm);
+        assert_eq!(s.bools.support(src), vec![Atom::Lane(cmp)]);
+    }
+
+    #[test]
+    fn barrier_branches_keep_inner_guards_unless_barrier_post_dominates() {
+        // Branch enclosing `s_barrier`: marked wave-wide (`Some(true)` for
+        // `execz`) and keeps the per-lane guard on `v_mov_b32` inside it.
+        let enclosing = build(
+            &[
+                0x7D84_0080, // v_cmp_eq_u32 vcc_lo, 0, v0
+                0xBE80_3C6A, // s_and_saveexec_b32 s0, vcc_lo
+                0xBF88_0002, // s_cbranch_execz -> 20
+                0x7E02_0281, // v_mov_b32 v1, 1
+                0xBF8A_0000, // s_barrier
+                0x887E_007E, // 20: s_or_b32 exec_lo, exec_lo, s0
+                S_ENDPGM,
+            ],
+            false,
+        );
+        let se = structure(&enclosing).unwrap();
+        assert_eq!(se.barrier_branches[0], Some(true));
+        assert!(
+            se.guards[1][0].is_some(),
+            "vector write inside barrier-sensitive branch must stay guarded"
+        );
+
+        // `s_barrier` after reconvergence post-dominates the branch: stays a
+        // normal per-lane branch with no inner guard.
+        let post_dom = build(
+            &[
+                0x7D84_0080, // v_cmp_eq_u32 vcc_lo, 0, v0
+                0xBE80_3C6A, // s_and_saveexec_b32 s0, vcc_lo
+                0xBF88_0001, // s_cbranch_execz -> 16
+                0x7E02_0281, // v_mov_b32 v1, 1
+                0x887E_007E, // 16: s_or_b32 exec_lo, exec_lo, s0
+                0xBF8A_0000, // s_barrier
+                S_ENDPGM,
+            ],
+            false,
+        );
+        let sp = structure(&post_dom).unwrap();
+        assert_eq!(sp.barrier_branches[0], None);
+        assert_eq!(guarded(&sp), 0);
+
+        // Mesh `GS_ALLOC_REQ` (`s_sendmsg 9`) dominates its own barrier, which
+        // lowering omits: the enclosing lane-0 check stays per-lane.
+        let mesh_alloc = build(
+            &[
+                0x7D84_0080, // v_cmp_eq_u32 vcc_lo, 0, v0
+                0xBE80_3C6A, // s_and_saveexec_b32 s0, vcc_lo
+                0xBF88_0002, // s_cbranch_execz -> 20
+                0xBF90_0009, // s_sendmsg 9 (GS_ALLOC_REQ)
+                0xBF8A_0000, // s_barrier
+                S_ENDPGM,    // 20
+            ],
+            false,
+        );
+        let sm = structure(&mesh_alloc).unwrap();
+        assert_eq!(sm.barrier_branches[0], None);
     }
 }
