@@ -869,6 +869,32 @@ fn bfe_signed_and_unsigned_match_rdna2() {
 }
 
 #[test]
+fn compute_uses_a_reloaded_lane_mask_for_select() {
+    // Select with the complement of (v1 == v2) after a spill to lane 3.
+    let [compare, compare_operands] = vop3(0x0c2, 6, vgpr(1), vgpr(2), 0);
+    let [spill, spill_operands] = vop3(0x361, 5, sgpr(7), 0x83, 0);
+    let [reload, reload_operands] = vop3(0x360, 20, vgpr(5), 0x83, 0);
+    let [select, select_operands] = vop3(0x101, 0, 0x91, 0x9d, sgpr(20));
+    let shader = build_valu_cs(&[
+        compare,
+        compare_operands,
+        sop2(0x12, 7, 6, 0xc1), // s_xor_b32 s7, s6, -1
+        spill,
+        spill_operands,
+        reload,
+        reload_operands,
+        select,
+        select_operands,
+    ]);
+
+    let cases = [[7, 7, 0, 0], [7, 9, 0, 0]];
+    run_cases(&shader, &cases, |backend, _, [a, b, ..], result| {
+        assert_eq!(result, if a == b { 17 } else { 29 }, "{backend}: {a}, {b}");
+        eprintln!("{backend}: {a}, {b} -> {result}");
+    });
+}
+
+#[test]
 fn v_cmp_class_f16_matches_rdna2() {
     // v_cmp_class_f16_e64 s6, v1, v2 (VOP3 opcode 0x08f); v_cndmask_b32_e64 v0, 0, 1, s6
     let cmp_lo = build_valu_cs(&[
