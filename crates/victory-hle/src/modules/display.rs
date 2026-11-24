@@ -95,11 +95,16 @@ extern "system" fn acquire_deferral(_: This, out: *mut *mut c_void) -> HRESULT {
     // SAFETY: a valid context; the string is copied by the call.
     let request = unsafe { PowerCreateRequest(&context) };
     if request as isize == -1 {
-        return last_error();
+        let hr = last_error();
+        tracing::debug!(code = hr, "no power request for a display deferral");
+        return hr;
     }
     // SAFETY: the request we just created.
     if unsafe { PowerSetRequest(request, PowerRequestDisplayRequired) } == 0 {
         let hr = last_error();
+        // A session with no display to keep awake refuses here
+        // (`ERROR_NOT_SUPPORTED`), and a console always grants it.
+        tracing::debug!(code = hr, "the host refuses to keep the display awake");
         // SAFETY: as above; not handed out.
         unsafe { windows_sys::Win32::Foundation::CloseHandle(request) };
         return hr;
@@ -175,6 +180,12 @@ mod tests {
     use super::*;
     use crate::modules::xgameruntime::{S_OK, method};
 
+    /// The host may refuse to keep the display awake — a session with no
+    /// display to keep (`PowerSetRequest` answers `ERROR_NOT_SUPPORTED`) —
+    /// where a console always grants it. Either way the call owes the title
+    /// one of two things, and nothing in between: a handle it can close, or
+    /// a failure and no handle. (This test asserted `S_OK` only, and fails on
+    /// a machine whose session has no display.)
     #[test]
     fn sdr_and_display_deferrals() {
         type Hdr = extern "system" fn(This, u32, *mut c_void) -> u32;
@@ -185,11 +196,18 @@ mod tests {
         type Acquire = extern "system" fn(This, *mut *mut c_void) -> HRESULT;
         type Close = extern "system" fn(This, *mut c_void);
         let mut handle = std::ptr::null_mut();
-        assert_eq!(
-            method::<Acquire>(&SHELL_OBJECT, 0x20)(&SHELL_OBJECT, &mut handle),
-            S_OK
-        );
-        assert!(!handle.is_null());
-        method::<Close>(&SHELL_OBJECT, 0x28)(&SHELL_OBJECT, handle);
+        let acquired = method::<Acquire>(&SHELL_OBJECT, 0x20)(&SHELL_OBJECT, &mut handle);
+        if acquired == S_OK {
+            assert!(!handle.is_null(), "a granted deferral comes with a handle");
+            method::<Close>(&SHELL_OBJECT, 0x28)(&SHELL_OBJECT, handle);
+        } else {
+            assert_eq!(
+                acquired, NOT_SUPPORTED,
+                "the only refusal a host gives here is a display it cannot keep"
+            );
+            assert!(handle.is_null(), "a refused deferral leaves no handle");
+        }
+        // Closing nothing is what a title does when it never got one.
+        method::<Close>(&SHELL_OBJECT, 0x28)(&SHELL_OBJECT, std::ptr::null_mut());
     }
 }
