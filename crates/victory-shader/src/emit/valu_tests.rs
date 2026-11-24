@@ -5,7 +5,7 @@
 //! `v_med3_f32`/`v_med3_f16` with NaN operands, `v_fract_f32`/`v_fract_f16`
 //! near `1.0`, and turn-range reduction for `v_sin_*`/`v_cos_*`.
 
-use super::host::{Dispatch, Host, Root, View};
+use super::host::{Dispatch, Draw, Host, Root, View};
 use super::{HostShader, lower, validator};
 use crate::native::{
     ComputeIo, HwStage, NativeProgram, ResourceType, RootParam, RootType, StageIo, UsedResource,
@@ -936,4 +936,325 @@ fn v_cmp_class_f16_matches_rdna2() {
             inp[0], inp[1],
         );
     });
+}
+
+#[test]
+fn reachability_overwritten_missing_phis_match_on_host_and_warp() {
+    // 1. Correlated overwrite of a missing descriptor word (`s13`) across two joins:
+    //    when s0 == 0: load s[12:15], read UAV via raw buffer_load_dword, then overwrite s13 = 29;
+    //    when s0 != 0: set s13 = 17, skip overwrite. Result v0 = s13.
+    let desc_word_shader = build_valu_cs(&[
+        0x7E0C_0280, // v_mov_b32 v6, 0
+        0xBF06_8000, // s_cmp_eq_u32 s0, 0
+        0xBF85_0002, // s_cbranch_scc1 +2
+        0xBE8D_0391, // s_mov_b32 s13, 17
+        0xBF82_0004, // s_branch +4
+        s_load_dwordx4(12, 4)[0],
+        s_load_dwordx4(12, 4)[1],
+        0xE030_0000,
+        0x8003_0506, // buffer_load_dword v5, v6, s[12:15], 0
+        0xBF84_0001, // s_cbranch_scc0 +1 (skip overwrite only when s0 != 0)
+        0xBE8D_039D, // s_mov_b32 s13, 29
+        vop1(0x001, 0, sgpr(13)),
+    ]);
+    // 2. Correlated overwrite of an unknown-stride buffer_load_dword (`v5` -> Missing) across two joins:
+    //    when s0 == 0: load with idxen (stride = 0 in build_valu_cs -> unknown stride), then overwrite v5 = 29;
+    //    when s0 != 0: v5 = 17, skip overwrite. Result v0 = v5.
+    let unknown_stride_shader = build_valu_cs(&[
+        0x7E0C_0280, // v_mov_b32 v6, 0
+        0xBF06_8000, // s_cmp_eq_u32 s0, 0
+        0xBF85_0002, // s_cbranch_scc1 +2
+        0x7E0A_0291, // v_mov_b32 v5, 17
+        0xBF82_0004, // s_branch +4
+        s_load_dwordx4(12, 4)[0],
+        s_load_dwordx4(12, 4)[1],
+        0xE030_2000,
+        0x8003_0506, // buffer_load_dword v5, v6, s[12:15], 0 idxen (unknown stride)
+        0xBF84_0001, // s_cbranch_scc0 +1 (skip overwrite only when s0 != 0)
+        0x7E0A_029D, // v_mov_b32 v5, 29
+        vop1(0x001, 0, vgpr(5)),
+    ]);
+    // 3. Loop-invariant infeasible s_memtime phi (latch uses VCC to preserve SCC):
+    //    when s0 == 0: loop runs s_memtime -> s13, then overwrites s13 = 29 after loop;
+    //    when s0 != 0: loop keeps s13 = 17, skips overwrite after loop.
+    let loop_shader = build_valu_cs(&[
+        0xBE8D_0391, // s_mov_b32 s13, 17
+        0x7E0E_0280, // v_mov_b32 v7, 0
+        0xBF06_8000, // s_cmp_eq_u32 s0, 0
+        0xBF84_0003, // s_cbranch_scc0 +3
+        0xF490_0180,
+        0,           // s_memtime s[6:7]
+        0xBE8D_0306, // s_mov_b32 s13, s6
+        0x4A0E_0E81, // v_add_nc_u32 v7, 1, v7
+        0x7D88_0E82, // v_cmp_gt_u32 vcc_lo, 2, v7
+        0xBF87_FFF9, // s_cbranch_vccnz -7
+        0xBF84_0001, // s_cbranch_scc0 +1
+        0xBE8D_039D, // s_mov_b32 s13, 29
+        vop1(0x001, 0, sgpr(13)),
+    ]);
+
+    let cases = [([0, 0, 0, 0], 29u32), ([1, 0, 0, 0], 17u32)];
+    let inputs: Vec<[u32; 4]> = cases.iter().map(|c| c.0).collect();
+    for (name, shader) in [
+        ("desc_word", &desc_word_shader),
+        ("unknown_stride", &unknown_stride_shader),
+        ("loop_memtime", &loop_shader),
+    ] {
+        run_cases(shader, &inputs, |backend, i, inp, got| {
+            let want = cases[i].1;
+            assert_eq!(
+                got, want,
+                "{backend} {name} s0={}: got {got}, want {want}",
+                inp[0]
+            );
+        });
+    }
+}
+
+/// Builds a fullscreen-triangle vertex shader for pixel-shader VALU readback tests.
+fn build_fullscreen_vs() -> HostShader {
+    use super::bitcode::{Attr, Term};
+    use super::container::SigElement;
+    use super::shader::Shader;
+    let mut s = Shader::new(false);
+    let b = s.entry;
+    s.inputs.push(SigElement {
+        name: "POSITION".into(),
+        index: 0,
+        kind: 0,
+        comp: 9,
+        interp: 0,
+        row: Some(0),
+        col: 0,
+        cols: 4,
+        usage: 0xF,
+        half: false,
+    });
+    s.outputs.push(SigElement {
+        name: "SV_Position".into(),
+        index: 0,
+        kind: 3,
+        comp: 9,
+        interp: 4,
+        row: Some(0),
+        col: 0,
+        cols: 4,
+        usage: 0xF,
+        half: false,
+    });
+    let f32t = s.t.f32;
+    let void = s.t.void;
+    let undef = s.m.undef(s.t.i32);
+    let zero = s.m.i32(0);
+    for col in 0..4u8 {
+        let col_v = s.m.i8(col);
+        let loaded = s.op(
+            b,
+            "loadInput.f32",
+            Attr::ReadNone,
+            f32t,
+            4,
+            &[zero, zero, col_v, undef],
+        );
+        s.op(
+            b,
+            "storeOutput.f32",
+            Attr::NoUnwind,
+            void,
+            5,
+            &[zero, zero, col_v, loaded],
+        );
+    }
+    s.m.terminate(b, Term::Ret);
+    HostShader {
+        stage: HwStage::Vs,
+        dxil: s.finish(),
+        user_data: Vec::new(),
+        samplers: Vec::new(),
+        static_samplers: Vec::new(),
+        root_cbvs: Vec::new(),
+        root_srvs: Vec::new(),
+    }
+}
+
+fn build_valu_ps(words: &[u32]) -> HostShader {
+    use super::container::SigElement;
+    let code: Vec<u8> = words.iter().flat_map(|w| w.to_le_bytes()).collect();
+    let native = NativeProgram {
+        stage: HwStage::Ps,
+        wave64: false,
+        vgprs: 8,
+        layout: vec![RootParam {
+            root: RootType::Constants,
+            table_offset_dwords: 0,
+            sgprs: 4,
+            base_register: 0,
+            user_data: 0,
+            slot: 0,
+        }],
+        used: vec![],
+        io: StageIo::Ps {
+            inputs: vec![],
+            input_addr: 1 << 1, // PERSP_CENTER: v0/v1 start as Input::Barycentric
+            db_shader_control: 0,
+            patches: vec![],
+        },
+        code,
+    };
+    let p = ir::build(&native.code, native.wave64, native.vgprs).expect("ir::build");
+    let st = structure::structure(&p).expect("structure");
+    let res =
+        resource::track(&p, &native.layout, native.stage, Some(&st)).expect("resource::track");
+    let io = io::raise(&p, &native).expect("io::raise");
+    let outputs = vec![SigElement {
+        name: "SV_Target".into(),
+        index: 0,
+        kind: 16,
+        comp: 9,
+        interp: 0,
+        row: Some(0),
+        col: 0,
+        cols: 4,
+        usage: 0,
+        half: false,
+    }];
+    let lowered = lower::lower(&lower::Parts {
+        native: &native,
+        p: &p,
+        st: &st,
+        io: &io,
+        res: &res,
+        inputs: Vec::new(),
+        outputs,
+        prims: Vec::new(),
+        mesh_stride: 0,
+    })
+    .expect("lower ps");
+
+    let shader = HostShader {
+        stage: HwStage::Ps,
+        dxil: lowered.dxil,
+        user_data: lowered.user_data,
+        samplers: lowered.samplers,
+        static_samplers: Vec::new(),
+        root_cbvs: lowered.root_cbvs,
+        root_srvs: lowered.root_srvs,
+    };
+
+    if let Ok(mut v) = validator::Validator::load(validator::Validator::default_path().as_deref()) {
+        let mut copy = shader.dxil.clone();
+        let ours = copy[4..20].to_vec();
+        v.validate(&mut copy).expect("DXIL validation failed");
+        assert_eq!(copy[4..20], ours[..], "container hash mismatch");
+    }
+
+    shader
+}
+
+#[test]
+fn pixel_barycentric_reuse_16bit_and_sdwa_match_on_host_and_warp() {
+    let vs = build_fullscreen_vs();
+    // Positive 1: Reuse entry barycentric v0 via write_16(lo) (`v_cvt_f16_f32 v0, s0`),
+    // then read only v0.lo16 via `v_cvt_f32_f16`, `v_and_b32(..., 0xFFFF)`,
+    // `v_bfe_u32(..., 0, 16)`, and SDWA `src0_sel:WORD_0`.
+    let ps_lo16_reads = build_valu_ps(&[
+        0x7E00_1400, // v_cvt_f16_f32 v0, s0
+        0x7E04_1700, // v_cvt_f32_f16 v2, v0
+        0x3606_00FF,
+        0x0000_FFFF, // v_and_b32 v3, 0xFFFF, v0
+        0xD548_0004,
+        256 | (0x80 << 9) | (0x90 << 18), // v_bfe_u32 v4, v0, 0, 16
+        0x7E0A_02F9,
+        0x0004_0600, // v_mov_b32_sdwa v5, v0 dst_sel:DWORD dst_unused:UNUSED_PAD src0_sel:WORD_0
+        vop1(0x006, 3, vgpr(3)), // v_cvt_f32_u32 v3, v3 (avoid denorm flush on RT export)
+        vop1(0x006, 4, vgpr(4)), // v_cvt_f32_u32 v4, v4
+        vop1(0x006, 5, vgpr(5)), // v_cvt_f32_u32 v5, v5
+        0xF800_180F,
+        0x0504_0302, // exp mrt0, v2, v3, v4, v5 done vm
+        S_ENDPGM,
+    ]);
+    // Positive 2: Reuse entry barycentrics v0 (via write_16(lo) then write_16(hi)) and
+    // v1 (via SDWA WORD_0 then WORD_1 UNUSED_PRESERVE), then export full 32-bit v0 and v1.
+    let ps_full_overwrite = build_valu_ps(&[
+        0x7E00_1400, // v_cvt_f16_f32 v0, s0
+        0xD58A_4000,
+        0x0000_0001, // v_cvt_f16_f32 v0, s1 op_sel:[0,0,0,1]
+        0x7E02_02F9,
+        0x0086_1402, // v_mov_b32_sdwa v1, s2 dst_sel:WORD_0 dst_unused:UNUSED_PRESERVE src0_sel:DWORD
+        0x7E02_02F9,
+        0x0086_1503, // v_mov_b32_sdwa v1, s3 dst_sel:WORD_1 dst_unused:UNUSED_PRESERVE src0_sel:DWORD
+        0xF800_180F,
+        0x0100_0100, // exp mrt0, v0, v1, v0, v1 done vm
+        S_ENDPGM,
+    ]);
+
+    let vertices = [
+        -1.0f32, -1.0, 0.5, 1.0, //
+        -1.0, 3.0, 0.5, 1.0, //
+        3.0, -1.0, 0.5, 1.0,
+    ];
+    let _one = ONE_AT_A_TIME.lock().unwrap_or_else(|e| e.into_inner());
+    let mut ran = 0;
+    for (label, warp) in [("hardware", false), ("warp", true)] {
+        let Ok(host) = Host::new(warp) else {
+            eprintln!("no SM 6.6 {label} device; skipped");
+            continue;
+        };
+        for (name, ps, consts, want) in [
+            (
+                "lo16_reads",
+                &ps_lo16_reads,
+                [1.5f32.to_bits(), 0, 0, 0],
+                [1.5f32, 15872.0, 15872.0, 15872.0],
+            ),
+            (
+                "full_overwrite",
+                &ps_full_overwrite,
+                [1.5f32.to_bits(), (-2.0f32).to_bits(), 0x1234, 0x5678],
+                [
+                    f32::from_bits(0xC000_3E00),
+                    f32::from_bits(0x5678_1234),
+                    f32::from_bits(0xC000_3E00),
+                    f32::from_bits(0x5678_1234),
+                ],
+            ),
+        ] {
+            let (root, pso) = host
+                .pipeline(&vs, ps)
+                .unwrap_or_else(|e| panic!("{label} {name}: pipeline failed: {e}"));
+            let mut ud = vec![0u32; ps.user_data_dwords().max(1) as usize];
+            for u in &ps.user_data {
+                ud[u.index as usize] = consts[u.dword as usize];
+            }
+            let pixels = host
+                .draw(
+                    &root,
+                    &pso,
+                    &Draw {
+                        roots: vec![(1, Root::Constants(ud))],
+                        textures: &[],
+                        samplers: &[],
+                        vertices: &vertices,
+                        stride: 16,
+                        size: (4, 4),
+                        mesh_groups: 0,
+                    },
+                )
+                .unwrap_or_else(|e| panic!("{label} {name}: draw failed: {e}"));
+            assert_eq!(pixels.len(), 16);
+            for (p_idx, px) in pixels.iter().enumerate() {
+                for c in 0..4 {
+                    assert_eq!(
+                        px[c].to_bits(),
+                        want[c].to_bits(),
+                        "{label} {name} pixel {p_idx} ch {c}: got {:#010x}, want {:#010x}",
+                        px[c].to_bits(),
+                        want[c].to_bits()
+                    );
+                }
+            }
+        }
+        ran += 1;
+    }
+    assert!(ran > 0, "neither hardware nor WARP SM 6.6 device available");
 }
