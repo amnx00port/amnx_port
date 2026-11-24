@@ -1312,7 +1312,7 @@ pub(crate) fn copy_mapped(dst: *mut u8, src: *const u8, len: usize, title_dst: b
     }
     #[cfg(feature = "diagnostics")]
     let moved = std::time::Instant::now();
-    let whole = read(src, dst, len);
+    let (whole, done) = read(src, dst, len);
     #[cfg(feature = "diagnostics")]
     crate::copystat::add(crate::copystat::C::MoveUs, moved.elapsed().as_micros() as u64);
     if whole {
@@ -1320,18 +1320,41 @@ pub(crate) fn copy_mapped(dst: *mut u8, src: *const u8, len: usize, title_dst: b
     }
     #[cfg(feature = "diagnostics")]
     crate::copystat::add(crate::copystat::C::Fallbacks, 1);
-    // Something is unmapped: page by page (64 KiB, then 4 KiB in a piece
-    // that fails), zeros for what cannot be read.
-    for_pieces(src as usize, len, 64 << 10, |at, n| {
-        let to = dst.wrapping_add(at - src as usize);
-        if !read(at as *const u8, to, n) {
+    // Something is unmapped or unreadable: walk regions via VirtualQuery
+    // starting past the prefix already copied, zeroing holes in one call and
+    // copying each committed readable region in one ReadProcessMemory call
+    // (falling back to 64 KiB / 4 KiB pieces if a region unmaps mid-read).
+    let src_addr = src as usize;
+    let done = done.min(len);
+    for_regions(src_addr + done, len - done, |at, n, accessible| {
+        let to = dst.wrapping_add(at - src_addr);
+        if !accessible {
+            zero_unmapped(to, n);
+            return;
+        }
+        let (ok, region_done) = read(at as *const u8, to, n);
+        if !ok {
+            let d = region_done.min(n);
+            copy_pieces(dst, src_addr, at + d, n - d);
+        }
+    });
+}
+
+fn zero_unmapped(to: *mut u8, n: usize) {
+    #[cfg(feature = "diagnostics")]
+    crate::copystat::add(crate::copystat::C::Unmapped, n as u64);
+    // SAFETY: inside the destination, which is mapped.
+    unsafe { to.write_bytes(0, n) };
+}
+
+fn copy_pieces(dst: *mut u8, src: usize, start: usize, len: usize) {
+    for_pieces(start, len, 64 << 10, |at, n| {
+        let to = dst.wrapping_add(at - src);
+        if !read(at as *const u8, to, n).0 {
             for_pieces(at, n, 4 << 10, |at, n| {
-                let to = dst.wrapping_add(at - src as usize);
-                if !read(at as *const u8, to, n) {
-                    #[cfg(feature = "diagnostics")]
-                    crate::copystat::add(crate::copystat::C::Unmapped, n as u64);
-                    // SAFETY: inside the destination, which is mapped.
-                    unsafe { to.write_bytes(0, n) };
+                let to = dst.wrapping_add(at - src);
+                if !read(at as *const u8, to, n).0 {
+                    zero_unmapped(to, n);
                 }
             });
         }
@@ -1341,42 +1364,103 @@ pub(crate) fn copy_mapped(dst: *mut u8, src: *const u8, len: usize, title_dst: b
 /// Reads title memory at `src` into `dst`; false if a page of it is not
 /// readable.
 pub(crate) fn read_into(src: *const u8, dst: &mut [u8]) -> bool {
-    read(src, dst.as_mut_ptr(), dst.len())
+    read(src, dst.as_mut_ptr(), dst.len()).0
 }
 
 /// Copies `len` bytes from `src` to `dst` unless a source page is not
-/// readable.
-fn read(src: *const u8, dst: *mut u8, len: usize) -> bool {
+/// readable; returns `(ok, bytes_read)`.
+fn read(src: *const u8, dst: *mut u8, len: usize) -> (bool, usize) {
     use windows_sys::Win32::System::Diagnostics::Debug::ReadProcessMemory;
     use windows_sys::Win32::System::Threading::GetCurrentProcess;
     let mut done = 0;
     // SAFETY: the destination is mapped writable memory of `len` bytes; the
     // kernel checks the source.
-    unsafe { ReadProcessMemory(GetCurrentProcess(), src.cast(), dst.cast(), len, &mut done) != 0 }
+    let ok = unsafe {
+        ReadProcessMemory(GetCurrentProcess(), src.cast(), dst.cast(), len, &mut done) != 0
+    };
+    (ok, done)
+}
+
+/// Writes `len` bytes from `src` to `dst` unless a destination page is not
+/// writable; returns `(ok, bytes_written)`.
+fn write(dst: *mut u8, src: *const u8, len: usize) -> (bool, usize) {
+    use windows_sys::Win32::System::Diagnostics::Debug::WriteProcessMemory;
+    use windows_sys::Win32::System::Threading::GetCurrentProcess;
+    let mut done = 0;
+    // SAFETY: the source is our mapped host copy; the kernel checks the
+    // destination.
+    let ok = unsafe {
+        WriteProcessMemory(GetCurrentProcess(), dst.cast(), src.cast(), len, &mut done) != 0
+    };
+    (ok, done)
 }
 
 /// Copies host memory into title memory after a submission (what shaders
 /// wrote), leaving pages that are not mapped alone.
 pub(crate) fn write_mapped(dst: *mut u8, src: *const u8, len: usize) {
-    use windows_sys::Win32::System::Diagnostics::Debug::WriteProcessMemory;
-    use windows_sys::Win32::System::Threading::GetCurrentProcess;
-    let write = |at: usize, n: usize| {
-        let from = src.wrapping_add(at - dst as usize);
-        let mut done = 0;
-        // SAFETY: the source is our mapped host copy; the kernel checks the
-        // destination.
-        unsafe { WriteProcessMemory(GetCurrentProcess(), at as _, from.cast(), n, &mut done) != 0 }
-    };
-    if len == 0 || write(dst as usize, len) {
+    if len == 0 {
         return;
     }
-    for_pieces(dst as usize, len, 64 << 10, |at, n| {
-        if !write(at, n) {
+    let (whole, done) = write(dst, src, len);
+    if whole {
+        return;
+    }
+    let dst_addr = dst as usize;
+    let done = done.min(len);
+    for_regions(dst_addr + done, len - done, |at, n, accessible| {
+        if !accessible {
+            return;
+        }
+        let from = src.wrapping_add(at - dst_addr);
+        let (ok, region_done) = write(at as *mut u8, from, n);
+        if !ok {
+            let d = region_done.min(n);
+            write_pieces(dst_addr, src, at + d, n - d);
+        }
+    });
+}
+
+fn write_pieces(dst: usize, src: *const u8, start: usize, len: usize) {
+    for_pieces(start, len, 64 << 10, |at, n| {
+        if !write(at as *mut u8, src.wrapping_add(at - dst), n).0 {
             for_pieces(at, n, 4 << 10, |at, n| {
-                write(at, n);
+                write(at as *mut u8, src.wrapping_add(at - dst), n);
             });
         }
     });
+}
+
+/// Walks `[start, start + len)` region by region via `VirtualQuery`, passing
+/// `(at, n, accessible)` where `accessible` is true for committed regions
+/// without `PAGE_NOACCESS` or `PAGE_GUARD`.
+fn for_regions(start: usize, len: usize, mut f: impl FnMut(usize, usize, bool)) {
+    use windows_sys::Win32::System::Memory::{
+        MEM_COMMIT, MEMORY_BASIC_INFORMATION, PAGE_GUARD, PAGE_NOACCESS, VirtualQuery,
+    };
+    let end = start + len;
+    let mut at = start;
+    while at < end {
+        // SAFETY: plain data filled in by the query.
+        let mut info: MEMORY_BASIC_INFORMATION = unsafe { std::mem::zeroed() };
+        // SAFETY: a valid out pointer of the right size.
+        let queried = unsafe { VirtualQuery(at as *const _, &mut info, size_of_val(&info)) };
+        if queried == 0 {
+            f(at, end - at, true);
+            break;
+        }
+        let region_end = (info.BaseAddress as usize)
+            .saturating_add(info.RegionSize)
+            .min(end);
+        if region_end <= at {
+            f(at, end - at, true);
+            break;
+        }
+        let accessible = info.State == MEM_COMMIT
+            && info.Protect != 0
+            && (info.Protect & (PAGE_NOACCESS | PAGE_GUARD)) == 0;
+        f(at, region_end - at, accessible);
+        at = region_end;
+    }
 }
 
 /// Calls `f` with the pieces of `[start, start + len)` cut at multiples of
@@ -2051,5 +2135,249 @@ mod batch {   // Batch::texture_due lives here; `mod tests` is already taken at 
             SIZE >> 20,
             before.as_secs_f64() / after.as_secs_f64()
         );
+    }
+}
+
+#[cfg(test)]
+mod mapped_copy_tests {
+    use super::{copy_mapped, copy_pieces, write_mapped};
+    use windows_sys::Win32::System::Memory::{
+        MEM_COMMIT, MEM_RELEASE, MEM_RESERVE, PAGE_GUARD, PAGE_NOACCESS, PAGE_READONLY,
+        PAGE_READWRITE, VirtualAlloc, VirtualFree, VirtualProtect,
+    };
+
+    struct Reserved {
+        ptr: *mut u8,
+    }
+
+    impl Reserved {
+        fn new(size: usize) -> Self {
+            // SAFETY: reserving an anonymous virtual range freed on Drop.
+            let ptr = unsafe { VirtualAlloc(std::ptr::null(), size, MEM_RESERVE, PAGE_NOACCESS) };
+            assert!(!ptr.is_null(), "VirtualAlloc(MEM_RESERVE) failed");
+            Self { ptr: ptr.cast() }
+        }
+
+        fn commit(&self, offset: usize, size: usize) {
+            // SAFETY: committing a sub-range within our reserved allocation.
+            let p = unsafe {
+                VirtualAlloc(
+                    self.ptr.add(offset).cast(),
+                    size,
+                    MEM_COMMIT,
+                    PAGE_READWRITE,
+                )
+            };
+            assert!(!p.is_null(), "VirtualAlloc(MEM_COMMIT) failed");
+        }
+
+        fn protect(&self, offset: usize, size: usize, flags: u32) {
+            let mut old = 0;
+            // SAFETY: changing protection on a committed sub-range we own.
+            let ok = unsafe { VirtualProtect(self.ptr.add(offset).cast(), size, flags, &mut old) };
+            assert_ne!(ok, 0, "VirtualProtect failed");
+        }
+
+        fn fill_pattern(&self, offset: usize, size: usize, seed: u8) {
+            // SAFETY: caller ensures `[offset, offset + size)` is committed RW.
+            let slice = unsafe { std::slice::from_raw_parts_mut(self.ptr.add(offset), size) };
+            for (i, b) in slice.iter_mut().enumerate() {
+                *b = ((i.wrapping_mul(131)).wrapping_add(seed as usize) & 0xff).max(1) as u8;
+            }
+        }
+
+        fn as_slice(&self, offset: usize, size: usize) -> &[u8] {
+            // SAFETY: caller ensures `[offset, offset + size)` is readable.
+            unsafe { std::slice::from_raw_parts(self.ptr.add(offset), size) }
+        }
+    }
+
+    impl Drop for Reserved {
+        fn drop(&mut self) {
+            // SAFETY: releases the entire reservation owned by `self`.
+            unsafe { VirtualFree(self.ptr.cast(), 0, MEM_RELEASE) };
+        }
+    }
+
+    #[test]
+    fn sparse_committed_regions_with_reserve_and_free_holes() {
+        const MIB: usize = 1 << 20;
+        const TOTAL: usize = 8 * MIB;
+        let region = Reserved::new(TOTAL);
+        region.commit(0, MIB);
+        region.commit(5 * MIB, MIB);
+        region.fill_pattern(0, MIB, 17);
+        region.fill_pattern(5 * MIB, MIB, 53);
+
+        let mut dst = vec![0xAAu8; TOTAL];
+        copy_mapped(dst.as_mut_ptr(), region.ptr, TOTAL, false);
+        assert_eq!(&dst[..MIB], region.as_slice(0, MIB));
+        assert!(dst[MIB..5 * MIB].iter().all(|&b| b == 0));
+        assert_eq!(&dst[5 * MIB..6 * MIB], region.as_slice(5 * MIB, MIB));
+        assert!(dst[6 * MIB..].iter().all(|&b| b == 0));
+
+        // write_mapped updates committed regions while skipping MEM_RESERVE holes.
+        let src = vec![0x55u8; TOTAL];
+        write_mapped(region.ptr, src.as_ptr(), TOTAL);
+        assert!(region.as_slice(0, MIB).iter().all(|&b| b == 0x55));
+        assert!(region.as_slice(5 * MIB, MIB).iter().all(|&b| b == 0x55));
+
+        // Separate allocation pair with a genuine multi-megabyte MEM_FREE hole.
+        let mut tested_free_hole = false;
+        for _ in 0..16 {
+            use windows_sys::Win32::System::Memory::{
+                MEM_FREE, MEMORY_BASIC_INFORMATION, VirtualQuery,
+            };
+            // SAFETY: reserving an anonymous probe range, released immediately below.
+            let probe =
+                unsafe { VirtualAlloc(std::ptr::null(), TOTAL, MEM_RESERVE, PAGE_NOACCESS) };
+            assert!(!probe.is_null());
+            // SAFETY: `probe` is a valid reservation returned by VirtualAlloc above.
+            unsafe { VirtualFree(probe, 0, MEM_RELEASE) };
+            // SAFETY: attempting to allocate at `probe` just released above.
+            let a = unsafe { VirtualAlloc(probe, MIB, MEM_RESERVE | MEM_COMMIT, PAGE_READWRITE) };
+            if a.is_null() {
+                continue;
+            }
+            // SAFETY: `probe` + 6 MiB lies within the released 8 MiB probe span.
+            let b = unsafe {
+                VirtualAlloc(
+                    probe.cast::<u8>().add(6 * MIB).cast(),
+                    MIB,
+                    MEM_RESERVE | MEM_COMMIT,
+                    PAGE_READWRITE,
+                )
+            };
+            if b.is_null() {
+                // SAFETY: `a` was allocated by VirtualAlloc above.
+                unsafe { VirtualFree(a, 0, MEM_RELEASE) };
+                continue;
+            }
+            let a = a.cast::<u8>();
+            let b = b.cast::<u8>();
+            let is_free_hole = || {
+                // SAFETY: plain data filled in by VirtualQuery.
+                let mut info: MEMORY_BASIC_INFORMATION = unsafe { std::mem::zeroed() };
+                // SAFETY: `a + MIB` is 1 MiB past `a` and inside the probed address span.
+                let n = unsafe { VirtualQuery(a.add(MIB).cast(), &mut info, size_of_val(&info)) };
+                n != 0 && info.State == MEM_FREE && info.RegionSize >= 5 * MIB
+            };
+            if is_free_hole() {
+                // SAFETY: `a` and `b` are valid 1 MiB RW allocations separated by 5 MiB MEM_FREE.
+                unsafe {
+                    std::slice::from_raw_parts_mut(a, MIB).fill(0x3C);
+                    std::slice::from_raw_parts_mut(b, MIB).fill(0xC3);
+                }
+                let mut free_dst = vec![0x77u8; 7 * MIB];
+                copy_mapped(free_dst.as_mut_ptr(), a, 7 * MIB, false);
+                if is_free_hole() {
+                    assert!(free_dst[..MIB].iter().all(|&x| x == 0x3C));
+                    assert!(free_dst[MIB..6 * MIB].iter().all(|&x| x == 0));
+                    assert!(free_dst[6 * MIB..].iter().all(|&x| x == 0xC3));
+                    tested_free_hole = true;
+                }
+            }
+            // SAFETY: release both allocations.
+            unsafe {
+                VirtualFree(a.cast(), 0, MEM_RELEASE);
+                VirtualFree(b.cast(), 0, MEM_RELEASE);
+            }
+            if tested_free_hole {
+                break;
+            }
+        }
+        assert!(tested_free_hole, "could not verify a 5 MiB MEM_FREE hole");
+    }
+
+    #[test]
+    fn noaccess_and_guard_pages_zeroed_on_copy_and_skipped_on_write() {
+        const KIB: usize = 1024;
+        const PAGE: usize = 4 * KIB;
+        const TOTAL: usize = 256 * KIB;
+        let region = Reserved::new(TOTAL);
+        region.commit(0, TOTAL);
+        region.fill_pattern(0, TOTAL, 91);
+
+        let noaccess_off = 64 * KIB;
+        let guard_off = 132 * KIB;
+        region.protect(noaccess_off, PAGE, PAGE_NOACCESS);
+        region.protect(guard_off, PAGE, PAGE_READWRITE | PAGE_GUARD);
+
+        let mut dst = vec![0xCCu8; TOTAL];
+        copy_mapped(dst.as_mut_ptr(), region.ptr, TOTAL, false);
+
+        assert_eq!(&dst[..noaccess_off], region.as_slice(0, noaccess_off));
+        assert!(
+            dst[noaccess_off..noaccess_off + PAGE]
+                .iter()
+                .all(|&b| b == 0)
+        );
+        assert_eq!(
+            &dst[noaccess_off + PAGE..guard_off],
+            region.as_slice(noaccess_off + PAGE, guard_off - (noaccess_off + PAGE))
+        );
+        assert!(dst[guard_off..guard_off + PAGE].iter().all(|&b| b == 0));
+        assert_eq!(
+            &dst[guard_off + PAGE..],
+            region.as_slice(guard_off + PAGE, TOTAL - (guard_off + PAGE))
+        );
+
+        // write_mapped writes readable/writable pages and leaves protected holes intact.
+        let src = vec![0x6Au8; TOTAL];
+        write_mapped(region.ptr, src.as_ptr(), TOTAL);
+        assert!(region.as_slice(0, noaccess_off).iter().all(|&b| b == 0x6A));
+        assert!(
+            region
+                .as_slice(noaccess_off + PAGE, guard_off - (noaccess_off + PAGE))
+                .iter()
+                .all(|&b| b == 0x6A)
+        );
+        assert!(
+            region
+                .as_slice(guard_off + PAGE, TOTAL - (guard_off + PAGE))
+                .iter()
+                .all(|&b| b == 0x6A)
+        );
+        // Unprotect NOACCESS page and verify its original pattern was not overwritten.
+        region.protect(noaccess_off, PAGE, PAGE_READWRITE);
+        assert_ne!(region.as_slice(noaccess_off, PAGE), &vec![0x6Au8; PAGE][..]);
+    }
+
+    #[test]
+    fn region_scan_exact_byte_parity_with_chunked_reads() {
+        const KIB: usize = 1024;
+        const PAGE: usize = 4 * KIB;
+        const TOTAL: usize = 512 * KIB;
+        let region = Reserved::new(TOTAL);
+        region.commit(0, 128 * KIB);
+        region.commit(192 * KIB, 128 * KIB);
+        region.commit(384 * KIB, 128 * KIB);
+        region.fill_pattern(0, 128 * KIB, 11);
+        region.fill_pattern(192 * KIB, 128 * KIB, 37);
+        region.fill_pattern(384 * KIB, 128 * KIB, 73);
+
+        region.protect(64 * KIB + PAGE, PAGE, PAGE_NOACCESS);
+        region.protect(200 * KIB, 2 * PAGE, PAGE_READONLY);
+        region.protect(256 * KIB, PAGE, PAGE_READWRITE | PAGE_GUARD);
+        region.protect(400 * KIB, PAGE, PAGE_NOACCESS);
+
+        // Unaligned sub-range spanning committed prefix, RESERVE, NOACCESS, READONLY, GUARD.
+        let offset = 137;
+        let len = TOTAL - offset - 311;
+        // SAFETY: `offset` is within `region`'s reserved range.
+        let src_ptr = unsafe { region.ptr.add(offset) };
+
+        let mut dst_regions = vec![0xDDu8; len];
+        let mut dst_chunked = vec![0xDDu8; len];
+
+        copy_mapped(dst_regions.as_mut_ptr(), src_ptr, len, false);
+        copy_pieces(
+            dst_chunked.as_mut_ptr(),
+            src_ptr as usize,
+            src_ptr as usize,
+            len,
+        );
+
+        assert_eq!(dst_regions, dst_chunked);
     }
 }
