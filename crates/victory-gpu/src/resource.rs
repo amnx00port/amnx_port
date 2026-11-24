@@ -280,8 +280,8 @@ pub(crate) const SRGB: [(u32, u32); 3] = [(29, 28), (91, 87), (93, 88)];
 /// typeless (see [`DEPTH_FORMATS`], [`SRGB`]): the title's own; `None` if
 /// the host copy is typed.
 pub(crate) fn view_format(this: This) -> Option<u32> {
-    let own = pc_format(resource(this).desc.format);
     let host = host_resource(this)?;
+    let own = pc_format(resource(this).desc.format);
     // SAFETY: a live resource.
     let format = unsafe { host.GetDesc() }.Format.0 as u32;
     (format != own).then_some(own)
@@ -291,6 +291,28 @@ pub(crate) fn view_format(this: This) -> Option<u32> {
 /// read are made typeless on the host, which only allows views of
 /// typeless depth resources.
 pub(crate) const DEPTH_FORMATS: [(u32, u32); 4] = [(20, 19), (40, 39), (45, 44), (55, 53)];
+
+/// The shader-resource format for a depth format's depth plane, or the
+/// format itself when it is not a depth format.
+#[cfg(windows)]
+pub(crate) fn depth_srv_format(format: u32) -> u32 {
+    match format {
+        20 => 21, // D32_FLOAT_S8X24_UINT -> R32_FLOAT_X8X24_TYPELESS
+        40 => 41, // D32_FLOAT -> R32_FLOAT
+        45 => 46, // D24_UNORM_S8_UINT -> R24_UNORM_X8_TYPELESS
+        55 => 56, // D16_UNORM -> R16_UNORM
+        other => other,
+    }
+}
+
+/// The linear twin of an sRGB format, or the format itself when it is not
+/// sRGB (for unordered access views, which D3D12 disallows in sRGB).
+#[cfg(windows)]
+pub(crate) fn linear_format(format: u32) -> u32 {
+    SRGB.iter()
+        .find(|&&(s, _)| s == format)
+        .map_or(format, |&(_, linear)| linear)
+}
 
 /// Mip levels, the full chain for 0.
 fn mip_count(desc: &ResourceDesc) -> u32 {
@@ -1173,8 +1195,12 @@ pub(crate) fn texture_at(address: u64, desc: &[u32; 14]) -> Option<This> {
     if made != S_OK {
         return None;
     }
+    if resource(out).host.is_none() {
+        resource_release(out);
+        return None;
+    }
     map.insert((address, *desc), out as usize);
-    resource(out).host.is_some().then_some(out)
+    Some(out)
 }
 
 pub(crate) extern "system" fn create_placed(
@@ -1348,6 +1374,43 @@ static RESOURCE_FUNCTIONS: Table<32> = {
     f[14] = heap_properties as *const (); // 0x70
     Table(f)
 };
+
+#[cfg(all(windows, test))]
+pub(crate) fn test_committed_texture(width: u64, height: u32, format: u32, flags: u32) -> This {
+    const PROPERTIES: HeapProperties = HeapProperties {
+        kind: 1,
+        cpu_pages: 0,
+        pool: 0,
+        creation_nodes: 0,
+        visible_nodes: 0,
+    };
+    let desc = ResourceDesc {
+        dimension: 3,
+        alignment: 0,
+        width,
+        height,
+        depth_or_array_size: 1,
+        mip_levels: 1,
+        format,
+        sample_count: 1,
+        sample_quality: 0,
+        layout: 0,
+        flags,
+    };
+    let mut out = std::ptr::null();
+    let hr = create_committed(
+        std::ptr::null(),
+        &PROPERTIES,
+        0,
+        &desc,
+        0,
+        std::ptr::null(),
+        &RESOURCE_IIDS[0],
+        &mut out,
+    );
+    assert_eq!(hr, S_OK);
+    out
+}
 
 #[cfg(test)]
 mod tests {
@@ -1840,5 +1903,37 @@ mod tests {
         // The resource keeps the heap alive.
         assert_eq!(slot::<Release>(heap, 0x10)(heap), 1);
         assert_eq!(slot::<Release>(placed, 0x10)(placed), 0);
+    }
+
+    /// Failed `texture_at()` calls release the temporary resource and never
+    /// insert it into `PLACED_TEXTURES`.
+    #[cfg(windows)]
+    #[test]
+    fn failed_texture_at_is_not_cached_or_leaked() {
+        let backing = vec![0u8; 4096];
+        let desc = ResourceDesc {
+            dimension: 3,
+            alignment: 0,
+            width: 4,
+            height: 4,
+            depth_or_array_size: 1,
+            mip_levels: 1,
+            format: 999, // invalid on the host
+            sample_count: 1,
+            sample_quality: 0,
+            layout: 0,
+            flags: 0,
+        };
+        // SAFETY: 56-byte repr(C) struct read as 14 u32 words.
+        let words: [u32; 14] = unsafe { (&raw const desc).cast::<[u32; 14]>().read_unaligned() };
+        let address = backing.as_ptr() as u64;
+        assert!(texture_at(address, &words).is_none());
+        assert!(
+            !PLACED_TEXTURES
+                .lock()
+                .unwrap()
+                .contains_key(&(address, words))
+        );
+        assert!(texture_at(address, &words).is_none());
     }
 }

@@ -190,6 +190,39 @@ pub(crate) fn bound(this: This) {
     }
 }
 
+#[cfg(test)]
+pub(crate) fn is_bound(this: This) -> bool {
+    !this.is_null()
+        && pipeline(this)
+            .bound
+            .load(std::sync::atomic::Ordering::Relaxed)
+}
+
+#[cfg(test)]
+pub(crate) fn test_graphics(vs: &[u8]) -> This {
+    let empty = || Bytecode {
+        code: std::ptr::null(),
+        size: 0,
+    };
+    let desc = GraphicsHead {
+        root: std::ptr::null(),
+        stages: [
+            Bytecode {
+                code: vs.as_ptr(),
+                size: vs.len(),
+            },
+            empty(),
+            empty(),
+            empty(),
+            empty(),
+        ],
+    };
+    let mut out = std::ptr::null();
+    let hr = create_graphics(std::ptr::null(), &desc, &PIPELINE_IIDS[0], &mut out);
+    assert_eq!(hr, crate::object::S_OK);
+    out
+}
+
 /// The host pipeline of a title pipeline; `None` if one of its shaders does
 /// not translate, the host refuses it, or it is still being made (its first
 /// use starts that, see [`make`]).

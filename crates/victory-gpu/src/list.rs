@@ -162,11 +162,11 @@ pub(crate) extern "system" fn create_list(
     _nodes: u32,
     kind: u32,
     allocator: This,
-    _pipeline: This,
+    pipeline: This,
     iid: *const Iid,
     out: *mut This,
 ) -> HRESULT {
-    new_list(kind, allocator, iid, out)
+    new_list(kind, allocator, pipeline, iid, out)
 }
 
 /// The console's list creation: type, flags, node mask and barrier batch
@@ -184,7 +184,7 @@ pub(crate) extern "system" fn create_list_x(
     _: This,
     desc: *const ListDesc,
     allocator: This,
-    _pipeline: This,
+    pipeline: This,
     iid: *const Iid,
     out: *mut This,
 ) -> HRESULT {
@@ -193,14 +193,25 @@ pub(crate) extern "system" fn create_list_x(
         return E_INVALIDARG;
     };
     tracing::debug!(?desc, "console command list");
-    new_list(desc.kind, allocator, iid, out)
+    new_list(desc.kind, allocator, pipeline, iid, out)
 }
 
-fn new_list(kind: u32, allocator: This, iid: *const Iid, out: *mut This) -> HRESULT {
+fn new_list(
+    kind: u32,
+    allocator: This,
+    pipeline: This,
+    iid: *const Iid,
+    out: *mut This,
+) -> HRESULT {
     if allocator.is_null() {
         return E_INVALIDARG;
     }
     tracing::debug!(kind, "command list");
+    if !pipeline.is_null() {
+        crate::pipeline::bound(pipeline);
+    }
+    #[cfg(not(windows))]
+    let _ = pipeline;
     let list = Box::new(List {
         object: if crate::device::newer() {
             Object::new(&NEWER_LIST_FUNCTIONS)
@@ -224,7 +235,11 @@ fn new_list(kind: u32, allocator: This, iid: *const Iid, out: *mut This) -> HRES
             }
         }),
         #[cfg(windows)]
-        state: Default::default(),
+        state: {
+            let mut state = crate::draw::State::default();
+            state.reset(pipeline);
+            std::sync::Mutex::new(state)
+        },
     });
     object::hand_out(LIST, list, iid, &LIST_IIDS, out)
 }
@@ -1444,6 +1459,65 @@ mod tests {
         assert!(unsafe { &(*list.cast::<List>()).uploads }.lock().unwrap().is_empty());
         let release = |o: This| slot::<extern "system" fn(This) -> u32>(o, 0x10)(o);
         assert_eq!(release(list), 0);
+        assert_eq!(release(allocator), 0);
+    }
+
+    #[test]
+    fn create_list_binds_initial_pipeline() {
+        let null = std::ptr::null();
+        let mut allocator = null;
+        assert_eq!(
+            create_allocator(null, 0, &ALLOCATOR_IIDS[0], &mut allocator),
+            S_OK
+        );
+        let pso1 = crate::pipeline::test_graphics(&[1u8, 2, 3]);
+        let pso2 = crate::pipeline::test_graphics(&[4u8, 5, 6]);
+        assert!(!crate::pipeline::is_bound(pso1));
+        assert!(!crate::pipeline::is_bound(pso2));
+
+        let mut list = null;
+        assert_eq!(
+            create_list(null, 0, 0, allocator, pso1, &LIST_IIDS[1], &mut list),
+            S_OK
+        );
+        assert!(crate::pipeline::is_bound(pso1));
+        #[cfg(windows)]
+        {
+            // SAFETY: `list` is a live `List` we just created.
+            let p = unsafe { &(*list.cast::<List>()).state }
+                .lock()
+                .unwrap()
+                .pipeline();
+            assert_eq!(p, pso1 as usize);
+        }
+
+        let desc = ListDesc {
+            kind: 0,
+            flags: 0,
+            nodes: 0,
+            barrier_batch: 0,
+        };
+        let mut list_x = null;
+        assert_eq!(
+            create_list_x(null, &desc, allocator, pso2, &LIST_IIDS[1], &mut list_x),
+            S_OK
+        );
+        assert!(crate::pipeline::is_bound(pso2));
+        #[cfg(windows)]
+        {
+            // SAFETY: `list_x` is a live `List` we just created.
+            let p = unsafe { &(*list_x.cast::<List>()).state }
+                .lock()
+                .unwrap()
+                .pipeline();
+            assert_eq!(p, pso2 as usize);
+        }
+
+        let release = |o: This| slot::<extern "system" fn(This) -> u32>(o, 0x10)(o);
+        assert_eq!(release(list), 0);
+        assert_eq!(release(list_x), 0);
+        assert_eq!(release(pso1), 0);
+        assert_eq!(release(pso2), 0);
         assert_eq!(release(allocator), 0);
     }
 }
