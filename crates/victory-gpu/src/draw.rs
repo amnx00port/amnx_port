@@ -10,6 +10,7 @@
 
 use std::sync::atomic::{AtomicU64, Ordering};
 
+use victory_shader::emit::UserData;
 use victory_shader::{ResourceType, RootType, UsedResource};
 
 use crate::descriptor::View;
@@ -20,6 +21,7 @@ use windows::Win32::Graphics::Dxgi::Common::DXGI_FORMAT;
 use windows::core::Interface;
 
 use crate::host::HostList;
+use crate::indirect::{self, DISPATCH, DRAW, INDEXED, MESH};
 use crate::object::This;
 use crate::pipeline::host::HostPipeline;
 
@@ -245,7 +247,12 @@ impl State {
     }
 
     pub(crate) fn clear_vertex_buffers(&mut self, start: u32, count: u32) {
-        for slot in self.vertex.iter_mut().skip(start as usize).take(count as usize) {
+        for slot in self
+            .vertex
+            .iter_mut()
+            .skip(start as usize)
+            .take(count as usize)
+        {
             *slot = VertexView::default();
         }
     }
@@ -349,7 +356,10 @@ impl State {
             return false;
         };
         if p.compute || p.mesh != mesh {
-            once!(mesh, "a draw or mesh dispatch with another kind of pipeline");
+            once!(
+                mesh,
+                "a draw or mesh dispatch with another kind of pipeline"
+            );
             return false;
         }
         if !self.bind(list, p, false) {
@@ -958,16 +968,13 @@ impl State {
 }
 
 impl State {
-    /// Indirect execution of a one-argument signature of `kind` (PC
-    /// numbering: 0 draw, 1 indexed draw, 2 dispatch, 10 mesh dispatch) with
-    /// records `stride` bytes apart at title address `arguments`, and the
-    /// record count at `count` if the title gives one: the GPU reads them
-    /// from the buffer's host copy, where earlier dispatches may have
-    /// written them. False if it cannot run on the host.
+    /// Runs packed records `stride` bytes apart at `arguments`, with an
+    /// optional record count at `count`. The GPU reads the host copies,
+    /// where earlier dispatches may have written the records.
     pub(crate) fn execute_indirect(
         &mut self,
         list: &HostList,
-        (kind, stride, max): (u32, u32, u32),
+        (guest_args, stride, max): (&[[u32; 4]], u32, u32),
         arguments: u64,
         count: Option<u64>,
     ) -> bool {
@@ -977,10 +984,30 @@ impl State {
             crate::pipeline::note_drop(self.pipeline as This);
             return false;
         }
-        const DRAW: u32 = 0;
-        const INDEXED: u32 = 1;
-        const DISPATCH: u32 = 2;
-        const MESH: u32 = 10;
+        let pipeline = if guest_args.len() > 1 {
+            crate::pipeline::host_pipeline(self.pipeline as This)
+        } else {
+            None
+        };
+        let stages = pipeline
+            .into_iter()
+            .flat_map(|p| &p.stages)
+            .filter_map(|stage| {
+                Some((
+                    stage.user_data?,
+                    stage.translated().host.user_data.as_slice(),
+                ))
+            });
+        let Some(layout) = map_indirect_args(guest_args, stride, stages) else {
+            #[cfg(feature = "diagnostics")]
+            crate::pipeline::note_why(format!("unsupported indirect signature {guest_args:?}"));
+            return false;
+        };
+        let IndirectLayout {
+            kind,
+            offset,
+            constants,
+        } = layout;
         #[cfg(feature = "diagnostics")]
         let why = |what: &str| crate::pipeline::note_why(format!("indirect kind {kind}: {what}"));
         #[cfg(not(feature = "diagnostics"))]
@@ -1000,10 +1027,11 @@ impl State {
             },
             None => None,
         };
-        let Some(signature) = matches!(kind, DRAW | INDEXED | DISPATCH | MESH)
-            .then(|| host_signature(kind, stride))
-            .flatten()
-        else {
+        let signature = match pipeline {
+            Some(p) => host_signature_with_constants(&p.root, kind, stride, &constants),
+            None => host_signature(kind, stride),
+        };
+        let Some(signature) = signature else {
             why("no host signature");
             return false;
         };
@@ -1012,8 +1040,13 @@ impl State {
             s.refresh(list, *at, 4);
         }
         // Bounded first: the clamp binds a compute pipeline of its own.
-        if !crate::indirect::bound(list, &args.buffer, args.gpu(arguments), (kind, stride, max)) {
-            why("not bounded (no clamp, or arguments not 4-byte aligned)");
+        if !indirect::bound(
+            list,
+            &args.buffer,
+            args.gpu(arguments),
+            (kind, stride, max, offset),
+        ) {
+            why("not bounded (no clamp, or invalid argument layout)");
             return false;
         }
         self.host_pipeline = 0;
@@ -1028,20 +1061,30 @@ impl State {
             _ => false,
         };
         if !ran {
-            crate::indirect::done(list, &args.buffer);
+            indirect::done(list, &args.buffer);
             #[cfg(feature = "diagnostics")]
             match crate::pipeline::host_pipeline(self.pipeline as This) {
                 None => crate::pipeline::note_drop(self.pipeline as This),
-                Some(p) => why(&format!("prepare failed (compute {}, mesh {})", p.compute, p.mesh)),
+                Some(p) => why(&format!(
+                    "prepare failed (compute {}, mesh {})",
+                    p.compute, p.mesh
+                )),
             }
             return false;
         }
         #[cfg(feature = "diagnostics")]
         list.note_op(|| {
-            self.op_text(format!("indirect kind {kind} max {max} at {arguments:#x}"), kind == DISPATCH)
+            self.op_text(
+                format!("indirect kind {kind} max {max} at {arguments:#x}"),
+                kind == DISPATCH,
+            )
         });
+        if !constants.is_empty() {
+            // The cache can evict this signature before the list runs.
+            list.keep(&signature);
+        }
         // SAFETY: an open list with everything set; the buffers are host
-        // copies the list keeps alive (refresh), the signature is cached.
+        // copies the list keeps alive (refresh), and the signature is live.
         unsafe {
             list.list.ExecuteIndirect(
                 &signature,
@@ -1052,7 +1095,18 @@ impl State {
                 counter.as_ref().map_or(0, |(s, at)| s.offset(*at)),
             )
         };
-        crate::indirect::done(list, &args.buffer);
+        indirect::done(list, &args.buffer);
+        // ExecuteIndirect zeroes the constants it sets. Mirror that in
+        // the title state so the next bind doesn't restore stale values.
+        for &[_, slot, dest, dwords] in &guest_args[..guest_args.len() - 1] {
+            if let Some(Root::Constants(values)) =
+                self.roots(kind == DISPATCH).get_mut(slot as usize)
+                && let Some(tail) = values.get_mut(dest as usize..)
+            {
+                let len = tail.len().min(dwords as usize);
+                tail[..len].fill(0);
+            }
+        }
         if kind == DISPATCH {
             DISPATCHED.fetch_add(1, Ordering::Relaxed);
         } else {
@@ -1060,6 +1114,86 @@ impl State {
         }
         true
     }
+}
+
+#[derive(Debug, PartialEq, Eq)]
+struct IndirectLayout {
+    kind: u32,
+    offset: u32,
+    /// Host root parameter, destination dword, and dword count per argument.
+    constants: Vec<[u32; 3]>,
+}
+
+fn map_indirect_args<'a>(
+    args: &[[u32; 4]],
+    stride: u32,
+    stages: impl Iterator<Item = ((u32, u32), &'a [UserData])> + Clone,
+) -> Option<IndirectLayout> {
+    const CONSTANT: u32 = 5;
+    const DISPATCH_SINGLE: u32 = 105;
+    let (&[action, ..], prefix) = args.split_last()?;
+    let kind = if action == DISPATCH_SINGLE {
+        DISPATCH
+    } else {
+        action
+    };
+    let offset = prefix
+        .iter()
+        .try_fold(0u32, |offset, &[ty, _, dest, dwords]| {
+            if ty != CONSTANT || dwords == 0 {
+                return None;
+            }
+            dest.checked_add(dwords - 1)?;
+            offset.checked_add(dwords.checked_mul(4)?)
+        })?;
+    if !indirect::fits_record(kind, stride, offset) {
+        return None;
+    }
+
+    let mut constants = Vec::<[u32; 3]>::new();
+    let mut previous = None;
+    for &[_, slot, dest, dwords] in prefix {
+        let first = constants.len();
+        for k in 0..dwords {
+            let guest_dword = dest + k;
+            let mut matches = stages.clone().flat_map(|((param, size), data)| {
+                data.iter()
+                    .filter(move |u| {
+                        u32::from(u.slot) == slot
+                            && u.root == RootType::Constants
+                            && u.dword == guest_dword
+                    })
+                    .map(move |u| (param, size, u.index))
+            });
+            let (param, size, index) = matches.next()?;
+            if index >= size || matches.next().is_some() {
+                return None;
+            }
+            // D3D12 requires sorted root parameters and non-overlapping,
+            // increasing offsets within each parameter. Reordering would
+            // change which values the packed record supplies.
+            let destination = (param, index);
+            if previous.is_some_and(|previous| destination <= previous) {
+                return None;
+            }
+            previous = Some(destination);
+            // Keep the record packed. A break in the destination range
+            // starts another descriptor at the next dword in the record.
+            if let Some([previous, start, count]) = constants[first..].last_mut()
+                && *previous == param
+                && start.checked_add(*count) == Some(index)
+            {
+                *count += 1;
+            } else {
+                constants.push([param, index, 1]);
+            }
+        }
+    }
+    Some(IndirectLayout {
+        kind,
+        offset,
+        constants,
+    })
 }
 
 /// The host command signature for one argument of `kind` with records
@@ -1072,32 +1206,100 @@ fn host_signature(kind: u32, stride: u32) -> Option<ID3D12CommandSignature> {
     if let Some((_, s)) = made.iter().find(|(k, _)| *k == (kind, stride)) {
         return Some(s.clone());
     }
-    let argument = D3D12_INDIRECT_ARGUMENT_DESC {
+    let signature = create_host_signature(None, kind, stride, &[])?;
+    made.push(((kind, stride), signature.clone()));
+    Some(signature)
+}
+
+struct RootCommandSignature {
+    root: ID3D12RootSignature,
+    kind: u32,
+    stride: u32,
+    constants: Vec<[u32; 3]>,
+    signature: ID3D12CommandSignature,
+}
+
+fn host_signature_with_constants(
+    root: &ID3D12RootSignature,
+    kind: u32,
+    stride: u32,
+    constants: &[[u32; 3]],
+) -> Option<ID3D12CommandSignature> {
+    const CAPACITY: usize = 64;
+    // Hold the root reference so its address cannot be reused while cached.
+    static MADE: std::sync::Mutex<std::collections::VecDeque<RootCommandSignature>> =
+        std::sync::Mutex::new(std::collections::VecDeque::new());
+    let mut made = MADE.lock().unwrap_or_else(|e| e.into_inner());
+    if let Some(entry) = made.iter().find(|entry| {
+        &entry.root == root
+            && entry.kind == kind
+            && entry.stride == stride
+            && entry.constants == constants
+    }) {
+        return Some(entry.signature.clone());
+    }
+    let signature = create_host_signature(Some(root), kind, stride, constants)?;
+    if made.len() == CAPACITY {
+        made.pop_front();
+    }
+    made.push_back(RootCommandSignature {
+        root: root.clone(),
+        kind,
+        stride,
+        constants: constants.to_vec(),
+        signature: signature.clone(),
+    });
+    Some(signature)
+}
+
+fn create_host_signature(
+    root: Option<&ID3D12RootSignature>,
+    kind: u32,
+    stride: u32,
+    constants: &[[u32; 3]],
+) -> Option<ID3D12CommandSignature> {
+    let action = D3D12_INDIRECT_ARGUMENT_DESC {
         Type: D3D12_INDIRECT_ARGUMENT_TYPE(kind as i32),
         ..Default::default()
     };
+    let mut arguments = Vec::new();
+    let args = if constants.is_empty() {
+        std::slice::from_ref(&action)
+    } else {
+        arguments.extend(constants.iter().map(|&[param, dest, count]| {
+            D3D12_INDIRECT_ARGUMENT_DESC {
+                Type: D3D12_INDIRECT_ARGUMENT_TYPE_CONSTANT,
+                Anonymous: D3D12_INDIRECT_ARGUMENT_DESC_0 {
+                    Constant: D3D12_INDIRECT_ARGUMENT_DESC_0_1 {
+                        RootParameterIndex: param,
+                        DestOffsetIn32BitValues: dest,
+                        Num32BitValuesToSet: count,
+                    },
+                },
+            }
+        }));
+        arguments.push(action);
+        arguments.as_slice()
+    };
     let desc = D3D12_COMMAND_SIGNATURE_DESC {
         ByteStride: stride,
-        NumArgumentDescs: 1,
-        pArgumentDescs: &argument,
+        NumArgumentDescs: args.len() as u32,
+        pArgumentDescs: args.as_ptr(),
         NodeMask: 0,
     };
     let mut signature: Option<ID3D12CommandSignature> = None;
-    // SAFETY: a description of one argument; no root arguments.
+    // SAFETY: the descriptors live through the call, with the matching
+    // root signature when there are root arguments.
     let result = unsafe {
-        crate::host::host()?.device.CreateCommandSignature(
-            &desc,
-            None::<&ID3D12RootSignature>,
-            &mut signature,
-        )
+        crate::host::host()?
+            .device
+            .CreateCommandSignature(&desc, root, &mut signature)
     };
     if let Err(e) = result {
         once!(error = %e, kind, stride, "host command signature refused");
         return None;
     }
-    let signature = signature?;
-    made.push(((kind, stride), signature.clone()));
-    Some(signature)
+    signature
 }
 
 /// Gets what a shader reads or writes through a view ready: buffer data
@@ -1155,7 +1357,10 @@ fn describe(view: Option<&View>) -> String {
         crate::resource::host_resource(r).map(|t| {
             // SAFETY: a live resource.
             let d = unsafe { t.GetDesc() };
-            format!("{}x{} f{} flags {:#x}", d.Width, d.Height, d.Format.0, d.Flags.0)
+            format!(
+                "{}x{} f{} flags {:#x}",
+                d.Width, d.Height, d.Format.0, d.Flags.0
+            )
         })
     };
     match view {
@@ -1214,4 +1419,174 @@ pub(crate) fn blend_factor(list: &HostList, factor: Option<&[f32; 4]>) {
 pub(crate) fn stencil_ref(list: &HostList, reference: u32) {
     // SAFETY: an open list.
     unsafe { list.list.OMSetStencilRef(reference) };
+}
+
+#[cfg(test)]
+mod indirect_tests {
+    use super::*;
+
+    fn user_data(slot: u8, dword: u32, index: u32) -> UserData {
+        UserData {
+            slot,
+            dword,
+            index,
+            root: RootType::Constants,
+        }
+    }
+
+    #[test]
+    fn maps_contiguous_constants_and_normalizes_dispatch_single() {
+        let data = [user_data(7, 3, 1), user_data(7, 4, 2), user_data(1, 0, 3)];
+        let stages = [((4, 4), data.as_slice())];
+        let args = [[5, 7, 3, 2], [5, 1, 0, 1], [105, 0, 0, 0]];
+
+        assert_eq!(
+            map_indirect_args(&args, 28, stages.into_iter()),
+            Some(IndirectLayout {
+                kind: DISPATCH,
+                offset: 12,
+                constants: vec![[4, 1, 2], [4, 3, 1]]
+            }),
+        );
+        assert_eq!(
+            map_indirect_args(&args[2..], 12, std::iter::empty()),
+            Some(IndirectLayout {
+                kind: DISPATCH,
+                offset: 0,
+                constants: vec![]
+            }),
+        );
+    }
+
+    #[test]
+    fn splits_noncontiguous_constants_in_record_order() {
+        let vs = [user_data(1, 2, 0), user_data(1, 3, 3)];
+        let ps = [user_data(1, 4, 1)];
+        let stages = [((0, 4), vs.as_slice()), ((2, 2), ps.as_slice())];
+        let args = [[5, 1, 2, 3], [DRAW, 0, 0, 0]];
+        let layout = map_indirect_args(&args, 28, stages.into_iter()).unwrap();
+
+        assert_eq!(layout.offset, 12);
+        assert_eq!(layout.constants, [[0, 0, 1], [0, 3, 1], [2, 1, 1]]);
+    }
+
+    #[test]
+    fn rejects_overlapping_or_out_of_order_destinations() {
+        let first = [user_data(1, 0, 3)];
+        let second = [user_data(1, 1, 0)];
+        let third = [user_data(1, 1, 3)];
+        let args = [[5, 1, 0, 2], [DISPATCH, 0, 0, 0]];
+        for stages in [
+            [((0, 4), first.as_slice()), ((0, 4), second.as_slice())],
+            [((2, 4), first.as_slice()), ((1, 4), second.as_slice())],
+            [((0, 4), first.as_slice()), ((0, 4), third.as_slice())],
+        ] {
+            assert!(map_indirect_args(&args, 20, stages.into_iter()).is_none());
+        }
+    }
+
+    #[test]
+    fn rejects_unmapped_and_aliased_constants() {
+        let args = [[5, 1, 0, 2], [INDEXED, 0, 0, 0]];
+        let vs = [user_data(1, 0, 0), user_data(1, 1, 1)];
+        let ps = [user_data(1, 1, 0)];
+        let table = [UserData {
+            root: RootType::Table,
+            ..vs[1]
+        }];
+        for stages in [
+            [((0, 2), &vs[..1]), ((2, 2), table.as_slice())],
+            [((0, 2), vs.as_slice()), ((2, 1), ps.as_slice())],
+            [((0, 1), vs.as_slice()), ((2, 0), &[])],
+        ] {
+            assert!(map_indirect_args(&args, 28, stages.into_iter()).is_none());
+        }
+    }
+
+    #[test]
+    fn rejects_unsupported_and_malformed_record_layouts() {
+        let data = [user_data(1, 0, 0)];
+        let stages = [((0, 1), data.as_slice())];
+        let action = [DRAW, 0, 0, 0];
+        let constant = [5, 1, 0, 1];
+        for prefix in [
+            [3, 0, 0, 0], // VBV
+            [4, 0, 0, 0], // IBV
+            [6, 1, 0, 0], // root CBV
+            [7, 1, 0, 0], // root SRV
+            [8, 1, 0, 0], // root UAV
+            [5, 1, 0, 0], // empty constant
+            [5, 1, u32::MAX, 2],
+            [5, 1, 0, u32::MAX],
+            action,
+        ] {
+            assert!(map_indirect_args(&[prefix, action], 20, stages.into_iter()).is_none());
+        }
+        assert!(map_indirect_args(&[], 20, stages.into_iter()).is_none());
+        assert!(map_indirect_args(&[constant], 20, stages.into_iter()).is_none());
+        for stride in [16, 19, 21] {
+            assert!(map_indirect_args(&[constant, action], stride, stages.into_iter()).is_none());
+        }
+        assert!(map_indirect_args(&[constant, action], 20, stages.into_iter()).is_some());
+    }
+
+    #[test]
+    fn indirect_command_signature_accepts_root_constants() {
+        let Some(host) = crate::host::host() else {
+            eprintln!("skipping D3D12 command signature test: no host device");
+            return;
+        };
+        #[cfg(feature = "diagnostics")]
+        if std::env::var_os("VICTORY_D3D12_DEBUG").is_some()
+            && host.device.cast::<ID3D12InfoQueue>().is_err()
+        {
+            eprintln!("D3D12 debug info queue unavailable; testing runtime acceptance");
+        }
+        let parameters = [0, 1].map(|register| D3D12_ROOT_PARAMETER {
+            ParameterType: D3D12_ROOT_PARAMETER_TYPE_32BIT_CONSTANTS,
+            Anonymous: D3D12_ROOT_PARAMETER_0 {
+                Constants: D3D12_ROOT_CONSTANTS {
+                    ShaderRegister: register,
+                    Num32BitValues: 4,
+                    ..Default::default()
+                },
+            },
+            ShaderVisibility: D3D12_SHADER_VISIBILITY_ALL,
+        });
+        let desc = D3D12_ROOT_SIGNATURE_DESC {
+            NumParameters: parameters.len() as u32,
+            pParameters: parameters.as_ptr(),
+            ..Default::default()
+        };
+        let mut blob = None;
+        // SAFETY: the descriptor and parameter are valid for serialization.
+        let root: ID3D12RootSignature = unsafe {
+            D3D12SerializeRootSignature(&desc, D3D_ROOT_SIGNATURE_VERSION_1, &mut blob, None)
+                .unwrap();
+            let blob = blob.unwrap();
+            let bytes = std::slice::from_raw_parts(
+                blob.GetBufferPointer().cast::<u8>(),
+                blob.GetBufferSize(),
+            );
+            host.device.CreateRootSignature(0, bytes).unwrap()
+        };
+        let first = [user_data(1, 0, 0), user_data(1, 1, 3)];
+        let second = [user_data(2, 0, 0)];
+        let stages = [((0, 4), first.as_slice()), ((1, 4), second.as_slice())];
+        let dispatch = [DISPATCH, 0, 0, 0];
+        let single = [[5, 1, 0, 1], dispatch];
+        let split = [[5, 1, 0, 2], [5, 2, 0, 1], dispatch];
+        for (args, stride) in [(single.as_slice(), 16), (split.as_slice(), 24)] {
+            let layout = map_indirect_args(args, stride, stages.into_iter()).unwrap();
+            let signature =
+                host_signature_with_constants(&root, layout.kind, stride, &layout.constants);
+            let error = host.log_messages();
+            assert!(
+                signature.is_some(),
+                "root constants {:?}: {error:?}",
+                layout.constants
+            );
+            assert_eq!(error, None);
+        }
+    }
 }
