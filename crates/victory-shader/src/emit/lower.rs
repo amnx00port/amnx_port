@@ -2039,6 +2039,16 @@ impl<'a> Lower<'a> {
         )
     }
 
+    /// Masks a console lane selector modulo the wavefront width (`31` or `63`).
+    fn mask_lane(&mut self, lane: V) -> V {
+        let mask = self.wave() - 1;
+        if let Some(k) = self.s.m.int_value(lane) {
+            return self.s.m.i32((k as u32) & mask);
+        }
+        let m = self.s.m.i32(mask);
+        self.s.m.bin(self.cur, Bin::And, lane, m)
+    }
+
     /// The float value of a register value.
     fn float_of(&mut self, v: Value) -> Result<V, Why> {
         if let Some(&f) = self.floats.get(&v) {
@@ -4204,37 +4214,21 @@ impl<'a> Lower<'a> {
             }
             "v_readlane_b32" => {
                 let (a, lane) = (s(self, 0)?, s(self, 1)?);
-                let mask = if self.x.native.wave64 { 63 } else { 31 };
-                let lane = match lane {
-                    V::Const(k) => self.s.m.i32(k & mask),
-                    _ => {
-                        let m = self.s.m.i32(mask);
-                        self.s.m.bin(c, Bin::And, lane, m)
-                    }
-                };
                 // A computed lane in a pixel or vertex program is a host lane
                 // (from a mask or `v_mbcnt`); a constant one is the console's.
-                if self.mask_data == MaskData::Host && !matches!(lane, V::Const(_)) {
+                let lane = if self.mask_data == MaskData::Host && !matches!(lane, V::Const(_)) {
                     self.s.flags |= flags::WAVE_OPS;
+                    lane
                 } else {
                     self.cross_lane(false)?;
-                }
+                    self.mask_lane(lane)
+                };
                 let r = self.read_lane(a, lane);
                 int(self, r)
             }
             "v_writelane_b32" => {
                 // The lane given takes the scalar; the others keep their value.
-                // RDNA2 ignores EXEC for v_writelane_b32 so compilers can spill
-                // SGPRs into inactive lanes.
                 let (a, lane) = (s(self, 0)?, s(self, 1)?);
-                let mask = if self.x.native.wave64 { 63 } else { 31 };
-                let lane = match lane {
-                    V::Const(k) => self.s.m.i32(k & mask),
-                    _ => {
-                        let m = self.s.m.i32(mask);
-                        self.s.m.bin(c, Bin::And, lane, m)
-                    }
-                };
                 let Some(Operand::Vector { reg, .. }) = v.dst else {
                     return Err("a lane write");
                 };
@@ -4243,11 +4237,11 @@ impl<'a> Lower<'a> {
                     None => self.s.m.i32(0),
                 };
                 self.cross_lane(false)?;
+                let lane = self.mask_lane(lane);
                 let me = self.lane_index();
                 let is = self.s.m.cmp(c, pred::EQ, me, lane);
                 let r = self.s.m.select(c, is, a, old);
-                self.write(inst, Reg::V(reg), r, None);
-                Ok(())
+                self.write_i(inst, r, None)
             }
             "v_readfirstlane_b32"
                 if inst
@@ -7346,30 +7340,6 @@ mod tests {
     }
 
     #[test]
-    fn v_readlane_and_writelane_mask_lane_and_ignore_exec() {
-        // v_writelane_b32 under narrowed EXEC ignores EXEC and writes target lane.
-        // v_readlane_b32 with lane > 31 masks to lane & 31.
-        let words = [
-            0xBE80_0380, // s_mov_b32 s0, 0
-            0xBEFE_0380, // s_mov_b32 exec_lo, 0
-            0xD761_0000,
-            0x0001_0000, // v_writelane_b32 v0, s0, 0 (VOP3 0x361)
-            0xD760_0000,
-            0x0001_5100, // v_readlane_b32 s0, v0, 40 (lane 40 inline const 168) (VOP3 0x360)
-            S_ENDPGM,
-        ];
-        let layout = || vec![];
-        let used = || vec![];
-        let l = lower_with(&words, layout(), used()).unwrap();
-        #[cfg(windows)]
-        if let Ok(mut v) = crate::emit::validator::Validator::load(
-            crate::emit::validator::Validator::default_path().as_deref(),
-        ) {
-            v.validate(&mut l.dxil.clone()).unwrap();
-        }
-    }
-
-    #[test]
     fn buffer_formats_by_number() {
         // The numbers the disassembler names 8_8_8_8_UNORM, 16_16_SNORM,
         // 2_10_10_10_UNORM, 16_FLOAT, 32_32_32_32_FLOAT.
@@ -7460,5 +7430,69 @@ mod tests {
         assert!(f10(0x3FF).is_nan());
         // A 16-bit float is a half already, sign included.
         assert_eq!(half(0xBC00 << half_shift(16)), -1.0);
+    }
+
+    #[test]
+    fn writelane_and_readlane_lower_and_validate_in_wave32_and_wave64() {
+        for wave64 in [false, true] {
+            let wave = if wave64 { 64 } else { 32 };
+            let words: &[u32] = &[
+                0x7E02_0200, // v_mov_b32 v1, v0
+                0x7DA4_0080, // v_cmpx_eq_u32 exec, 0, v0
+                0xD761_0001, // v_writelane_b32 v1, 42, 65 (constant > wave)
+                (128 + 42) | 0xFF << 9,
+                65,
+                0xD761_0001, // v_writelane_b32 v1, s0, s1 (dynamic selector)
+                1 << 9,
+                0xD760_0004, // v_readlane_b32 s4, v1, -1 (inline negative constant)
+                257 | 193 << 9,
+                0x4A02_0204, // v_add_nc_u32 v1, s4, v1
+                0xD834_0000, // ds_write_b32 v0, v1
+                0x0000_0100,
+                S_ENDPGM,
+            ];
+            let code: Vec<u8> = words.iter().flat_map(|w| w.to_le_bytes()).collect();
+            let native = NativeProgram {
+                stage: HwStage::Cs,
+                wave64,
+                vgprs: 8,
+                layout: vec![RootParam {
+                    root: RootType::Constants,
+                    table_offset_dwords: 0,
+                    sgprs: 2,
+                    base_register: 0,
+                    user_data: 0,
+                    slot: 0,
+                }],
+                used: vec![],
+                io: StageIo::Cs(ComputeIo {
+                    rsrc2: (2 << 1) | (1 << 15),
+                    threads: [wave, 1, 1],
+                }),
+                code,
+            };
+            let p = ir::build(&native.code, wave64, native.vgprs).expect("ir");
+            let st = structure::structure(&p).expect("structure");
+            let res = resource::track(&p, &native.layout, HwStage::Cs, Some(&st)).expect("res");
+            let io = io::raise(&p, &native).expect("io");
+            let mut out = lower(&Parts {
+                native: &native,
+                p: &p,
+                st: &st,
+                io: &io,
+                res: &res,
+                inputs: vec![],
+                outputs: vec![],
+                prims: vec![],
+                mesh_stride: 0,
+            })
+            .expect("lower");
+            #[cfg(windows)]
+            if let Ok(mut v) = crate::emit::validator::Validator::load(
+                crate::emit::validator::Validator::default_path().as_deref(),
+            ) {
+                v.validate(&mut out.dxil).expect("DXIL validation");
+            }
+        }
     }
 }
