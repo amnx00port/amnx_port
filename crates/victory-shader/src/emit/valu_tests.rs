@@ -715,6 +715,52 @@ fn v_cvt_u16_and_i16_f16_saturate() {
 }
 
 #[test]
+fn v_not_bfrev_and_bit_scan_ops_match_rdna2() {
+    // v_<op> v0, v1 (VOP1). The searches give -1 for no bit, and v_ffbh_i32
+    // looks for the first bit that differs from the sign bit.
+    type Op = fn(u32) -> u32;
+    let signed_first_bit = |x: u32| {
+        let x = if x >> 31 == 1 { !x } else { x };
+        if x == 0 { u32::MAX } else { x.leading_zeros() }
+    };
+    let ops: [(&str, u16, Op); 5] = [
+        ("v_not_b32", 0x37, |x| !x),
+        ("v_bfrev_b32", 0x38, u32::reverse_bits),
+        ("v_ffbh_u32", 0x39, |x| {
+            if x == 0 { u32::MAX } else { x.leading_zeros() }
+        }),
+        ("v_ffbl_b32", 0x3A, |x| {
+            if x == 0 { u32::MAX } else { x.trailing_zeros() }
+        }),
+        ("v_ffbh_i32", 0x3B, signed_first_bit),
+    ];
+    let values = [
+        0u32,
+        1,
+        2,
+        0x80,
+        0x0001_0000,
+        0x00F0_0000,
+        0x7FFF_FFFF,
+        0x8000_0000,
+        0xFFFF_FFFE,
+        0xFFFF_FFFF,
+    ];
+    let cases: Vec<[u32; 4]> = values.iter().map(|&v| [v, 0, 0, 0]).collect();
+    for (name, op, pick) in ops {
+        let shader = build_valu_cs(&[vop1(op, 0, vgpr(1))]);
+        run_cases(&shader, &cases, |backend, _, inp, got| {
+            let want = pick(inp[0]);
+            assert_eq!(
+                got, want,
+                "{backend}: {name}({:#010x}) = {got:#010x}, want {want:#010x}",
+                inp[0],
+            );
+        });
+    }
+}
+
+#[test]
 fn v_sin_and_v_cos_f16_reduce_large_turns() {
     let sin_shader = build_valu_cs(&[vop1(0x060, 0, vgpr(1))]);
     let cos_shader = build_valu_cs(&[vop1(0x061, 0, vgpr(1))]);
