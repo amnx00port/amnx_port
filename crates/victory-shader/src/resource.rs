@@ -299,7 +299,30 @@ struct Tracer<'a> {
     lanes: Option<&'a Structured>,
     /// Reverse-postorder index per block.
     rpo: Vec<usize>,
+    /// Memo of [`Tracer::uniform`] per value.
+    uniform_memo: std::cell::RefCell<Vec<Option<bool>>>,
 }
+
+/// VALU operations whose result is uniform when their operands are: the
+/// address arithmetic a compiler moves into VGPRs and then reads back with
+/// `v_readfirstlane_b32`.
+const UNIFORM_VALU: &[&str] = &[
+    "v_mov_b32",
+    "v_add_co_u32",
+    "v_add_nc_u32",
+    "v_add_co_ci_u32",
+    "v_sub_co_u32",
+    "v_sub_nc_u32",
+    "v_lshlrev_b32",
+    "v_lshlrev_b64",
+    "v_lshl_add_u32",
+    "v_add3_u32",
+    "v_ashrrev_i32",
+    "v_med3_i32",
+    "v_and_b32",
+    "v_or_b32",
+    "v_mul_lo_u32",
+];
 
 /// What lanes are known to satisfy: each [`Bool`] where its flag is set,
 /// its negation where not.
@@ -360,6 +383,7 @@ impl<'a> Tracer<'a> {
             origin: Vec::new(),
             lanes,
             rpo,
+            uniform_memo: std::cell::RefCell::new(vec![None; n]),
         };
         t.origin = t.propagate_copies(n)?;
         Ok(t)
@@ -504,6 +528,9 @@ impl<'a> Tracer<'a> {
                 dynamic: None,
             };
         }
+        if let Some(src) = self.uniform_first_lane(v) {
+            return self.sum(self.vorigin(src));
+        }
         let Some([a, b]) = self
             .sop2(v, &["s_add_u32", "s_add_i32"])
             .map(|(_, t)| t)
@@ -627,6 +654,7 @@ impl<'a> Tracer<'a> {
     /// The address `lo` and `hi` hold, plus `extra` (an instruction's
     /// immediate and offset register).
     fn address(&self, lo: Term, hi: Term, extra: Sum) -> Result<Address, &'static str> {
+        let (lo, hi) = (self.unlaned(lo), self.unlaned(hi));
         let s = self.sum(lo);
         if s.dynamic.is_some() && extra.dynamic.is_some() {
             return Err("an address with two computed terms");
@@ -686,7 +714,9 @@ impl<'a> Tracer<'a> {
     /// `hi` adds something (with carry) to `high`: `s_addc_u32` or
     /// `v_add_co_ci_u32` with `high` as an operand.
     fn carried(&self, hi: Term, high: Value) -> bool {
-        let Term::Value(v) = hi else { return false };
+        let Term::Value(v) = self.unlaned(hi) else {
+            return false;
+        };
         if v == high {
             return true;
         }
@@ -719,6 +749,9 @@ impl<'a> Tracer<'a> {
             return "an address relative to the program counter";
         }
         match self.def(v).map(|i| i.name()) {
+            Some("v_readfirstlane_b32") => {
+                "an address read from the first lane of a per-lane value"
+            }
             Some(n) if n.starts_with("s_load_") => "an address loaded from memory",
             None => "an address from a phi",
             _ => "an address not from a root parameter",
@@ -1019,6 +1052,60 @@ impl<'a> Tracer<'a> {
             return None;
         };
         inst.read(Reg::V(reg))
+    }
+
+    /// The VGPR a `v_readfirstlane_b32` writing `v` reads, when that value
+    /// is uniform: the first lane's is then every lane's.
+    fn uniform_first_lane(&self, v: Value) -> Option<Value> {
+        self.first_lane_source(v).filter(|&s| self.uniform(s))
+    }
+
+    /// `t`, with a first-lane read of a uniform value replaced by its source.
+    fn unlaned(&self, t: Term) -> Term {
+        match t {
+            Term::Value(v) => self
+                .uniform_first_lane(v)
+                .map_or(t, |src| self.vorigin(src)),
+            Term::Const(_) => t,
+        }
+    }
+
+    /// Whether every lane holds the same value of `v`: built from scalars,
+    /// constants and first-lane reads, through [`UNIFORM_VALU`].
+    fn uniform(&self, v: Value) -> bool {
+        let memo = self.uniform_memo.borrow()[v.0 as usize];
+        if let Some(known) = memo {
+            return known;
+        }
+        let known = self.uniform_now(v);
+        self.uniform_memo.borrow_mut()[v.0 as usize] = Some(known);
+        known
+    }
+
+    fn uniform_now(&self, v: Value) -> bool {
+        if let Some(reg) = self.inputs[v.0 as usize] {
+            return matches!(reg, Reg::S(_));
+        }
+        let Some(inst) = self.def(v) else {
+            return false;
+        };
+        if inst.name() == "v_readfirstlane_b32" {
+            return true;
+        }
+        let uniform_op = |op: &Operand| match *op {
+            Operand::Vector { reg, dwords } => {
+                (0..dwords).all(|k| inst.read(Reg::V(reg + k)).is_some_and(|x| self.uniform(x)))
+            }
+            Operand::Scalar { code, dwords } if code != NULL => {
+                (0..dwords).all(|k| inst.read(Reg::S(code + k)).is_some_and(|x| self.uniform(x)))
+            }
+            _ => true,
+        };
+        match &inst.fields {
+            Fields::Sop { src, .. } => src.iter().all(uniform_op),
+            Fields::Valu(f) if UNIFORM_VALU.contains(&inst.name()) => f.src.iter().all(uniform_op),
+            _ => false,
+        }
     }
 
     /// The `v_readfirstlane_b32` results the descriptor operand `op` of
@@ -2013,6 +2100,73 @@ pub(crate) mod tests {
             ShaderError::Unsupported {
                 offset: 0,
                 what: "an address in an SGPR that is no root parameter"
+            }
+        );
+    }
+
+    /// A scalar load of a table in the code, at an address a VGPR sum builds
+    /// from `s_getpc_b64` and a uniform index, read back to SGPRs with
+    /// `v_readfirstlane_b32` (the console compiler's form). Assembled with
+    /// llvm-mc for gfx1030, wave32.
+    const CODE_TABLE_FIRST_LANE: &[u32] = &[
+        0xBE80_1F00, // s_getpc_b64 s[0:1]
+        0x8000_FF00,
+        0x0000_0DDC, // s_add_u32 s0, s0, 0xddc
+        0x8201_8001, // s_addc_u32 s1, s1, 0
+        0x7E00_0283, // v_mov_b32 v0, 3
+        0x3402_0082, // v_lshlrev_b32 v1, 2, v0
+        0xD70F_6A01,
+        0x0000_0101, // v_add_co_u32 v1, vcc_lo, v1, s0
+        0xD528_6A02,
+        0x01A9_0001, // v_add_co_ci_u32 v2, vcc_lo, s1, 0, vcc_lo
+        0x7E04_0501, // v_readfirstlane_b32 s2, v1
+        0x7E06_0502, // v_readfirstlane_b32 s3, v2
+        0xF400_0181,
+        0xFA00_0000, // s_load_dword s6, s[2:3], null
+        S_ENDPGM,
+    ];
+
+    #[test]
+    fn a_first_lane_read_of_a_uniform_code_table_address_is_traced() {
+        let r = track_words(CODE_TABLE_FIRST_LANE, &[], HwStage::Cs);
+        let (_, a) = r
+            .scalar
+            .iter()
+            .find(|s| s.1.param == CODE)
+            .expect("the code table load is traced");
+        // s_getpc_b64 is the first instruction: its next one is at 4.
+        assert_eq!(a.offset, 4 + 0xDDC);
+        assert!(a.dynamic.is_some(), "the index stays a computed term");
+    }
+
+    #[test]
+    fn a_first_lane_read_of_a_per_lane_code_table_address_is_refused_by_name() {
+        // Same, but the index is lane 0's own input (v0 is never set).
+        let words = [
+            0xBE80_1F00, // s_getpc_b64 s[0:1]
+            0x8000_FF00,
+            0x0000_0DDC, // s_add_u32 s0, s0, 0xddc
+            0x8201_8001, // s_addc_u32 s1, s1, 0
+            0x3402_0082, // v_lshlrev_b32 v1, 2, v0
+            0xD70F_6A01,
+            0x0000_0101, // v_add_co_u32 v1, vcc_lo, v1, s0
+            0xD528_6A02,
+            0x01A9_0001, // v_add_co_ci_u32 v2, vcc_lo, s1, 0, vcc_lo
+            0x7E04_0501, // v_readfirstlane_b32 s2, v1
+            0x7E06_0502, // v_readfirstlane_b32 s3, v2
+            0xF400_0181,
+            0xFA00_0000, // s_load_dword s6, s[2:3], null
+            S_ENDPGM,
+        ];
+        let code: Vec<u8> = words.iter().flat_map(|w| w.to_le_bytes()).collect();
+        let p = crate::ir::build(&code, false, 256).unwrap();
+        let err = track(&p, &[], HwStage::Cs, lanes(&p).as_ref()).unwrap_err();
+        assert_eq!(
+            err,
+            ShaderError::Unsupported {
+                // the s_load_dword, at byte 44
+                offset: 44,
+                what: "an address read from the first lane of a per-lane value"
             }
         );
     }
