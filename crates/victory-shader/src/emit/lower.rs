@@ -173,6 +173,11 @@ struct Lower<'a> {
     scalar: HashMap<Site, Address>,
     exports: HashMap<Site, &'a Export>,
     interps: HashMap<Site, &'a Interp>,
+    /// Pixel input rows read with two interpolation modes (bit per row),
+    /// once known: declared flat, their interpolations made by hand.
+    manual_rows: Option<u64>,
+    /// `SV_Barycentrics` elements: interpolation mode, input id.
+    barycentrics: Vec<(u8, usize)>,
     handles: HashMap<(usize, Site, u8, bool, u32), V>,
     /// Blocks splitting the edge from one IR block to another.
     edges: HashMap<(usize, usize), usize>,
@@ -478,6 +483,8 @@ impl<'a> Lower<'a> {
             scalar: x.res.scalar.iter().copied().collect(),
             exports: x.io.exports.iter().map(|e| (e.site, e)).collect(),
             interps: x.io.interps.iter().map(|(s, i)| (*s, i)).collect(),
+            manual_rows: None,
+            barycentrics: Vec::new(),
             handles: HashMap::new(),
             edges: HashMap::new(),
             exported: vec![false; p.blocks.len()],
@@ -5450,6 +5457,141 @@ impl<'a> Lower<'a> {
         }
     }
 
+    /// The pixel input rows whose elements need more than one
+    /// interpolation mode: a D3D12 row has one (an element's, or every
+    /// element packed into it). Their elements are declared flat
+    /// (nointerpolation); an interpolation of one is the vertex values
+    /// weighted by `SV_Barycentrics`, as the console's v_interp computes it.
+    fn manual_rows(&mut self) -> u64 {
+        if let Some(rows) = self.manual_rows {
+            return rows;
+        }
+        let StageIo::Ps { inputs, .. } = &self.x.native.io else {
+            self.manual_rows = Some(0);
+            return 0;
+        };
+        // Per row, a bit per mode its reads need.
+        let mut modes: HashMap<u32, u16> = HashMap::new();
+        for interp in self.interps.values() {
+            let (attribute, mode) = match **interp {
+                Interp::Interpolated {
+                    attribute,
+                    barycentric,
+                    ..
+                } => match interp_mode(barycentric) {
+                    Some(mode) => (attribute, mode),
+                    None => continue,
+                },
+                Interp::Vertex { attribute, .. } => (attribute, 1),
+            };
+            let row2 = inputs
+                .iter()
+                .find(|i| i.row == attribute.row && i.fp16 && i.pack2)
+                .map(|i| i.row2);
+            for row in [Some(attribute.row), row2].into_iter().flatten() {
+                *modes.entry(u32::from(row)).or_default() |= 1 << mode;
+            }
+        }
+        // Integers and system values (the front face) are never interpolated.
+        for e in &self.s.inputs {
+            if let Some(row) = e.row
+                && e.kind != 3
+                && (e.kind != 0 || e.comp != 9)
+                && let Some(m) = modes.get_mut(&row)
+            {
+                *m |= 1 << 1;
+            }
+        }
+        let rows = modes
+            .iter()
+            .filter(|&(&r, m)| m.count_ones() > 1 && r < 64)
+            .fold(0u64, |rows, (&r, _)| rows | 1 << r);
+        for e in &mut self.s.inputs {
+            if e.row.is_some_and(|r| r < 64 && rows >> r & 1 != 0) {
+                e.interp = 1;
+            }
+        }
+        self.manual_rows = Some(rows);
+        rows
+    }
+
+    /// The `SV_Barycentrics` input interpolated as `mode`.
+    fn barycentrics(&mut self, mode: u8) -> Result<usize, Why> {
+        if let Some(&(_, id)) = self.barycentrics.iter().find(|b| b.0 == mode) {
+            return Ok(id);
+        }
+        // D3D12 allows two: one perspective, one not.
+        let perspective = |m: u8| matches!(m, 2 | 3 | 6);
+        if self
+            .barycentrics
+            .iter()
+            .any(|b| perspective(b.0) == perspective(mode))
+        {
+            return Err("two barycentric modes of one kind");
+        }
+        self.s.inputs.push(SigElement {
+            name: "SV_Barycentrics".into(),
+            index: self.barycentrics.len() as u32,
+            kind: 28,
+            comp: 9,
+            interp: mode,
+            row: None,
+            col: 0,
+            cols: 3,
+            usage: 0,
+            half: false,
+        });
+        self.s.flags |= flags::BARYCENTRICS;
+        let id = self.s.inputs.len() - 1;
+        self.barycentrics.push((mode, id));
+        Ok(id)
+    }
+
+    /// Input `id`'s channel `col` interpolated by hand: the three vertex
+    /// values weighted by the barycentrics of `mode`.
+    fn interpolate(&mut self, id: usize, col: u8, mode: u8) -> Result<V, Why> {
+        if self.s.inputs[id].comp != 9 {
+            return Err("an interpolated integer input");
+        }
+        let b = self.barycentrics(mode)?;
+        self.s.inputs[id].usage |= 1 << col;
+        let entry = self.s.entry;
+        let mut sum = None;
+        for k in 0..3u8 {
+            let Val::I32(w) = self.load_any_input(b, k) else {
+                return Err("an input");
+            };
+            let w = self.s.m.cast(entry, Cast::Bitcast, w, self.s.t.f32);
+            let args = [
+                self.s.m.i32(id as u32),
+                self.s.m.i32(0),
+                self.s.m.i8(col),
+                self.s.m.i8(k),
+            ];
+            let a = self.s.op(
+                entry,
+                "attributeAtVertex.f32",
+                Attr::ReadNone,
+                self.s.t.f32,
+                137,
+                &args,
+            );
+            sum = Some(match sum {
+                None => self.s.m.bin(entry, Bin::Mul, a, w),
+                Some(s) => self.s.op(
+                    entry,
+                    "tertiary.f32",
+                    Attr::ReadNone,
+                    self.s.t.f32,
+                    46,
+                    &[a, w, s],
+                ),
+            });
+        }
+        let sum = sum.expect("three vertices");
+        Ok(self.s.m.cast(entry, Cast::Bitcast, sum, self.s.t.i32))
+    }
+
     fn interp(&mut self, inst: &Inst, site: Site) -> Result<(), Why> {
         let Some(&interp) = self.interps.get(&site) else {
             return Err("the first half of an interpolation");
@@ -5461,15 +5603,7 @@ impl<'a> Lower<'a> {
                 ..
             } => (
                 attribute,
-                match barycentric {
-                    Barycentric::PerspectiveCenter => 2,
-                    Barycentric::PerspectiveCentroid => 3,
-                    Barycentric::PerspectiveSample => 6,
-                    Barycentric::LinearCenter => 4,
-                    Barycentric::LinearCentroid => 5,
-                    Barycentric::LinearSample => 7,
-                    Barycentric::PerspectivePullModel => return Err("pull-model interpolation"),
-                },
+                interp_mode(*barycentric).ok_or("pull-model interpolation")?,
             ),
             // P0, the provoking vertex: a flat (nointerpolation) input.
             Interp::Vertex {
@@ -5486,11 +5620,22 @@ impl<'a> Lower<'a> {
         let Operand::Vector { reg, .. } = dst else {
             return Err("an interpolation");
         };
+        let manual = self.manual_rows();
         // A channel of an input element, interpolated as `mode` says.
         let channel = |l: &mut Self, row: u8, ch: u8| -> Result<V, Why> {
             let (id, col) = l
                 .find_input(row, ch)
                 .ok_or("an input the signature lacks")?;
+            if row < 64 && manual >> row & 1 != 0 {
+                // Declared flat: P0 as loaded, an interpolation by hand.
+                if mode != 1 {
+                    return l.interpolate(id, col, mode);
+                }
+                return match l.load_any_input(id, col) {
+                    Val::I32(x) => Ok(x),
+                    _ => Err("an input"),
+                };
+            }
             let e = &mut l.s.inputs[id];
             if e.interp != mode && e.usage != 0 {
                 return Err("one input interpolated two ways");
@@ -6945,6 +7090,20 @@ impl<'a> Lower<'a> {
     }
 }
 
+/// The DXIL interpolation mode of a barycentric kind (none for the pull
+/// model, which D3D12 lacks).
+fn interp_mode(b: Barycentric) -> Option<u8> {
+    Some(match b {
+        Barycentric::PerspectiveCenter => 2,
+        Barycentric::PerspectiveCentroid => 3,
+        Barycentric::PerspectiveSample => 6,
+        Barycentric::LinearCenter => 4,
+        Barycentric::LinearCentroid => 5,
+        Barycentric::LinearSample => 7,
+        Barycentric::PerspectivePullModel => return None,
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use super::{Lowered, Numeric, Parts, buffer_format, half_shift, lower};
@@ -7099,9 +7258,7 @@ mod tests {
             S_ENDPGM,
         ];
 
-        let code: Vec<u8> = words.iter()
-            .flat_map(|w| w.to_le_bytes())
-            .collect();
+        let code: Vec<u8> = words.iter().flat_map(|w| w.to_le_bytes()).collect();
 
         let native = NativeProgram {
             stage: HwStage::Cs,
@@ -7118,9 +7275,12 @@ mod tests {
 
         let p = ir::build(&native.code, false, 256).unwrap();
 
-        assert!(p.blocks.iter()
-            .flat_map(|b| &b.insts)
-            .any(|i| i.name() == "v_perm_b32"));
+        assert!(
+            p.blocks
+                .iter()
+                .flat_map(|b| &b.insts)
+                .any(|i| i.name() == "v_perm_b32")
+        );
 
         let st = structure::structure(&p).unwrap();
         let res = resource::track(&p, &native.layout, native.stage, Some(&st)).unwrap();
@@ -7137,13 +7297,12 @@ mod tests {
             outputs: vec![],
             prims: vec![],
             mesh_stride: 0,
-        }).unwrap();
+        })
+        .unwrap();
 
-        let container =
-            crate::Container::parse(&emitted.dxil).unwrap();
+        let container = crate::Container::parse(&emitted.dxil).unwrap();
 
-        let features =
-            container.part(crate::FourCC::SFI0).unwrap();
+        let features = container.part(crate::FourCC::SFI0).unwrap();
 
         u64::from_le_bytes(features.data.try_into().unwrap())
     }

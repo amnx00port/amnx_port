@@ -282,12 +282,6 @@ pub fn raise(p: &Program, native: &NativeProgram) -> Result<Io, ShaderError> {
             )),
         _ => Err(unsupported(inst.machine.offset, "an interpolation operand")),
     };
-    // A VGPR value's barycentric kind and index, if it is one as loaded.
-    let barycentric = |v: Option<Value>| match v.and_then(input_of) {
-        Some(Input::Barycentric { kind, index }) => Some((kind, index)),
-        _ => None,
-    };
-
     let mut io = Io {
         inputs: inputs.clone(),
         initialized_sgprs: match &native.io {
@@ -320,6 +314,41 @@ pub fn raise(p: &Program, native: &NativeProgram) -> Result<Io, ShaderError> {
                 .map(move |(i, phi)| (phi.value, (b, i)))
         })
         .collect();
+    // A VGPR value through plain `v_mov_b32` copies (a program may move i
+    // and j out of v0-v1 to free them): the value copied, or the constant.
+    let copied = |mut v: Option<Value>| -> Result<Option<Value>, Operand> {
+        while let Some(&(b, i)) = v.and_then(|v| defs.get(&v)) {
+            let inst = &p.blocks[b].insts[i];
+            match &inst.fields {
+                Fields::Valu(f)
+                    if inst.name() == "v_mov_b32"
+                        && f.abs == 0
+                        && f.neg == 0
+                        && f.sdwa.is_none()
+                        && f.dpp.is_none() =>
+                {
+                    v = match f.src.first() {
+                        Some(&Operand::Vector { reg, .. }) => inst.read(Reg::V(reg)),
+                        Some(&c @ Operand::Const(_)) => return Err(c),
+                        _ => None,
+                    };
+                }
+                _ => break,
+            }
+        }
+        Ok(v)
+    };
+    // A VGPR value's barycentric kind and index, if it is one as loaded or
+    // a copy of one; `Some(None)` for a zero weight.
+    let barycentric = |v: Option<Value>| match copied(v) {
+        Ok(v) => match v.and_then(input_of) {
+            Some(Input::Barycentric { kind, index }) => Some((Some(kind), index)),
+            _ => None,
+        },
+        // Inline constant 128: integer 0, the bits of 0.0.
+        Err(Operand::Const(128)) => Some((None, 0)),
+        Err(_) => None,
+    };
     let halves = Halves {
         p,
         defs: &defs,
@@ -441,16 +470,24 @@ fn ps_vgprs(addr: u32) -> Vec<(u8, Input)> {
 
 /// An interpolation before its attribute is known.
 struct Pair {
-    barycentric: Barycentric,
+    /// `None`: i and j are both zero.
+    barycentric: Option<Barycentric>,
     first: Vec<Site>,
 }
 
 impl Pair {
     fn with(self, attribute: Attribute) -> Interp {
-        Interp::Interpolated {
-            attribute,
-            barycentric: self.barycentric,
-            first: self.first,
+        match self.barycentric {
+            Some(barycentric) => Interp::Interpolated {
+                attribute,
+                barycentric,
+                first: self.first,
+            },
+            // P0 + 0 * P10 + 0 * P20: the provoking vertex's value.
+            None => Interp::Vertex {
+                attribute,
+                vertex: 2,
+            },
         }
     }
 }
@@ -465,13 +502,14 @@ struct Halves<'a> {
 impl Halves<'_> {
     /// The interpolation whose second half reads the first half's result
     /// `acc`, the barycentric `j`, and attribute `attr`: every first half
-    /// must read the same attribute channel and the same kind's i.
+    /// must read the same attribute channel and the same kind's i (or, with
+    /// a zero j, a zero i).
     fn pair(
         &self,
         attr: &Operand,
         acc: Option<Value>,
         j: Option<Value>,
-        barycentric: &impl Fn(Option<Value>) -> Option<(Barycentric, u8)>,
+        barycentric: &impl Fn(Option<Value>) -> Option<(Option<Barycentric>, u8)>,
     ) -> Result<Pair, &'static str> {
         let mut first = Vec::new();
         self.sites(
@@ -479,8 +517,10 @@ impl Halves<'_> {
             &mut Vec::new(),
             &mut first,
         )?;
-        let Some((kind, 1)) = barycentric(j) else {
-            return Err("an interpolation with computed barycentrics");
+        let kind = match barycentric(j) {
+            Some((Some(kind), 1)) => Some(kind),
+            Some((None, _)) => None,
+            _ => return Err("an interpolation with computed barycentrics"),
         };
         for &(b, i) in &first {
             let inst = &self.p.blocks[b].insts[i];
@@ -499,7 +539,11 @@ impl Halves<'_> {
             if a != *attr {
                 return Err("interpolation halves of different attributes");
             }
-            if barycentric(i) != Some((kind, 0)) {
+            let paired = match (kind, barycentric(i)) {
+                (Some(kind), i) => i == Some((Some(kind), 0)),
+                (None, i) => matches!(i, Some((None, _))),
+            };
+            if !paired {
                 return Err("an interpolation with computed barycentrics");
             }
         }
@@ -622,6 +666,80 @@ mod tests {
             (Target::Color(0), true, false)
         );
         assert_eq!(e.values[0], p.blocks[0].insts[1].write(Reg::V(2)));
+    }
+
+    #[test]
+    fn interpolation_from_copied_barycentrics() {
+        // i and j moved out of v0/v1 first, then interpolated from the copies.
+        let p = program(&[
+            0x7E08_0300, // v_mov_b32 v4, v0
+            0x7E0A_0301, // v_mov_b32 v5, v1
+            0xC808_0004, // v_interp_p1_f32 v2, v4, attr0.x
+            0xC809_0005, // v_interp_p2_f32 v2, v5, attr0.x
+            S_ENDPGM,
+        ]);
+        let io = raise(&p, &pixel(vec![TEXCOORD], 2)).unwrap();
+        let [
+            (
+                site,
+                Interp::Interpolated {
+                    barycentric, first, ..
+                },
+            ),
+        ] = &io.interps[..]
+        else {
+            panic!("{:?}", io.interps)
+        };
+        assert_eq!(*site, (0, 3));
+        assert_eq!(*barycentric, Barycentric::PerspectiveCenter);
+        assert_eq!(first, &[(0, 2)]);
+
+        // A constant is no barycentric, copied or not.
+        let k = program(&[
+            0x7E0A_02F2, // v_mov_b32 v5, 1.0
+            0xC808_0000, // v_interp_p1_f32 v2, v0, attr0.x
+            0xC809_0005, // v_interp_p2_f32 v2, v5, attr0.x
+            S_ENDPGM,
+        ]);
+        assert!(raise(&k, &pixel(vec![TEXCOORD], 2)).is_err());
+    }
+
+    #[test]
+    fn interpolation_at_zero_barycentrics_is_the_provoking_vertex() {
+        let attribute = Attribute {
+            usage: Usage::Generic,
+            row: 1,
+            channel: 0,
+            high: false,
+        };
+        // i = j = 0: P0 + 0 * P10 + 0 * P20.
+        let p = program(&[
+            0x7E08_0280, // v_mov_b32 v4, 0
+            0x7E0A_0280, // v_mov_b32 v5, 0
+            0xC808_0004, // v_interp_p1_f32 v2, v4, attr0.x
+            0xC809_0005, // v_interp_p2_f32 v2, v5, attr0.x
+            S_ENDPGM,
+        ]);
+        let io = raise(&p, &pixel(vec![TEXCOORD], 2)).unwrap();
+        assert_eq!(
+            io.interps,
+            [(
+                (0, 3),
+                Interp::Vertex {
+                    attribute,
+                    vertex: 2
+                }
+            )]
+        );
+
+        // Only one weight zero is a point on an edge, no vertex.
+        let edge = program(&[
+            0x7E0A_0280, // v_mov_b32 v5, 0
+            0xC808_0000, // v_interp_p1_f32 v2, v0, attr0.x
+            0xC809_0005, // v_interp_p2_f32 v2, v5, attr0.x
+            S_ENDPGM,
+        ]);
+        assert!(raise(&edge, &pixel(vec![TEXCOORD], 2)).is_err());
     }
 
     #[test]

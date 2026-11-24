@@ -246,6 +246,20 @@ pub fn emit(
             _ => 0,
         };
     }
+    // A D3D12 row has one mode: elements packed beside a constant one are
+    // constant too (one read interpolated is interpolated by hand).
+    if pixel {
+        let flat: Vec<u32> = inputs
+            .iter()
+            .filter(|e| e.interp == 1)
+            .filter_map(|e| e.row)
+            .collect();
+        for e in inputs.iter_mut().filter(|e| e.kind != 3) {
+            if e.row.is_some_and(|r| flat.contains(&r)) {
+                e.interp = 1;
+            }
+        }
+    }
     // With a conservative depth output (SV_DepthLessEqual, GreaterEqual) DXIL
     // wants the position centroid (or per sample), as DXC declares it then.
     if pixel && outputs.iter().any(|e| matches!(e.kind, 18 | 19)) {
@@ -359,6 +373,7 @@ fn signature(part: &[u8]) -> Result<Vec<container::SigElement>, ShaderError> {
             69 => 20,
             70 => 15,
             25 => 30, // cull primitive
+            23 => 28, // barycentrics
             _ => {
                 return Err(ShaderError::Unsupported {
                     offset: 0,
@@ -745,5 +760,84 @@ mod tests {
         let io = crate::io::raise(&p, &native).unwrap();
         // Translated or refused with a reason; it must not panic.
         let _ = super::emit(&c, &native, &p, &st, &io, &res);
+    }
+
+    /// One input row read both as P0 (flat) and interpolated: a D3D12 row
+    /// has one interpolation mode, so the row is declared flat and the
+    /// interpolation made from the three vertex values (`AttributeAtVertex`)
+    /// weighted by `SV_Barycentrics`.
+    #[test]
+    fn a_row_read_flat_and_interpolated_is_interpolated_by_hand() {
+        let words = [
+            0xC80E_0002u32, // v_interp_mov_f32 v3, p0, attr0.x
+            0xC808_0100,    // v_interp_p1_f32 v2, v0, attr0.y
+            0xC809_0101,    // v_interp_p2_f32 v2, v1, attr0.y
+            0xF800_180F,
+            0x0302_0302, // exp mrt0, v2, v3, v2, v3 done vm
+            0xBF81_0000,
+        ];
+        let native = super::NativeProgram {
+            stage: super::HwStage::Ps,
+            wave64: false,
+            vgprs: 4,
+            layout: vec![],
+            used: vec![],
+            io: crate::native::StageIo::Ps {
+                inputs: vec![crate::native::PsInput {
+                    usage: crate::native::Usage::Generic,
+                    row: 0,
+                    mask: 0b0011,
+                    attr: 0,
+                    flat: false,
+                    fp16: false,
+                    pack2: false,
+                    row2: 0,
+                }],
+                input_addr: 1 << 1,
+                db_shader_control: 0,
+                patches: vec![],
+            },
+            code: words.iter().flat_map(|w| w.to_le_bytes()).collect(),
+        };
+        let el = |name: &str, kind, cols, usage| SigElement {
+            name: name.into(),
+            index: 0,
+            kind,
+            comp: 9,
+            interp: 0,
+            row: Some(0),
+            col: 0,
+            cols,
+            usage,
+            half: false,
+        };
+        let isg1 = super::container::signature(&[el("TEXCOORD", 0, 2, 0)], true);
+        let osg1 = super::container::signature(&[el("SV_Target", 16, 4, 15)], false);
+        let bytes =
+            crate::dxbc::build(&[(super::FourCC::ISG1, &isg1), (super::FourCC::OSG1, &osg1)]);
+        let c = super::Container::parse(&bytes).unwrap();
+        let p = crate::ir::build(&native.patched_code(), native.wave64, native.vgprs).unwrap();
+        let st = crate::structure::structure(&p).unwrap();
+        let res = crate::resource::track(&p, &native.layout, native.stage, Some(&st)).unwrap();
+        let io = crate::io::raise(&p, &native).unwrap();
+        let out = super::emit(&c, &native, &p, &st, &io, &res).unwrap();
+        #[cfg(windows)]
+        if let Ok(mut v) = super::validator::Validator::load(
+            super::validator::Validator::default_path().as_deref(),
+        ) {
+            v.validate(&mut out.dxil.clone()).unwrap();
+        }
+        let host = super::Container::parse(&out.dxil).unwrap();
+        let isg1 = host.part(super::FourCC::ISG1).unwrap().data;
+        // Read back (as a stub vertex shader for this one does).
+        let back = super::signature(isg1).unwrap();
+        assert!(
+            back.iter()
+                .any(|e| e.kind == 28 && e.name == "SV_Barycentrics"),
+            "no SV_Barycentrics input: {back:?}"
+        );
+        // SFI0: the barycentrics feature.
+        let sfi0 = host.part(super::FourCC::SFI0).unwrap().data;
+        assert_ne!(u64::from_le_bytes(sfi0[..8].try_into().unwrap()) & 0x2_0000, 0);
     }
 }
