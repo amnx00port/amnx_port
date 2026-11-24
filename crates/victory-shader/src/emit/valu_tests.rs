@@ -715,6 +715,58 @@ fn v_cvt_u16_and_i16_f16_saturate() {
 }
 
 #[test]
+fn v_mul_and_v_mad_24_bit_forms_match_rdna2() {
+    // v_mul_{u32_u24,i32_i24} (VOP2 0x0b, 0x09; VOP3 0x10b, 0x109) and
+    // v_mad_{u32_u24,i32_i24} (VOP3 0x143, 0x142) v0, v1, v2, v3: only the low
+    // 24 bits of each factor count, zero- or sign-extended.
+    type Pick = fn(u32, u32, u32) -> u32;
+    let ops: [(&str, u16, Pick); 4] = [
+        ("v_mul_u32_u24", 0x10B, |a, b, _| {
+            (a & 0xFF_FFFF).wrapping_mul(b & 0xFF_FFFF)
+        }),
+        ("v_mul_i32_i24", 0x109, |a, b, _| {
+            ((((a << 8) as i32) >> 8) as u32).wrapping_mul((((b << 8) as i32) >> 8) as u32)
+        }),
+        ("v_mad_u32_u24", 0x143, |a, b, c| {
+            (a & 0xFF_FFFF).wrapping_mul(b & 0xFF_FFFF).wrapping_add(c)
+        }),
+        ("v_mad_i32_i24", 0x142, |a, b, c| {
+            ((((a << 8) as i32) >> 8) as u32)
+                .wrapping_mul((((b << 8) as i32) >> 8) as u32)
+                .wrapping_add(c)
+        }),
+    ];
+    let values = [
+        0u32,
+        1,
+        0x7F_FFFF,
+        0x80_0000,
+        0xFF_FFFF,
+        0x100_0001,
+        0xFFFF_FFFF,
+    ];
+    let mut cases = Vec::new();
+    for a in values {
+        for b in values {
+            for c in [0u32, 7] {
+                cases.push([a, b, c, 0]);
+            }
+        }
+    }
+    for (name, op, pick) in ops {
+        let shader = build_valu_cs(&vop3(op, 0, vgpr(1), vgpr(2), vgpr(3)));
+        run_cases(&shader, &cases, |backend, _, inp, got| {
+            let want = pick(inp[0], inp[1], inp[2]);
+            assert_eq!(
+                got, want,
+                "{backend}: {name}({:#010x}, {:#010x}, {:#010x}) = {got:#010x}, want {want:#010x}",
+                inp[0], inp[1], inp[2],
+            );
+        });
+    }
+}
+
+#[test]
 fn v_sin_and_v_cos_f16_reduce_large_turns() {
     let sin_shader = build_valu_cs(&[vop1(0x060, 0, vgpr(1))]);
     let cos_shader = build_valu_cs(&[vop1(0x061, 0, vgpr(1))]);
