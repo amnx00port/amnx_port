@@ -83,24 +83,27 @@ struct Cursor<'a> {
 }
 
 impl Cursor<'_> {
-    fn bit(&mut self) -> Option<u32> {
-        if self.pos.is_multiple_of(PACKET_BITS) {
-            // Leaving a packet: jump over the other streams' packets.
-            let previous = self.pos / PACKET_BITS;
-            if previous > 0 {
-                let skip = packet(self.data, previous - 1)?.skip as usize;
-                self.pos = (previous + skip) * PACKET_BITS;
+    fn bits(&mut self, mut n: u32) -> Option<u32> {
+        let mut value = 0;
+        while n != 0 {
+            if self.pos.is_multiple_of(PACKET_BITS) {
+                // Leaving a packet: jump over the other streams' packets.
+                let previous = self.pos / PACKET_BITS;
+                if previous > 0 {
+                    let skip = packet(self.data, previous - 1)?.skip as usize;
+                    self.pos = (previous + skip) * PACKET_BITS;
+                }
+                self.pos += HEADER_BITS;
             }
-            self.pos += HEADER_BITS;
+            let byte = u32::from(*self.data.get(self.pos / 8)?);
+            let available = 8 - (self.pos % 8) as u32;
+            let take = n.min(available);
+            let chunk = (byte >> (available - take)) & ((1 << take) - 1);
+            value = (value << take) | chunk;
+            self.pos += take as usize;
+            n -= take;
         }
-        let byte = *self.data.get(self.pos / 8)?;
-        let bit = (byte >> (7 - self.pos % 8)) & 1;
-        self.pos += 1;
-        Some(bit as u32)
-    }
-
-    fn bits(&mut self, n: u32) -> Option<u32> {
-        (0..n).try_fold(0, |v, _| Some(v << 1 | self.bit()?))
+        Some(value)
     }
 }
 
@@ -112,10 +115,14 @@ pub fn read_frame(data: &[u8], start: usize) -> Option<Frame> {
     if bits <= LENGTH_BITS as usize || bits == 0x7fff {
         return None;
     }
-    let mut out = vec![0u8; bits.div_ceil(8)];
     let mut cursor = Cursor { data, pos: start };
-    for i in 0..bits {
-        out[i / 8] |= (cursor.bit()? as u8) << (7 - i % 8);
+    let mut out = Vec::with_capacity(bits.div_ceil(8));
+    for _ in 0..bits / 8 {
+        out.push(cursor.bits(8)? as u8);
+    }
+    let tail = (bits % 8) as u32;
+    if tail != 0 {
+        out.push((cursor.bits(tail)? << (8 - tail)) as u8);
     }
     let end = cursor.pos;
     let next = next_frame(data, start, end);
@@ -1151,6 +1158,36 @@ mod tests {
         assert_eq!(c.bits, 60);
         // C was packet 1's only frame: the next would be in packet 2.
         assert_eq!(c.next, None);
+    }
+
+    #[test]
+    fn frame_bytes_cross_an_interleaved_packet_boundary() {
+        // A 29-bit frame: 15 length bits and 14 payload bits. Its tail
+        // byte must have three zero padding bits.
+        let bits = 29u32;
+        let payload = 0b10_1101_0010_0111;
+        let frame_word = (bits << 14) | payload;
+        let expected = (frame_word << 3).to_be_bytes();
+        let continuation = 2 * PACKET_BITS + HEADER_BITS;
+        let mut data = [0u8; 3 * PACKET_BYTES];
+        for first_bits in 1..=16 {
+            data.fill(0);
+            // The frame starts near the end of packet 0, and packet 1
+            // belongs to another stream.
+            let start = PACKET_BITS - first_bits;
+            put_bits(&mut data, 0, 32, (1 << 26) | (((start - HEADER_BITS) as u32) << 11) | 1);
+            data[PACKET_BYTES..2 * PACKET_BYTES].fill(0xff);
+
+            let remaining = bits - first_bits as u32;
+            put_bits(&mut data, start, first_bits as u32, frame_word >> remaining);
+            put_bits(&mut data, continuation, remaining, frame_word);
+
+            let frame = read_frame(&data, start).unwrap();
+            assert_eq!(frame.bits, bits as usize);
+            assert_eq!(frame.data, expected);
+            let end_byte = continuation / 8 + (remaining as usize).div_ceil(8);
+            assert!(read_frame(&data[..end_byte - 1], start).is_none());
+        }
     }
 
     /// Walks and decodes saved input buffers (`VICTORY_XMA_STREAMS=<dir>` of
