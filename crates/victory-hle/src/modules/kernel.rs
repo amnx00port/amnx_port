@@ -392,6 +392,9 @@ pub(crate) fn callers() -> String {
     host::callers()
 }
 
+#[cfg(all(windows, feature = "diagnostics"))]
+pub(crate) use host::module_callers;
+
 #[cfg(windows)]
 mod host {
     use std::ffi::c_void;
@@ -509,6 +512,17 @@ mod host {
 
     /// Our caller's callers, as `module+rva`.
     pub(super) fn callers() -> String {
+        format_callers(|address| Some(victory_loader::locate(address)))
+    }
+
+    /// Return named frames only, so a shared trace contains no raw addresses.
+    #[cfg(feature = "diagnostics")]
+    pub(crate) fn module_callers() -> String {
+        format_callers(victory_loader::module_of)
+    }
+
+    #[inline(always)]
+    fn format_callers(name: impl Fn(usize) -> Option<String>) -> String {
         let mut frames = [std::ptr::null_mut(); 12];
         // SAFETY: fills at most `frames.len()` return addresses.
         let n = unsafe {
@@ -521,7 +535,7 @@ mod host {
         };
         let names: Vec<_> = frames[..usize::from(n)]
             .iter()
-            .map(|&f| victory_loader::locate(f as usize))
+            .filter_map(|&f| name(f as usize))
             .collect();
         names.join(" < ")
     }
