@@ -117,6 +117,8 @@ type Factory = *const Object;
 extern "system" fn open_file(_: Factory, path: *const u16, iid: *const Guid, out: Out) -> HRESULT {
     const GENERIC_READ: u32 = 0x8000_0000;
     const FILE_SHARE_READ: u32 = 1;
+    const FILE_SHARE_WRITE: u32 = 2;
+    const FILE_SHARE_DELETE: u32 = 4;
     const OPEN_EXISTING: u32 = 3;
     if path.is_null() {
         return E_INVALIDARG;
@@ -125,19 +127,25 @@ extern "system" fn open_file(_: Factory, path: *const u16, iid: *const Guid, out
     let handle = super::files::CreateFileW(
         path,
         GENERIC_READ,
-        FILE_SHARE_READ,
+        FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
         std::ptr::null(),
         OPEN_EXISTING,
         0,
         std::ptr::null_mut(),
     );
+    // Capture the Win32 error before path formatting or logging can change
+    // the calling thread's last-error value.
+    let error = if handle as isize == -1 {
+        Some(std::io::Error::last_os_error())
+    } else {
+        None
+    };
     // SAFETY: the title passes a NUL-terminated path.
     let name = unsafe {
         let len = (0..).take_while(|&i| *path.add(i) != 0).count();
         String::from_utf16_lossy(std::slice::from_raw_parts(path, len))
     };
-    if handle as isize == -1 {
-        let error = std::io::Error::last_os_error();
+    if let Some(error) = error {
         tracing::warn!(path = name, %error, "dstorage: opening a file failed");
         return from_win32(&error);
     }
@@ -1127,6 +1135,58 @@ mod tests {
         std::fs::write(&path, bytes).unwrap();
         let file = open(&path);
         (dir, file)
+    }
+
+    #[test]
+    fn open_file_shares_with_existing_write_and_delete_handles() {
+        const GENERIC_WRITE: u32 = 0x4000_0000;
+        const DELETE: u32 = 0x0001_0000;
+        const FILE_SHARE_READ: u32 = 1;
+        const OPEN_EXISTING: u32 = 3;
+
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("shared.bin");
+        std::fs::write(&path, b"shared").unwrap();
+        let wide: Vec<u16> = path.as_os_str().encode_wide().chain([0]).collect();
+        let blocker = super::super::files::CreateFileW(
+            wide.as_ptr(),
+            GENERIC_WRITE | DELETE,
+            FILE_SHARE_READ,
+            std::ptr::null(),
+            OPEN_EXISTING,
+            0,
+            std::ptr::null_mut(),
+        );
+        assert_ne!(blocker as isize, -1, "could not open sharing-test handle");
+        // SAFETY: `blocker` is a valid file handle returned by CreateFileW.
+        let _blocker = unsafe { std::fs::File::from_raw_handle(blocker) };
+
+        let open: extern "system" fn(*mut c_void, *const u16, *const Guid, Out) -> HRESULT =
+            call(factory(), 0x20);
+        let mut file = std::ptr::null_mut();
+        assert_eq!(
+            open(factory(), wide.as_ptr(), std::ptr::null(), &mut file),
+            S_OK
+        );
+        let release: extern "system" fn(*mut c_void) -> u32 = call(file, 0x10);
+        release(file);
+    }
+
+    #[test]
+    fn open_missing_file_returns_the_win32_error_as_hresult() {
+        const ERROR_FILE_NOT_FOUND: HRESULT = 0x8007_0002_u32 as i32;
+
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("missing.bin");
+        let wide: Vec<u16> = path.as_os_str().encode_wide().chain([0]).collect();
+        let open: extern "system" fn(*mut c_void, *const u16, *const Guid, Out) -> HRESULT =
+            call(factory(), 0x20);
+        let mut file = std::ptr::null_mut();
+        assert_eq!(
+            open(factory(), wide.as_ptr(), std::ptr::null(), &mut file),
+            ERROR_FILE_NOT_FOUND
+        );
+        assert!(file.is_null());
     }
 
     fn pattern(n: usize) -> Vec<u8> {
