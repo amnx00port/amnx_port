@@ -34,8 +34,135 @@ struct Queue {
     object: Object,
     kind: u32,
     desc: QueueDesc,
+    schedule:std::sync::Arc<Schedule>,
 }
 const _: () = assert!(std::mem::offset_of!(Queue, kind) == 0x10);
+
+
+// Own references while operations are waiting in
+// the FIFO. Addresses are only used while pinned.
+struct Retained {
+    address:usize,
+}
+
+impl Retained {
+    fn new(this:This)->Self {
+        object::add_ref(this);
+        Self{address:this as usize}
+    }
+
+    fn this(&self)->This {
+        self.address as This
+    }
+}
+
+impl Drop for Retained {
+    fn drop(&mut self) {
+        object::release_retained(self.this());
+    }
+}
+
+enum Scheduled {
+    Wait(Retained,u64),
+    Work(Box<dyn FnOnce()+Send+'static>),
+}
+
+#[derive(Default)]
+struct ScheduleState {
+    running:bool,
+    pending:std::collections::VecDeque<Scheduled>,
+}
+
+#[derive(Default)]
+struct Schedule {
+    state:std::sync::Mutex<ScheduleState>,
+}
+
+impl Schedule {
+    fn push(self:&std::sync::Arc<Self>,op:Scheduled) {
+        let mut s=self.state.lock()
+            .unwrap_or_else(|e|e.into_inner());
+
+        s.pending.push_back(op);
+
+        if s.running {
+            return;
+        }
+
+        s.running=true;
+        drop(s);
+
+        // Preserve the original synchronous fast path
+        // until a future fence introduces a dependency.
+        self.drive(false);
+    }
+
+    fn drive(self:&std::sync::Arc<Self>,worker:bool) {
+        loop {
+            let op={
+                let mut s=self.state.lock()
+                    .unwrap_or_else(|e|e.into_inner());
+
+                match s.pending.pop_front() {
+                    Some(op)=>op,
+                    None=>{
+                        s.running=false;
+                        return;
+                    }
+                }
+            };
+
+            match op {
+                Scheduled::Work(job)=>job(),
+
+                Scheduled::Wait(fence,target)=>{
+                    let ticket=crate::fence::queue_ticket(
+                        fence.this(),target
+                    );
+
+                    let ready=||{
+                        ticket.load(Ordering::Acquire)
+                        ||crate::fence::completed(
+                            fence.this()
+                        )>=target
+                    };
+
+                    if ready() {
+                        continue;
+                    }
+
+                    if worker {
+                        while !ready() {
+                            std::thread::sleep(
+                                std::time::Duration::from_millis(1)
+                            );
+                        }
+                    } else {
+                        let schedule=self.clone();
+
+                        drop(std::thread::spawn(move||{
+                            while !ticket.load(Ordering::Acquire)
+                                && crate::fence::completed(
+                                    fence.this()
+                                )<target
+                            {
+                                std::thread::sleep(
+                                    std::time::Duration::from_millis(1)
+                                );
+                            }
+
+                            drop(fence);
+                            schedule.drive(true);
+                        }));
+
+                        return;
+                    }
+                }
+            }
+        }
+    }
+}
+
 
 fn queue<'a>(this: This) -> &'a Queue {
     // SAFETY: called from queue methods only.
@@ -61,6 +188,7 @@ pub(crate) extern "system" fn create(
         },
         kind: desc.kind,
         desc,
+        schedule:std::sync::Arc::new(Schedule::default()),
     });
     object::hand_out(QUEUE, queue, iid, &QUEUE_IIDS, out)
 }
@@ -111,7 +239,7 @@ extern "system" fn release(this: This) -> u32 {
 }
 
 /// Runs the lists' host lists and waits for them (decision 0007).
-extern "system" fn execute(_: This, count: u32, lists: *const This) {
+fn execute_now(_: This, count: u32, lists: *const This) {
     if lists.is_null() {
         return;
     }
@@ -131,6 +259,42 @@ extern "system" fn execute(_: This, count: u32, lists: *const This) {
         tracing::warn!(count, "command lists submitted; no host GPU runs them");
     }
 }
+
+
+extern "system" fn execute(
+    this:This,count:u32,lists:*const This
+) {
+    if count==0 || lists.is_null() {
+        return;
+    }
+
+    // SAFETY: the queue ABI requires count readable list pointers for this call;
+    // the null and zero-count cases were handled above.
+    let lists=unsafe{
+        std::slice::from_raw_parts(lists,count as usize)
+    };
+
+    let held:Vec<_>=lists.iter()
+        .copied()
+        .filter(|p|!p.is_null())
+        .map(crate::list::PendingList::new)
+        .collect();
+
+    queue(this).schedule.push(
+        Scheduled::Work(Box::new(move||{
+            let addresses:Vec<This>=held.iter()
+                .map(|list|list.this())
+                .collect();
+
+            execute_now(
+                std::ptr::null(),
+                addresses.len() as u32,
+                addresses.as_ptr()
+            );
+        }))
+    );
+}
+
 
 /// The start of a present plane: frame token, then the plane's resources.
 #[repr(C)]
@@ -157,15 +321,40 @@ extern "system" fn signal2_x(
 }
 /// Markers and events only matter to profilers.
 extern "system" fn marker(_: This) {}
-extern "system" fn signal(_: This, fence: This, value: u64) -> HRESULT {
+extern "system" fn signal(
+    this:This,fence:This,value:u64
+)->HRESULT {
     if fence.is_null() {
         return E_INVALIDARG;
     }
-    crate::fence::signal(fence, value)
+
+    let held=Retained::new(fence);
+
+    queue(this).schedule.push(
+        Scheduled::Work(Box::new(move||{
+            let _=crate::fence::signal(
+                held.this(),value
+            );
+        }))
+    );
+
+    S_OK
 }
 /// Nothing runs on the queue, so waiting for a fence never blocks it.
-extern "system" fn wait(_: This, fence: This, _value: u64) -> HRESULT {
-    if fence.is_null() { E_INVALIDARG } else { S_OK }
+extern "system" fn wait(
+    this:This,fence:This,value:u64
+)->HRESULT {
+    if fence.is_null() {
+        return E_INVALIDARG;
+    }
+
+    queue(this).schedule.push(
+        Scheduled::Wait(
+            Retained::new(fence),value
+        )
+    );
+
+    S_OK
 }
 /// Ticks per second of GPU timestamps (see [`Written::GpuTimestamp`]).
 extern "system" fn timestamp_frequency(_: This, out: *mut u64) -> HRESULT {
@@ -236,7 +425,7 @@ pub(crate) fn presented() -> u64 {
 ///
 /// shortcut: one plane, no scaling or placement, the source expected in
 /// the common state.
-extern "system" fn present(
+fn present_now(
     _: This,
     planes: u32,
     plane_parameters: *const Plane,
@@ -300,6 +489,60 @@ extern "system" fn present(
     let _ = (planes, plane_parameters);
     S_OK
 }
+
+extern "system" fn present(
+    this:This,planes:u32,
+    parameters:*const Plane,
+    _extra:*const u8
+)->HRESULT {
+    let resource=if planes>0 && !parameters.is_null() {
+        // SAFETY: the present ABI supplies at least one readable Plane here.
+        let plane=unsafe{&*parameters};
+
+        if plane.count>0 && !plane.resources.is_null() {
+            // SAFETY: the plane ABI supplies count readable resource pointers.
+            let resource=unsafe{*plane.resources};
+
+            if resource.is_null() {
+                None
+            } else {
+                Some(Retained::new(resource))
+            }
+        } else {
+            None
+        }
+    } else {
+        None
+    };
+
+    queue(this).schedule.push(
+        Scheduled::Work(Box::new(move||{
+            if let Some(resource)=resource {
+                let address=resource.this();
+
+                let plane=Plane {
+                    token:0,
+                    count:1,
+                    resources:&address,
+                };
+
+                let _=present_now(
+                    std::ptr::null(),1,&plane,
+                    std::ptr::null()
+                );
+            } else {
+                let _=present_now(
+                    std::ptr::null(),0,
+                    std::ptr::null(),
+                    std::ptr::null()
+                );
+            }
+        }))
+    );
+
+    S_OK
+}
+
 /// Diagnostics: logs a presented frame that is black after one that was
 /// not, with what was presented and how many draws ran since.
 #[cfg(all(windows, feature = "diagnostics"))]
@@ -338,6 +581,7 @@ fn blinks(frame: u64, resource: This, state: u32, shown: Option<bool>) {
 /// `start` on, 1 pool page `start` each, 2 unmapped, 3 left as they are)
 /// and how many.
 #[repr(C)]
+#[derive(Clone,Copy)]
 pub(crate) struct PageRange {
     kind: u32,
     start: u32,
@@ -361,7 +605,7 @@ const PAGE: u64 = 64 << 10;
 /// and maps them into its tiled heap this way (title+0xf2c470, ranges of
 /// one constant page or of unmapped pages). Done at once: every earlier
 /// submission has run.
-extern "system" fn copy_page_mappings(
+fn copy_page_mappings_now(
     _: This,
     count: u32,
     batches: *const PageBatch,
@@ -405,6 +649,65 @@ extern "system" fn copy_page_mappings(
         static ONCE: std::sync::Once = std::sync::Once::new();
         ONCE.call_once(|| tracing::warn!(pool = format_args!("{pool:#x}"), "a page mapping failed"));
     }
+    S_OK
+}
+
+
+extern "system" fn copy_page_mappings(
+    this:This,count:u32,
+    batches:*const PageBatch,
+    pool:u64,pool_pages:u32,flags:u32
+)->HRESULT {
+    if crate::resource::page_mapper().is_none()
+        || (count>0 && batches.is_null())
+    {
+        return E_INVALIDARG;
+    }
+
+    let mut owned=Vec::new();
+
+    if count>0 {
+        // SAFETY: the mapping ABI supplies count readable PageBatch values;
+        // batches is non-null when count is positive.
+        for batch in unsafe{
+            std::slice::from_raw_parts(
+                batches,count as usize
+            )
+        } {
+            if batch.ranges.is_null() {
+                continue;
+            }
+
+            // SAFETY: each batch supplies count readable ranges, copied before return.
+            let ranges=unsafe{
+                std::slice::from_raw_parts(
+                    batch.ranges,batch.count as usize
+                )
+            }.to_vec();
+
+            owned.push((batch.destination,ranges));
+        }
+    }
+
+    queue(this).schedule.push(
+        Scheduled::Work(Box::new(move||{
+            let views:Vec<PageBatch>=owned.iter()
+                .map(|(destination,ranges)|PageBatch{
+                    destination:*destination,
+                    count:ranges.len() as u32,
+                    ranges:ranges.as_ptr(),
+                })
+                .collect();
+
+            let _=copy_page_mappings_now(
+                std::ptr::null(),
+                views.len() as u32,
+                views.as_ptr(),
+                pool,pool_pages,flags
+            );
+        }))
+    );
+
     S_OK
 }
 
@@ -543,5 +846,216 @@ mod tests {
         std::thread::sleep(std::time::Duration::from_millis(2));
         Written::GpuTimestamp.write(at[1..].as_mut_ptr().cast(), 8);
         assert!(at[1] > first);
+    }
+}
+
+
+#[cfg(test)]
+mod systems_final_queue {
+    use super::*;
+    use std::time::{Duration,Instant};
+
+    fn make_queue()->This {
+        let null=std::ptr::null();
+        let mut q=null;
+
+        let desc=QueueDesc{
+            kind:0,priority:0,flags:0,nodes:0
+        };
+
+        assert_eq!(
+            create(null,&desc,&QUEUE_IIDS[0],&mut q),
+            S_OK
+        );
+
+        q
+    }
+
+    fn make_fence()->This {
+        let null=std::ptr::null();
+        let mut f=null;
+
+        assert_eq!(
+            crate::fence::create(
+                null,0,0,
+                &crate::fence::FENCE_IIDS[0],
+                &mut f
+            ),S_OK
+        );
+
+        f
+    }
+
+    fn reached(f:This,target:u64)->bool {
+        let deadline=Instant::now()+Duration::from_secs(5);
+
+        while Instant::now()<deadline {
+            if crate::fence::completed(f)>=target {
+                return true;
+            }
+
+            std::thread::sleep(Duration::from_millis(2));
+        }
+
+        crate::fence::completed(f)>=target
+    }
+
+    fn free(this:This) {
+        object::slot::<
+            extern "system" fn(This)->u32
+        >(this,0x10)(this);
+    }
+
+    #[test]
+    fn future_signal_orders_fifo() {
+        let a=make_queue();
+        let b=make_queue();
+        let gate=make_fence();
+        let done=make_fence();
+
+        assert_eq!(wait(a,gate,5),S_OK);
+        assert_eq!(signal(a,done,7),S_OK);
+        assert_eq!(crate::fence::completed(done),0);
+
+        assert_eq!(signal(b,gate,5),S_OK);
+        assert!(reached(done,7));
+
+        for p in [a,b,gate,done] {
+            free(p);
+        }
+
+        println!("FINAL_QUEUE_FIFO_PASS");
+    }
+
+    #[test]
+    fn activated_wait_survives_rewind() {
+        let q=make_queue();
+        let gate=make_fence();
+        let done=make_fence();
+
+        assert_eq!(wait(q,gate,5),S_OK);
+        assert_eq!(signal(q,done,1),S_OK);
+
+        assert_eq!(
+            crate::fence::signal(gate,5),S_OK
+        );
+
+        assert_eq!(
+            crate::fence::signal(gate,0),S_OK
+        );
+
+        assert!(reached(done,1));
+
+        for p in [q,gate,done] {
+            free(p);
+        }
+
+        println!("FINAL_QUEUE_REWIND_PASS");
+    }
+
+    #[test]
+    fn later_wait_activates_in_order() {
+        let q=make_queue();
+        let first=make_fence();
+        let second=make_fence();
+        let done=make_fence();
+
+        assert_eq!(wait(q,first,1),S_OK);
+        assert_eq!(wait(q,second,1),S_OK);
+        assert_eq!(signal(q,done,1),S_OK);
+
+        let _=crate::fence::signal(second,1);
+        let _=crate::fence::signal(second,0);
+        let _=crate::fence::signal(first,1);
+
+        std::thread::sleep(Duration::from_millis(100));
+
+        let early=crate::fence::completed(done);
+
+        let _=crate::fence::signal(second,1);
+
+        assert!(reached(done,1));
+        assert_eq!(early,0);
+
+        for p in [q,first,second,done] {
+            free(p);
+        }
+
+        println!("FINAL_QUEUE_ACTIVATION_PASS");
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn command_list_remains_pending_until_gate() {
+        let null=std::ptr::null();
+
+        let q=make_queue();
+        let gate=make_fence();
+        let done=make_fence();
+
+        let mut allocator=null;
+        let mut list=null;
+
+        let allocator_iid=guid(
+            0x6102dee4,0xaf59,0x4b09,
+            [0xb9,0x99,0xb4,0x4d,0x73,0xf0,0x9b,0x24]
+        );
+
+        let list_iid=guid(
+            0x7116d91c,0xe7e4,0x47ce,
+            [0xb8,0xc6,0xec,0x81,0x68,0xf4,0x37,0xe5]
+        );
+
+        assert_eq!(
+            crate::list::create_allocator(
+                null,0,&allocator_iid,&mut allocator
+            ),S_OK
+        );
+
+        assert_eq!(
+            crate::list::create_list(
+                null,0,0,allocator,null,
+                &list_iid,&mut list
+            ),S_OK
+        );
+
+        assert!(
+            crate::list::host_list(list).is_some(),
+            "Host GPU command list unavailable"
+        );
+
+        let close=object::slot::<
+            extern "system" fn(This)->HRESULT
+        >(list,0x48);
+
+        let reset=object::slot::<
+            extern "system" fn(This,This,This)->HRESULT
+        >(list,0x50);
+
+        assert_eq!(close(list),S_OK);
+
+        assert_eq!(wait(q,gate,1),S_OK);
+
+        execute(q,1,&list);
+
+        assert_eq!(signal(q,done,1),S_OK);
+
+        let pending_reset=reset(list,allocator,null);
+        let early=crate::fence::completed(done);
+
+        let _=crate::fence::signal(gate,1);
+
+        assert!(reached(done,1));
+
+        assert_eq!(pending_reset,E_INVALIDARG);
+        assert_eq!(early,0);
+        assert_eq!(reset(list,allocator,null),S_OK);
+        assert_eq!(close(list),S_OK);
+
+        for p in [list,allocator,q,gate,done] {
+            free(p);
+        }
+
+        println!("FINAL_QUEUE_HOST_LIST_PASS");
     }
 }

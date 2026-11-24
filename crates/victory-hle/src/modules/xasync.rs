@@ -86,9 +86,110 @@ impl Task {
     }
 }
 
+
+
+enum DispatchKind {
+    Normal(u64),
+    Cancel(Task, Arc<Stage>),
+    Notify(usize, TerminatedCallback, Arc<Stage>),
+}
+
+struct Stage {
+    remaining: Mutex<usize>,
+    changed: Condvar,
+}
+
+impl Stage {
+    fn new(count: usize) -> Arc<Self> {
+        Arc::new(Self {
+            remaining: Mutex::new(count),
+            changed: Condvar::new(),
+        })
+    }
+
+    fn done(&self) {
+        let mut remaining=lock(&self.remaining);
+
+        *remaining -= 1;
+
+        if *remaining == 0 {
+            self.changed.notify_all();
+        }
+    }
+
+    fn wait(&self) {
+        let remaining=lock(&self.remaining);
+
+        drop(
+            self.changed.wait_while(
+                remaining, |n| *n != 0
+            ).unwrap_or_else(|e| e.into_inner())
+        );
+    }
+}
+
+struct Tracked {
+    owner: Arc<Queue>,
+    kind: DispatchKind,
+}
+
+impl Tracked {
+    fn run(self) {
+        let Tracked { owner, kind }=self;
+
+        match kind {
+            DispatchKind::Normal(id) => {
+                let (port,task)={
+                    let mut state=lock(&owner.state);
+
+                    let Some((port,task))=
+                        state.pending.remove(&id)
+                    else {
+                        return;
+                    };
+
+                    state.active[port as usize] += 1;
+
+                    (port,task)
+                };
+
+                let _activity=Activity(
+                    &owner,port
+                );
+
+                task.run(false);
+            }
+
+            DispatchKind::Cancel(task,stage) => {
+                task.run(true);
+                stage.done();
+            }
+
+            DispatchKind::Notify(
+                context,callback,stage
+            ) => {
+                callback(context as *mut c_void);
+                stage.done();
+            }
+        }
+    }
+}
+
+struct Activity<'a>(&'a Queue,u32);
+
+impl Drop for Activity<'_> {
+    fn drop(&mut self) {
+        let mut state=lock(&self.0.state);
+
+        state.active[self.1 as usize] -= 1;
+
+        self.0.changed.notify_all();
+    }
+}
+
 struct Port {
     mode: Mode,
-    tasks: Mutex<VecDeque<Task>>,
+    tasks: Mutex<VecDeque<Tracked>>,
     ready: Condvar,
 }
 
@@ -99,26 +200,27 @@ impl Port {
             tasks: Mutex::default(),
             ready: Condvar::new(),
         });
+
         if mode == Mode::Serialized {
-            // The worker ends once it holds the last reference (every queue
-            // using the port is closed) and nothing is left to run.
             let worker = port.clone();
+
             std::thread::spawn(move || {
                 loop {
                     match worker.take(1000, || false) {
-                        Some(task) => task.run(false),
+                        Some(task) => task.run(),
                         None if Arc::strong_count(&worker) == 1 => break,
                         None => {}
                     }
                 }
             });
         }
+
         port
     }
 
-    fn submit(&self, task: Task) {
+    fn submit(&self, task: Tracked) {
         match self.mode {
-            Mode::Immediate => task.run(false),
+            Mode::Immediate => task.run(),
             Mode::ThreadPool => POOL.submit(task),
             Mode::Manual | Mode::Serialized => {
                 lock(&self.tasks).push_back(task);
@@ -127,32 +229,56 @@ impl Port {
         }
     }
 
-    /// The next queued task, waiting up to `timeout_ms`, or until `ended`
-    /// (checked whenever the port is woken) says no task will come.
-    fn take(&self, timeout_ms: u32, ended: impl Fn() -> bool) -> Option<Task> {
-        let waiting = |t: &mut VecDeque<Task>| t.is_empty() && !ended();
+    fn take(
+        &self,
+        timeout_ms: u32,
+        ended: impl Fn() -> bool,
+    ) -> Option<Tracked> {
+        let waiting = |t: &mut VecDeque<Tracked>| {
+            t.is_empty() && !ended()
+        };
+
         let tasks = lock(&self.tasks);
+
         let mut tasks = if timeout_ms == INFINITE {
             self.ready
                 .wait_while(tasks, waiting)
                 .unwrap_or_else(|e| e.into_inner())
         } else {
-            let timeout = Duration::from_millis(timeout_ms.into());
             self.ready
-                .wait_timeout_while(tasks, timeout, waiting)
+                .wait_timeout_while(
+                    tasks,
+                    Duration::from_millis(timeout_ms.into()),
+                    waiting,
+                )
                 .unwrap_or_else(|e| e.into_inner())
                 .0
         };
+
+        // A terminated dispatcher must not consume
+        // work that belongs to a surviving composite queue.
+        if ended() {
+            return None;
+        }
+
         tasks.pop_front()
+    }
+
+    fn discard_owner(&self, owner: &Arc<Queue>) {
+        let mut tasks = lock(&self.tasks);
+
+        tasks.retain(|task| {
+            !Arc::ptr_eq(&task.owner, owner)
+        });
+
+        self.ready.notify_all();
     }
 }
 
-/// The thread pool behind thread-pool ports: idle workers are reused, and a
-/// new one starts whenever more tasks wait than workers idle, so a callback
-/// that blocks on another never starves it. Workers stay for reuse.
+/// Preserve the upstream pool policy for this experiment.
+/// Bounding the pool requires separate starvation tests.
 struct Pool {
-    /// Queued tasks and the number of idle workers.
-    state: Mutex<(VecDeque<Task>, usize)>,
+    state: Mutex<(VecDeque<Tracked>, usize)>,
     ready: Condvar,
 }
 
@@ -162,9 +288,11 @@ static POOL: Pool = Pool {
 };
 
 impl Pool {
-    fn submit(&'static self, task: Task) {
+    fn submit(&'static self, task: Tracked) {
         let mut state = lock(&self.state);
+
         state.0.push_back(task);
+
         if state.0.len() > state.1 {
             std::thread::spawn(move || self.work());
         } else {
@@ -174,28 +302,298 @@ impl Pool {
 
     fn work(&self) {
         let mut state = lock(&self.state);
+
         loop {
             while state.0.is_empty() {
                 state.1 += 1;
-                state = self.ready.wait(state).unwrap_or_else(|e| e.into_inner());
+
+                let (next, timeout) = self.ready.wait_timeout(
+                    state, Duration::from_secs(2)
+                ).unwrap_or_else(|e| e.into_inner());
+
+                state = next;
+
+                if timeout.timed_out() && state.0.is_empty() {
+                    state.1 -= 1;
+                    return;
+                }
+
                 state.1 -= 1;
             }
+
             let task = state.0.pop_front();
+
             drop(state);
+
             if let Some(task) = task {
-                task.run(false);
+                task.run();
             }
+
             state = lock(&self.state);
         }
     }
+
+    fn discard_owner(&self, owner: &Arc<Queue>) {
+        lock(&self.state).0.retain(|task| {
+            !Arc::ptr_eq(&task.owner, owner)
+        });
+    }
 }
 
-/// A queue handle is `Arc::into_raw` of this; duplicating and closing a
-/// handle add and drop a reference.
+#[derive(Default)]
+struct QueueState {
+    next: u64,
+
+    // Ordered by submission ID for deterministic
+    // cancellation within each port.
+    pending: std::collections::BTreeMap<u64, (u32, Task)>,
+
+    active: [usize; 2],
+    termination_complete: bool,
+}
+
+/// A queue handle owns a reference to this object.
+/// Accepted dispatch tokens also hold references.
 pub struct Queue {
     ports: [Arc<Port>; 2],
     monitors: Mutex<Vec<(u64, usize, usize)>>,
     terminated: AtomicBool,
+    finished: AtomicBool,
+    state: Mutex<QueueState>,
+    changed: Condvar,
+}
+
+
+type TimerEntries = std::collections::BTreeMap<
+    (std::time::Instant, u64),
+    (Arc<Queue>, u64, u32),
+>;
+
+// Shared scheduler for delayed callbacks.
+// It holds no queue lock while delivering callbacks.
+struct SharedTimer {
+    entries: Mutex<TimerEntries>,
+    changed: Condvar,
+    sequence: AtomicU64,
+}
+
+static SHARED_TIMER:
+    std::sync::OnceLock<Arc<SharedTimer>>=
+    std::sync::OnceLock::new();
+
+fn shared_timer()->&'static Arc<SharedTimer> {
+    SHARED_TIMER.get_or_init(||{
+        let timer=Arc::new(SharedTimer {
+            entries:Mutex::default(),
+            changed:Condvar::new(),
+            sequence:AtomicU64::new(0),
+        });
+
+        let worker=timer.clone();
+
+        drop(std::thread::spawn(
+            move || worker.run()
+        ));
+
+        timer
+    })
+}
+
+
+// Elastic delivery workers are reused between timer
+// expirations. Idle workers leave after 500 ms.
+// No hard limit on active callbacks: one callback may
+// wait for another callback that has not started.
+type DeliveryJob=Box<dyn FnOnce()+Send+'static>;
+
+#[derive(Default)]
+struct DeliveryState {
+    jobs:VecDeque<DeliveryJob>,
+    idle:usize,
+    starting:usize,
+    workers:usize,
+}
+
+struct DeliveryPool {
+    state:Mutex<DeliveryState>,
+    ready:Condvar,
+}
+
+static TIMER_DELIVERY:LazyLock<DeliveryPool>=
+    LazyLock::new(||DeliveryPool {
+        state:Mutex::default(),
+        ready:Condvar::new(),
+    });
+
+impl DeliveryPool {
+    fn submit(&'static self,job:DeliveryJob) {
+        let mut s=lock(&self.state);
+        s.jobs.push_back(job);
+
+        if s.jobs.len()>s.idle+s.starting {
+            s.starting+=1;
+            s.workers+=1;
+
+            let spawned=std::thread::Builder::new()
+                .name("victory-timer-worker".into())
+                .spawn(move||self.work());
+
+            if spawned.is_err() {
+                s.starting-=1;
+                s.workers-=1;
+
+                if s.workers==0 {
+                    let job=s.jobs.pop_front();
+                    drop(s);
+
+                    if let Some(job)=job {
+                        job();
+                    }
+                    return;
+                }
+            }
+        }
+
+        self.ready.notify_one();
+    }
+
+    fn work(&self) {
+        let mut s=lock(&self.state);
+        s.starting-=1;
+
+        loop {
+            if let Some(job)=s.jobs.pop_front() {
+                drop(s);
+                job();
+                s=lock(&self.state);
+                continue;
+            }
+
+            s.idle+=1;
+
+            let (next,timeout)=self.ready.wait_timeout(
+                s,Duration::from_millis(500)
+            ).unwrap_or_else(|e|e.into_inner());
+
+            s=next;
+            s.idle-=1;
+
+            if timeout.timed_out() && s.jobs.is_empty() {
+                s.workers-=1;
+                return;
+            }
+        }
+    }
+}
+
+impl SharedTimer {
+    fn schedule(
+        &self,
+        owner:&Arc<Queue>,
+        id:u64,
+        port:u32,
+        delay_ms:u32
+    ) {
+        // Serialize insertion against termination
+        // and cancellation of this pending callback.
+        let queue_state=lock(&owner.state);
+
+        if !queue_state.pending.contains_key(&id) {
+            return;
+        }
+
+        let deadline=std::time::Instant::now()
+            +Duration::from_millis(
+                delay_ms.into()
+            );
+
+        let order=self.sequence.fetch_add(
+            1,Ordering::Relaxed
+        );
+
+        let mut entries=lock(&self.entries);
+
+        entries.insert(
+            (deadline,order),
+            (owner.clone(),id,port)
+        );
+
+        self.changed.notify_one();
+
+        drop(entries);
+        drop(queue_state);
+    }
+
+    fn discard_owner(&self,owner:&Arc<Queue>) {
+        let mut entries=lock(&self.entries);
+
+        entries.retain(
+            |_,(queue,_,_)|
+                !Arc::ptr_eq(queue,owner)
+        );
+
+        self.changed.notify_one();
+    }
+
+    fn run(&self) {
+        loop {
+            let (owner,id,port)={
+                let mut entries=lock(
+                    &self.entries
+                );
+
+                loop {
+                    let deadline=entries
+                        .first_key_value()
+                        .map(|(key,_)|key.0);
+
+                    match deadline {
+                        None=>{
+                            entries=self.changed
+                                .wait(entries)
+                                .unwrap_or_else(
+                                    |e|e.into_inner()
+                                );
+                        }
+
+                        Some(at)=>{
+                            let now=
+                                std::time::Instant::now();
+
+                            if at<=now {
+                                break entries
+                                    .pop_first()
+                                    .unwrap().1;
+                            }
+
+                            entries=self.changed
+                                .wait_timeout(
+                                    entries,at-now
+                                )
+                                .unwrap_or_else(
+                                    |e|e.into_inner()
+                                ).0;
+                        }
+                    }
+                }
+            };
+
+            // Avoid starting a delivery that has
+            // already been canceled.
+            if !lock(&owner.state)
+                .pending.contains_key(&id)
+            {
+                continue;
+            }
+
+            // An Immediate callback or monitor
+            // may block. Do not run it on the
+            // shared timer scheduler thread.
+            TIMER_DELIVERY.submit(Box::new(move||{
+                owner.deliver(id,port);
+            }));
+        }
+    }
 }
 
 impl Queue {
@@ -204,37 +602,226 @@ impl Queue {
             ports,
             monitors: Mutex::default(),
             terminated: AtomicBool::new(false),
+            finished: AtomicBool::new(false),
+            state: Mutex::default(),
+            changed: Condvar::new(),
         })
     }
 
-    fn submit(self: &Arc<Self>, port: u32, delay_ms: u32, task: Task) -> HRESULT {
+    fn submit(
+        self: &Arc<Self>,
+        port: u32,
+        delay_ms: u32,
+        task: Task,
+    ) -> HRESULT {
         if port > COMPLETION {
             return E_INVALIDARG;
         }
-        if self.terminated.load(Ordering::Acquire) {
-            return E_ABORT;
-        }
+
+        let id = {
+            let mut state = lock(&self.state);
+
+            if self.terminated.load(Ordering::Acquire) {
+                return E_ABORT;
+            }
+
+            let Some(next) = state.next.checked_add(1)
+            else {
+                return E_ABORT;
+            };
+
+            state.next = next;
+            state.pending.insert(next, (port, task));
+
+            next
+        };
+
         if delay_ms == 0 {
-            self.deliver(port, task);
+            self.deliver(id, port);
         } else {
-            let queue = self.clone();
-            std::thread::spawn(move || {
-                std::thread::sleep(Duration::from_millis(delay_ms.into()));
-                queue.deliver(port, task);
-            });
+            shared_timer().schedule(
+                self, id, port, delay_ms
+            );
         }
+
         S_OK
     }
 
-    fn deliver(self: &Arc<Self>, port: u32, task: Task) {
-        self.ports[port as usize].submit(task);
-        // Copied out: a monitor may unregister itself.
-        let monitors = lock(&self.monitors).clone();
-        for (_, context, callback) in monitors {
-            // SAFETY: stored from a `MonitorCallback` in `register_monitor`.
-            let callback: MonitorCallback = unsafe { std::mem::transmute(callback) };
-            callback(context as *mut c_void, Arc::as_ptr(self), port);
+    fn deliver(self: &Arc<Self>, id: u64, port: u32) {
+        {
+            let mut state = lock(&self.state);
+
+            if !state.pending.contains_key(&id) {
+                return;
+            }
+
+            // Count delivery and monitor activity as well
+            // as execution of the actual callback.
+            state.active[port as usize] += 1;
         }
+
+        let _activity = Activity(self,port);
+
+        self.ports[port as usize].submit(Tracked {
+            owner: self.clone(),
+            kind: DispatchKind::Normal(id),
+        });
+
+        // Never call application code with queue locks held.
+        let monitors = lock(&self.monitors).clone();
+
+        for (_, context, callback) in monitors {
+            // SAFETY: The address was stored from a MonitorCallback during registration.
+            let callback: MonitorCallback = unsafe {
+                std::mem::transmute(callback)
+            };
+
+            callback(
+                context as *mut c_void,
+                Arc::as_ptr(self),
+                port,
+            );
+        }
+    }
+
+
+    fn wait_idle(&self, port:u32) {
+        let state=lock(&self.state);
+
+        drop(
+            self.changed.wait_while(
+                state,
+                |s|s.active[port as usize]!=0
+            ).unwrap_or_else(|e|e.into_inner())
+        );
+    }
+
+    fn cancel_stage(
+        self:&Arc<Self>,
+        port:u32,
+        pending:&std::collections::BTreeMap<
+            u64,(u32,Task)
+        >,
+    ) {
+        let count=pending.values()
+            .filter(|(p,_)|*p==port)
+            .count();
+
+        let stage=Stage::new(count);
+
+        for &(p,task) in pending.values() {
+            if p==port {
+                self.ports[port as usize].submit(
+                    Tracked {
+                        owner:self.clone(),
+                        kind:DispatchKind::Cancel(
+                            task,stage.clone()
+                        ),
+                    }
+                );
+            }
+        }
+
+        stage.wait();
+
+        // Existing work already claimed by another
+        // dispatcher must also finish.
+        self.wait_idle(port);
+    }
+
+    fn discard_tokens(self: &Arc<Self>) {
+        for port in &self.ports {
+            port.discard_owner(self);
+        }
+
+        POOL.discard_owner(self);
+    }
+
+    fn terminate(
+        self: &Arc<Self>,
+        wait: bool,
+        context: *mut c_void,
+        callback: Option<TerminatedCallback>,
+    ) -> HRESULT {
+        let pending = {
+            let mut state = lock(&self.state);
+
+            if self.terminated.swap(
+                true, Ordering::AcqRel
+            ) {
+                // Experimental repeated-termination policy.
+                // Full GDK behavior needs separate validation.
+                return E_ABORT;
+            }
+
+            let pending = std::mem::take(
+                &mut state.pending
+            );
+
+            // Wake delay workers whose tasks were canceled.
+            self.changed.notify_all();
+
+            pending
+        };
+
+        // Wake dispatchers and remove only this queue's
+        // tokens, not those of composite siblings.
+        if let Some(timer)=SHARED_TIMER.get() {
+            timer.discard_owner(self);
+        }
+        self.discard_tokens();
+
+        let owner = self.clone();
+        let context = context as usize;
+
+
+        let finish=move || {
+            // Cancel through the actual dispatch ports.
+            owner.cancel_stage(WORK,&pending);
+            owner.cancel_stage(COMPLETION,&pending);
+
+            // No application notification before
+            // both stages have completed.
+            if let Some(callback)=callback {
+                let stage=Stage::new(1);
+
+                owner.ports[COMPLETION as usize]
+                    .submit(Tracked {
+                        owner:owner.clone(),
+                        kind:DispatchKind::Notify(
+                            context,
+                            callback,
+                            stage.clone(),
+                        ),
+                    });
+
+                stage.wait();
+            }
+
+            {
+                let mut state=lock(&owner.state);
+
+                state.termination_complete=true;
+
+                owner.finished.store(
+                    true,Ordering::Release
+                );
+
+                owner.changed.notify_all();
+            }
+
+            // Remove stale tokens and wake any
+            // dispatchers waiting for termination.
+            owner.discard_tokens();
+        };
+
+        if wait {
+            finish();
+        } else {
+            std::thread::spawn(finish);
+        }
+
+        S_OK
     }
 }
 
@@ -347,9 +934,9 @@ pub fn XTaskQueueDispatch(handle: *const Queue, port: u32, timeout_ms: u32) -> b
     if port.mode != Mode::Manual {
         return false;
     }
-    match port.take(timeout_ms, || queue.terminated.load(Ordering::Acquire)) {
+    match port.take(timeout_ms, || queue.finished.load(Ordering::Acquire)) {
         Some(task) => {
-            task.run(false);
+            task.run();
             true
         }
         None => false,
@@ -373,28 +960,15 @@ pub fn XTaskQueueSubmitDelayedCallback(
 /// work, then calls `callback`.
 pub fn XTaskQueueTerminate(
     handle: *const Queue,
-    _wait: bool,
+    wait: bool,
     context: *mut c_void,
     callback: Option<TerminatedCallback>,
 ) -> HRESULT {
     let Some(queue) = queue(handle) else {
         return E_INVALIDARG;
     };
-    queue.terminated.store(true, Ordering::Release);
-    for port in &queue.ports {
-        let pending: Vec<Task> = lock(&port.tasks).drain(..).collect();
-        // Dispatches waiting on this queue end: nothing more will come.
-        // (Those of other queues on the port see theirs is open and wait
-        // on.) After the lock above, so none misses both flag and wake.
-        port.ready.notify_all();
-        for task in pending {
-            task.run(true);
-        }
-    }
-    if let Some(callback) = callback {
-        callback(context);
-    }
-    S_OK
+
+    queue.terminate(wait, context, callback)
 }
 
 static NEXT_TOKEN: AtomicU64 = AtomicU64::new(1);
@@ -1334,4 +1908,2329 @@ mod tests {
         );
         XTaskQueueCloseHandle(q);
     }
+}
+
+
+#[cfg(test)]
+mod systems_hle_critical {
+    use super::*;
+    use std::sync::atomic::{
+        AtomicUsize, AtomicBool, Ordering
+    };
+    use std::time::{Duration, Instant};
+    use std::thread;
+
+    const ACQ: Ordering = Ordering::Acquire;
+    const REL: Ordering = Ordering::Release;
+    const SEQ: Ordering = Ordering::SeqCst;
+
+    struct Counts {
+        normal: AtomicUsize,
+        canceled: AtomicUsize,
+        terminated: AtomicUsize,
+        canceled_at_termination: AtomicUsize,
+    }
+
+    impl Counts {
+        fn new() -> &'static Self {
+            Box::leak(Box::new(Self {
+                normal: AtomicUsize::new(0),
+                canceled: AtomicUsize::new(0),
+                terminated: AtomicUsize::new(0),
+                canceled_at_termination:
+                    AtomicUsize::new(0),
+            }))
+        }
+
+        fn ptr(&self) -> *mut c_void {
+            (self as *const Self).cast_mut().cast()
+        }
+    }
+
+    extern "system" fn count(
+        context: *mut c_void,
+        canceled: bool
+    ) {
+        // SAFETY: The test passes a leaked Counts allocation as the callback context.
+        let c = unsafe {
+            &*context.cast::<Counts>()
+        };
+
+        if canceled {
+            c.canceled.fetch_add(1,SEQ);
+        } else {
+            c.normal.fetch_add(1,SEQ);
+        }
+    }
+
+    extern "system" fn terminated(
+        context: *mut c_void
+    ) {
+        // SAFETY: The termination context is the same leaked Counts allocation.
+        let c = unsafe {
+            &*context.cast::<Counts>()
+        };
+
+        c.canceled_at_termination.store(
+            c.canceled.load(ACQ),
+            REL
+        );
+
+        c.terminated.fetch_add(1,SEQ);
+    }
+
+    fn make_queue(
+        work:u32,
+        completion:u32
+    ) -> *const Queue {
+        let mut q = std::ptr::null();
+
+        assert_eq!(
+            XTaskQueueCreate(
+                work,completion,&mut q
+            ),
+            S_OK
+        );
+
+        assert!(!q.is_null());
+
+        q
+    }
+
+    #[test]
+    fn registry_inventory() {
+        let modules = crate::registry();
+
+        let mut total = 0usize;
+
+        for m in modules {
+            println!(
+                "HLE_MODULE name={} exports={}",
+                m.name,
+                m.exports.len()
+            );
+
+            assert!(
+                m.exports.iter().all(
+                    |e| e.address != 0
+                )
+            );
+
+            total += m.exports.len();
+        }
+
+        println!(
+            "HLE_REGISTRY modules={} exports={}",
+            modules.len(),total
+        );
+
+        assert!(total > 0);
+
+        println!("HLE_REGISTRY_PASS");
+    }
+
+    #[test]
+    fn manual_ports_are_independent() {
+        let q = make_queue(0,0);
+
+        let work = Counts::new();
+        let completion = Counts::new();
+
+        assert_eq!(
+            XTaskQueueSubmitDelayedCallback(
+                q,WORK,0,
+                work.ptr(),Some(count)
+            ),S_OK
+        );
+
+        assert_eq!(
+            XTaskQueueSubmitDelayedCallback(
+                q,COMPLETION,0,
+                completion.ptr(),Some(count)
+            ),S_OK
+        );
+
+        assert_eq!(work.normal.load(ACQ),0);
+        assert_eq!(completion.normal.load(ACQ),0);
+
+        assert!(XTaskQueueDispatch(q,WORK,0));
+
+        assert_eq!(work.normal.load(ACQ),1);
+        assert_eq!(completion.normal.load(ACQ),0);
+
+        assert!(!XTaskQueueDispatch(q,WORK,0));
+
+        assert!(XTaskQueueDispatch(
+            q,COMPLETION,0
+        ));
+
+        assert_eq!(completion.normal.load(ACQ),1);
+
+        assert!(!XTaskQueueDispatch(
+            q,COMPLETION,0
+        ));
+
+        XTaskQueueCloseHandle(q);
+
+        println!("HLE_MANUAL_PORTS_PASS");
+    }
+
+    #[test]
+    fn duplicated_handle_preserves_queue() {
+        let q = make_queue(0,0);
+
+        let c = Counts::new();
+
+        let mut duplicate = std::ptr::null();
+
+        assert_eq!(
+            XTaskQueueDuplicateHandle(
+                q,&mut duplicate
+            ),S_OK
+        );
+
+        assert_eq!(
+            XTaskQueueSubmitDelayedCallback(
+                q,WORK,0,c.ptr(),Some(count)
+            ),S_OK
+        );
+
+        XTaskQueueCloseHandle(q);
+
+        assert!(
+            XTaskQueueDispatch(
+                duplicate,WORK,0
+            )
+        );
+
+        assert_eq!(c.normal.load(ACQ),1);
+
+        XTaskQueueCloseHandle(duplicate);
+
+        println!("HLE_HANDLE_LIFETIME_PASS");
+    }
+
+    #[test]
+    fn delayed_callbacks_must_cancel_on_terminate() {
+        // Immediate ports, with delayed submissions.
+        let q = make_queue(3,3);
+        let c = Counts::new();
+
+        for port in [WORK,COMPLETION] {
+            assert_eq!(
+                XTaskQueueSubmitDelayedCallback(
+                    q,port,1000,
+                    c.ptr(),Some(count)
+                ),S_OK
+            );
+        }
+
+        assert_eq!(c.normal.load(ACQ),0);
+
+        assert_eq!(
+            XTaskQueueTerminate(
+                q,true,
+                c.ptr(),Some(terminated)
+            ),S_OK
+        );
+
+        let canceled_at_return =
+            c.canceled.load(ACQ);
+
+        let terminated_at_return =
+            c.terminated.load(ACQ);
+
+        // Both the callback context and its counters
+        // stay alive even if the implementation
+        // incorrectly dispatches after termination.
+        thread::sleep(
+            Duration::from_millis(1300)
+        );
+
+        let normal = c.normal.load(ACQ);
+        let canceled = c.canceled.load(ACQ);
+
+        let at_termination =
+            c.canceled_at_termination.load(ACQ);
+
+        let refused =
+            XTaskQueueSubmitDelayedCallback(
+                q,WORK,0,
+                c.ptr(),Some(count)
+            );
+
+        XTaskQueueCloseHandle(q);
+
+        println!(
+            "HLE_DELAYED_TERMINATION normal={} \
+            canceled={} canceled_at_return={} \
+            terminated_at_return={} \
+            canceled_at_termination={}",
+            normal,canceled,
+            canceled_at_return,
+            terminated_at_return,
+            at_termination
+        );
+
+        assert_eq!(
+            refused,E_ABORT,
+            "HLE_NEW_WORK_ACCEPTED_AFTER_TERMINATION"
+        );
+
+        assert_eq!(
+            (
+                normal,
+                canceled,
+                canceled_at_return,
+                terminated_at_return,
+                at_termination
+            ),
+            (0,2,2,1,2),
+            "HLE_DELAYED_TERMINATION_DEFECT"
+        );
+
+        println!("HLE_DELAYED_TERMINATION_PASS");
+    }
+
+    struct Running {
+        entered: AtomicBool,
+        release: AtomicBool,
+        finished: AtomicBool,
+    }
+
+    extern "system" fn running(
+        context:*mut c_void,
+        _canceled:bool
+    ) {
+        // SAFETY: The test supplies a leaked Running allocation to this callback.
+        let state = unsafe {
+            &*context.cast::<Running>()
+        };
+
+        state.entered.store(true,REL);
+
+        let deadline = Instant::now()
+            + Duration::from_secs(5);
+
+        while !state.release.load(ACQ)
+            && Instant::now() < deadline
+        {
+            thread::sleep(
+                Duration::from_millis(1)
+            );
+        }
+
+        state.finished.store(true,REL);
+    }
+
+    #[test]
+    fn termination_waits_for_running_callback() {
+        let q = make_queue(1,1);
+
+        let state:&'static Running =
+            Box::leak(Box::new(Running {
+                entered:AtomicBool::new(false),
+                release:AtomicBool::new(false),
+                finished:AtomicBool::new(false),
+            }));
+
+        let ptr = (
+            state as *const Running
+        ).cast_mut().cast();
+
+        assert_eq!(
+            XTaskQueueSubmitDelayedCallback(
+                q,WORK,0,ptr,Some(running)
+            ),S_OK
+        );
+
+        let until = Instant::now()
+            + Duration::from_secs(3);
+
+        while !state.entered.load(ACQ)
+            && Instant::now() < until
+        {
+            thread::sleep(
+                Duration::from_millis(1)
+            );
+        }
+
+        assert!(
+            state.entered.load(ACQ),
+            "HLE_WORKER_CONTROL_FAILED"
+        );
+
+        let q_address = q as usize;
+
+        let (sent,received) =
+            std::sync::mpsc::channel();
+
+        let (enter_tx,enter_rx) =
+            std::sync::mpsc::channel();
+
+        let terminator = thread::spawn(move || {
+            enter_tx.send(()).unwrap();
+
+            let hr = XTaskQueueTerminate(
+                q_address as *const Queue,
+                true,
+                std::ptr::null_mut(),
+                None
+            );
+
+            sent.send((
+                hr,state.finished.load(ACQ)
+            )).unwrap();
+        });
+
+        enter_rx.recv_timeout(
+            Duration::from_secs(2)
+        ).unwrap();
+
+        let early = received.recv_timeout(
+            Duration::from_millis(250)
+        ).ok();
+
+        state.release.store(true,REL);
+
+        let final_result = match early {
+            Some(value) => value,
+            None => received.recv_timeout(
+                Duration::from_secs(5)
+            ).unwrap()
+        };
+
+        terminator.join().unwrap();
+
+        let until = Instant::now()
+            + Duration::from_secs(2);
+
+        while !state.finished.load(ACQ)
+            && Instant::now() < until
+        {
+            thread::sleep(
+                Duration::from_millis(1)
+            );
+        }
+
+        assert!(state.finished.load(ACQ));
+
+        XTaskQueueCloseHandle(q);
+
+        println!(
+            "HLE_RUNNING_TERMINATION \
+            returned_early={} \
+            finished_at_return={}",
+            early.is_some(),
+            final_result.1
+        );
+
+        assert_eq!(final_result.0,S_OK);
+
+        assert!(
+            !early.is_some()
+                && final_result.1,
+            "HLE_RUNNING_TERMINATION_DEFECT"
+        );
+
+        println!("HLE_RUNNING_TERMINATION_PASS");
+    }
+
+    static IDENTITY:u8 = 1;
+    static WRONG_IDENTITY:u8 = 2;
+
+    #[test]
+    fn async_result_bounds_and_identity() {
+        let q = make_queue(0,0);
+
+        let identity =
+            (&raw const IDENTITY).cast();
+
+        let wrong =
+            (&raw const WRONG_IDENTITY).cast();
+
+        let mut b = AsyncBlock {
+            queue:q,
+            context:std::ptr::null_mut(),
+            callback:None,
+            internal:[0;4],
+        };
+
+        let payload=vec![
+            0x12u8,0x34,0x56,0x78,
+            0x9a,0xbc,0xde,0xf0
+        ];
+
+        assert_eq!(
+            finished_with(
+                &mut b,identity,
+                Ok(payload.clone())
+            ),S_OK
+        );
+
+        assert_eq!(
+            XAsyncGetStatus(
+                &mut b,false
+            ),S_OK
+        );
+
+        let mut size=0;
+
+        assert_eq!(
+            XAsyncGetResultSize(
+                &mut b,&mut size
+            ),S_OK
+        );
+
+        assert_eq!(size,8);
+
+        let mut buf=[0xCDu8;16];
+
+        let mut used=0;
+
+        assert_eq!(
+            XAsyncGetResult(
+                &mut b,wrong,
+                8,buf.as_mut_ptr().cast(),
+                &mut used
+            ),E_INVALIDARG
+        );
+
+        assert_eq!(buf,[0xCD;16]);
+
+        assert_eq!(
+            XAsyncGetResult(
+                &mut b,identity,
+                7,buf.as_mut_ptr().cast(),
+                &mut used
+            ),E_NOT_SUFFICIENT_BUFFER
+        );
+
+        assert_eq!(buf,[0xCD;16]);
+
+        assert_eq!(
+            XAsyncGetResult(
+                &mut b,identity,
+                8,buf.as_mut_ptr().cast(),
+                &mut used
+            ),S_OK
+        );
+
+        assert_eq!(used,8);
+        assert_eq!(&buf[..8],payload.as_slice());
+        assert_eq!(&buf[8..],&[0xCD;8]);
+
+        XTaskQueueCloseHandle(q);
+
+        println!("HLE_ASYNC_RESULT_PASS");
+    }
+
+    struct AsyncCounters {
+        canceled:AtomicUsize,
+        cleanup:AtomicUsize,
+        callbacks:AtomicUsize,
+    }
+
+    extern "system" fn provider(
+        op:u32,
+        data:*const ProviderData
+    ) -> HRESULT {
+        // SAFETY: The runtime supplies valid ProviderData for the duration of this call.
+        let data=unsafe { &*data };
+
+        // SAFETY: XAsyncBegin receives the leaked AsyncCounters allocation as context.
+        let c=unsafe {
+            &*data.context.cast::<AsyncCounters>()
+        };
+
+        if op==OP_CANCEL {
+            c.canceled.fetch_add(1,SEQ);
+        }
+
+        if op==OP_CLEANUP {
+            c.cleanup.fetch_add(1,SEQ);
+        }
+
+        S_OK
+    }
+
+    extern "system" fn completed(
+        b:*mut AsyncBlock
+    ) {
+        // SAFETY: The test keeps its AsyncBlock alive through dispatch; its context is leaked.
+        let c=unsafe {
+            &*(*b).context.cast::<AsyncCounters>()
+        };
+
+        c.callbacks.fetch_add(1,SEQ);
+    }
+
+    #[test]
+    fn async_cancel_completes_exactly_once() {
+        let q=make_queue(0,0);
+
+        let c=Box::leak(Box::new(
+            AsyncCounters {
+                canceled:AtomicUsize::new(0),
+                cleanup:AtomicUsize::new(0),
+                callbacks:AtomicUsize::new(0),
+            }
+        ));
+
+        let ptr=(
+            c as *mut AsyncCounters
+        ).cast();
+
+        let mut b=AsyncBlock {
+            queue:q,
+            context:ptr,
+            callback:Some(completed),
+            internal:[0;4]
+        };
+
+        let identity=
+            (&raw const IDENTITY).cast();
+
+        assert_eq!(
+            XAsyncBegin(
+                &mut b,ptr,identity,
+                std::ptr::null(),
+                Some(provider)
+            ),S_OK
+        );
+
+        assert_eq!(
+            XAsyncGetStatus(
+                &mut b,false
+            ),E_PENDING
+        );
+
+        XAsyncCancel(&mut b);
+
+        // A second cancellation must not deliver
+        // another completion or cleanup.
+        XAsyncCancel(&mut b);
+
+        assert_eq!(
+            XAsyncGetStatus(
+                &mut b,false
+            ),E_ABORT
+        );
+
+        assert!(
+            XTaskQueueDispatch(
+                q,COMPLETION,0
+            )
+        );
+
+        assert!(
+            !XTaskQueueDispatch(
+                q,COMPLETION,0
+            )
+        );
+
+        assert_eq!(c.canceled.load(ACQ),1);
+        assert_eq!(c.cleanup.load(ACQ),1);
+        assert_eq!(c.callbacks.load(ACQ),1);
+
+        XTaskQueueCloseHandle(q);
+
+        println!("HLE_ASYNC_CANCEL_PASS");
+    }
+}
+
+
+
+
+#[cfg(test)]
+mod systems_upstream_review {
+    use super::*;
+    use std::sync::atomic::{
+        AtomicBool, AtomicUsize, Ordering
+    };
+    use std::time::{Duration,Instant};
+    use std::thread;
+
+    const ACQ:Ordering = Ordering::Acquire;
+    const REL:Ordering = Ordering::Release;
+
+    struct State {
+        entered:AtomicBool,
+        release:AtomicBool,
+        finished:AtomicBool,
+        terminated:AtomicUsize,
+        early_callback:AtomicBool,
+    }
+
+    impl State {
+        fn new() -> &'static State {
+            Box::leak(Box::new(State {
+                entered:AtomicBool::new(false),
+                release:AtomicBool::new(false),
+                finished:AtomicBool::new(false),
+                terminated:AtomicUsize::new(0),
+                early_callback:AtomicBool::new(false),
+            }))
+        }
+
+        fn context(&self) -> *mut c_void {
+            (self as *const Self)
+                .cast_mut().cast()
+        }
+    }
+
+    fn until(
+        limit:Duration,
+        predicate:impl Fn()->bool
+    ) -> bool {
+        let deadline=Instant::now()+limit;
+
+        while Instant::now()<deadline {
+            if predicate() {
+                return true;
+            }
+
+            thread::sleep(
+                Duration::from_millis(1)
+            );
+        }
+
+        predicate()
+    }
+
+    extern "system" fn work(
+        context:*mut c_void,
+        _canceled:bool
+    ) {
+        // SAFETY: The test context points to a leaked State allocation.
+        let s=unsafe {
+            &*context.cast::<State>()
+        };
+
+        s.entered.store(true,REL);
+
+        until(
+            Duration::from_secs(5),
+            ||s.release.load(ACQ)
+        );
+
+        s.finished.store(true,REL);
+    }
+
+    extern "system" fn on_terminated(
+        context:*mut c_void
+    ) {
+        // SAFETY: The termination callback receives the same leaked State allocation.
+        let s=unsafe {
+            &*context.cast::<State>()
+        };
+
+        if !s.finished.load(ACQ) {
+            s.early_callback.store(true,REL);
+        }
+
+        s.terminated.fetch_add(
+            1,Ordering::AcqRel
+        );
+    }
+
+    fn termination_case(
+        mode:u32,
+        wait:bool,
+        notify:bool
+    ) {
+        let mut q=std::ptr::null();
+
+        assert_eq!(
+            XTaskQueueCreate(
+                mode,mode,&mut q
+            ),S_OK
+        );
+
+        let s=State::new();
+
+        assert_eq!(
+            XTaskQueueSubmitDelayedCallback(
+                q,WORK,0,
+                s.context(),Some(work)
+            ),S_OK
+        );
+
+        let q_addr=q as usize;
+
+        // Manual ports require a separate dispatcher.
+        let dispatcher=if mode==0 {
+            Some(thread::spawn(move || {
+                XTaskQueueDispatch(
+                    q_addr as *const Queue,
+                    WORK,1000
+                )
+            }))
+        } else {
+            None
+        };
+
+        let entered=until(
+            Duration::from_secs(3),
+            ||s.entered.load(ACQ)
+        );
+
+        if !entered {
+            s.release.store(true,REL);
+
+            panic!("WORKER_DID_NOT_START");
+        }
+
+        let (tx,rx)=std::sync::mpsc::channel();
+
+        let (started_tx,started_rx)=
+            std::sync::mpsc::channel();
+
+        let terminator=thread::spawn(move || {
+            started_tx.send(()).unwrap();
+
+            let cb:Option<TerminatedCallback>=
+                if notify {
+                    Some(on_terminated)
+                } else {
+                    None
+                };
+
+            let hr=XTaskQueueTerminate(
+                q_addr as *const Queue,
+                wait,s.context(),cb
+            );
+
+            tx.send((
+                hr,s.finished.load(ACQ)
+            )).unwrap();
+        });
+
+        started_rx.recv_timeout(
+            Duration::from_secs(2)
+        ).unwrap();
+
+        let early=rx.recv_timeout(
+            Duration::from_millis(250)
+        ).ok();
+
+        let callbacks_before_release=
+            s.terminated.load(ACQ);
+
+        // Always unblock the worker before assertions.
+        s.release.store(true,REL);
+
+        let returned=match early {
+            Some(value)=>value,
+            None=>rx.recv_timeout(
+                Duration::from_secs(5)
+            ).unwrap()
+        };
+
+        terminator.join().unwrap();
+
+        if let Some(worker)=dispatcher {
+            worker.join().unwrap();
+        }
+
+        assert!(
+            until(
+                Duration::from_secs(2),
+                ||s.finished.load(ACQ)
+            ),
+            "WORKER_DID_NOT_FINISH"
+        );
+
+        if notify {
+            let _=until(
+                Duration::from_secs(2),
+                || {
+                    if mode==0 {
+                        XTaskQueueDispatch(
+                            q,COMPLETION,0
+                        );
+                    }
+
+                    s.terminated.load(ACQ)>0
+                }
+            );
+        }
+
+        let count=s.terminated.load(ACQ);
+
+        let callback_early=
+            s.early_callback.load(ACQ);
+
+        XTaskQueueCloseHandle(q);
+
+        println!(
+            "UPSTREAM_TERMINATION mode={} wait={} \
+            notify={} returned_early={} \
+            finished_at_return={} \
+            callback_before_release={} \
+            callback_count={} callback_early={}",
+            mode,wait,notify,
+            early.is_some(),returned.1,
+            callbacks_before_release,
+            count,callback_early
+        );
+
+        assert_eq!(returned.0,S_OK);
+
+        if wait {
+            assert!(
+                early.is_none() && returned.1,
+                "UPSTREAM_WAIT_RETURNED_EARLY"
+            );
+        } else {
+            assert!(
+                early.is_some(),
+                "UPSTREAM_ASYNC_TERMINATE_BLOCKED"
+            );
+        }
+
+        if notify {
+            assert_eq!(
+                callbacks_before_release,0,
+                "UPSTREAM_EARLY_CALLBACK"
+            );
+
+            assert!(!callback_early);
+
+            assert_eq!(
+                count,1,
+                "UPSTREAM_CALLBACK_COUNT"
+            );
+        }
+
+        println!("UPSTREAM_CASE_PASS");
+    }
+
+    #[test]
+    fn manual_wait_without_callback() {
+        termination_case(0,true,false);
+    }
+
+    #[test]
+    fn pool_wait_without_callback() {
+        termination_case(1,true,false);
+    }
+
+    #[test]
+    fn pool_wait_with_callback() {
+        termination_case(1,true,true);
+    }
+
+    #[test]
+    fn pool_async_termination() {
+        termination_case(1,false,true);
+    }
+
+    #[test]
+    fn serialized_wait_with_callback() {
+        termination_case(2,true,true);
+    }
+
+    #[test]
+    fn serialized_async_termination() {
+        termination_case(2,false,true);
+    }
+
+    struct Counter {
+        normal:AtomicUsize,
+        canceled:AtomicUsize,
+    }
+
+    impl Counter {
+        fn new()->&'static Self {
+            Box::leak(Box::new(Self {
+                normal:AtomicUsize::new(0),
+                canceled:AtomicUsize::new(0),
+            }))
+        }
+
+        fn ptr(&self)->*mut c_void {
+            (self as *const Self)
+                .cast_mut().cast()
+        }
+    }
+
+    extern "system" fn count(
+        context:*mut c_void,
+        canceled:bool
+    ) {
+        // SAFETY: Counter::new leaks the allocation used as this callback context.
+        let c=unsafe {
+            &*context.cast::<Counter>()
+        };
+
+        if canceled {
+            c.canceled.fetch_add(
+                1,Ordering::AcqRel
+            );
+        } else {
+            c.normal.fetch_add(
+                1,Ordering::AcqRel
+            );
+        }
+    }
+
+    #[test]
+    fn composite_queue_isolation() {
+        let mut a=std::ptr::null();
+
+        assert_eq!(
+            XTaskQueueCreate(0,0,&mut a),
+            S_OK
+        );
+
+        let mut work_port=std::ptr::null();
+        let mut completion_port=std::ptr::null();
+
+        assert_eq!(
+            XTaskQueueGetPort(
+                a,WORK,&mut work_port
+            ),S_OK
+        );
+
+        assert_eq!(
+            XTaskQueueGetPort(
+                a,COMPLETION,
+                &mut completion_port
+            ),S_OK
+        );
+
+        let mut b=std::ptr::null();
+
+        assert_eq!(
+            XTaskQueueCreateComposite(
+                work_port,
+                completion_port,
+                &mut b
+            ),S_OK
+        );
+
+        let ca=Counter::new();
+        let cb=Counter::new();
+
+        assert_eq!(
+            XTaskQueueSubmitDelayedCallback(
+                a,WORK,0,
+                ca.ptr(),Some(count)
+            ),S_OK
+        );
+
+        assert_eq!(
+            XTaskQueueSubmitDelayedCallback(
+                b,WORK,0,
+                cb.ptr(),Some(count)
+            ),S_OK
+        );
+
+        assert_eq!(
+            XTaskQueueTerminate(
+                a,false,
+                std::ptr::null_mut(),None
+            ),S_OK
+        );
+
+        let _=until(
+            Duration::from_secs(2),
+            || {
+                XTaskQueueDispatch(
+                    b,WORK,0
+                );
+
+                XTaskQueueDispatch(
+                    b,COMPLETION,0
+                );
+
+                ca.canceled.load(ACQ)>0
+                && (
+                    cb.normal.load(ACQ)>0 ||
+                    cb.canceled.load(ACQ)>0
+                )
+            }
+        );
+
+        let observed=(
+            ca.normal.load(ACQ),
+            ca.canceled.load(ACQ),
+            cb.normal.load(ACQ),
+            cb.canceled.load(ACQ)
+        );
+
+        XTaskQueueCloseHandle(a);
+        XTaskQueueCloseHandle(b);
+
+        println!(
+            "UPSTREAM_SHARED_PORTS={observed:?}"
+        );
+
+        assert_eq!(
+            observed,(0,1,1,0),
+            "UPSTREAM_SHARED_PORT_ISOLATION"
+        );
+
+        println!("UPSTREAM_CASE_PASS");
+    }
+}
+
+
+
+
+#[cfg(test)]
+mod systems_unified_stress {
+    use super::*;
+    use std::sync::atomic::{
+        AtomicBool, AtomicUsize, Ordering
+    };
+    use std::sync::Barrier;
+    use std::thread;
+
+    struct Item {
+        hits: AtomicUsize,
+        accepted: AtomicBool,
+    }
+
+    impl Item {
+        fn new() -> &'static Item {
+            Box::leak(Box::new(Item {
+                hits: AtomicUsize::new(0),
+                accepted: AtomicBool::new(false),
+            }))
+        }
+
+        fn ptr(&self) -> *mut c_void {
+            (self as *const Self)
+                .cast_mut().cast()
+        }
+    }
+
+    extern "system" fn count(
+        context:*mut c_void,
+        _canceled:bool
+    ) {
+        // SAFETY: Item::new leaks each test item passed to this callback.
+        let item=unsafe {
+            &*context.cast::<Item>()
+        };
+
+        item.hits.fetch_add(
+            1,Ordering::SeqCst
+        );
+    }
+
+    fn submit(
+        q:*const Queue,
+        item:&Item,
+        port:u32,
+        delay:u32
+    ) {
+        let hr=XTaskQueueSubmitDelayedCallback(
+            q,port,delay,
+            item.ptr(),Some(count)
+        );
+
+        assert!(
+            hr==S_OK || hr==E_ABORT
+        );
+
+        item.accepted.store(
+            hr==S_OK,Ordering::SeqCst
+        );
+    }
+
+    fn race(mode:u32) {
+        let mut q=std::ptr::null();
+
+        assert_eq!(
+            XTaskQueueCreate(mode,mode,&mut q),
+            S_OK
+        );
+
+        let q_addr=q as usize;
+
+        let items:Vec<&'static Item>=
+            (0..136).map(|_|Item::new()).collect();
+
+        // Ensure a nonzero number of accepted tasks.
+        for (i, &item) in items[..8].iter().enumerate() {
+            submit(
+                q,item,
+                (i%2) as u32,
+                100
+            );
+        }
+
+        let barrier=Arc::new(Barrier::new(5));
+
+        let mut workers=Vec::new();
+
+        for worker in 0..4 {
+            let start=8+worker*32;
+
+            let group=items[start..start+32].to_vec();
+
+            let barrier=barrier.clone();
+
+            workers.push(thread::spawn(move || {
+                barrier.wait();
+
+                for (i,item) in group.iter().enumerate() {
+                    let delay=if i%4==0 { 20 } else { 0 };
+
+                    submit(
+                        q_addr as *const Queue,
+                        item,
+                        (i%2) as u32,
+                        delay
+                    );
+                }
+            }));
+        }
+
+        barrier.wait();
+
+        let dispatchers:Vec<_>=if mode==0 {
+            [WORK,COMPLETION].into_iter()
+                .map(|port| {
+                    thread::spawn(move || {
+                        while XTaskQueueDispatch(
+                            q_addr as *const Queue,
+                            port,INFINITE
+                        ) {}
+                    })
+                }).collect()
+        } else {
+            Vec::new()
+        };
+
+        thread::yield_now();
+
+        assert_eq!(
+            XTaskQueueTerminate(
+                q,true,std::ptr::null_mut(),None
+            ),
+            S_OK
+        );
+
+        for worker in workers {
+            worker.join().unwrap();
+        }
+
+        for dispatcher in dispatchers {
+            dispatcher.join().unwrap();
+        }
+
+        let mut accepted=0;
+        let mut delivered=0;
+
+        for item in &items {
+            let wanted=usize::from(
+                item.accepted.load(Ordering::SeqCst)
+            );
+
+            let hits=item.hits.load(Ordering::SeqCst);
+
+            assert_eq!(
+                hits,wanted,
+                "UNIFIED_EXACTLY_ONCE_DEFECT"
+            );
+
+            accepted+=wanted;
+            delivered+=hits;
+        }
+
+        assert!(accepted>=8);
+
+        // No pending callbacks or active delivery.
+        let owner=queue(q).unwrap();
+
+        {
+            let state=lock(&owner.state);
+
+            assert!(state.pending.is_empty());
+            assert_eq!(state.active,[0,0]);
+            assert!(state.termination_complete);
+        }
+
+        // Delayed callbacks must not run a second time.
+        thread::sleep(Duration::from_millis(150));
+
+        for item in &items {
+            assert_eq!(
+                item.hits.load(Ordering::SeqCst),
+                usize::from(
+                    item.accepted.load(Ordering::SeqCst)
+                )
+            );
+        }
+
+        XTaskQueueCloseHandle(q);
+
+        println!(
+            "UNIFIED_RACE mode={mode} \
+            accepted={accepted} delivered={delivered}"
+        );
+    }
+
+    #[test]
+    fn manual_race() {
+        race(0);
+    }
+
+    #[test]
+    fn pool_race() {
+        race(1);
+    }
+
+    #[test]
+    fn serialized_race() {
+        race(2);
+    }
+
+    #[test]
+    fn immediate_race() {
+        race(3);
+    }
+
+    #[test]
+    fn closing_original_handle_keeps_pending_work_alive() {
+        let mut q=std::ptr::null();
+
+        assert_eq!(
+            XTaskQueueCreate(0,0,&mut q),
+            S_OK
+        );
+
+        let item=Item::new();
+
+        submit(q,item,WORK,0);
+
+        let owner=queue(q).unwrap();
+
+        let weak=Arc::downgrade(&owner);
+
+        drop(owner);
+
+        // The accepted dispatch token owns a reference.
+        XTaskQueueCloseHandle(q);
+
+        let owner=weak.upgrade()
+            .expect("pending callback lost its queue");
+
+        assert!(
+            XTaskQueueDispatch(
+                Arc::as_ptr(&owner),
+                WORK,0
+            )
+        );
+
+        assert_eq!(
+            item.hits.load(Ordering::SeqCst),1
+        );
+
+        drop(owner);
+
+        assert!(weak.upgrade().is_none());
+
+        println!("UNIFIED_PENDING_LIFETIME_PASS");
+    }
+}
+
+
+
+
+#[cfg(test)]
+mod systems_affinity {
+    use super::*;
+    use std::sync::atomic::{
+        AtomicBool, AtomicUsize, AtomicI32, Ordering
+    };
+    use std::thread;
+    use std::time::{Duration, Instant};
+
+    const SEQ: Ordering = Ordering::SeqCst;
+
+    fn make_queue(
+        work:u32,
+        completion:u32
+    ) -> *const Queue {
+        let mut q=std::ptr::null();
+
+        assert_eq!(
+            XTaskQueueCreate(
+                work,completion,&mut q
+            ),
+            S_OK
+        );
+
+        q
+    }
+
+    fn until(
+        seconds:u64,
+        mut predicate:impl FnMut()->bool
+    ) -> bool {
+        let deadline=Instant::now()
+            +Duration::from_secs(seconds);
+
+        while Instant::now()<deadline {
+            if predicate() {
+                return true;
+            }
+
+            thread::sleep(
+                Duration::from_millis(1)
+            );
+        }
+
+        predicate()
+    }
+
+    struct Manual {
+        dispatcher:thread::ThreadId,
+        work:AtomicUsize,
+        completion:AtomicUsize,
+        notified:AtomicUsize,
+        violations:AtomicUsize,
+    }
+
+    impl Manual {
+        fn new()->&'static Self {
+            Box::leak(Box::new(Self {
+                dispatcher:thread::current().id(),
+                work:AtomicUsize::new(0),
+                completion:AtomicUsize::new(0),
+                notified:AtomicUsize::new(0),
+                violations:AtomicUsize::new(0),
+            }))
+        }
+
+        fn ptr(&self)->*mut c_void {
+            (self as *const Self)
+                .cast_mut().cast()
+        }
+
+        fn check(&self,condition:bool) {
+            if !condition {
+                self.violations.fetch_add(1,SEQ);
+            }
+        }
+    }
+
+    extern "system" fn cancel_work(
+        context:*mut c_void,
+        canceled:bool
+    ) {
+        // SAFETY: The work callback receives the leaked Manual test state.
+        let s=unsafe {
+            &*context.cast::<Manual>()
+        };
+
+        s.check(canceled);
+        s.check(
+            thread::current().id()==s.dispatcher
+        );
+
+        s.work.fetch_add(1,SEQ);
+    }
+
+    extern "system" fn cancel_completion(
+        context:*mut c_void,
+        canceled:bool
+    ) {
+        // SAFETY: The completion callback receives the leaked Manual test state.
+        let s=unsafe {
+            &*context.cast::<Manual>()
+        };
+
+        s.check(canceled);
+
+        s.check(
+            thread::current().id()==s.dispatcher
+        );
+
+        s.check(s.work.load(SEQ)==2);
+
+        s.completion.fetch_add(1,SEQ);
+    }
+
+    extern "system" fn notify(
+        context:*mut c_void
+    ) {
+        // SAFETY: The notification context is the leaked Manual test state.
+        let s=unsafe {
+            &*context.cast::<Manual>()
+        };
+
+        s.check(
+            thread::current().id()==s.dispatcher
+        );
+
+        s.check(s.work.load(SEQ)==2);
+        s.check(s.completion.load(SEQ)==2);
+
+        s.notified.fetch_add(1,SEQ);
+    }
+
+    fn manual_case(with_notification:bool) {
+        let q=make_queue(0,0);
+        let state=Manual::new();
+
+        // Two accepted callbacks per port:
+        // one immediate submission and one delayed.
+        for delay in [0,60000] {
+            assert_eq!(
+                XTaskQueueSubmitDelayedCallback(
+                    q,WORK,delay,
+                    state.ptr(),
+                    Some(cancel_work)
+                ),
+                S_OK
+            );
+
+            assert_eq!(
+                XTaskQueueSubmitDelayedCallback(
+                    q,COMPLETION,delay,
+                    state.ptr(),
+                    Some(cancel_completion)
+                ),
+                S_OK
+            );
+        }
+
+        let notification:Option<TerminatedCallback>=
+            if with_notification {
+                Some(notify)
+            } else {
+                None
+            };
+
+        assert_eq!(
+            XTaskQueueTerminate(
+                q,false,
+                state.ptr(),notification
+            ),
+            S_OK
+        );
+
+        // The test's thread owns both manual ports.
+        let completed=until(5,|| {
+            XTaskQueueDispatch(q,WORK,0);
+
+            XTaskQueueDispatch(
+                q,COMPLETION,0
+            );
+
+            state.work.load(SEQ)==2
+            && state.completion.load(SEQ)==2
+            && (
+                !with_notification
+                || state.notified.load(SEQ)==1
+            )
+        });
+
+        let observed=(
+            state.work.load(SEQ),
+            state.completion.load(SEQ),
+            state.notified.load(SEQ),
+            state.violations.load(SEQ)
+        );
+
+        println!(
+            "AFFINITY_MANUAL notify={} \
+            completed={} observed={observed:?}",
+            with_notification,completed
+        );
+
+        XTaskQueueCloseHandle(q);
+
+        assert!(completed);
+
+        assert_eq!(
+            observed,
+            (
+                2,2,
+                usize::from(with_notification),
+                0
+            ),
+            "AFFINITY_MANUAL_DEFECT"
+        );
+    }
+
+    #[test]
+    fn manual_completion_affinity() {
+        manual_case(true);
+    }
+
+    #[test]
+    fn manual_cancellation_without_notification() {
+        manual_case(false);
+    }
+
+    struct Serial {
+        entered:AtomicBool,
+        release:AtomicBool,
+        active:AtomicBool,
+        canceled:AtomicUsize,
+        overlap:AtomicBool,
+        notified:AtomicBool,
+    }
+
+    extern "system" fn blocking(
+        context:*mut c_void,
+        canceled:bool
+    ) {
+        // SAFETY: The test supplies a leaked Serial allocation as callback context.
+        let s=unsafe {
+            &*context.cast::<Serial>()
+        };
+
+        if canceled {
+            s.overlap.store(true,SEQ);
+        }
+
+        s.active.store(true,SEQ);
+        s.entered.store(true,SEQ);
+
+        until(
+            5,||s.release.load(SEQ)
+        );
+
+        s.active.store(false,SEQ);
+    }
+
+    extern "system" fn serialized_cancel(
+        context:*mut c_void,
+        canceled:bool
+    ) {
+        // SAFETY: The cancellation callback uses the same leaked Serial allocation.
+        let s=unsafe {
+            &*context.cast::<Serial>()
+        };
+
+        if !canceled || s.active.load(SEQ) {
+            s.overlap.store(true,SEQ);
+        }
+
+        s.canceled.fetch_add(1,SEQ);
+    }
+
+    extern "system" fn serialized_notify(
+        context:*mut c_void
+    ) {
+        // SAFETY: The notification callback uses the leaked Serial allocation.
+        let s=unsafe {
+            &*context.cast::<Serial>()
+        };
+
+        if s.active.load(SEQ)
+            || s.canceled.load(SEQ)!=1
+        {
+            s.overlap.store(true,SEQ);
+        }
+
+        s.notified.store(true,SEQ);
+    }
+
+    #[test]
+    fn serialized_cancel_does_not_overlap_active_work() {
+        let q=make_queue(2,2);
+
+        let s:&'static Serial=
+            Box::leak(Box::new(Serial {
+                entered:AtomicBool::new(false),
+                release:AtomicBool::new(false),
+                active:AtomicBool::new(false),
+                canceled:AtomicUsize::new(0),
+                overlap:AtomicBool::new(false),
+                notified:AtomicBool::new(false),
+            }));
+
+        let context=(
+            s as *const Serial
+        ).cast_mut().cast();
+
+        assert_eq!(
+            XTaskQueueSubmitDelayedCallback(
+                q,WORK,0,
+                context,Some(blocking)
+            ),
+            S_OK
+        );
+
+        assert!(until(
+            3,||s.entered.load(SEQ)
+        ));
+
+        assert_eq!(
+            XTaskQueueSubmitDelayedCallback(
+                q,WORK,60000,
+                context,Some(serialized_cancel)
+            ),
+            S_OK
+        );
+
+        assert_eq!(
+            XTaskQueueTerminate(
+                q,false,context,
+                Some(serialized_notify)
+            ),
+            S_OK
+        );
+
+        thread::sleep(
+            Duration::from_millis(200)
+        );
+
+        let premature=s.canceled.load(SEQ);
+
+        s.release.store(true,SEQ);
+
+        assert!(until(
+            5,||s.notified.load(SEQ)
+        ));
+
+        let overlap=s.overlap.load(SEQ);
+        let canceled=s.canceled.load(SEQ);
+
+        XTaskQueueCloseHandle(q);
+
+        println!(
+            "AFFINITY_SERIAL premature={premature} \
+            overlap={overlap} canceled={canceled}"
+        );
+
+        assert_eq!(
+            premature,0,
+            "AFFINITY_SERIAL_PREMATURE"
+        );
+
+        assert!(!overlap);
+        assert_eq!(canceled,1);
+    }
+
+    struct Reentrant {
+        queue:usize,
+        dispatcher:thread::ThreadId,
+        result:AtomicI32,
+        returned:AtomicBool,
+        notified:AtomicBool,
+        violation:AtomicBool,
+    }
+
+    extern "system" fn reentrant_notify(
+        context:*mut c_void
+    ) {
+        // SAFETY: The reentrant notification uses a leaked Reentrant allocation.
+        let s=unsafe {
+            &*context.cast::<Reentrant>()
+        };
+
+        if !s.returned.load(SEQ)
+            || thread::current().id()!=s.dispatcher
+        {
+            s.violation.store(true,SEQ);
+        }
+
+        s.notified.store(true,SEQ);
+    }
+
+    extern "system" fn reentrant_work(
+        context:*mut c_void,
+        canceled:bool
+    ) {
+        // SAFETY: The reentrant work callback uses a leaked Reentrant allocation.
+        let s=unsafe {
+            &*context.cast::<Reentrant>()
+        };
+
+        if canceled {
+            s.violation.store(true,SEQ);
+        }
+
+        let hr=XTaskQueueTerminate(
+            s.queue as *const Queue,
+            false,
+            context,
+            Some(reentrant_notify)
+        );
+
+        s.result.store(hr,SEQ);
+        s.returned.store(true,SEQ);
+    }
+
+    #[test]
+    fn callback_can_request_async_termination() {
+        let q=make_queue(0,0);
+
+        let s:&'static Reentrant=
+            Box::leak(Box::new(Reentrant {
+                queue:q as usize,
+                dispatcher:thread::current().id(),
+                result:AtomicI32::new(E_PENDING),
+                returned:AtomicBool::new(false),
+                notified:AtomicBool::new(false),
+                violation:AtomicBool::new(false),
+            }));
+
+        let context=(
+            s as *const Reentrant
+        ).cast_mut().cast();
+
+        assert_eq!(
+            XTaskQueueSubmitDelayedCallback(
+                q,WORK,0,
+                context,Some(reentrant_work)
+            ),
+            S_OK
+        );
+
+        assert!(
+            XTaskQueueDispatch(q,WORK,0)
+        );
+
+        assert!(s.returned.load(SEQ));
+        assert_eq!(s.result.load(SEQ),S_OK);
+
+        let notified=until(5,||{
+            XTaskQueueDispatch(
+                q,COMPLETION,0
+            );
+
+            s.notified.load(SEQ)
+        });
+
+        let violation=s.violation.load(SEQ);
+
+        XTaskQueueCloseHandle(q);
+
+        println!(
+            "AFFINITY_REENTRANT \
+            notified={notified} violation={violation}"
+        );
+
+        assert!(notified);
+
+        assert!(
+            !violation,
+            "AFFINITY_REENTRANT_DEFECT"
+        );
+    }
+}
+
+
+
+#[cfg(test)]
+mod systems_shared_timer {
+    use super::*;
+    use std::sync::atomic::{
+        AtomicUsize, Ordering
+    };
+    use std::time::{Duration, Instant};
+    use std::thread;
+
+    const SEQ:Ordering=Ordering::SeqCst;
+
+    #[repr(C)]
+    struct ThreadEntry {
+        size:u32,
+        usage:u32,
+        thread_id:u32,
+        owner_pid:u32,
+        base_priority:i32,
+        delta_priority:i32,
+        flags:u32,
+    }
+
+    #[link(name="kernel32")]
+    unsafe extern "system" {
+        fn CreateToolhelp32Snapshot(
+            flags:u32,pid:u32
+        )->*mut c_void;
+
+        fn Thread32First(
+            snapshot:*mut c_void,
+            entry:*mut ThreadEntry
+        )->i32;
+
+        fn Thread32Next(
+            snapshot:*mut c_void,
+            entry:*mut ThreadEntry
+        )->i32;
+
+        fn CloseHandle(
+            handle:*mut c_void
+        )->i32;
+
+        fn GetCurrentProcessId()->u32;
+    }
+
+    fn thread_count()->usize {
+        // SAFETY: The snapshot handle is checked; ThreadEntry has C layout and its size is initialized. The handle is closed after enumeration.
+        unsafe {
+            let snapshot=
+                CreateToolhelp32Snapshot(4,0);
+
+            assert_ne!(
+                snapshot as usize,
+                usize::MAX
+            );
+
+            let pid=GetCurrentProcessId();
+
+            let mut entry=ThreadEntry {
+                size:std::mem::size_of::<
+                    ThreadEntry
+                >() as u32,
+                usage:0,
+                thread_id:0,
+                owner_pid:0,
+                base_priority:0,
+                delta_priority:0,
+                flags:0,
+            };
+
+            let mut count=0;
+
+            let mut more=Thread32First(
+                snapshot,&mut entry
+            );
+
+            while more!=0 {
+                if entry.owner_pid==pid {
+                    count+=1;
+                }
+
+                entry.size=std::mem::size_of::<
+                    ThreadEntry
+                >() as u32;
+
+                more=Thread32Next(
+                    snapshot,&mut entry
+                );
+            }
+
+            CloseHandle(snapshot);
+
+            assert!(count>0);
+
+            count
+        }
+    }
+
+    struct Hits {
+        normal:AtomicUsize,
+        canceled:AtomicUsize,
+    }
+
+    impl Hits {
+        fn new()->&'static Self {
+            Box::leak(Box::new(Self {
+                normal:AtomicUsize::new(0),
+                canceled:AtomicUsize::new(0),
+            }))
+        }
+
+        fn ptr(&self)->*mut c_void {
+            (self as *const Self)
+                .cast_mut().cast()
+        }
+    }
+
+    extern "system" fn hit(
+        context:*mut c_void,
+        canceled:bool
+    ) {
+        // SAFETY: Hits::new leaks the allocation used as the callback context.
+        let s=unsafe {
+            &*context.cast::<Hits>()
+        };
+
+        if canceled {
+            s.canceled.fetch_add(1,SEQ);
+        } else {
+            s.normal.fetch_add(1,SEQ);
+        }
+    }
+
+    fn make_queue(mode:u32)->*const Queue {
+        let mut q=std::ptr::null();
+
+        assert_eq!(
+            XTaskQueueCreate(mode,mode,&mut q),
+            S_OK
+        );
+
+        q
+    }
+
+    fn wait_until(
+        mut check:impl FnMut()->bool
+    )->bool {
+        let deadline=Instant::now()
+            +Duration::from_secs(8);
+
+        while Instant::now()<deadline {
+            if check() {
+                return true;
+            }
+
+            thread::sleep(
+                Duration::from_millis(2)
+            );
+        }
+
+        check()
+    }
+
+    #[test]
+    fn delayed_thread_budget() {
+        let q=make_queue(0);
+        let s=Hits::new();
+
+        let before=thread_count();
+
+        for _ in 0..128 {
+            assert_eq!(
+                XTaskQueueSubmitDelayedCallback(
+                    q,WORK,60000,
+                    s.ptr(),Some(hit)
+                ),
+                S_OK
+            );
+        }
+
+        thread::sleep(
+            Duration::from_millis(150)
+        );
+
+        let pending=thread_count();
+
+        assert_eq!(
+            XTaskQueueTerminate(
+                q,false,std::ptr::null_mut(),None
+            ),
+            S_OK
+        );
+
+        let completed=wait_until(||{
+            XTaskQueueDispatch(q,WORK,0);
+
+            XTaskQueueDispatch(
+                q,COMPLETION,0
+            );
+
+            queue(q).unwrap()
+                .finished.load(SEQ)
+        });
+
+        let normal=s.normal.load(SEQ);
+        let canceled=s.canceled.load(SEQ);
+
+        XTaskQueueCloseHandle(q);
+
+        let extra=pending.saturating_sub(before);
+
+        println!(
+            "TIMER_BUDGET before={before} \
+            pending={pending} extra={extra} \
+            normal={normal} canceled={canceled}"
+        );
+
+        assert!(completed);
+        assert_eq!((normal,canceled),(0,128));
+
+        assert!(
+            extra<=16,
+            "TIMER_THREAD_BUDGET_EXCEEDED"
+        );
+    }
+
+    #[test]
+    fn earlier_deadline_wakes_scheduler() {
+        let q=make_queue(0);
+
+        let long=Hits::new();
+        let short=Hits::new();
+
+        assert_eq!(
+            XTaskQueueSubmitDelayedCallback(
+                q,WORK,60000,
+                long.ptr(),Some(hit)
+            ),
+            S_OK
+        );
+
+        thread::sleep(
+            Duration::from_millis(30)
+        );
+
+        assert_eq!(
+            XTaskQueueSubmitDelayedCallback(
+                q,WORK,20,
+                short.ptr(),Some(hit)
+            ),
+            S_OK
+        );
+
+        let fired=wait_until(||{
+            XTaskQueueDispatch(q,WORK,0);
+            short.normal.load(SEQ)==1
+        });
+
+        assert_eq!(
+            XTaskQueueTerminate(
+                q,false,std::ptr::null_mut(),None
+            ),
+            S_OK
+        );
+
+        let completed=wait_until(||{
+            XTaskQueueDispatch(q,WORK,0);
+
+            XTaskQueueDispatch(
+                q,COMPLETION,0
+            );
+
+            queue(q).unwrap()
+                .finished.load(SEQ)
+        });
+
+        XTaskQueueCloseHandle(q);
+
+        assert!(fired);
+        assert!(completed);
+
+        assert_eq!(
+            short.normal.load(SEQ),1
+        );
+
+        assert_eq!(
+            short.canceled.load(SEQ),0
+        );
+
+        assert_eq!(
+            long.normal.load(SEQ),0
+        );
+
+        assert_eq!(
+            long.canceled.load(SEQ),1
+        );
+
+        println!("TIMER_EARLIER_DEADLINE_PASS");
+    }
+
+    #[test]
+    fn cancellation_releases_timer_references() {
+        let q=make_queue(3);
+        let s=Hits::new();
+
+        let weak=Arc::downgrade(
+            &queue(q).unwrap()
+        );
+
+        for _ in 0..64 {
+            assert_eq!(
+                XTaskQueueSubmitDelayedCallback(
+                    q,WORK,60000,
+                    s.ptr(),Some(hit)
+                ),
+                S_OK
+            );
+        }
+
+        assert_eq!(
+            XTaskQueueTerminate(
+                q,true,std::ptr::null_mut(),None
+            ),
+            S_OK
+        );
+
+        XTaskQueueCloseHandle(q);
+
+        let released=wait_until(||{
+            weak.upgrade().is_none()
+        });
+
+        assert!(released);
+
+        assert_eq!(
+            s.normal.load(SEQ),0
+        );
+
+        assert_eq!(
+            s.canceled.load(SEQ),64
+        );
+
+        println!("TIMER_REFERENCES_RELEASED");
+    }
+
+
+    #[test]
+    fn expired_burst_delivered_and_reaped() {
+        let q=make_queue(0);
+        let hits=Hits::new();
+
+        let before=thread_count();
+
+        for i in 0..128 {
+            assert_eq!(
+                XTaskQueueSubmitDelayedCallback(
+                    q,WORK,20+(i%8)*5,
+                    hits.ptr(),Some(hit)
+                ),S_OK
+            );
+        }
+
+        let mut peak=before;
+
+        let delivered=wait_until(||{
+            peak=peak.max(thread_count());
+
+            XTaskQueueDispatch(q,WORK,0);
+
+            hits.normal.load(SEQ)==128
+        });
+
+        assert_eq!(
+            XTaskQueueTerminate(
+                q,false,std::ptr::null_mut(),None
+            ),S_OK
+        );
+
+        let finished=wait_until(||{
+            XTaskQueueDispatch(q,WORK,0);
+            XTaskQueueDispatch(q,COMPLETION,0);
+            queue(q).unwrap().finished.load(SEQ)
+        });
+
+        XTaskQueueCloseHandle(q);
+
+        let reaped=wait_until(||{
+            let s=lock(&TIMER_DELIVERY.state);
+            s.workers==0 && s.jobs.is_empty()
+        });
+
+        println!(
+            "FINAL_TIMER_BURST delivered={} peak={} reaped={}",
+            hits.normal.load(SEQ),peak,reaped
+        );
+
+        assert!(delivered && finished && reaped);
+        assert_eq!(hits.normal.load(SEQ),128);
+        assert_eq!(hits.canceled.load(SEQ),0);
+    }
+
+    #[test]
+    fn delivery_does_not_block_other_timer() {
+        struct Gate {
+            entered:AtomicBool,
+            release:AtomicBool,
+        }
+
+        extern "system" fn blocked(
+            ctx:*mut c_void,_:bool
+        ) {
+            // SAFETY: The test leaks the Gate allocation before registering this callback.
+            let gate=unsafe{&*ctx.cast::<Gate>()};
+            gate.entered.store(true,SEQ);
+
+            while !gate.release.load(SEQ) {
+                thread::sleep(Duration::from_millis(1));
+            }
+        }
+
+        let gate=Box::leak(Box::new(Gate{
+            entered:AtomicBool::new(false),
+            release:AtomicBool::new(false),
+        }));
+
+        let hits=Hits::new();
+
+        let a=make_queue(3);
+        let b=make_queue(3);
+
+        assert_eq!(
+            XTaskQueueSubmitDelayedCallback(
+                a,WORK,20,
+                (gate as *mut Gate).cast(),
+                Some(blocked)
+            ),S_OK
+        );
+
+        let entered=wait_until(||gate.entered.load(SEQ));
+
+        assert_eq!(
+            XTaskQueueSubmitDelayedCallback(
+                b,WORK,20,hits.ptr(),Some(hit)
+            ),S_OK
+        );
+
+        let independent=wait_until(||hits.normal.load(SEQ)==1);
+
+        gate.release.store(true,SEQ);
+
+        for q in [a,b] {
+            assert_eq!(
+                XTaskQueueTerminate(
+                    q,true,std::ptr::null_mut(),None
+                ),S_OK
+            );
+            XTaskQueueCloseHandle(q);
+        }
+
+        assert!(entered && independent);
+
+        println!("FINAL_TIMER_INDEPENDENCE_PASS");
+    }
+
+
+
+    #[test]
+    fn original_pool_reaps_idle_workers() {
+        let q=make_queue(1);
+        let hits=Hits::new();
+
+        for _ in 0..64 {
+            assert_eq!(
+                XTaskQueueSubmitDelayedCallback(
+                    q,WORK,0,
+                    hits.ptr(),Some(hit)
+                ),
+                S_OK
+            );
+        }
+
+        assert!(wait_until(||{
+            hits.normal.load(SEQ)==64
+        }));
+
+        assert_eq!(
+            XTaskQueueTerminate(
+                q,true,std::ptr::null_mut(),None
+            ),
+            S_OK
+        );
+
+        XTaskQueueCloseHandle(q);
+
+        let observed_idle=wait_until(||{
+            lock(&POOL.state).1>0
+        });
+
+        let reaped=wait_until(||{
+            let state=lock(&POOL.state);
+            state.0.is_empty() && state.1==0
+        });
+
+        assert!(observed_idle && reaped);
+        assert_eq!(hits.normal.load(SEQ),64);
+        assert_eq!(hits.canceled.load(SEQ),0);
+
+        println!("FINAL_ORIGINAL_POOL_REAPED");
+    }
+
 }
