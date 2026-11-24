@@ -2581,6 +2581,12 @@ impl<'a> Lower<'a> {
                     .op(c, "unary.i32", Attr::ReadNone, self.s.t.i32, 30, &[a]);
                 (r, None)
             }
+            "s_sext_i32_i8" | "s_sext_i32_i16" => {
+                let a = src32(self, 0)?;
+                let shift = self.s.m.i32(if name == "s_sext_i32_i8" { 24 } else { 16 });
+                let t = self.s.m.bin(c, Bin::Shl, a, shift);
+                (self.s.m.bin(c, Bin::AShr, t, shift), None)
+            }
             "s_not_b32" => {
                 let a = src32(self, 0)?;
                 let ones = self.s.m.i32(u32::MAX);
