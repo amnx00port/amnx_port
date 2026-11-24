@@ -1178,14 +1178,30 @@ fn describe(view: Option<&View>) -> String {
         ),
         // The first four values, as a colour rectangle's constants are.
         Some(View::Constant(address, size))
-            if *size >= 16 && crate::texture::committed(*address as *const u8, 16) =>
+            if *size >= 16
+                && let Some(words) = first_constant_words(*address) =>
         {
-            // SAFETY: 16 committed bytes of title memory.
-            let v = unsafe { (*address as *const [f32; 4]).read_unaligned() };
-            format!("Constant({address:#x}, {size}) {v:?}")
+            format!("Constant({address:#x}, {size}) {words:?}")
         }
         Some(v) => format!("{v:?}").chars().take(60).collect(),
     }
+}
+
+/// Reads the first four `f32` words at `address` through `ReadProcessMemory`
+/// without walking the allocation's pages via `VirtualQuery`; `None` when the
+/// address is null or any page in the 16-byte span is not readable.
+#[cfg(feature = "diagnostics")]
+fn first_constant_words(address: u64) -> Option<[f32; 4]> {
+    if address == 0 {
+        return None;
+    }
+    let mut raw = [0u8; 16];
+    if !crate::host::read_into(address as *const u8, &mut raw) {
+        return None;
+    }
+    Some(std::array::from_fn(|i| {
+        f32::from_le_bytes([raw[i * 4], raw[i * 4 + 1], raw[i * 4 + 2], raw[i * 4 + 3]])
+    }))
 }
 
 /// The console's own primitive topologies.
@@ -1214,4 +1230,159 @@ pub(crate) fn blend_factor(list: &HostList, factor: Option<&[f32; 4]>) {
 pub(crate) fn stencil_ref(list: &HostList, reference: u32) {
     // SAFETY: an open list.
     unsafe { list.list.OMSetStencilRef(reference) };
+}
+
+#[cfg(all(test, feature = "diagnostics"))]
+mod tests {
+    use super::*;
+    use crate::object::{HRESULT, S_OK};
+    use windows::core::Interface;
+
+    #[test]
+    fn constant_view_notes_read_committed_words_and_skip_unmapped_pages() {
+        assert_eq!(describe(None), "no view");
+
+        let mut backing = [0u8; 80];
+        let words = [1.25f32, -0.0, 42.5, -8.75];
+        for (i, word) in words.into_iter().enumerate() {
+            backing[4 + i * 4..8 + i * 4].copy_from_slice(&word.to_le_bytes());
+        }
+        // SAFETY: `backing` is 80 bytes long, so offset 4 leaves 76 readable bytes.
+        let unaligned = unsafe { backing.as_ptr().add(4) } as u64;
+        assert_eq!(
+            describe(Some(&View::Constant(unaligned, 64))),
+            format!("Constant({unaligned:#x}, 64) {words:?}")
+        );
+        assert_eq!(
+            describe(Some(&View::Constant(unaligned, 12))),
+            format!("Constant({unaligned}, 12)")
+        );
+        assert_eq!(
+            describe(Some(&View::Constant(unaligned, 0))),
+            format!("Constant({unaligned}, 0)")
+        );
+        assert_eq!(describe(Some(&View::Constant(0, 256))), "Constant(0, 256)");
+
+        use windows_sys::Win32::System::Memory::{
+            MEM_COMMIT, MEM_RELEASE, MEM_RESERVE, PAGE_NOACCESS, PAGE_READWRITE, VirtualAlloc,
+            VirtualFree,
+        };
+        struct Reserved(*mut std::ffi::c_void);
+        impl Drop for Reserved {
+            fn drop(&mut self) {
+                // SAFETY: `self.0` was returned by `VirtualAlloc` with `MEM_RESERVE`.
+                unsafe {
+                    VirtualFree(self.0, 0, MEM_RELEASE);
+                }
+            }
+        }
+
+        // SAFETY: reserves two 4 KiB pages without committing either.
+        let region = unsafe { VirtualAlloc(std::ptr::null(), 8192, MEM_RESERVE, PAGE_NOACCESS) };
+        assert!(!region.is_null(), "reserve test pages");
+        let region = Reserved(region);
+        let base = region.0 as u64;
+
+        // Entirely uncommitted `MEM_RESERVE` memory falls back cleanly without faulting.
+        assert_eq!(
+            describe(Some(&View::Constant(base, 256))),
+            format!("Constant({base}, 256)")
+        );
+
+        // Commit only the first 4 KiB page, leaving `[base + 4096, base + 8192)` uncommitted.
+        // SAFETY: commits the first page of our reserved region.
+        let committed_page = unsafe { VirtualAlloc(region.0, 4096, MEM_COMMIT, PAGE_READWRITE) };
+        assert_eq!(committed_page, region.0);
+        let edge_words = [3.5f32, -7.0, 0.25, 16.0];
+        let edge_ok = base + 4080;
+        for (i, word) in edge_words.into_iter().enumerate() {
+            // SAFETY: `4080..4096` lies inside the committed first page.
+            unsafe {
+                std::ptr::copy_nonoverlapping(
+                    word.to_le_bytes().as_ptr(),
+                    (edge_ok as *mut u8).add(i * 4),
+                    4,
+                );
+            }
+        }
+        assert_eq!(
+            describe(Some(&View::Constant(edge_ok, 16))),
+            format!("Constant({edge_ok:#x}, 16) {edge_words:?}")
+        );
+
+        // Straddling `[4088..4104)` across the committed/uncommitted page boundary must not fault.
+        let straddle = base + 4088;
+        assert_eq!(
+            describe(Some(&View::Constant(straddle, 12))),
+            format!("Constant({straddle}, 12)")
+        );
+        assert_eq!(
+            describe(Some(&View::Constant(straddle, 256))),
+            format!("Constant({straddle}, 256)")
+        );
+
+        let Some(host) = crate::host::host() else {
+            return;
+        };
+        let _ = host.log_messages();
+        let heap_desc = [0u32, 2, 1, 0, 0, 0, 0, 0];
+        let heap_iid = ID3D12DescriptorHeap::IID;
+        let mut heap = std::ptr::null();
+        assert_eq!(
+            crate::descriptor::create_heap(
+                std::ptr::null(),
+                heap_desc.as_ptr().cast(),
+                (&raw const heap_iid).cast(),
+                &mut heap,
+            ),
+            S_OK
+        );
+        let start = crate::descriptor::heap(heap).start;
+        let cbv_ok = [edge_ok as u32, (edge_ok >> 32) as u32, 256, 0];
+        let cbv_bad = [straddle as u32, (straddle >> 32) as u32, 256, 0];
+        crate::descriptor::create_cbv(std::ptr::null(), &cbv_ok, start);
+        crate::descriptor::create_cbv(std::ptr::null(), &cbv_bad, start + 32);
+        assert_eq!(
+            describe(crate::descriptor::view(start).as_ref()),
+            format!("Constant({edge_ok:#x}, 256) {edge_words:?}")
+        );
+        assert_eq!(
+            describe(crate::descriptor::view(start + 32).as_ref()),
+            format!("Constant({straddle}, 256)")
+        );
+
+        let null = std::ptr::null();
+        let alloc_iid = ID3D12CommandAllocator::IID;
+        let list_iid = ID3D12GraphicsCommandList::IID;
+        let mut allocator = null;
+        assert_eq!(
+            crate::list::create_allocator(null, 0, (&raw const alloc_iid).cast(), &mut allocator),
+            S_OK
+        );
+        let mut list = null;
+        assert_eq!(
+            crate::list::create_list(
+                null,
+                0,
+                0,
+                allocator,
+                null,
+                (&raw const list_iid).cast(),
+                &mut list,
+            ),
+            S_OK
+        );
+        let host_list = crate::list::host_list(list).expect("host list");
+        host_list.note_op(|| describe(crate::descriptor::view(start).as_ref()));
+        host_list.note_op(|| describe(crate::descriptor::view(start + 32).as_ref()));
+        let close = crate::object::slot::<extern "system" fn(This) -> HRESULT>(list, 0x48);
+        assert_eq!(close(list), S_OK);
+        host.execute(&[host_list]);
+        assert_eq!(host.log_messages(), None);
+
+        let release = |o: This| crate::object::slot::<extern "system" fn(This) -> u32>(o, 0x10)(o);
+        assert_eq!(release(list), 0);
+        assert_eq!(release(allocator), 0);
+        assert_eq!(release(heap), 0);
+    }
 }
