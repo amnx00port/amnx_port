@@ -45,6 +45,18 @@ pub(crate) struct Mesh {
     pub topology: u8,
 }
 
+/// Geometry shader state (`GSState` metadata and `PSV0`).
+#[derive(Debug, Clone, Copy)]
+pub(crate) struct Geometry {
+    /// DXIL `InputPrimitive`: 1 point, 2 line, 3 triangle, 6 lineadj, 7 triangleadj.
+    pub input_primitive: u32,
+    /// DXIL `PrimitiveTopology`: 1 pointlist, 3 linestrip, 5 trianglestrip.
+    pub output_topology: u32,
+    pub max_vertices: u32,
+    pub invocations: u32,
+    pub stream_mask: u32,
+}
+
 pub(crate) struct Shader {
     pub m: Module,
     pub t: Types,
@@ -55,6 +67,8 @@ pub(crate) struct Shader {
     pub prims: Vec<SigElement>,
     /// A mesh shader (`threads` is its thread-group size).
     pub mesh: Option<Mesh>,
+    /// A geometry shader.
+    pub geometry: Option<Geometry>,
     /// Dwords of user data the shader reads (0: no user-data buffer).
     pub user_data: u32,
     /// Immediate samplers, bound as `s0..` in [`SAMPLER_SPACE`].
@@ -115,6 +129,7 @@ impl Shader {
             outputs: Vec::new(),
             prims: Vec::new(),
             mesh: None,
+            geometry: None,
             user_data: 0,
             samplers: 0,
             cmp_samplers: 0,
@@ -497,6 +512,20 @@ impl Shader {
             let f = self.m.int_const(i64t, self.flags as i64);
             props.push(self.m.md_value(f));
         }
+        if let Some(gs) = self.geometry {
+            // GSState (tag 1): input primitive, max vertex count, active stream
+            // mask, output stream topology, instance count.
+            props.push(i32c(&mut self, 1));
+            let state = [
+                gs.input_primitive,
+                gs.max_vertices,
+                gs.stream_mask,
+                gs.output_topology,
+                gs.invocations,
+            ]
+            .map(|n| Some(i32c(&mut self, n)));
+            props.push(self.m.md_node(state.to_vec()));
+        }
         if let Some(threads) = self.threads {
             let t = threads.map(|n| Some(i32c(&mut self, n)));
             let t = self.m.md_node(t.to_vec());
@@ -543,9 +572,10 @@ impl Shader {
         let version = self.m.md_node(vec![Some(one), Some(six)]);
         self.m.named_md("dx.version", vec![version]);
         self.m.named_md("dx.valver", vec![version]);
-        // Program kinds: 0 pixel, 1 vertex, 5 compute, 13 mesh.
+        // Program kinds: 0 pixel, 1 vertex, 2 geometry, 5 compute, 13 mesh.
         let (name, kind) = match (self.threads, self.pixel) {
             _ if self.mesh.is_some() => ("ms", 13u32),
+            _ if self.geometry.is_some() => ("gs", 2u32),
             (Some(_), _) => ("cs", 5u32),
             (None, true) => ("ps", 0),
             (None, false) => ("vs", 1),
@@ -599,6 +629,7 @@ impl Shader {
             outputs: &self.outputs,
             prims: &self.prims,
             mesh: self.mesh.map(|m| (m, self.lds_dwords * 4)),
+            geometry: self.geometry,
             bindings: &bindings,
             threads: self.threads.unwrap_or_default(),
             wave_size: self.wave_size,

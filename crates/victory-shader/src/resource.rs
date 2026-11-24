@@ -37,6 +37,9 @@ pub struct Address {
 /// compiler appends after the code and reads through `s_getpc_b64`; the
 /// offset is then the byte offset in the code.
 pub const CODE: usize = usize::MAX;
+/// [`Address::param`] of the console GS internal state table (`s[8:9]`), from
+/// which merged GS prologues load the GSVS LDS ring base offset.
+pub const GS_TABLE: usize = usize::MAX - 1;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Source {
@@ -494,6 +497,11 @@ impl<'a> Tracer<'a> {
                     offset: 0,
                     dynamic: None,
                 },
+                None if self.stage == HwStage::Gs && reg == Reg::S(8) => Sum {
+                    base: Some(v),
+                    offset: 0,
+                    dynamic: None,
+                },
                 _ => dynamic,
             };
         }
@@ -647,6 +655,21 @@ impl<'a> Tracer<'a> {
             });
         }
         let reg = self.inputs[base.0 as usize].ok_or("an address not from a root parameter")?;
+        if self.stage == HwStage::Gs && reg == Reg::S(8) && self.param_of(reg).is_none() {
+            let s9 = self.p.inputs.iter().find(|i| i.0 == Reg::S(9)).map(|i| i.1);
+            let ok_hi = self.high_half(hi, s9)
+                || matches!(hi, Term::Value(v) if self.sop2(v, &["s_and_b32"]).is_some_and(
+                    |(_, [a, b])| s9.is_some_and(|h| a == Term::Value(h) || b == Term::Value(h))
+                ));
+            if !ok_hi {
+                return Err("an address with an untracked high half");
+            }
+            return Ok(Address {
+                param: GS_TABLE,
+                offset: s.offset.wrapping_add(extra.offset),
+                dynamic: s.dynamic.or(extra.dynamic),
+            });
+        }
         let (param, _) = self
             .param_of(reg)
             .ok_or("an address not from a root parameter")?;

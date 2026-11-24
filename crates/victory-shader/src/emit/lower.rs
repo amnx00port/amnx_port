@@ -14,10 +14,10 @@ use super::container::SigElement;
 use super::shader::{Shader, flags};
 use crate::ShaderError;
 use crate::gfx10::{Dpp, Fields, NULL, Operand};
-use crate::io::{Barycentric, Export, Input, Interp, Io, Target};
+use crate::io::{Barycentric, Export, GsInput, GsOp, Input, Interp, Io, LdsOutput, Target};
 use crate::ir::{EXEC, Exit, Inst, Program, Reg, Value};
 use crate::native::{HwStage, NativeProgram, ResourceType, RootType, StageIo, Usage, UsedResource};
-use crate::resource::{Address, CODE, Resources, Role, Site, Source};
+use crate::resource::{Address, CODE, GS_TABLE, Resources, Role, Site, Source};
 use crate::structure::{Atom, Bool, LaneExit, Structured};
 
 type Why = &'static str;
@@ -56,6 +56,8 @@ pub(crate) struct Parts<'a> {
     pub prims: Vec<SigElement>,
     /// Mesh: what the group id arrives multiplied by.
     pub mesh_stride: u32,
+    /// Geometry: input primitive, output topology, vertex/instance limits.
+    pub geometry: Option<super::shader::Geometry>,
 }
 
 enum Stop {
@@ -173,6 +175,12 @@ struct Lower<'a> {
     scalar: HashMap<Site, Address>,
     exports: HashMap<Site, &'a Export>,
     interps: HashMap<Site, &'a Interp>,
+    gs_reads: HashMap<Site, &'a [(u8, GsInput)]>,
+    lds_outputs: HashMap<Site, &'a [LdsOutput]>,
+    gs_ops: HashMap<Site, GsOp>,
+    /// Opaque EXEC masks written by the merged ES+GS active-lane preamble:
+    /// every PC VS/GS invocation is active, so these evaluate to `true`.
+    merged_wave_mask: HashSet<Value>,
     handles: HashMap<(usize, Site, u8, bool, u32), V>,
     /// Blocks splitting the edge from one IR block to another.
     edges: HashMap<(usize, usize), usize>,
@@ -311,7 +319,8 @@ fn packed_half(elements: &[SigElement], a: u8, b: Option<u8>, h: u8) -> Option<(
 /// output entry names, taken in row order.
 fn half_outputs(io: &StageIo, outputs: &[SigElement]) -> HashMap<u8, (bool, Option<u8>)> {
     let entries = match io {
-        StageIo::Vs { outputs, .. } => outputs,
+        StageIo::Vs { outputs, .. } | StageIo::Es { outputs, .. } => outputs,
+        StageIo::Gs(gs) => &gs.outputs,
         StageIo::Ms(ms) => &ms.outputs,
         _ => return HashMap::new(),
     };
@@ -340,6 +349,70 @@ fn half_outputs(io: &StageIo, outputs: &[SigElement]) -> HashMap<u8, (bool, Opti
 
 fn unsupported(offset: usize, what: Why) -> Stop {
     Stop::Fail(ShaderError::Unsupported { offset, what })
+}
+
+/// Finds EXEC mask values written by the GFX10 merged ES+GS active-lane
+/// preamble (`s_bfe_{i32,u32} count, s3, ...; s_bfm_b64 exec, count, 0;
+/// s_cmp_eq_u32 count, 64; s_cselect_b64 exec, -1, exec`).
+fn merged_wave_masks(p: &Program) -> HashSet<Value> {
+    let mut out = HashSet::new();
+    let Some(s3) = p.inputs.iter().find(|i| i.0 == Reg::S(3)).map(|i| i.1) else {
+        return out;
+    };
+    let Some(entry) = p.blocks.first() else {
+        return out;
+    };
+    let mut counts = HashSet::new();
+    let mut bfm = HashSet::new();
+    for inst in &entry.insts {
+        let Fields::Sop { dst, src, .. } = &inst.fields else {
+            continue;
+        };
+        match inst.name() {
+            "s_bfe_i32" | "s_bfe_u32" => {
+                if matches!(src.first(), Some(Operand::Scalar { code: 3, .. }))
+                    && inst.read(Reg::S(3)) == Some(s3)
+                    && let Some(&Operand::Scalar { code, .. }) = dst.as_ref()
+                    && let Some(w) = inst.write(Reg::S(code))
+                {
+                    counts.insert(w);
+                }
+            }
+            "s_bfm_b64" => {
+                if matches!(dst, Some(Operand::Scalar { code, .. }) if *code == EXEC)
+                    && matches!(src.first(), Some(Operand::Scalar { code, .. }) if inst.read(Reg::S(*code)).is_some_and(|v| counts.contains(&v)))
+                    && matches!(src.get(1), Some(Operand::Const(128)))
+                    && let Some(w) = inst.write(Reg::S(EXEC))
+                {
+                    bfm.insert(w);
+                    out.insert(w);
+                }
+            }
+            "s_cmp_eq_u32" => {
+                if matches!(src.first(), Some(Operand::Scalar { code, .. }) if inst.read(Reg::S(*code)).is_some_and(|v| counts.contains(&v)))
+                    && matches!(
+                        src.get(1),
+                        Some(Operand::Const(192)) | Some(Operand::Literal(64))
+                    )
+                    && let Some(w) = inst.write(Reg::Scc)
+                {
+                    out.insert(w);
+                }
+            }
+            "s_cselect_b64" => {
+                if matches!(dst, Some(Operand::Scalar { code, .. }) if *code == EXEC)
+                    && matches!(src.first(), Some(Operand::Const(193)))
+                    && matches!(src.get(1), Some(Operand::Scalar { code, .. }) if *code == EXEC)
+                    && inst.read(Reg::S(EXEC)).is_some_and(|v| bfm.contains(&v))
+                    && let Some(w) = inst.write(Reg::S(EXEC))
+                {
+                    out.insert(w);
+                }
+            }
+            _ => {}
+        }
+    }
+    out
 }
 
 impl<'a> Lower<'a> {
@@ -449,6 +522,16 @@ impl<'a> Lower<'a> {
                 }
             }
         }
+        if x.native.stage == HwStage::Es {
+            // ES->GS handover barrier is implicit between PC VS and GS stages.
+            no_barrier.extend(0..p.blocks.len());
+        }
+        s.geometry = x.geometry;
+        let merged_wave_mask = if matches!(x.native.stage, HwStage::Es | HwStage::Gs) {
+            merged_wave_masks(p)
+        } else {
+            HashSet::new()
+        };
         Lower {
             s,
             x,
@@ -478,6 +561,20 @@ impl<'a> Lower<'a> {
             scalar: x.res.scalar.iter().copied().collect(),
             exports: x.io.exports.iter().map(|e| (e.site, e)).collect(),
             interps: x.io.interps.iter().map(|(s, i)| (*s, i)).collect(),
+            gs_reads: x
+                .io
+                .gs_reads
+                .iter()
+                .map(|(s, r)| (*s, r.as_slice()))
+                .collect(),
+            lds_outputs: x
+                .io
+                .lds_outputs
+                .iter()
+                .map(|(s, o)| (*s, o.as_slice()))
+                .collect(),
+            gs_ops: x.io.gs_ops.iter().copied().collect(),
+            merged_wave_mask,
             handles: HashMap::new(),
             edges: HashMap::new(),
             exported: vec![false; p.blocks.len()],
@@ -491,7 +588,7 @@ impl<'a> Lower<'a> {
             half_outputs: half_outputs(&x.native.io, &x.outputs),
             mask_data: match x.native.stage {
                 HwStage::Cs => MaskData::Console,
-                HwStage::Ps | HwStage::Vs => MaskData::Host,
+                HwStage::Ps | HwStage::Vs | HwStage::Es | HwStage::Gs => MaskData::Host,
                 _ => MaskData::None,
             },
             mask_ok: false,
@@ -968,7 +1065,29 @@ impl<'a> Lower<'a> {
                 };
             }
             Input::Barycentric { .. } => return Val::Missing("barycentrics read directly"),
+            Input::PrimitiveId if self.s.geometry.is_some() => {
+                let v = self.s.op(
+                    self.s.entry,
+                    "primitiveID.i32",
+                    Attr::ReadNone,
+                    self.s.t.i32,
+                    108,
+                    &[],
+                );
+                return Val::I32(v);
+            }
             Input::PrimitiveId => return Val::Missing("the primitive id"),
+            Input::GsInstanceId => {
+                let v = self.s.op(
+                    self.s.entry,
+                    "gsInstanceID.i32",
+                    Attr::ReadNone,
+                    self.s.t.i32,
+                    100,
+                    &[],
+                );
+                return Val::I32(v);
+            }
             // The console code tests it against 0 (`v_cmp_ne_u32`), as the
             // host's value can be.
             Input::FrontFace => (13, 0),
@@ -1108,6 +1227,45 @@ impl<'a> Lower<'a> {
         } else {
             Val::I32(self.s.m.cast(entry, Cast::Bitcast, v, self.s.t.i32))
         }
+    }
+
+    /// Loads one per-vertex input channel for a geometry shader (`gsVertexAxis = vertex`).
+    fn load_gs_input(&mut self, id: usize, col: u8, vertex: u8) -> Result<V, Why> {
+        if self.s.inputs[id].half {
+            return Err("a 16-bit GS input");
+        }
+        let e = &mut self.s.inputs[id];
+        e.usage |= 1 << col;
+        let (int, bit) = (e.comp != 9, e.comp == 1);
+        let (ty, suffix) = if bit {
+            (self.s.t.i1, ".i1")
+        } else if int {
+            (self.s.t.i32, ".i32")
+        } else {
+            (self.s.t.f32, ".f32")
+        };
+        let c = self.cur;
+        let args = [
+            self.s.m.i32(id as u32),
+            self.s.m.i32(0),
+            self.s.m.i8(col),
+            self.s.m.i32(u32::from(vertex)),
+        ];
+        let v = self.s.op(
+            c,
+            &format!("loadInput{suffix}"),
+            Attr::ReadNone,
+            ty,
+            4,
+            &args,
+        );
+        Ok(if bit {
+            self.s.m.cast(c, Cast::ZExt, v, self.s.t.i32)
+        } else if int {
+            v
+        } else {
+            self.s.m.cast(c, Cast::Bitcast, v, self.s.t.i32)
+        })
     }
 
     /// The DXIL form of an IR value.
@@ -1592,6 +1750,7 @@ impl<'a> Lower<'a> {
                     .copied()
                     .unwrap_or("a lane mask from a carry")
             }),
+            Atom::Uniform(v) if self.merged_wave_mask.contains(&v) => Ok(self.s.m.bool(true)),
             Atom::Uniform(v) => match self.get(v)? {
                 Val::Bit(x) => Ok(x),
                 Val::I32(x) => {
@@ -1618,6 +1777,7 @@ impl<'a> Lower<'a> {
             // lanes it adds only feed derivatives, and exports keep their own
             // masks. Wrong if such a section had a side effect.
             Atom::Quad(_) => Ok(self.s.m.bool(true)),
+            Atom::Opaque(v) if self.merged_wave_mask.contains(&v) => Ok(self.s.m.bool(true)),
             // With console lanes, a mask held as a number is the console's:
             // the lane tests its own bit.
             Atom::Opaque(v) if self.console_lanes => {
@@ -1708,7 +1868,14 @@ impl<'a> Lower<'a> {
     fn guard(&mut self, b: usize, i: usize) -> Result<Option<V>, Why> {
         match self.x.st.guards[b][i] {
             None => Ok(None),
-            Some(g) => Ok(Some(self.boolean(g, self.cur)?)),
+            Some(g) => {
+                let v = self.boolean(g, self.cur)?;
+                if !self.merged_wave_mask.is_empty() && v == self.s.m.bool(true) {
+                    Ok(None)
+                } else {
+                    Ok(Some(v))
+                }
+            }
         }
     }
 
@@ -2127,6 +2294,64 @@ impl<'a> Lower<'a> {
             self.write(inst, Reg::V(reg), r, guard);
             return Ok(());
         }
+        if let Some(&reads) = self.gs_reads.get(&(b, i)) {
+            let reg = dst_reg.ok_or("a GS input read result")?;
+            for &(dst_off, gs_in) in reads {
+                let (id, col) = self
+                    .find_input(gs_in.row, gs_in.channel)
+                    .ok_or("a GS input the signature lacks")?;
+                let x = self.load_gs_input(id, col, gs_in.vertex)?;
+                self.write(inst, Reg::V(reg + dst_off), x, guard);
+            }
+            return Ok(());
+        }
+        if let Some(&writes) = self.lds_outputs.get(&(b, i)) {
+            let at = self.begin_guarded(guard);
+            for &out in writes {
+                let found = self.s.outputs.iter().enumerate().find_map(|(id, o)| {
+                    (o.row == Some(u32::from(out.row))
+                        && out.channel >= o.col
+                        && out.channel < o.col + o.cols)
+                        .then(|| (id, out.channel - o.col))
+                });
+                let Some((id, col)) = found else {
+                    continue;
+                };
+                if self.s.outputs[id].half {
+                    return Err("a 16-bit ES/GS LDS output");
+                }
+                let x = self.i32_of(out.value)?;
+                let el = &mut self.s.outputs[id];
+                el.usage |= 1 << col;
+                let (suffix, val) = if el.comp == 9 {
+                    let f = self
+                        .floats
+                        .get(&out.value)
+                        .copied()
+                        .unwrap_or_else(|| self.as_float(x));
+                    (".f32", f)
+                } else {
+                    (".i32", x)
+                };
+                let args = [
+                    self.s.m.i32(id as u32),
+                    self.s.m.i32(0),
+                    self.s.m.i8(col),
+                    val,
+                ];
+                let void = self.s.t.void;
+                self.s.op(
+                    self.cur,
+                    &format!("storeOutput{suffix}"),
+                    Attr::NoUnwind,
+                    void,
+                    5,
+                    &args,
+                );
+            }
+            self.end_guarded(at, &[]);
+            return Ok(());
+        }
         if self.s.lds_dwords == 0 {
             return Err("LDS the program does not allocate");
         }
@@ -2272,6 +2497,7 @@ impl<'a> Lower<'a> {
             || name.contains("store")
             || name.contains("atomic")
             || name == "s_barrier"
+            || self.gs_ops.contains_key(&(b, i))
             || matches!(inst.fields, Fields::Ds { .. })
                 && !(name.starts_with("ds_read")
                     || name.starts_with("ds_swizzle")
@@ -2289,6 +2515,38 @@ impl<'a> Lower<'a> {
                 self.s
                     .op(self.cur, "barrier", Attr::NoDuplicate, void, 80, &[mode]);
                 Ok(())
+            }
+            Fields::Sopp { .. } if self.gs_ops.contains_key(&(b, i)) => {
+                let op = self.gs_ops[&(b, i)];
+                self.guard(b, i).map(|guard| {
+                    let at = self.begin_guarded(guard);
+                    let void = self.s.t.void;
+                    match op {
+                        GsOp::Emit(stream) => {
+                            let s = self.s.m.i8(stream);
+                            self.s
+                                .op(self.cur, "emitStream", Attr::NoUnwind, void, 97, &[s]);
+                        }
+                        GsOp::Cut(stream) => {
+                            let s = self.s.m.i8(stream);
+                            self.s
+                                .op(self.cur, "cutStream", Attr::NoUnwind, void, 98, &[s]);
+                        }
+                        GsOp::EmitCut(stream) => {
+                            let s = self.s.m.i8(stream);
+                            self.s.op(
+                                self.cur,
+                                "emitThenCutStream",
+                                Attr::NoUnwind,
+                                void,
+                                99,
+                                &[s],
+                            );
+                        }
+                        GsOp::Done => {}
+                    }
+                    self.end_guarded(at, &[]);
+                })
             }
             Fields::Sopp { .. } => Ok(()),
             Fields::Smem { .. } => self.smem(inst, (b, i)),
@@ -2806,8 +3064,13 @@ impl<'a> Lower<'a> {
             unreachable!()
         };
         let name = inst.name();
-        if let Some(a) = self.scalar.get(&site).copied().filter(|a| a.param == CODE) {
-            return self.code_smem(inst, a);
+        if let Some(a) = self.scalar.get(&site).copied() {
+            if a.param == CODE {
+                return self.code_smem(inst, a);
+            }
+            if a.param == GS_TABLE {
+                return Err("console GS ring table");
+            }
         }
         let Some(rest) = name.strip_prefix("s_buffer_load_dword") else {
             return self.descriptor_data(inst, site);
@@ -6813,6 +7076,7 @@ impl<'a> Lower<'a> {
                 }
                 Term::Ret
             }
+            LaneExit::Indirect if self.x.native.stage == HwStage::Es => Term::Ret,
             LaneExit::Indirect => return Err(unsupported(offset, "an indirect jump")),
         };
         let _ = Exit::End;
@@ -6984,6 +7248,7 @@ mod tests {
             outputs: vec![],
             prims: vec![],
             mesh_stride: 0,
+            geometry: None,
         })
         .map(|_| ())
     }
@@ -7034,6 +7299,7 @@ mod tests {
             outputs: vec![],
             prims: vec![],
             mesh_stride: 0,
+            geometry: None,
         })
     }
 
@@ -7137,6 +7403,7 @@ mod tests {
             outputs: vec![],
             prims: vec![],
             mesh_stride: 0,
+            geometry: None,
         }).unwrap();
 
         let container =
