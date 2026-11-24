@@ -174,8 +174,9 @@ struct Lower<'a> {
     exports: HashMap<Site, &'a Export>,
     interps: HashMap<Site, &'a Interp>,
     handles: HashMap<(usize, Site, u8, bool, u32), V>,
-    /// Blocks splitting the edge from one IR block to another.
-    edges: HashMap<(usize, usize), usize>,
+    /// Blocks splitting each edge from one IR block to another (kept in
+    /// predecessor order so duplicate targets from one branch keep both edges).
+    edges: HashMap<(usize, usize), Vec<usize>>,
     /// Per IR block: a `done` export is behind every lane entering it.
     exported: Vec<bool>,
     /// Reverse-postorder index per IR block.
@@ -3371,14 +3372,15 @@ impl<'a> Lower<'a> {
                 // join picks one with a phi.
                 let _ = site;
                 let mut incoming = Vec::new();
-                for (&q, arg) in self.x.p.blocks[*block].preds.iter().zip(args) {
+                let preds = &self.x.p.blocks[*block].preds;
+                for ((n, &q), arg) in preds.iter().enumerate().zip(args) {
                     if self.block[q].is_none() {
                         continue;
                     }
                     let (Some(tail), Source::Loaded { load, first }) = (self.tail[q], arg) else {
                         return Err("a descriptor chosen by control flow");
                     };
-                    let at = self.edges.get(&(q, *block)).copied().unwrap_or(tail);
+                    let at = self.edge_block(preds, n, *block, tail);
                     let here = std::mem::replace(&mut self.cur, at);
                     let index = self.heap_index(*load, *first, sampler);
                     self.cur = here;
@@ -3454,13 +3456,14 @@ impl<'a> Lower<'a> {
                 let join =
                     self.block[*block].ok_or("a per-lane descriptor chosen by control flow")?;
                 let mut incoming = Vec::new();
-                for (&q, arg) in self.x.p.blocks[*block].preds.iter().zip(args) {
+                let preds = &self.x.p.blocks[*block].preds;
+                for ((n, &q), arg) in preds.iter().enumerate().zip(args) {
                     if self.block[q].is_none() {
                         continue;
                     }
                     let tail =
                         self.tail[q].ok_or("a per-lane descriptor joined from a later block")?;
-                    let at = self.edges.get(&(q, *block)).copied().unwrap_or(tail);
+                    let at = self.edge_block(preds, n, *block, tail);
                     let index = match arg {
                         Some(arg) => {
                             let here = std::mem::replace(&mut self.cur, at);
@@ -6876,8 +6879,18 @@ impl<'a> Lower<'a> {
         }
         let e = self.s.m.new_block();
         self.s.m.terminate(e, Term::Br(target));
-        self.edges.insert((from, to), e);
+        self.edges.entry((from, to)).or_default().push(e);
         e
+    }
+
+    /// The DXIL block representing incoming predecessor edge `preds[idx]` into `to`.
+    fn edge_block(&self, preds: &[usize], idx: usize, to: usize, tail: usize) -> usize {
+        let q = preds[idx];
+        let occ = preds[..idx].iter().filter(|&&p| p == q).count();
+        self.edges
+            .get(&(q, to))
+            .and_then(|v| v.get(occ).copied())
+            .unwrap_or(tail)
     }
 
     fn fill_phis(&mut self) -> Result<(), Stop> {
@@ -6900,9 +6913,10 @@ impl<'a> Lower<'a> {
             let phi = &p.blocks[b].phis[i];
             let bit = phi.reg == Reg::Scc;
             let mut incoming = Vec::new();
-            for (n, &q) in p.blocks[b].preds.iter().enumerate() {
+            let preds = &p.blocks[b].preds;
+            for (n, &q) in preds.iter().enumerate() {
                 let Some(qb) = self.tail[q] else { continue };
-                let qb = self.edges.get(&(q, b)).copied().unwrap_or(qb);
+                let qb = self.edge_block(preds, n, b, qb);
                 let arg = phi.args[n];
                 let x = match (self.vals.get(&arg).copied(), bit) {
                     (Some(Val::I32(x)), false) | (Some(Val::Bit(x)), true) => x,
@@ -6929,9 +6943,10 @@ impl<'a> Lower<'a> {
             let phi = &p.blocks[b].phis[i];
             let offset = p.blocks[b].offset;
             let mut incoming = Vec::new();
-            for (n, &q) in p.blocks[b].preds.iter().enumerate() {
+            let preds = &p.blocks[b].preds;
+            for (n, &q) in preds.iter().enumerate() {
                 let Some(qb) = self.tail[q] else { continue };
-                let qb = self.edges.get(&(q, b)).copied().unwrap_or(qb);
+                let qb = self.edge_block(preds, n, b, qb);
                 let m =
                     *self.x.st.masks.get(&phi.args[n]).ok_or_else(|| {
                         unsupported(offset, "a lane-mask join of an untracked mask")
