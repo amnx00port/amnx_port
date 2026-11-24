@@ -937,3 +937,267 @@ fn v_cmp_class_f16_matches_rdna2() {
         );
     });
 }
+
+/// EXP instruction `exp target, vsrc0, vsrc1, vsrc2, vsrc3` (`en` bitmask).
+const fn exp_inst(target: u8, en: u8, srcs: [u8; 4], done: bool, vm: bool) -> [u32; 2] {
+    [
+        0x3E << 26
+            | (done as u32) << 11
+            | (vm as u32) << 12
+            | (target as u32) << 4
+            | (en as u32 & 0xF),
+        (srcs[0] as u32) | (srcs[1] as u32) << 8 | (srcs[2] as u32) << 16 | (srcs[3] as u32) << 24,
+    ]
+}
+
+#[test]
+fn vs_rt_and_viewport_array_index_exports_render_across_slices_and_viewports() {
+    use super::container::{self, SigElement};
+    use super::host::Draw;
+    use crate::dxbc::{self, Container, FourCC};
+    use crate::native::{Usage, VsInput};
+    use windows::Win32::Graphics::Direct3D12::D3D12_VIEWPORT;
+
+    let sig_el = |name: &str, kind: u8, comp: u8, row: u32, col: u8, cols: u8| SigElement {
+        name: name.into(),
+        index: 0,
+        kind,
+        comp,
+        interp: 0,
+        row: Some(row),
+        col,
+        cols,
+        usage: (1 << cols) - 1,
+        half: false,
+    };
+
+    // Minimal synthetic pixel shader outputting constant RGBA (0.25, 0.5, 0.75, 1.0).
+    let ps = {
+        let mut words = Vec::new();
+        for (dst, val) in [(0u8, 0.25f32), (1, 0.5), (2, 0.75), (3, 1.0)] {
+            words.push(vop1(0x01, dst, 255));
+            words.push(val.to_bits());
+        }
+        words.extend_from_slice(&exp_inst(0, 0xF, [0, 1, 2, 3], true, true));
+        words.push(S_ENDPGM);
+
+        let code: Vec<u8> = words.iter().flat_map(|w| w.to_le_bytes()).collect();
+        let native = NativeProgram {
+            stage: HwStage::Ps,
+            wave64: false,
+            vgprs: 8,
+            layout: Vec::new(),
+            used: Vec::new(),
+            io: StageIo::Ps {
+                inputs: Vec::new(),
+                input_addr: 0,
+                db_shader_control: 0,
+                patches: Vec::new(),
+            },
+            code,
+        };
+        let osg1 = container::signature(&[sig_el("SV_Target", 16, 9, 0, 0, 4)], false);
+        let bytes = dxbc::build(&[(FourCC::OSG1, &osg1)]);
+        let c = Container::parse(&bytes).expect("parse PS container");
+        let p = ir::build(&native.code, false, native.vgprs).expect("PS ir");
+        let st = structure::structure(&p).expect("PS structure");
+        let res = resource::track(&p, &native.layout, native.stage, Some(&st)).expect("PS res");
+        let io = io::raise(&p, &native).expect("PS io");
+        super::emit(&c, &native, &p, &st, &io, &res).expect("PS emit")
+    };
+
+    let build_vs = |misc_z: u32, clip: Option<f32>, osg_elems: Vec<SigElement>| -> HostShader {
+        // v4, v5 = vertex input POSITION.xy; v6 = 0.0; v7 = 1.0.
+        let mut words = vec![
+            vop1(0x01, 6, 128),
+            vop1(0x01, 7, 255),
+            1.0f32.to_bits(),
+            vop1(0x01, 8, 255),
+            misc_z,
+        ];
+        words.extend_from_slice(&exp_inst(12, 0xF, [4, 5, 6, 7], false, false)); // pos0
+        words.extend_from_slice(&exp_inst(13, 0x4, [0, 0, 8, 0], clip.is_none(), false)); // pos1.z
+        if let Some(clip_val) = clip {
+            words.push(vop1(0x01, 9, 255));
+            words.push(clip_val.to_bits());
+            words.extend_from_slice(&exp_inst(14, 0x1, [9, 0, 0, 0], true, false)); // pos2.x
+        }
+        words.extend_from_slice(&exp_inst(32, 0x0, [0, 0, 0, 0], false, false)); // unread param0
+        words.push(S_ENDPGM);
+
+        let code: Vec<u8> = words.iter().flat_map(|w| w.to_le_bytes()).collect();
+        let native = NativeProgram {
+            stage: HwStage::Vs,
+            wave64: false,
+            vgprs: 12,
+            layout: Vec::new(),
+            used: Vec::new(),
+            io: StageIo::Vs {
+                inputs: vec![VsInput {
+                    usage: Usage::Generic,
+                    row: 0,
+                    mask: 0x3,
+                    vgpr: 4,
+                }],
+                outputs: Vec::new(),
+            },
+            code,
+        };
+        let isg1 = container::signature(&[sig_el("POSITION", 0, 9, 0, 0, 2)], true);
+        let osg1 = container::signature(&osg_elems, false);
+        let bytes = dxbc::build(&[(FourCC::ISG1, &isg1), (FourCC::OSG1, &osg1)]);
+        let c = Container::parse(&bytes).expect("parse VS container");
+        let p = ir::build(&native.code, false, native.vgprs).expect("VS ir");
+        let st = structure::structure(&p).expect("VS structure");
+        let res = resource::track(&p, &native.layout, native.stage, Some(&st)).expect("VS res");
+        let io = io::raise(&p, &native).expect("VS io");
+        let vs = super::emit(&c, &native, &p, &st, &io, &res).expect("VS emit");
+
+        let host_c = Container::parse(&vs.dxil).expect("emitted VS container");
+        let sfi0 = u64::from_le_bytes(
+            host_c
+                .part(FourCC::SFI0)
+                .expect("SFI0")
+                .data
+                .try_into()
+                .unwrap(),
+        );
+        assert_ne!(
+            sfi0 & 0x2000,
+            0,
+            "VS must set VIEWPORT_RT_INDEX feature (0x2000)"
+        );
+        if let Ok(mut v) =
+            validator::Validator::load(validator::Validator::default_path().as_deref())
+        {
+            let mut copy = vs.dxil.clone();
+            let ours = copy[4..20].to_vec();
+            v.validate(&mut copy).expect("VS DXIL validation failed");
+            assert_eq!(copy[4..20], ours[..], "VS container hash mismatch");
+        }
+        vs
+    };
+
+    if let Ok(mut v) = validator::Validator::load(validator::Validator::default_path().as_deref()) {
+        let mut copy = ps.dxil.clone();
+        let ours = copy[4..20].to_vec();
+        v.validate(&mut copy).expect("PS DXIL validation failed");
+        assert_eq!(copy[4..20], ours[..], "PS container hash mismatch");
+    }
+
+    // 1) `SV_RenderTargetArrayIndex` only: slice 2 in low 16 bits, non-zero
+    //    upper bits (`0xDEAD_0002`) masked off -> slice 2, viewport 0 (left).
+    let vs_rt_only = build_vs(
+        0xDEAD_0002,
+        None,
+        vec![
+            sig_el("SV_Position", 3, 9, 0, 0, 4),
+            sig_el("SV_RenderTargetArrayIndex", 4, 5, 1, 0, 1),
+        ],
+    );
+    // 2) `SV_ViewportArrayIndex` only: viewport 1 in high 16 bits, non-zero
+    //    lower bits (`0x0001_BEEF`) shifted out -> slice 0, viewport 1 (right).
+    let vs_vp_only = build_vs(
+        0x0001_BEEF,
+        None,
+        vec![
+            sig_el("SV_Position", 3, 9, 0, 0, 4),
+            sig_el("SV_ViewportArrayIndex", 5, 5, 1, 0, 1),
+        ],
+    );
+    // 3) Both packed in row 1 (`col 0` and `col 1`) + `SV_ClipDistance0`
+    //    shifted to `pos2.x` (+1.0 keeps, -1.0 clips) -> slice 1, viewport 1.
+    let both_sig = || {
+        vec![
+            sig_el("SV_Position", 3, 9, 0, 0, 4),
+            sig_el("SV_RenderTargetArrayIndex", 4, 5, 1, 0, 1),
+            sig_el("SV_ViewportArrayIndex", 5, 5, 1, 1, 1),
+            sig_el("SV_ClipDistance", 6, 9, 2, 0, 1),
+        ]
+    };
+    let vs_both_keep = build_vs(0x0001_0001, Some(1.0), both_sig());
+    let vs_both_clip = build_vs(0x0001_0001, Some(-1.0), both_sig());
+
+    let _one = ONE_AT_A_TIME.lock().unwrap_or_else(|e| e.into_inner());
+    let adapters = Host::adapters();
+    assert!(!adapters.is_empty(), "no SM 6.6 adapter available");
+    let viewports = [
+        D3D12_VIEWPORT {
+            TopLeftX: 0.0,
+            TopLeftY: 0.0,
+            Width: 4.0,
+            Height: 4.0,
+            MinDepth: 0.0,
+            MaxDepth: 1.0,
+        },
+        D3D12_VIEWPORT {
+            TopLeftX: 4.0,
+            TopLeftY: 0.0,
+            Width: 4.0,
+            Height: 4.0,
+            MinDepth: 0.0,
+            MaxDepth: 1.0,
+        },
+    ];
+    let fullscreen = [-1.0f32, -1.0, 3.0, -1.0, -1.0, 3.0];
+    let want_color = [0.25f32, 0.5, 0.75, 1.0];
+    let clear = [0.0f32; 4];
+
+    let mut ran = 0;
+    for (label, host) in &adapters {
+        let supported = host.supports_vp_rt_array_index();
+        eprintln!("VP/RT array index from VS on {label}: supported={supported}");
+        if !supported {
+            continue;
+        }
+        let draw_case = |vs: &HostShader| -> Vec<Vec<[f32; 4]>> {
+            let (root, pso) = host
+                .pipeline(vs, &ps)
+                .unwrap_or_else(|e| panic!("{label}: pipeline failed: {e}"));
+            host.draw_layered(
+                &root,
+                &pso,
+                &Draw {
+                    roots: Vec::new(),
+                    textures: &[],
+                    samplers: &[],
+                    vertices: &fullscreen,
+                    stride: 8,
+                    size: (8, 4),
+                    mesh_groups: 0,
+                },
+                3,
+                &viewports,
+            )
+            .unwrap_or_else(|e| panic!("{label}: draw_layered failed: {e}"))
+        };
+
+        let check_grid = |slices: &[Vec<[f32; 4]>], hit: Option<(usize, usize)>, tag: &str| {
+            assert_eq!(slices.len(), 3);
+            for (s, texels) in slices.iter().enumerate() {
+                for y in 0..4usize {
+                    for x in 0..8usize {
+                        let vp = usize::from(x >= 4);
+                        let want = if hit == Some((s, vp)) {
+                            want_color
+                        } else {
+                            clear
+                        };
+                        assert_eq!(
+                            texels[y * 8 + x],
+                            want,
+                            "{label} ({tag}): slice {s} pixel ({x}, {y}) mismatch"
+                        );
+                    }
+                }
+            }
+        };
+
+        check_grid(&draw_case(&vs_rt_only), Some((2, 0)), "rt_only");
+        check_grid(&draw_case(&vs_vp_only), Some((0, 1)), "vp_only");
+        check_grid(&draw_case(&vs_both_keep), Some((1, 1)), "both_keep");
+        check_grid(&draw_case(&vs_both_clip), None, "both_clip");
+        ran += 1;
+    }
+    assert!(ran > 0, "no adapter supported VP/RT array index from VS");
+}
