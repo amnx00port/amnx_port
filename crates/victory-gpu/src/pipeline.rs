@@ -226,6 +226,18 @@ mod timing {
         }
 
         #[test]
+        fn successful_cached_lookup_does_not_record_a_wait() {
+            let cell = OnceLock::new();
+            let init = Counter::default();
+            let wait = Counter::default();
+            assert_eq!(*lookup(&cell, || 42, &init, &wait), 42);
+            let before = init.snapshot();
+            assert_eq!(*lookup(&cell, || panic!("must not retry"), &init, &wait), 42);
+            assert_eq!(init.snapshot(), before);
+            assert_eq!(wait.snapshot(), (0, 0));
+        }
+
+        #[test]
         fn counter_accumulates_samples() {
             let counter = Counter::default();
             counter.record(7);
