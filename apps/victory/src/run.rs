@@ -4,6 +4,90 @@ use anyhow::{Context, Result};
 
 use crate::{Console, Unimplemented};
 
+#[cfg(any(windows, test))]
+const SKIP_CPU_CHECK_ENV: &str = "VICTORY_SKIP_CPU_CHECK";
+
+#[cfg(any(windows, test))]
+fn skip_cpu_check(value: Option<&str>) -> bool {
+    value == Some("1")
+}
+
+/// Instruction set extensions an Xbox Series title runs without asking the
+/// CPU first, so a host without one stops on an illegal instruction instead
+/// of a message. Measured on Grand Theft Auto VI 1.0.2.1: across its 26.7 M
+/// instructions it executes `cpuid` from 9 places only, and uses FMA3, BMI1,
+/// BMI2, F16C, MOVBE, LZCNT, POPCNT, AES-NI and PCLMULQDQ throughout (every
+/// AVX2 CPU has all of them). Not listed:
+/// * the console's AMD-only instructions (SSE4a `insertq`, `clzero`,
+///   `monitorx`/`mwaitx`) and `clwb`, which the loader emulates
+///   (`victory_loader::crash`);
+/// * ADX, used only next to the title's AES code, where it may be chosen by
+///   `cpuid`; requiring it would turn away Haswell CPUs that may run fine.
+#[cfg(any(windows, test))]
+const REQUIRED_FEATURES: &[&str] = &[
+    "AVX2",
+    "FMA",
+    "BMI1",
+    "BMI2",
+    "F16C",
+    "LZCNT",
+    "POPCNT",
+    "MOVBE",
+    "AES",
+    "PCLMULQDQ",
+];
+
+/// `missing` are the [`REQUIRED_FEATURES`] this CPU lacks.
+#[cfg(any(windows, test))]
+fn check_cpu_features_with(missing: &[&str], skip_env: Option<&str>) -> Result<()> {
+    if missing.is_empty() || skip_cpu_check(skip_env) {
+        return Ok(());
+    }
+    anyhow::bail!(
+        "this CPU does not support {}, which Xbox Series titles require \
+         (they are built for Zen 2: AVX2 with FMA3, BMI1/2, F16C, MOVBE, LZCNT, POPCNT, AES and PCLMULQDQ); \
+         set {SKIP_CPU_CHECK_ENV}=1 to bypass this check (for example under CPU emulation such as Intel SDE)",
+        missing.join(", ")
+    );
+}
+
+/// The [`REQUIRED_FEATURES`] this CPU lacks.
+#[cfg(windows)]
+fn missing_cpu_features() -> Vec<&'static str> {
+    #[cfg(target_arch = "x86_64")]
+    {
+        use std::arch::is_x86_feature_detected as has;
+        let present = [
+            has!("avx2"),
+            has!("fma"),
+            has!("bmi1"),
+            has!("bmi2"),
+            has!("f16c"),
+            has!("lzcnt"),
+            has!("popcnt"),
+            has!("movbe"),
+            has!("aes"),
+            has!("pclmulqdq"),
+        ];
+        REQUIRED_FEATURES
+            .iter()
+            .zip(present)
+            .filter(|&(_, present)| !present)
+            .map(|(name, _)| *name)
+            .collect()
+    }
+    #[cfg(not(target_arch = "x86_64"))]
+    Vec::new()
+}
+
+/// Pre-flight check before executing title code: Xbox Series binaries are
+/// compiled for Zen 2 and use its extensions unconditionally.
+#[cfg(windows)]
+fn check_cpu_features() -> Result<()> {
+    let skip = std::env::var(SKIP_CPU_CHECK_ENV).ok();
+    check_cpu_features_with(&missing_cpu_features(), skip.as_deref())
+}
+
 #[cfg(windows)]
 pub fn run(
     exe: &Path,
@@ -16,6 +100,9 @@ pub fn run(
     use victory_hle::{HleResolver, HostPolicy};
     use victory_loader::{BindReport, UnimplementedPolicy, WithTitleDlls};
 
+    if execute {
+        check_cpu_features()?;
+    }
     // A title that relaunched itself: the old process must be gone first.
     victory_hle::modules::lifecycle::wait_for_previous();
     let cfg = victory_core::Config::load()?;
@@ -329,6 +416,65 @@ mod tests {
         });
         other.join().unwrap();
         assert_eq!(*order.lock().unwrap(), [1, 2]);
+    }
+
+    #[test]
+    fn cpu_feature_check_matches_host() {
+        let skip = std::env::var(super::SKIP_CPU_CHECK_ENV).ok();
+        let expected_ok = super::missing_cpu_features().is_empty() || skip.as_deref() == Some("1");
+        assert_eq!(super::check_cpu_features().is_ok(), expected_ok);
+    }
+
+    #[test]
+    fn missing_features_come_from_the_list() {
+        let missing = super::missing_cpu_features();
+        assert!(missing.iter().all(|f| super::REQUIRED_FEATURES.contains(f)));
+    }
+}
+
+#[cfg(test)]
+mod cpu_check_tests {
+    use super::{SKIP_CPU_CHECK_ENV, check_cpu_features_with};
+
+    #[test]
+    fn nothing_missing_passes() {
+        assert!(check_cpu_features_with(&[], None).is_ok());
+        assert!(check_cpu_features_with(&[], Some("0")).is_ok());
+        assert!(check_cpu_features_with(&[], Some("1")).is_ok());
+    }
+
+    #[test]
+    fn avx2_missing_fails_with_clear_error() {
+        for skip in [None, Some(""), Some("0"), Some("true")] {
+            let err = check_cpu_features_with(&["AVX2"], skip).unwrap_err();
+            let msg = err.to_string();
+            assert!(msg.contains("support AVX2,"), "unexpected error: {msg}");
+            assert!(msg.contains("Xbox Series"), "unexpected error: {msg}");
+            assert!(msg.contains(SKIP_CPU_CHECK_ENV), "unexpected error: {msg}");
+        }
+    }
+
+    #[test]
+    fn every_missing_feature_is_named() {
+        // Every missing extension is named, not only the first.
+        let msg = check_cpu_features_with(&["BMI1", "BMI2"], None)
+            .unwrap_err()
+            .to_string();
+        assert!(
+            msg.contains("support BMI1, BMI2,"),
+            "unexpected error: {msg}"
+        );
+    }
+
+    #[test]
+    fn skip_env_var_bypasses_missing_features() {
+        assert!(check_cpu_features_with(&["AVX2", "FMA"], Some("1")).is_ok());
+    }
+
+    #[test]
+    fn required_features_are_distinct() {
+        let mut seen = std::collections::HashSet::new();
+        assert!(super::REQUIRED_FEATURES.iter().all(|f| seen.insert(*f)));
     }
 }
 

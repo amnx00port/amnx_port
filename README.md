@@ -46,9 +46,10 @@ What each part does today and what it still needs:
 
 ## Getting started
 
-Requirements: Windows 10/11 x64, a CPU with AVX2, a Direct3D 12 GPU with
-shader model 6.6 (and mesh shaders for the world), Rust (pinned in
-`rust-toolchain.toml`).
+Requirements: Windows 10/11 x64, a CPU with AVX2 (and the FMA3, BMI1/2,
+F16C, MOVBE, LZCNT, POPCNT, AES and PCLMULQDQ that come with it, which
+`victory run` checks), a Direct3D 12 GPU with shader model 6.6 (and mesh
+shaders for the world), Rust (pinned in `rust-toolchain.toml`).
 
 The title also needs several GiB of available Windows commit at startup.
 Check **Committed** under **Task Manager → Performance → Memory**. If
