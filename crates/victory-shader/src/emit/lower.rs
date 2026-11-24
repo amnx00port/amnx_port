@@ -64,12 +64,24 @@ pub(crate) fn lower(parts: &Parts) -> Result<Lowered, ShaderError> {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum ReadDep {
-    Value(Value),
+    Value {
+        value: Value,
+        mask: u32,
+    },
     Edge {
         from: usize,
         to: usize,
         value: Value,
+        mask: u32,
     },
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Transfer {
+    /// Any tainted bit in the read mask taints all bits in `dst_mask`.
+    Broadcast(u32),
+    /// Bit `i` in the read mask flows to bit `i + shift` within `dst_mask`.
+    Shift { shift: i8, dst_mask: u32 },
 }
 
 struct ValueDeps {
@@ -77,6 +89,7 @@ struct ValueDeps {
     guard: Option<Bool>,
     invert_guard: bool,
     ignore_why: Option<Why>,
+    transfer: Transfer,
     deps: Vec<ReadDep>,
 }
 
@@ -85,6 +98,126 @@ struct OldDep {
     direct_why: Option<Why>,
     invert_guard: bool,
     ignore_why: Option<Why>,
+    mask: u32,
+}
+
+struct DirectMissing {
+    dst: Value,
+    why: Why,
+    block: usize,
+    guard: Option<Bool>,
+    invert_guard: bool,
+    mask: u32,
+}
+
+#[derive(Clone)]
+enum BitMaskCond {
+    Uniform(Bool),
+    PerBit([Bool; 32]),
+}
+
+impl BitMaskCond {
+    fn new(mask: u32, cond: Bool) -> Self {
+        if mask == u32::MAX {
+            Self::Uniform(cond)
+        } else {
+            let mut bits = [Bool::FALSE; 32];
+            let mut m = mask;
+            while m != 0 {
+                let i = m.trailing_zeros() as usize;
+                m &= m - 1;
+                bits[i] = cond;
+            }
+            Self::PerBit(bits)
+        }
+    }
+
+    fn merge(&mut self, mask: u32, cond: Bool, bools: &mut BoolSet) -> bool {
+        if mask == 0 || cond == Bool::FALSE {
+            return false;
+        }
+        match self {
+            Self::Uniform(c) if mask == u32::MAX => {
+                let next = bools.or(*c, cond);
+                if next != *c {
+                    *c = next;
+                    true
+                } else {
+                    false
+                }
+            }
+            Self::Uniform(c) => {
+                let cur = *c;
+                if bools.or(cur, cond) == cur {
+                    return false;
+                }
+                let mut bits = [cur; 32];
+                let mut m = mask;
+                let mut changed = false;
+                while m != 0 {
+                    let i = m.trailing_zeros() as usize;
+                    m &= m - 1;
+                    let next = bools.or(bits[i], cond);
+                    if next != bits[i] {
+                        bits[i] = next;
+                        changed = true;
+                    }
+                }
+                *self = Self::PerBit(bits);
+                changed
+            }
+            Self::PerBit(bits) => {
+                let mut changed = false;
+                let mut m = mask;
+                while m != 0 {
+                    let i = m.trailing_zeros() as usize;
+                    m &= m - 1;
+                    let next = bools.or(bits[i], cond);
+                    if next != bits[i] {
+                        bits[i] = next;
+                        changed = true;
+                    }
+                }
+                changed
+            }
+        }
+    }
+
+    fn read(&self, mask: u32, bools: &mut BoolSet) -> Bool {
+        if mask == 0 {
+            return Bool::FALSE;
+        }
+        match self {
+            Self::Uniform(c) => *c,
+            Self::PerBit(bits) => {
+                let mut acc = Bool::FALSE;
+                let mut m = mask;
+                while m != 0 {
+                    let i = m.trailing_zeros() as usize;
+                    m &= m - 1;
+                    acc = bools.or(acc, bits[i]);
+                }
+                acc
+            }
+        }
+    }
+
+    fn widen_to_true(&mut self) {
+        match self {
+            Self::Uniform(c) => {
+                if *c != Bool::FALSE {
+                    *c = Bool::TRUE;
+                }
+            }
+            Self::PerBit(bits) => {
+                for b in bits.iter_mut() {
+                    if *b != Bool::FALSE {
+                        *b = Bool::TRUE;
+                    }
+                }
+            }
+        }
+    }
 }
 
 struct SinkRead {
@@ -179,10 +312,12 @@ struct Lower<'a> {
     taint_candidates: HashSet<Value>,
     cur_reads: Vec<ReadDep>,
     cur_old_deps: Vec<OldDep>,
+    cur_write_mask: u32,
+    cur_transfers: Vec<(Transfer, Vec<ReadDep>)>,
     cur_edge: Option<(usize, usize)>,
     deps: HashMap<Value, Vec<ValueDeps>>,
     deps_order: Vec<Value>,
-    direct_missing: Vec<(Value, Why, usize, Option<Bool>, bool)>,
+    direct_missing: Vec<DirectMissing>,
     sinks: Vec<SinkRead>,
     params: HashMap<Value, (usize, u32)>,
     user_data: Option<V>,
@@ -488,6 +623,8 @@ impl<'a> Lower<'a> {
             taint_candidates: HashSet::new(),
             cur_reads: Vec::new(),
             cur_old_deps: Vec::new(),
+            cur_write_mask: u32::MAX,
+            cur_transfers: Vec::new(),
             cur_edge: None,
             deps: HashMap::new(),
             deps_order: Vec::new(),
@@ -749,7 +886,15 @@ impl<'a> Lower<'a> {
                     Ok(x) => {
                         let reads = std::mem::take(&mut self.cur_reads);
                         if !reads.is_empty() {
-                            self.record_write_deps(w, b, None, false, None, reads);
+                            self.record_write_deps(
+                                w,
+                                b,
+                                None,
+                                false,
+                                None,
+                                Transfer::Broadcast(u32::MAX),
+                                reads,
+                            );
                         }
                         Val::I32(x)
                     }
@@ -1149,19 +1294,73 @@ impl<'a> Lower<'a> {
         }
     }
 
+    fn push_read(&mut self, dep: ReadDep) {
+        for existing in &mut self.cur_reads {
+            match (existing, dep) {
+                (
+                    ReadDep::Value {
+                        value: v1,
+                        mask: m1,
+                    },
+                    ReadDep::Value {
+                        value: v2,
+                        mask: m2,
+                    },
+                ) if *v1 == v2 => {
+                    *m1 |= m2;
+                    return;
+                }
+                (
+                    ReadDep::Edge {
+                        from: f1,
+                        to: t1,
+                        value: v1,
+                        mask: m1,
+                    },
+                    ReadDep::Edge {
+                        from: f2,
+                        to: t2,
+                        value: v2,
+                        mask: m2,
+                    },
+                ) if *f1 == f2 && *t1 == t2 && *v1 == v2 => {
+                    *m1 |= m2;
+                    return;
+                }
+                _ => {}
+            }
+        }
+        self.cur_reads.push(dep);
+    }
+
     fn record_read(&mut self, v: Value) {
-        if !self.taint_candidates.contains(&v) {
+        self.record_read_masked(v, u32::MAX);
+    }
+
+    fn record_read_masked(&mut self, v: Value, mask: u32) {
+        if mask == 0 || !self.taint_candidates.contains(&v) {
             return;
         }
         let dep = match self.cur_edge {
-            Some((from, to)) => ReadDep::Edge { from, to, value: v },
-            None => ReadDep::Value(v),
+            Some((from, to)) => ReadDep::Edge {
+                from,
+                to,
+                value: v,
+                mask,
+            },
+            None => ReadDep::Value { value: v, mask },
         };
-        if !self.cur_reads.contains(&dep) {
-            self.cur_reads.push(dep);
-        }
+        self.push_read(dep);
     }
 
+    fn scoped_reads<T>(&mut self, f: impl FnOnce(&mut Self) -> T) -> (T, Vec<ReadDep>) {
+        let saved = std::mem::take(&mut self.cur_reads);
+        let out = f(self);
+        let sub = std::mem::replace(&mut self.cur_reads, saved);
+        (out, sub)
+    }
+
+    #[allow(clippy::too_many_arguments)]
     fn record_write_deps(
         &mut self,
         w: Value,
@@ -1169,6 +1368,7 @@ impl<'a> Lower<'a> {
         guard: Option<Bool>,
         invert_guard: bool,
         ignore_why: Option<Why>,
+        transfer: Transfer,
         deps: Vec<ReadDep>,
     ) {
         self.taint_candidates.insert(w);
@@ -1181,16 +1381,21 @@ impl<'a> Lower<'a> {
             guard,
             invert_guard,
             ignore_why,
+            transfer,
             deps,
         });
     }
 
     /// The DXIL form of an IR value.
     fn get(&mut self, v: Value) -> Result<Val, Why> {
-        self.get_inner(v, true)
+        self.get_inner(v, true, u32::MAX)
     }
 
-    fn get_inner(&mut self, v: Value, track: bool) -> Result<Val, Why> {
+    fn get_masked(&mut self, v: Value, mask: u32) -> Result<Val, Why> {
+        self.get_inner(v, true, mask)
+    }
+
+    fn get_inner(&mut self, v: Value, track: bool, mask: u32) -> Result<Val, Why> {
         let is_mask = self.x.st.masks.contains_key(&v) || self.x.st.highs.contains_key(&v);
         match self.vals.get(&v) {
             Some(&Val::Missing(_)) | None if self.mask_ok && is_mask => {
@@ -1199,7 +1404,7 @@ impl<'a> Lower<'a> {
             Some(&Val::Missing(w)) => return Err(w),
             Some(&val) => {
                 if track {
-                    self.record_read(v);
+                    self.record_read_masked(v, mask);
                 }
                 return Ok(val);
             }
@@ -1214,13 +1419,23 @@ impl<'a> Lower<'a> {
     }
 
     /// Reads an overwritten register's previous value, recording its lane
-    /// dependency (`invert_guard` for `!guard`, active lanes otherwise) so
-    /// direct missing values and tainted phis still propagate where kept.
-    fn old_i32_of(&mut self, v: Option<Value>, invert_guard: bool, ignore_why: Option<Why>) -> V {
+    /// dependency (`invert_guard` for `!guard`, active lanes otherwise) on
+    /// bits `mask` so direct missing values and tainted phis still propagate
+    /// where kept.
+    fn old_i32_of_masked(
+        &mut self,
+        v: Option<Value>,
+        invert_guard: bool,
+        ignore_why: Option<Why>,
+        mask: u32,
+    ) -> V {
         let Some(v) = v else {
             return self.s.m.i32(0);
         };
-        match self.get_inner(v, false) {
+        if mask == 0 {
+            return self.s.m.i32(0);
+        }
+        match self.get_inner(v, false, mask) {
             Ok(Val::I32(x)) => {
                 if self.taint_candidates.contains(&v) {
                     self.cur_old_deps.push(OldDep {
@@ -1228,6 +1443,7 @@ impl<'a> Lower<'a> {
                         direct_why: None,
                         invert_guard,
                         ignore_why,
+                        mask,
                     });
                 }
                 x
@@ -1239,6 +1455,7 @@ impl<'a> Lower<'a> {
                         direct_why: None,
                         invert_guard,
                         ignore_why,
+                        mask,
                     });
                 }
                 self.s.m.cast(self.cur, Cast::ZExt, x, self.s.t.i32)
@@ -1250,6 +1467,7 @@ impl<'a> Lower<'a> {
                         direct_why: Some(why),
                         invert_guard,
                         ignore_why,
+                        mask,
                     });
                 }
                 self.s.m.i32(0)
@@ -1257,8 +1475,16 @@ impl<'a> Lower<'a> {
         }
     }
 
+    fn old_i32_of(&mut self, v: Option<Value>, invert_guard: bool, ignore_why: Option<Why>) -> V {
+        self.old_i32_of_masked(v, invert_guard, ignore_why, u32::MAX)
+    }
+
     fn i32_of(&mut self, v: Value) -> Result<V, Why> {
-        match self.get(v)? {
+        self.i32_of_masked(v, u32::MAX)
+    }
+
+    fn i32_of_masked(&mut self, v: Value, mask: u32) -> Result<V, Why> {
+        match self.get_masked(v, mask)? {
             Val::I32(x) => Ok(x),
             Val::Bit(x) => Ok(self.s.m.cast(self.cur, Cast::ZExt, x, self.s.t.i32)),
             Val::Missing(w) => Err(w),
@@ -1307,9 +1533,7 @@ impl<'a> Lower<'a> {
 
     fn extend_cur_reads(&mut self, extra: &[ReadDep]) {
         for &dep in extra {
-            if !self.cur_reads.contains(&dep) {
-                self.cur_reads.push(dep);
-            }
+            self.push_read(dep);
         }
     }
 
@@ -1367,16 +1591,29 @@ impl<'a> Lower<'a> {
 
     // ---- operands ----
 
+    fn const_operand(op: &Operand) -> Option<u32> {
+        match *op {
+            Operand::Literal(x) => Some(x),
+            Operand::Const(k) => crate::resource::inline(k),
+            Operand::Scalar { code: NULL, .. } => Some(0),
+            _ => None,
+        }
+    }
+
     fn operand(&mut self, inst: &Inst, op: &Operand) -> Result<V, Why> {
+        self.operand_masked(inst, op, u32::MAX)
+    }
+
+    fn operand_masked(&mut self, inst: &Inst, op: &Operand, mask: u32) -> Result<V, Why> {
         match *op {
             Operand::Scalar { code: NULL, .. } => Ok(self.s.m.i32(0)),
             Operand::Scalar { code, .. } => {
                 let v = inst.read(Reg::S(code)).ok_or("an unread operand")?;
-                self.i32_of(v)
+                self.i32_of_masked(v, mask)
             }
             Operand::Vector { reg, .. } => {
                 let v = inst.read(Reg::V(reg)).ok_or("an unread operand")?;
-                self.i32_of(v)
+                self.i32_of_masked(v, mask)
             }
             Operand::Const(c) => crate::resource::inline(c)
                 .map(|x| self.s.m.i32(x))
@@ -1387,7 +1624,7 @@ impl<'a> Lower<'a> {
     }
 
     /// GFX10 puts an inline f16 constant in the low half of the operand.
-    fn f16_operand(&mut self, inst: &Inst, op: &Operand) -> Result<V, Why> {
+    fn f16_operand_masked(&mut self, inst: &Inst, op: &Operand, mask: u32) -> Result<V, Why> {
         match *op {
             Operand::Const(c @ 240..=248) => {
                 let h = [
@@ -1395,7 +1632,7 @@ impl<'a> Lower<'a> {
                 ][usize::from(c - 240)];
                 Ok(self.s.m.i32(h))
             }
-            _ => self.operand(inst, op),
+            _ => self.operand_masked(inst, op, mask),
         }
     }
 
@@ -1417,6 +1654,14 @@ impl<'a> Lower<'a> {
         let sel = *s.src_sel.get(k)?;
         let sext = s.sext >> k & 1 != 0;
         (sel < 6).then_some((sel, sext))
+    }
+
+    fn sdwa_sel_mask(sel: u8) -> u32 {
+        if sel < 4 {
+            0xFF << (8 * sel)
+        } else {
+            0xFFFF << (16 * (sel - 4))
+        }
     }
 
     /// Bits `sel` (0-3 a byte, 4-5 a word) of `x`, extended.
@@ -1444,7 +1689,7 @@ impl<'a> Lower<'a> {
         let mut f = match op {
             _ if selected.is_some() => {
                 let (sel, sext) = selected.expect("checked");
-                let x = self.operand(inst, &op)?;
+                let x = self.operand_masked(inst, &op, Self::sdwa_sel_mask(sel))?;
                 let x = self.select_bits(x, sel, sext);
                 self.as_float(x)
             }
@@ -1479,6 +1724,10 @@ impl<'a> Lower<'a> {
     }
 
     fn src(&mut self, inst: &Inst, k: usize) -> Result<V, Why> {
+        self.src_masked(inst, k, u32::MAX)
+    }
+
+    fn src_masked(&mut self, inst: &Inst, k: usize, mask: u32) -> Result<V, Why> {
         let Fields::Valu(v) = &inst.fields else {
             unreachable!()
         };
@@ -1488,12 +1737,119 @@ impl<'a> Lower<'a> {
         }
         match self.src0 {
             Some(x) if k == 0 => Ok(x),
-            _ => {
-                let x = self.operand(inst, &op)?;
-                Ok(match Self::sdwa_src(inst, k) {
-                    Some((sel, sext)) => self.select_bits(x, sel, sext),
-                    None => x,
-                })
+            _ => match Self::sdwa_src(inst, k) {
+                Some((sel, sext)) => {
+                    let x = self.operand_masked(inst, &op, Self::sdwa_sel_mask(sel))?;
+                    Ok(self.select_bits(x, sel, sext))
+                }
+                None => self.operand_masked(inst, &op, mask),
+            },
+        }
+    }
+
+    /// Reads `op` as a bit-field extract of `(off, width)` bits, recording
+    /// exact bit-shift transfers into `dst` (and sign-bit broadcast if `signed`).
+    fn read_bfe_op(
+        &mut self,
+        inst: &Inst,
+        op: &Operand,
+        off: u32,
+        width: u32,
+        signed: bool,
+    ) -> Result<V, Why> {
+        let o = off & 31;
+        if width == 0 {
+            return self.operand_masked(inst, op, 0);
+        }
+        let valid_w = width.min(32 - o);
+        let read_mask = if width >= 32 {
+            (!0u32) << o
+        } else {
+            (((1u64 << width) - 1) << o) as u32
+        };
+        let lo_dst = if valid_w >= 32 {
+            u32::MAX
+        } else {
+            (1u32 << valid_w) - 1
+        };
+        let (x, sub) = self.scoped_reads(|l| l.operand_masked(inst, op, read_mask));
+        let x = x?;
+        self.cur_transfers.push((
+            Transfer::Shift {
+                shift: -(o as i8),
+                dst_mask: lo_dst,
+            },
+            sub,
+        ));
+        if signed && valid_w > 0 && valid_w < 32 {
+            let sign_mask = 1u32 << (o + valid_w - 1);
+            let (_, sign_sub) = self.scoped_reads(|l| l.operand_masked(inst, op, sign_mask));
+            self.cur_transfers
+                .push((Transfer::Broadcast(!lo_dst), sign_sub));
+        }
+        Ok(x)
+    }
+
+    /// Reads `op` as a constant left-shift by `sh & 31`, recording exact
+    /// bit-shift transfer into `dst`.
+    fn read_shl_op(&mut self, inst: &Inst, op: &Operand, sh: u32) -> Result<V, Why> {
+        let s = sh & 31;
+        let read_mask = (!0u32) >> s;
+        let dst_mask = (!0u32) << s;
+        let (x, sub) = self.scoped_reads(|l| l.operand_masked(inst, op, read_mask));
+        let x = x?;
+        self.cur_transfers.push((
+            Transfer::Shift {
+                shift: s as i8,
+                dst_mask,
+            },
+            sub,
+        ));
+        Ok(x)
+    }
+
+    /// Reads `op` masked with constant `mask`, recording bitwise transfer.
+    fn read_and_const_op(
+        &mut self,
+        inst: &Inst,
+        op: &Operand,
+        mask: u32,
+        sdwa: Option<(u8, bool)>,
+    ) -> Result<V, Why> {
+        match sdwa {
+            None => {
+                let (x, sub) = self.scoped_reads(|l| l.operand_masked(inst, op, mask));
+                let x = x?;
+                self.cur_transfers.push((
+                    Transfer::Shift {
+                        shift: 0,
+                        dst_mask: mask,
+                    },
+                    sub,
+                ));
+                Ok(x)
+            }
+            Some((sel, false)) => {
+                let (width, at) = if sel < 4 {
+                    (8u32, 8 * u32::from(sel))
+                } else {
+                    (16, 16 * u32::from(sel - 4))
+                };
+                let low_mask = mask & ((1u32 << width) - 1);
+                let (x, sub) = self.scoped_reads(|l| l.operand_masked(inst, op, low_mask << at));
+                let x = x?;
+                self.cur_transfers.push((
+                    Transfer::Shift {
+                        shift: -(at as i8),
+                        dst_mask: low_mask,
+                    },
+                    sub,
+                ));
+                Ok(self.select_bits(x, sel, false))
+            }
+            Some((sel, true)) => {
+                let x = self.operand_masked(inst, op, Self::sdwa_sel_mask(sel))?;
+                Ok(self.select_bits(x, sel, true))
             }
         }
     }
@@ -1911,6 +2267,42 @@ impl<'a> Lower<'a> {
         (s.dst_sel < 6).then_some((s.dst_sel, s.dst_unused))
     }
 
+    /// Updates `cur_write_mask` and `cur_transfers` when `place_bits` shifts
+    /// the low `width` bits of the result into `at..at+width`.
+    fn apply_place_bits_taint(&mut self, at: u32, low_mask: u32, written_mask: u32, unused: u8) {
+        self.cur_write_mask = if unused == 1 {
+            (!0u32) << at
+        } else {
+            written_mask
+        };
+        let transfers = std::mem::take(&mut self.cur_transfers);
+        for (tr, deps) in transfers {
+            let next = if unused == 1 {
+                let hits = match tr {
+                    Transfer::Broadcast(m) => m & low_mask != 0,
+                    Transfer::Shift { dst_mask, .. } => dst_mask & low_mask != 0,
+                };
+                hits.then_some(Transfer::Broadcast((!0u32) << at))
+            } else {
+                match tr {
+                    Transfer::Broadcast(m) => {
+                        (m & low_mask != 0).then_some(Transfer::Broadcast(written_mask))
+                    }
+                    Transfer::Shift { shift, dst_mask } => {
+                        let masked = dst_mask & low_mask;
+                        (masked != 0).then_some(Transfer::Shift {
+                            shift: shift + at as i8,
+                            dst_mask: masked << at,
+                        })
+                    }
+                }
+            };
+            if let Some(tr) = next {
+                self.cur_transfers.push((tr, deps));
+            }
+        }
+    }
+
     /// The low byte or word of `x` placed at `sel` in VGPR `reg`.
     fn place_bits(&mut self, inst: &Inst, reg: Reg, x: V, sel: u8, unused: u8) -> V {
         let c = self.cur;
@@ -1919,6 +2311,9 @@ impl<'a> Lower<'a> {
         } else {
             (16, 16 * u32::from(sel - 4))
         };
+        let low_mask = ((1u64 << width) - 1) as u32;
+        let written_mask = low_mask << at;
+        self.apply_place_bits_taint(at, low_mask, written_mask, unused);
         let left = self.s.m.i32(32 - width);
         let t = self.s.m.bin(c, Bin::Shl, x, left);
         let right = self.s.m.i32(32 - width - at);
@@ -1930,8 +2325,8 @@ impl<'a> Lower<'a> {
         if unused != 2 {
             return field;
         }
-        let old = self.old_i32_of(inst.read(reg), false, None);
-        let keep = self.s.m.i32(!((((1u64 << width) - 1) as u32) << at));
+        let old = self.old_i32_of_masked(inst.read(reg), false, None, !written_mask);
+        let keep = self.s.m.i32(!written_mask);
         let old = self.s.m.bin(c, Bin::And, old, keep);
         self.s.m.bin(c, Bin::Or, old, field)
     }
@@ -2408,6 +2803,8 @@ impl<'a> Lower<'a> {
         let name = inst.name();
         self.cur_reads.clear();
         self.cur_old_deps.clear();
+        self.cur_write_mask = u32::MAX;
+        self.cur_transfers.clear();
         self.cur_edge = None;
         self.mask_ok = match self.mask_data {
             MaskData::Console => true,
@@ -2459,49 +2856,98 @@ impl<'a> Lower<'a> {
         };
         let reads = std::mem::take(&mut self.cur_reads);
         let old_deps = std::mem::take(&mut self.cur_old_deps);
+        let transfers = std::mem::take(&mut self.cur_transfers);
         match r {
             Ok(()) => {
                 let guard = self.x.st.guards[b][i];
-                if !reads.is_empty() {
-                    if effect {
+                if effect {
+                    self.cur_reads = reads;
+                    for (_, sub) in transfers {
+                        self.extend_cur_reads(&sub);
+                    }
+                    let sink_deps = std::mem::take(&mut self.cur_reads);
+                    if !sink_deps.is_empty() {
                         self.sinks.push(SinkRead {
                             block: b,
                             guard,
                             offset,
-                            deps: reads,
+                            deps: sink_deps,
                         });
-                    } else {
-                        let use_guard = matches!(
-                            &inst.fields,
-                            Fields::Valu(v)
-                                if v.dpp.is_none()
-                                    && !matches!(
-                                        name,
-                                        "v_readfirstlane_b32"
-                                            | "v_readlane_b32"
-                                            | "v_writelane_b32"
-                                    )
-                        )
-                        .then_some(guard)
-                        .flatten();
-                        for &(_, w) in &inst.writes {
-                            if matches!(self.vals.get(&w), Some(Val::I32(_) | Val::Bit(_)))
-                                || self.lane_bits.contains_key(&w)
-                            {
-                                self.record_write_deps(w, b, use_guard, false, None, reads.clone());
+                    }
+                } else {
+                    let use_guard = matches!(
+                        &inst.fields,
+                        Fields::Valu(v)
+                            if v.dpp.is_none()
+                                && !matches!(
+                                    name,
+                                    "v_readfirstlane_b32"
+                                        | "v_readlane_b32"
+                                        | "v_writelane_b32"
+                                )
+                    )
+                    .then_some(guard)
+                    .flatten();
+                    for &(_, w) in &inst.writes {
+                        let is_scalar_or_vec = matches!(self.vals.get(&w), Some(Val::I32(_)));
+                        let is_bit = matches!(self.vals.get(&w), Some(Val::Bit(_)))
+                            || self.lane_bits.contains_key(&w);
+                        if is_scalar_or_vec || is_bit {
+                            let mask = if is_bit {
+                                u32::MAX
+                            } else {
+                                self.cur_write_mask
+                            };
+                            if !reads.is_empty() {
+                                self.record_write_deps(
+                                    w,
+                                    b,
+                                    use_guard,
+                                    false,
+                                    None,
+                                    Transfer::Broadcast(mask),
+                                    reads.clone(),
+                                );
+                            }
+                            for &(transfer, ref sub) in &transfers {
+                                if !sub.is_empty() {
+                                    let transfer = if is_bit {
+                                        Transfer::Broadcast(u32::MAX)
+                                    } else {
+                                        transfer
+                                    };
+                                    self.record_write_deps(
+                                        w,
+                                        b,
+                                        use_guard,
+                                        false,
+                                        None,
+                                        transfer,
+                                        sub.clone(),
+                                    );
+                                }
                             }
                         }
                     }
                 }
                 for old in old_deps {
+                    if old.mask == 0 {
+                        continue;
+                    }
                     for &(_, w) in &inst.writes {
                         if !matches!(self.vals.get(&w), Some(Val::I32(_) | Val::Bit(_))) {
                             continue;
                         }
                         if let Some(why) = old.direct_why {
                             self.taint_candidates.insert(w);
-                            self.direct_missing
-                                .push((w, why, b, guard, old.invert_guard));
+                            self.direct_missing.push(DirectMissing {
+                                dst: w,
+                                why,
+                                block: b,
+                                guard,
+                                invert_guard: old.invert_guard,
+                                mask: old.mask,
+                            });
                         }
                         if let Some(u) = old.value {
                             self.record_write_deps(
@@ -2510,7 +2956,14 @@ impl<'a> Lower<'a> {
                                 guard,
                                 old.invert_guard,
                                 old.ignore_why,
-                                vec![ReadDep::Value(u)],
+                                Transfer::Shift {
+                                    shift: 0,
+                                    dst_mask: old.mask,
+                                },
+                                vec![ReadDep::Value {
+                                    value: u,
+                                    mask: old.mask,
+                                }],
                             );
                         }
                     }
@@ -2780,11 +3233,34 @@ impl<'a> Lower<'a> {
         let m = &mut self.s.m;
         let _ = m;
         let (r, carry): (V, Option<V>) = match name {
-            "s_mov_b32" => (src32(self, 0)?, None),
+            "s_mov_b32" => {
+                let (x, sub) = self.scoped_reads(|l| src32(l, 0));
+                let x = x?;
+                self.cur_transfers.push((
+                    Transfer::Shift {
+                        shift: 0,
+                        dst_mask: u32::MAX,
+                    },
+                    sub,
+                ));
+                (x, None)
+            }
             "s_movk_i32" => (sext16(self), None),
             "s_cselect_b32" => {
-                let cond = self.scc_in(inst)?;
-                let (a, b) = (src32(self, 0)?, src32(self, 1)?);
+                let (cond, cond_reads) = self.scoped_reads(|l| l.scc_in(inst));
+                let cond = cond?;
+                self.cur_transfers
+                    .push((Transfer::Broadcast(u32::MAX), cond_reads));
+                let (a, a_reads) = self.scoped_reads(|l| src32(l, 0));
+                let a = a?;
+                let (b, b_reads) = self.scoped_reads(|l| src32(l, 1));
+                let b = b?;
+                let tr = Transfer::Shift {
+                    shift: 0,
+                    dst_mask: u32::MAX,
+                };
+                self.cur_transfers.push((tr, a_reads));
+                self.cur_transfers.push((tr, b_reads));
                 (self.s.m.select(c, cond, a, b), None)
             }
             "s_brev_b32" => {
@@ -2860,40 +3336,82 @@ impl<'a> Lower<'a> {
             }
             "s_bfe_u32" | "s_bfe_i32" => {
                 // src1: offset in bits 0-4, width in bits 16-22.
-                let (a, b) = (src32(self, 0)?, src32(self, 1)?);
-                let (k16, k127) = (self.s.m.i32(16), self.s.m.i32(0x7F));
-                let w = self.s.m.bin(c, Bin::LShr, b, k16);
-                let w = self.s.m.bin(c, Bin::And, w, k127);
-                (self.bfe(a, b, w, name == "s_bfe_i32"), None)
+                let signed = name == "s_bfe_i32";
+                if let (Some(op0), Some(imm_b)) =
+                    (src.first(), src.get(1).and_then(Self::const_operand))
+                {
+                    let a =
+                        self.read_bfe_op(inst, op0, imm_b & 31, (imm_b >> 16) & 0x7F, signed)?;
+                    let b = self.s.m.i32(imm_b);
+                    let (k16, k127) = (self.s.m.i32(16), self.s.m.i32(0x7F));
+                    let w = self.s.m.bin(c, Bin::LShr, b, k16);
+                    let w = self.s.m.bin(c, Bin::And, w, k127);
+                    (self.bfe(a, b, w, signed), None)
+                } else {
+                    let (a, b) = (src32(self, 0)?, src32(self, 1)?);
+                    let (k16, k127) = (self.s.m.i32(16), self.s.m.i32(0x7F));
+                    let w = self.s.m.bin(c, Bin::LShr, b, k16);
+                    let w = self.s.m.bin(c, Bin::And, w, k127);
+                    (self.bfe(a, b, w, signed), None)
+                }
             }
             "s_and_b32" | "s_or_b32" | "s_xor_b32" | "s_andn2_b32" | "s_orn2_b32"
             | "s_nand_b32" | "s_nor_b32" | "s_xnor_b32" => {
-                let (a, mut b) = (src32(self, 0)?, src32(self, 1)?);
-                let ones = self.s.m.i32(u32::MAX);
-                if name.contains("n2") {
-                    b = self.s.m.bin(c, Bin::Xor, b, ones);
+                if name == "s_and_b32"
+                    && let (Some(op0), Some(op1)) = (src.first(), src.get(1))
+                    && let Some((k, var)) = Self::const_operand(op0)
+                        .map(|k| (k, op1))
+                        .or_else(|| Self::const_operand(op1).map(|k| (k, op0)))
+                {
+                    let a = self.read_and_const_op(inst, var, k, None)?;
+                    let b = self.s.m.i32(k);
+                    (self.s.m.bin(c, Bin::And, a, b), None)
+                } else {
+                    let (a, mut b) = (src32(self, 0)?, src32(self, 1)?);
+                    let ones = self.s.m.i32(u32::MAX);
+                    if name.contains("n2") {
+                        b = self.s.m.bin(c, Bin::Xor, b, ones);
+                    }
+                    let op = match &name[2..5] {
+                        "and" | "nan" => Bin::And,
+                        "or_" | "orn" | "nor" => Bin::Or,
+                        _ => Bin::Xor,
+                    };
+                    let mut r = self.s.m.bin(c, op, a, b);
+                    if matches!(name, "s_nand_b32" | "s_nor_b32" | "s_xnor_b32") {
+                        r = self.s.m.bin(c, Bin::Xor, r, ones);
+                    }
+                    (r, None)
                 }
-                let op = match &name[2..5] {
-                    "and" | "nan" => Bin::And,
-                    "or_" | "orn" | "nor" => Bin::Or,
-                    _ => Bin::Xor,
-                };
-                let mut r = self.s.m.bin(c, op, a, b);
-                if matches!(name, "s_nand_b32" | "s_nor_b32" | "s_xnor_b32") {
-                    r = self.s.m.bin(c, Bin::Xor, r, ones);
-                }
-                (r, None)
             }
             "s_lshl_b32" | "s_lshr_b32" | "s_ashr_i32" => {
-                let (a, b) = (src32(self, 0)?, src32(self, 1)?);
-                let k31 = self.s.m.i32(31);
-                let b = self.s.m.bin(c, Bin::And, b, k31);
-                let op = match name {
-                    "s_lshl_b32" => Bin::Shl,
-                    "s_lshr_b32" => Bin::LShr,
-                    _ => Bin::AShr,
-                };
-                (self.s.m.bin(c, op, a, b), None)
+                if let (Some(op0), Some(sh)) =
+                    (src.first(), src.get(1).and_then(Self::const_operand))
+                {
+                    let a = if name == "s_lshl_b32" {
+                        self.read_shl_op(inst, op0, sh)?
+                    } else {
+                        let s = sh & 31;
+                        self.read_bfe_op(inst, op0, s, 32 - s, name == "s_ashr_i32")?
+                    };
+                    let b = self.s.m.i32(sh & 31);
+                    let op = match name {
+                        "s_lshl_b32" => Bin::Shl,
+                        "s_lshr_b32" => Bin::LShr,
+                        _ => Bin::AShr,
+                    };
+                    (self.s.m.bin(c, op, a, b), None)
+                } else {
+                    let (a, b) = (src32(self, 0)?, src32(self, 1)?);
+                    let k31 = self.s.m.i32(31);
+                    let b = self.s.m.bin(c, Bin::And, b, k31);
+                    let op = match name {
+                        "s_lshl_b32" => Bin::Shl,
+                        "s_lshr_b32" => Bin::LShr,
+                        _ => Bin::AShr,
+                    };
+                    (self.s.m.bin(c, op, a, b), None)
+                }
             }
             "s_lshl1_add_u32" | "s_lshl2_add_u32" | "s_lshl3_add_u32" | "s_lshl4_add_u32" => {
                 let (a, b) = (src32(self, 0)?, src32(self, 1)?);
@@ -4127,6 +4645,54 @@ impl<'a> Lower<'a> {
                     let a = f(self, 0)?;
                     return float(self, a);
                 }
+                if self.src0.is_none() {
+                    if let Some((sel, sext)) = Self::sdwa_src(inst, 0) {
+                        let (width, at) = if sel < 4 {
+                            (8u32, 8 * u32::from(sel))
+                        } else {
+                            (16, 16 * u32::from(sel - 4))
+                        };
+                        let low_mask = (1u32 << width) - 1;
+                        let (a, sub) = self.scoped_reads(|l| s(l, 0));
+                        let a = a?;
+                        self.cur_transfers.push((
+                            Transfer::Shift {
+                                shift: -(at as i8),
+                                dst_mask: low_mask,
+                            },
+                            sub,
+                        ));
+                        if sext {
+                            let op = v.src.first().ok_or("a missing operand")?;
+                            let sign_mask = 1u32 << (at + width - 1);
+                            let (_, sign_sub) =
+                                self.scoped_reads(|l| l.operand_masked(inst, op, sign_mask));
+                            self.cur_transfers
+                                .push((Transfer::Broadcast(!low_mask), sign_sub));
+                        }
+                        return int(self, a);
+                    }
+                    let mask = match Self::sdwa_dst(inst) {
+                        Some((sel, _)) => {
+                            if sel < 4 {
+                                0xFF
+                            } else {
+                                0xFFFF
+                            }
+                        }
+                        None => u32::MAX,
+                    };
+                    let (a, sub) = self.scoped_reads(|l| l.src_masked(inst, 0, mask));
+                    let a = a?;
+                    self.cur_transfers.push((
+                        Transfer::Shift {
+                            shift: 0,
+                            dst_mask: mask,
+                        },
+                        sub,
+                    ));
+                    return int(self, a);
+                }
                 let a = s(self, 0)?;
                 int(self, a)
             }
@@ -4247,7 +4813,15 @@ impl<'a> Lower<'a> {
             }
             "v_cvt_f32_i32" | "v_cvt_f32_u32" | "v_cvt_f32_ubyte0" | "v_cvt_f32_ubyte1"
             | "v_cvt_f32_ubyte2" | "v_cvt_f32_ubyte3" => {
-                let mut a = s(self, 0)?;
+                let mut a = if let Some(n) = name.strip_prefix("v_cvt_f32_ubyte")
+                    && Self::sdwa_src(inst, 0).is_none()
+                    && self.src0.is_none()
+                {
+                    let sh = 8 * u32::from(n.as_bytes()[0] - b'0');
+                    self.src_masked(inst, 0, 0xFF << sh)?
+                } else {
+                    s(self, 0)?
+                };
                 if let Some(n) = name.strip_prefix("v_cvt_f32_ubyte") {
                     let sh = self.s.m.i32(8 * u32::from(n.as_bytes()[0] - b'0'));
                     let ff = self.s.m.i32(0xff);
@@ -4268,7 +4842,16 @@ impl<'a> Lower<'a> {
                 let mut xs = Vec::new();
                 for i in 0..3 {
                     let op = v.src.get(i).ok_or("a missing operand")?;
-                    let x = self.operand(inst, op)?;
+                    let read_mask = if v.opsel_hi >> i & 1 != 0 {
+                        if v.opsel >> i & 1 != 0 {
+                            0xFFFF_0000
+                        } else {
+                            0x0000_FFFF
+                        }
+                    } else {
+                        u32::MAX
+                    };
+                    let x = self.operand_masked(inst, op, read_mask)?;
                     let mut x = if v.opsel_hi >> i & 1 != 0 {
                         let h = if v.opsel >> i & 1 != 0 {
                             let k16 = self.s.m.i32(16);
@@ -4301,10 +4884,13 @@ impl<'a> Lower<'a> {
                 let Some(Operand::Vector { reg, .. }) = v.dst else {
                     return Err("a mixed-precision result");
                 };
-                let old = match inst.read(Reg::V(reg)) {
-                    Some(o) => self.i32_of(o)?,
-                    None => self.s.m.i32(0),
+                let (keep_mask, written_mask) = if name == "v_fma_mixhi_f16" {
+                    (0x0000_FFFF, 0xFFFF_0000)
+                } else {
+                    (0xFFFF_0000, 0x0000_FFFF)
                 };
+                self.cur_write_mask = written_mask;
+                let old = self.old_i32_of_masked(inst.read(Reg::V(reg)), false, None, keep_mask);
                 let h = self
                     .s
                     .op(c, "legacyF32ToF16", Attr::ReadNone, self.s.t.i32, 130, &[r]);
@@ -4321,7 +4907,14 @@ impl<'a> Lower<'a> {
                 Ok(())
             }
             "v_cvt_pkrtz_f16_f32" => {
-                let (a, bb) = (f(self, 0)?, f(self, 1)?);
+                let (a, a_reads) = self.scoped_reads(|l| f(l, 0));
+                let a = a?;
+                let (bb, b_reads) = self.scoped_reads(|l| f(l, 1));
+                let bb = bb?;
+                self.cur_transfers
+                    .push((Transfer::Broadcast(0x0000_FFFF), a_reads));
+                self.cur_transfers
+                    .push((Transfer::Broadcast(0xFFFF_0000), b_reads));
                 let lo = self.f16_toward_zero(a);
                 let hi = self.f16_toward_zero(bb);
                 let sh = self.s.m.i32(16);
@@ -4347,7 +4940,16 @@ impl<'a> Lower<'a> {
                 let mut halves = Vec::new();
                 for k in 0..2 {
                     let op = v.src.get(k).ok_or("a missing operand")?;
-                    let mut x = self.operand(inst, op)?;
+                    let read_mask = if v.opsel >> k & 1 != 0 {
+                        0xFFFF_0000
+                    } else {
+                        0x0000_FFFF
+                    };
+                    let (x, sub) = self.scoped_reads(|l| l.operand_masked(inst, op, read_mask));
+                    let mut x = x?;
+                    let dst_mask = if k == 0 { 0x0000_FFFF } else { 0xFFFF_0000 };
+                    self.cur_transfers
+                        .push((Transfer::Broadcast(dst_mask), sub));
                     if v.opsel >> k & 1 != 0 {
                         let k16 = self.s.m.i32(16);
                         x = self.s.m.bin(c, Bin::LShr, x, k16);
@@ -4381,11 +4983,31 @@ impl<'a> Lower<'a> {
                 let m = mask
                     .and_then(|m| self.x.st.masks.get(&m).copied())
                     .ok_or("a select on an untracked mask")?;
-                let cond = self.boolean(m, c)?;
+                let (cond, cond_reads) = self.scoped_reads(|l| l.boolean(m, c));
+                let cond = cond?;
+                self.cur_transfers
+                    .push((Transfer::Broadcast(u32::MAX), cond_reads));
                 if v.abs != 0 || v.neg != 0 {
                     let (a, bb) = (f(self, 0)?, f(self, 1)?);
                     let r = self.s.m.select(c, cond, bb, a);
                     return float(self, r);
+                }
+                if v.dpp.is_none()
+                    && Self::sdwa_src(inst, 0).is_none()
+                    && Self::sdwa_src(inst, 1).is_none()
+                {
+                    let (a, a_reads) = self.scoped_reads(|l| s(l, 0));
+                    let a = a?;
+                    let (bb, b_reads) = self.scoped_reads(|l| s(l, 1));
+                    let bb = bb?;
+                    let tr = Transfer::Shift {
+                        shift: 0,
+                        dst_mask: u32::MAX,
+                    };
+                    self.cur_transfers.push((tr, a_reads));
+                    self.cur_transfers.push((tr, b_reads));
+                    let r = self.s.m.select(c, cond, bb, a);
+                    return int(self, r);
                 }
                 let (a, bb) = (s(self, 0)?, s(self, 1)?);
                 let r = self.s.m.select(c, cond, bb, a);
@@ -4548,9 +5170,10 @@ impl<'a> Lower<'a> {
                 _ => return Err("a byte select on a 16-bit operation"),
             }
         }
+        let read_mask = if high { 0xFFFF_0000 } else { 0x0000_FFFF };
         let x = match self.src0 {
             Some(x) if k == 0 => x,
-            _ => self.f16_operand(inst, &op)?,
+            _ => self.f16_operand_masked(inst, &op, read_mask)?,
         };
         let c = self.cur;
         let x = if high {
@@ -4606,9 +5229,11 @@ impl<'a> Lower<'a> {
                 _ => return Err("an SDWA destination of a 16-bit operation"),
             }
         }
+        let written_mask = if high { 0xFFFF_0000 } else { 0x0000_FFFF };
+        self.cur_write_mask = written_mask;
         let c = self.cur;
         let old = if keep {
-            self.old_i32_of(inst.read(Reg::V(reg)), false, None)
+            self.old_i32_of_masked(inst.read(Reg::V(reg)), false, None, !written_mask)
         } else {
             self.s.m.i32(0)
         };
@@ -4744,7 +5369,13 @@ impl<'a> Lower<'a> {
                 let Some(Operand::Vector { reg, .. }) = v.dst else {
                     return Err("an accumulator");
                 };
-                let x = self.i32_of(inst.read(Reg::V(reg)).ok_or("an accumulator")?)?;
+                let acc_mask = if v.opsel >> 3 & 1 != 0 {
+                    0xFFFF_0000
+                } else {
+                    0x0000_FFFF
+                };
+                let x =
+                    self.i32_of_masked(inst.read(Reg::V(reg)).ok_or("an accumulator")?, acc_mask)?;
                 let x = if v.opsel >> 3 & 1 != 0 {
                     let k16 = self.s.m.i32(16);
                     self.s.m.bin(c, Bin::LShr, x, k16)
@@ -4978,10 +5609,11 @@ impl<'a> Lower<'a> {
         };
         let op = *v.src.get(k).ok_or("a missing operand")?;
         let sel = if high { v.opsel_hi } else { v.opsel } >> k & 1 != 0;
+        let read_mask = if sel { 0xFFFF_0000 } else { 0x0000_FFFF };
         let x = if float {
-            self.f16_operand(inst, &op)?
+            self.f16_operand_masked(inst, &op, read_mask)?
         } else {
-            self.operand(inst, &op)?
+            self.operand_masked(inst, &op, read_mask)?
         };
         let c = self.cur;
         let x = if sel {
@@ -5015,23 +5647,28 @@ impl<'a> Lower<'a> {
         let (i32t, f32t) = (self.s.t.i32, self.s.t.f32);
         let mut halves = Vec::new();
         for high in [false, true] {
-            let mut xs = Vec::new();
-            for k in 0..n {
-                let h = self.packed_src(inst, k, high, float)?;
-                if float {
-                    let mut f = self
-                        .s
-                        .op(c, "legacyF16ToF32", Attr::ReadNone, f32t, 131, &[h]);
-                    let neg = if high { v.neg_hi } else { v.neg };
-                    if neg >> k & 1 != 0 {
-                        let z = self.s.m.f32(0x8000_0000);
-                        f = self.s.m.bin(c, Bin::Sub, z, f);
+            let (xs, sub) = self.scoped_reads(|l| {
+                let mut xs = Vec::new();
+                for k in 0..n {
+                    let h = l.packed_src(inst, k, high, float)?;
+                    if float {
+                        let mut f = l.s.op(c, "legacyF16ToF32", Attr::ReadNone, f32t, 131, &[h]);
+                        let neg = if high { v.neg_hi } else { v.neg };
+                        if neg >> k & 1 != 0 {
+                            let z = l.s.m.f32(0x8000_0000);
+                            f = l.s.m.bin(c, Bin::Sub, z, f);
+                        }
+                        xs.push(f);
+                    } else {
+                        xs.push(h);
                     }
-                    xs.push(f);
-                } else {
-                    xs.push(h);
                 }
-            }
+                Ok(xs)
+            });
+            let mut xs = xs?;
+            let dst_mask = if high { 0xFFFF_0000 } else { 0x0000_FFFF };
+            self.cur_transfers
+                .push((Transfer::Broadcast(dst_mask), sub));
             let r = if float {
                 let mut f = match op {
                     "add_f16" => self.s.m.bin(c, Bin::Add, xs[0], xs[1]),
@@ -5106,6 +5743,9 @@ impl<'a> Lower<'a> {
     }
 
     fn integer(&mut self, inst: &Inst, name: &'static str) -> Result<V, Why> {
+        let Fields::Valu(v) = &inst.fields else {
+            unreachable!()
+        };
         let c = self.cur;
         let s = |l: &mut Self, k| l.src(inst, k);
         let k = |l: &mut Self, x: u32| l.s.m.i32(x);
@@ -5116,6 +5756,19 @@ impl<'a> Lower<'a> {
         Ok(match name {
             "v_and_b32" | "v_or_b32" | "v_xor_b32" | "v_add_nc_u32" | "v_sub_nc_u32"
             | "v_subrev_nc_u32" | "v_mul_lo_u32" => {
+                if name == "v_and_b32"
+                    && v.dpp.is_none()
+                    && v.abs == 0
+                    && v.neg == 0
+                    && let (Some(op0), Some(op1)) = (v.src.first(), v.src.get(1))
+                    && let Some((mask, var, rk)) = Self::const_operand(op0)
+                        .map(|m| (m, op1, 1))
+                        .or_else(|| Self::const_operand(op1).map(|m| (m, op0, 0)))
+                {
+                    let a = self.read_and_const_op(inst, var, mask, Self::sdwa_src(inst, rk))?;
+                    let b = k(self, mask);
+                    return Ok(self.s.m.bin(c, Bin::And, a, b));
+                }
                 let (a, b) = (s(self, 0)?, s(self, 1)?);
                 let (op, a, b) = match name {
                     "v_and_b32" => (Bin::And, a, b),
@@ -5140,6 +5793,27 @@ impl<'a> Lower<'a> {
                 self.s.m.bin(c, Bin::Xor, a, ones)
             }
             "v_lshlrev_b32" | "v_lshrrev_b32" | "v_ashrrev_i32" => {
+                if v.dpp.is_none()
+                    && v.abs == 0
+                    && v.neg == 0
+                    && Self::sdwa_src(inst, 1).is_none()
+                    && let (Some(sh), Some(op1)) =
+                        (v.src.first().and_then(Self::const_operand), v.src.get(1))
+                {
+                    let a = if name == "v_lshlrev_b32" {
+                        self.read_shl_op(inst, op1, sh)?
+                    } else {
+                        let s = sh & 31;
+                        self.read_bfe_op(inst, op1, s, 32 - s, name == "v_ashrrev_i32")?
+                    };
+                    let sh = k(self, sh & 31);
+                    let op = match name {
+                        "v_lshlrev_b32" => Bin::Shl,
+                        "v_lshrrev_b32" => Bin::LShr,
+                        _ => Bin::AShr,
+                    };
+                    return Ok(self.s.m.bin(c, op, a, sh));
+                }
                 let (sh, a) = (s(self, 0)?, s(self, 1)?);
                 let sh = m31(self, sh);
                 let op = match name {
@@ -5182,7 +5856,16 @@ impl<'a> Lower<'a> {
                 }
             }
             "v_mul_u32_u24" | "v_mul_i32_i24" => {
-                let (a, b) = (s(self, 0)?, s(self, 1)?);
+                let a = if Self::sdwa_src(inst, 0).is_none() && self.src0.is_none() {
+                    self.src_masked(inst, 0, 0x00FF_FFFF)?
+                } else {
+                    s(self, 0)?
+                };
+                let b = if Self::sdwa_src(inst, 1).is_none() {
+                    self.src_masked(inst, 1, 0x00FF_FFFF)?
+                } else {
+                    s(self, 1)?
+                };
                 let (sh, op) = (
                     k(self, 8),
                     if name == "v_mul_i32_i24" {
@@ -5198,9 +5881,25 @@ impl<'a> Lower<'a> {
                 self.s.m.bin(c, Bin::Mul, a, b)
             }
             "v_bfe_u32" | "v_bfe_i32" => {
+                let signed = name == "v_bfe_i32";
+                if v.dpp.is_none()
+                    && v.abs == 0
+                    && v.neg == 0
+                    && Self::sdwa_src(inst, 0).is_none()
+                    && let (Some(op0), Some(off), Some(width)) = (
+                        v.src.first(),
+                        v.src.get(1).and_then(Self::const_operand),
+                        v.src.get(2).and_then(Self::const_operand),
+                    )
+                {
+                    let a = self.read_bfe_op(inst, op0, off & 31, width & 31, signed)?;
+                    let off = k(self, off & 31);
+                    let w = k(self, width & 31);
+                    return Ok(self.bfe(a, off, w, signed));
+                }
                 let (a, off, w) = (s(self, 0)?, s(self, 1)?, s(self, 2)?);
                 let w = m31(self, w);
-                self.bfe(a, off, w, name == "v_bfe_i32")
+                self.bfe(a, off, w, signed)
             }
             "v_bfi_b32" => {
                 let (m, a, b) = (s(self, 0)?, s(self, 1)?, s(self, 2)?);
@@ -5259,7 +5958,17 @@ impl<'a> Lower<'a> {
                 self.s.m.bin(c, Bin::Add, n, b)
             }
             "v_mad_u32_u24" | "v_mad_i32_i24" => {
-                let (a, b, d) = (s(self, 0)?, s(self, 1)?, s(self, 2)?);
+                let a = if Self::sdwa_src(inst, 0).is_none() && self.src0.is_none() {
+                    self.src_masked(inst, 0, 0x00FF_FFFF)?
+                } else {
+                    s(self, 0)?
+                };
+                let b = if Self::sdwa_src(inst, 1).is_none() {
+                    self.src_masked(inst, 1, 0x00FF_FFFF)?
+                } else {
+                    s(self, 1)?
+                };
+                let d = s(self, 2)?;
                 let (sh, op) = (
                     k(self, 8),
                     if name == "v_mad_i32_i24" {
@@ -5360,7 +6069,66 @@ impl<'a> Lower<'a> {
                         return Ok(r);
                     }
                 };
-                let (a, b) = (s(self, 0)?, s(self, 1)?);
+                let op0 = v.src.first().ok_or("a missing operand")?;
+                let op1 = v.src.get(1).ok_or("a missing operand")?;
+                let (mut a_mask, mut b_mask) = (0u32, 0u32);
+                for i in 0..4 {
+                    let pick = sel >> (8 * i) & 0xFF;
+                    let dst_byte = 0xFF << (8 * i);
+                    match pick {
+                        0..=3 => {
+                            let rm = 0xFF << (8 * pick);
+                            b_mask |= rm;
+                            let (_, sub) = self.scoped_reads(|l| l.operand_masked(inst, op1, rm));
+                            self.cur_transfers.push((
+                                Transfer::Shift {
+                                    shift: (i as i8 - pick as i8) * 8,
+                                    dst_mask: dst_byte,
+                                },
+                                sub,
+                            ));
+                        }
+                        4..=7 => {
+                            let n = pick - 4;
+                            let rm = 0xFF << (8 * n);
+                            a_mask |= rm;
+                            let (_, sub) = self.scoped_reads(|l| l.operand_masked(inst, op0, rm));
+                            self.cur_transfers.push((
+                                Transfer::Shift {
+                                    shift: (i as i8 - n as i8) * 8,
+                                    dst_mask: dst_byte,
+                                },
+                                sub,
+                            ));
+                        }
+                        8..=11 => {
+                            let is_b = pick < 10;
+                            let bit = if pick % 2 == 0 { 15 } else { 31 };
+                            let rm = 1u32 << bit;
+                            let op = if is_b {
+                                b_mask |= rm;
+                                op1
+                            } else {
+                                a_mask |= rm;
+                                op0
+                            };
+                            let (_, sub) = self.scoped_reads(|l| l.operand_masked(inst, op, rm));
+                            self.cur_transfers
+                                .push((Transfer::Broadcast(dst_byte), sub));
+                        }
+                        _ => {}
+                    }
+                }
+                let a = if a_mask != 0 {
+                    self.scoped_reads(|l| l.operand_masked(inst, op0, 0)).0?
+                } else {
+                    k(self, 0)
+                };
+                let b = if b_mask != 0 {
+                    self.scoped_reads(|l| l.operand_masked(inst, op1, 0)).0?
+                } else {
+                    k(self, 0)
+                };
                 let mut r = k(self, 0);
                 for i in 0..4 {
                     let pick = sel >> (8 * i) & 0xFF;
@@ -5787,10 +6555,12 @@ impl<'a> Lower<'a> {
     /// results keep the register's high half (GFX10).
     fn low_half(&mut self, inst: &Inst, reg: u8, x: V) -> V {
         let c = self.cur;
-        let old = self.old_i32_of(
+        self.cur_write_mask = 0x0000_FFFF;
+        let old = self.old_i32_of_masked(
             inst.read(Reg::V(reg)),
             false,
             Some("the first half of an interpolation"),
+            0xFFFF_0000,
         );
         let (high, low) = (self.s.m.i32(0xFFFF_0000), self.s.m.i32(0xFFFF));
         let old = self.s.m.bin(c, Bin::And, old, high);
@@ -5855,7 +6625,16 @@ impl<'a> Lower<'a> {
                 .get(if *a16 { k / 2 } else { k })
                 .ok_or("an image address")?;
             let v = inst.read(Reg::V(r)).ok_or("an image address")?;
-            let x = l.i32_of(v)?;
+            let read_mask = if *a16 {
+                if k.is_multiple_of(2) {
+                    0x0000_FFFF
+                } else {
+                    0xFFFF_0000
+                }
+            } else {
+                u32::MAX
+            };
+            let x = l.i32_of_masked(v, read_mask)?;
             if !*a16 {
                 return Ok(x);
             }
@@ -6548,8 +7327,25 @@ impl<'a> Lower<'a> {
         }
         if store {
             let regs = if d16 { count.div_ceil(2) } else { count };
-            let mut vals =
-                self.vgprs(inst, data.as_ref().ok_or("buffer store data")?, regs as u8)?;
+            let mut vals = if d16 {
+                let d = data.as_ref().ok_or("buffer store data")?;
+                let Operand::Vector { reg, .. } = *d else {
+                    return Err("a vector operand");
+                };
+                (0..regs as u8)
+                    .map(|k| {
+                        let v = inst.read(Reg::V(reg + k)).ok_or("an unread operand")?;
+                        let mask = if count % 2 == 1 && u32::from(k) == regs - 1 {
+                            0x0000_FFFF
+                        } else {
+                            u32::MAX
+                        };
+                        self.i32_of_masked(v, mask)
+                    })
+                    .collect::<Result<Vec<_>, _>>()?
+            } else {
+                self.vgprs(inst, data.as_ref().ok_or("buffer store data")?, regs as u8)?
+            };
             if d16 {
                 // shortcut: d16 data is taken as f16 (integer formats would
                 // keep 16 bits), widened for the 32-bit float store.
@@ -6865,7 +7661,12 @@ impl<'a> Lower<'a> {
             (true, true) => ("storePrimitiveOutput", 172),
         };
         for (id, col, value, half) in stores {
-            let mut x = self.i32_of(value)?;
+            let read_mask = match half {
+                Some(true) => 0xFFFF_0000,
+                Some(false) => 0x0000_FFFF,
+                None => u32::MAX,
+            };
+            let mut x = self.i32_of_masked(value, read_mask)?;
             if let Some(high) = half {
                 // An f16 half, declared a 32-bit float on the host.
                 let c = self.cur;
@@ -6970,6 +7771,8 @@ impl<'a> Lower<'a> {
             .map_or(self.x.p.blocks[b].offset, |i| i.machine.offset);
         self.cur_reads.clear();
         self.cur_old_deps.clear();
+        self.cur_write_mask = u32::MAX;
+        self.cur_transfers.clear();
         self.cur_edge = None;
         let term = match self.x.st.exits[b] {
             LaneExit::Jump(t) if self.counters.contains_key(&t) && self.rpo[t] <= self.rpo[b] => {
@@ -7165,10 +7968,11 @@ impl<'a> Lower<'a> {
                     let deps = reads
                         .into_iter()
                         .map(|dep| match dep {
-                            ReadDep::Value(value) => ReadDep::Edge {
+                            ReadDep::Value { value, mask } => ReadDep::Edge {
                                 from: q,
                                 to: b,
                                 value,
+                                mask,
                             },
                             other => other,
                         })
@@ -7198,7 +8002,7 @@ impl<'a> Lower<'a> {
         let p = self.x.p;
         let st = self.x.st;
         let mut bools = BoolSet::new(&st.bools);
-        let mut taint: HashMap<Value, Vec<(Why, Bool)>> = HashMap::new();
+        let mut taint: HashMap<Value, Vec<(Why, BitMaskCond)>> = HashMap::new();
 
         let site_cond =
             |bools: &mut BoolSet, block: usize, guard: Option<Bool>, invert: bool| -> Bool {
@@ -7210,41 +8014,115 @@ impl<'a> Lower<'a> {
                     None => st.reach[block],
                 }
             };
-        let dep_cond = |bools: &mut BoolSet, base: Bool, dep: ReadDep| -> (Value, Bool) {
+        let dep_cond = |bools: &mut BoolSet, base: Bool, dep: ReadDep| -> (Value, Bool, u32) {
             match dep {
-                ReadDep::Value(u) => (u, base),
-                ReadDep::Edge { from, to, value: u } => {
+                ReadDep::Value { value: u, mask } => (u, base, mask),
+                ReadDep::Edge {
+                    from,
+                    to,
+                    value: u,
+                    mask,
+                } => {
                     let ec = bools.edge(st, from, to);
-                    (u, bools.and(base, ec))
+                    (u, bools.and(base, ec), mask)
                 }
             }
         };
-        let merge = |taint: &mut HashMap<Value, Vec<(Why, Bool)>>,
+        let merge = |taint: &mut HashMap<Value, Vec<(Why, BitMaskCond)>>,
                      dst: Value,
                      why: Why,
+                     mask: u32,
                      cond: Bool,
                      bools: &mut BoolSet|
          -> bool {
-            if cond == Bool::FALSE {
+            if mask == 0 || cond == Bool::FALSE {
                 return false;
             }
             let list = taint.entry(dst).or_default();
             if let Some((_, existing)) = list.iter_mut().find(|(w, _)| *w == why) {
-                let next = bools.or(*existing, cond);
-                if next != *existing {
-                    *existing = next;
-                    return true;
-                }
-                false
+                existing.merge(mask, cond, bools)
             } else {
-                list.push((why, cond));
+                list.push((why, BitMaskCond::new(mask, cond)));
                 true
             }
         };
+        #[allow(clippy::too_many_arguments)]
+        let transfer_taint = |taint: &mut HashMap<Value, Vec<(Why, BitMaskCond)>>,
+                              dst: Value,
+                              why: Why,
+                              src_bmc: &BitMaskCond,
+                              read_mask: u32,
+                              transfer: Transfer,
+                              dc: Bool,
+                              back_rpo: Option<usize>,
+                              precise: bool,
+                              bools: &mut BoolSet|
+         -> bool {
+            if read_mask == 0 || dc == Bool::FALSE {
+                return false;
+            }
+            let cond_with = |c: Bool, bools: &mut BoolSet| -> Bool {
+                if !precise {
+                    return if c != Bool::FALSE {
+                        Bool::TRUE
+                    } else {
+                        Bool::FALSE
+                    };
+                }
+                let mut tc = bools.and(c, dc);
+                if let Some(rpo) = back_rpo {
+                    tc = bools.forget(tc, rpo);
+                }
+                tc
+            };
+            match transfer {
+                Transfer::Broadcast(dst_mask) => {
+                    if dst_mask == 0 {
+                        return false;
+                    }
+                    let c = src_bmc.read(read_mask, bools);
+                    let tc = cond_with(c, bools);
+                    merge(taint, dst, why, dst_mask, tc, bools)
+                }
+                Transfer::Shift { shift, dst_mask } => {
+                    if dst_mask == 0 {
+                        return false;
+                    }
+                    let shifted = if shift >= 0 {
+                        read_mask.checked_shl(shift as u32).unwrap_or(0)
+                    } else {
+                        read_mask.checked_shr((-shift) as u32).unwrap_or(0)
+                    };
+                    let target_mask = shifted & dst_mask;
+                    if target_mask == 0 {
+                        return false;
+                    }
+                    match src_bmc {
+                        BitMaskCond::Uniform(c) => {
+                            let tc = cond_with(*c, bools);
+                            merge(taint, dst, why, target_mask, tc, bools)
+                        }
+                        BitMaskCond::PerBit(bits) => {
+                            let mut changed = false;
+                            let mut m = target_mask;
+                            while m != 0 {
+                                let j = m.trailing_zeros() as usize;
+                                m &= m - 1;
+                                let i = (j as i32) - (shift as i32);
+                                debug_assert!((0..32).contains(&i));
+                                let tc = cond_with(bits[i as usize], bools);
+                                changed |= merge(taint, dst, why, 1u32 << j, tc, bools);
+                            }
+                            changed
+                        }
+                    }
+                }
+            }
+        };
 
-        for &(dst, why, block, guard, invert) in &self.direct_missing {
-            let c = site_cond(&mut bools, block, guard, invert);
-            merge(&mut taint, dst, why, c, &mut bools);
+        for dm in &self.direct_missing {
+            let c = site_cond(&mut bools, dm.block, dm.guard, dm.invert_guard);
+            merge(&mut taint, dm.dst, dm.why, dm.mask, c, &mut bools);
         }
 
         for &(_, b, i) in data_phis {
@@ -7265,76 +8143,89 @@ impl<'a> Lower<'a> {
                 if self.rpo[b] <= self.rpo[q] {
                     c = bools.forget(c, self.rpo[b]);
                 }
-                merge(&mut taint, phi.value, why, c, &mut bools);
+                merge(&mut taint, phi.value, why, u32::MAX, c, &mut bools);
             }
         }
 
-        let propagate_step =
-            |taint: &mut HashMap<Value, Vec<(Why, Bool)>>, bools: &mut BoolSet, precise: bool| {
-                let mut changed = false;
-                for &(_, b, i) in data_phis {
-                    let phi = &p.blocks[b].phis[i];
-                    for (n, &q) in p.blocks[b].preds.iter().enumerate() {
-                        if self.tail[q].is_none() {
-                            continue;
-                        }
-                        let Some(list) = taint.get(&phi.args[n]).cloned() else {
-                            continue;
-                        };
-                        let ec = if precise {
-                            bools.edge(st, q, b)
-                        } else {
-                            Bool::TRUE
-                        };
-                        for (why, c) in list {
-                            let tc = if precise {
-                                let mut tc = bools.and(c, ec);
-                                if self.rpo[b] <= self.rpo[q] {
-                                    tc = bools.forget(tc, self.rpo[b]);
-                                }
-                                tc
-                            } else {
-                                Bool::TRUE
-                            };
-                            changed |= merge(taint, phi.value, why, tc, bools);
-                        }
+        let propagate_step = |taint: &mut HashMap<Value, Vec<(Why, BitMaskCond)>>,
+                              bools: &mut BoolSet,
+                              precise: bool| {
+            let mut changed = false;
+            for &(_, b, i) in data_phis {
+                let phi = &p.blocks[b].phis[i];
+                for (n, &q) in p.blocks[b].preds.iter().enumerate() {
+                    if self.tail[q].is_none() {
+                        continue;
+                    }
+                    let Some(list) = taint.get(&phi.args[n]).cloned() else {
+                        continue;
+                    };
+                    let ec = if precise {
+                        bools.edge(st, q, b)
+                    } else {
+                        Bool::TRUE
+                    };
+                    let back_rpo = (self.rpo[b] <= self.rpo[q]).then_some(self.rpo[b]);
+                    for (why, bmc) in list {
+                        changed |= transfer_taint(
+                            taint,
+                            phi.value,
+                            why,
+                            &bmc,
+                            u32::MAX,
+                            Transfer::Shift {
+                                shift: 0,
+                                dst_mask: u32::MAX,
+                            },
+                            ec,
+                            back_rpo,
+                            precise,
+                            bools,
+                        );
                     }
                 }
-                for &w in &self.deps_order {
-                    for info in &self.deps[&w] {
-                        let use_c = if precise {
-                            site_cond(bools, info.block, info.guard, info.invert_guard)
+            }
+            for &w in &self.deps_order {
+                for info in &self.deps[&w] {
+                    let use_c = if precise {
+                        site_cond(bools, info.block, info.guard, info.invert_guard)
+                    } else {
+                        Bool::TRUE
+                    };
+                    for &dep in &info.deps {
+                        let (val, dc, read_mask) = if precise {
+                            dep_cond(bools, use_c, dep)
                         } else {
-                            Bool::TRUE
-                        };
-                        for &dep in &info.deps {
-                            let (val, dc) = if precise {
-                                dep_cond(bools, use_c, dep)
-                            } else {
-                                let u = match dep {
-                                    ReadDep::Value(u) | ReadDep::Edge { value: u, .. } => u,
-                                };
-                                (u, Bool::TRUE)
-                            };
-                            let Some(list) = taint.get(&val).cloned() else {
-                                continue;
-                            };
-                            for (why, c) in list {
-                                if info.ignore_why == Some(why) {
-                                    continue;
-                                }
-                                let tc = if precise {
-                                    bools.and(c, dc)
-                                } else {
-                                    Bool::TRUE
-                                };
-                                changed |= merge(taint, w, why, tc, bools);
+                            match dep {
+                                ReadDep::Value { value: u, mask }
+                                | ReadDep::Edge { value: u, mask, .. } => (u, Bool::TRUE, mask),
                             }
+                        };
+                        let Some(list) = taint.get(&val).cloned() else {
+                            continue;
+                        };
+                        for (why, bmc) in list {
+                            if info.ignore_why == Some(why) {
+                                continue;
+                            }
+                            changed |= transfer_taint(
+                                taint,
+                                w,
+                                why,
+                                &bmc,
+                                read_mask,
+                                info.transfer,
+                                dc,
+                                None,
+                                precise,
+                                bools,
+                            );
                         }
                     }
                 }
-                changed
-            };
+            }
+            changed
+        };
 
         let mut settled = false;
         for _ in 0..MAX_TAINT_ROUNDS {
@@ -7346,8 +8237,8 @@ impl<'a> Lower<'a> {
         if !settled {
             // Conservative widening when cyclic propagation exceeds the round cap.
             for list in taint.values_mut() {
-                for (_, c) in list.iter_mut() {
-                    *c = Bool::TRUE;
+                for (_, bmc) in list.iter_mut() {
+                    bmc.widen_to_true();
                 }
             }
             while propagate_step(&mut taint, &mut bools, false) {}
@@ -7356,9 +8247,10 @@ impl<'a> Lower<'a> {
         for sink in &self.sinks {
             let sink_c = site_cond(&mut bools, sink.block, sink.guard, false);
             for &dep in &sink.deps {
-                let (val, dc) = dep_cond(&mut bools, sink_c, dep);
+                let (val, dc, mask) = dep_cond(&mut bools, sink_c, dep);
                 if let Some(list) = taint.get(&val) {
-                    for &(why, c) in list {
+                    for (why, bmc) in list {
+                        let c = bmc.read(mask, &mut bools);
                         if bools.sat(c, dc) {
                             return Err(unsupported(sink.offset, why));
                         }
@@ -8070,6 +8962,214 @@ mod tests {
             panic!("live loop back-edge missing value must refuse");
         };
         assert_eq!(what, "a scalar memory read as data");
+    }
+
+    #[test]
+    fn pixel_barycentric_reuse_tracks_exact_bitmasks() {
+        let lower_ps = |words: &[u32], has_consts: bool| {
+            let layout = if has_consts {
+                vec![root(RootType::Constants, 0, 0)]
+            } else {
+                vec![]
+            };
+            let native = NativeProgram {
+                stage: HwStage::Ps,
+                wave64: false,
+                vgprs: 8,
+                layout,
+                used: vec![],
+                io: StageIo::Ps {
+                    inputs: vec![],
+                    input_addr: 1 << 1, // PERSP_CENTER: v0 = i, v1 = j (Input::Barycentric)
+                    db_shader_control: 0,
+                    patches: vec![],
+                },
+                code: words.iter().flat_map(|w| w.to_le_bytes()).collect(),
+            };
+            let p = ir::build(&native.code, false, 8).unwrap();
+            let st = structure::structure(&p).unwrap();
+            let res = resource::track(&p, &native.layout, native.stage, Some(&st)).unwrap();
+            let io = io::raise(&p, &native).unwrap();
+            let outputs = vec![super::SigElement {
+                name: "SV_Target".into(),
+                index: 0,
+                kind: 16,
+                comp: 9,
+                interp: 0,
+                row: Some(0),
+                col: 0,
+                cols: 4,
+                usage: 0,
+                half: false,
+            }];
+            lower(&Parts {
+                native: &native,
+                p: &p,
+                st: &st,
+                io: &io,
+                res: &res,
+                inputs: vec![],
+                outputs,
+                prims: vec![],
+                mesh_stride: 0,
+            })
+        };
+
+        // Positive 1a: Reuse entry barycentric v0 via write_half(lo) (`v_cvt_f16_f32`),
+        // then read only v0.lo16 via `v_cvt_f32_f16`, `v_and_b32(..., 0xFFFF)`,
+        // `v_bfe_u32(..., 0, 16)`, `v_mov_b32_sdwa(... WORD_0)`, and `v_pack_b32_f16`.
+        let pos1_reads = [
+            0x7E00_14F2, // v_cvt_f16_f32 v0, 1.0 (writes v0.lo16, keeps v0.hi16 = dead barycentric)
+            0x7E04_1700, // v_cvt_f32_f16 v2, v0 (reads v0.lo16)
+            0x3606_00FF,
+            0x0000_FFFF, // v_and_b32 v3, 0xFFFF, v0 (reads v0.lo16)
+            0xD548_0004,
+            256 | (0x80 << 9) | (0x90 << 18), // v_bfe_u32 v4, v0, 0, 16 (reads v0.lo16)
+            0x7E0A_02F9,
+            0x0004_0600, // v_mov_b32_sdwa v5, v0 dst_sel:DWORD dst_unused:UNUSED_PAD src0_sel:WORD_0
+            0xD711_0006,
+            256 | (0xF2 << 9), // v_pack_b32_f16 v6, v0, 1.0 (reads v0.lo16)
+            0xF800_180F,
+            0x0605_0402, // exp mrt0, v2, v4, v5, v6 done vm
+            S_ENDPGM,
+        ];
+        let lowered = lower_ps(&pos1_reads, false).expect("lo16 reads after lo16 write must lower");
+        validate_dxil(&lowered.dxil);
+
+        // Positive 1b: Same via `v_and_b32` output exported directly and via SDWA `UNUSED_PRESERVE`
+        // write into `v0.lo16` (`place_bits`) then `v_cvt_f32_f16 v2, v0`.
+        let pos1_sdwa = [
+            0x7E00_02F9,
+            0x0086_1482, // v_mov_b32_sdwa v0, 2 dst_sel:WORD_0 dst_unused:UNUSED_PRESERVE src0_sel:DWORD
+            0x7E04_1700, // v_cvt_f32_f16 v2, v0
+            0x3606_00FF,
+            0x0000_FFFF, // v_and_b32 v3, 0xFFFF, v0
+            0xF800_180F,
+            0x0303_0202, // exp mrt0, v2, v2, v3, v3 done vm
+            S_ENDPGM,
+        ];
+        let lowered =
+            lower_ps(&pos1_sdwa, false).expect("lo16 reads after SDWA lo16 write must lower");
+        validate_dxil(&lowered.dxil);
+
+        // Positive 1c: Across an if/else phi join where both arms write `v0.lo16`, reading `v0.lo16` lowers.
+        let pos1_phi = [
+            0xBF06_8000, // s_cmp_eq_u32 s0, 0
+            0xBF85_0002, // s_cbranch_scc1 +2
+            0x7E00_14F2, // v_cvt_f16_f32 v0, 1.0
+            0xBF82_0001, // s_branch +1
+            0x7E00_14F4, // v_cvt_f16_f32 v0, 2.0
+            0x7E04_1700, // v_cvt_f32_f16 v2, v0
+            0xF800_180F,
+            0x0202_0202, // exp mrt0, v2, v2, v2, v2 done vm
+            S_ENDPGM,
+        ];
+        let lowered =
+            lower_ps(&pos1_phi, true).expect("lo16 phi after lo16 writes in both arms must lower");
+        validate_dxil(&lowered.dxil);
+
+        // Positive 2a: Reuse entry barycentric v0 via write_16(lo) then write_16(hi),
+        // then export full 32-bit v0.
+        let pos2_write16 = [
+            0x7E00_14F2, // v_cvt_f16_f32 v0, 1.0 (writes v0.lo16)
+            0xD58A_4000,
+            0x0000_00F4, // v_cvt_f16_f32 v0, 2.0 op_sel:[0,0,0,1] (writes v0.hi16, keeps lo16)
+            0xF800_180F,
+            0x0000_0000, // exp mrt0, v0, v0, v0, v0 done vm
+            S_ENDPGM,
+        ];
+        let lowered = lower_ps(&pos2_write16, false)
+            .expect("full 32-bit export after lo+hi writes must lower");
+        validate_dxil(&lowered.dxil);
+
+        // Positive 2b: Same via SDWA `UNUSED_PRESERVE` WORD_0 then WORD_1, then export full 32-bit v0.
+        let pos2_sdwa = [
+            0x7E00_02F9,
+            0x0086_1482, // v_mov_b32_sdwa v0, 2 dst_sel:WORD_0 dst_unused:UNUSED_PRESERVE src0_sel:DWORD
+            0x7E00_02F9,
+            0x0086_1584, // v_mov_b32_sdwa v0, 4 dst_sel:WORD_1 dst_unused:UNUSED_PRESERVE src0_sel:DWORD
+            0xF800_180F,
+            0x0000_0000, // exp mrt0, v0, v0, v0, v0 done vm
+            S_ENDPGM,
+        ];
+        let lowered = lower_ps(&pos2_sdwa, false)
+            .expect("full 32-bit export after SDWA lo+hi writes must lower");
+        validate_dxil(&lowered.dxil);
+
+        // Negative: Write only v0.lo16 over entry barycentric v0, then read full 32-bit v0 or v0.hi16
+        // -> MUST refuse with "barycentrics read directly".
+        let neg_cases: &[(&str, &[u32])] = &[
+            (
+                "32-bit export after lo16 write",
+                &[
+                    0x7E00_14F2, // v_cvt_f16_f32 v0, 1.0
+                    0xF800_180F,
+                    0x0000_0000, // exp mrt0, v0, v0, v0, v0 done vm
+                    S_ENDPGM,
+                ],
+            ),
+            (
+                "hi16 v_cvt_f32_f16 after lo16 write",
+                &[
+                    0x7E00_14F2, // v_cvt_f16_f32 v0, 1.0
+                    0xD58B_0802,
+                    0x0000_0100, // v_cvt_f32_f16 v2, v0 op_sel:[1]
+                    0xF800_180F,
+                    0x0202_0202, // exp mrt0, v2, v2, v2, v2 done vm
+                    S_ENDPGM,
+                ],
+            ),
+            (
+                "hi16 shift after lo16 write",
+                &[
+                    0x7E00_14F2, // v_cvt_f16_f32 v0, 1.0
+                    0x2C04_0090, // v_lshrrev_b32 v2, 16, v0
+                    0xF800_180F,
+                    0x0202_0202, // exp mrt0, v2, v2, v2, v2 done vm
+                    S_ENDPGM,
+                ],
+            ),
+            (
+                "SDWA WORD_1 read after SDWA WORD_0 preserve",
+                &[
+                    0x7E00_02F9,
+                    0x0086_1482, // v_mov_b32_sdwa v0, 2 dst_sel:WORD_0 dst_unused:UNUSED_PRESERVE
+                    0x7E06_02F9,
+                    0x0005_0600, // v_mov_b32_sdwa v3, v0 dst_sel:DWORD dst_unused:UNUSED_PAD src0_sel:WORD_1
+                    0xF800_180F,
+                    0x0303_0303, // exp mrt0, v3, v3, v3, v3 done vm
+                    S_ENDPGM,
+                ],
+            ),
+            (
+                "v_and_b32 0xFFFF0000 after lo16 write",
+                &[
+                    0x7E00_14F2, // v_cvt_f16_f32 v0, 1.0
+                    0x3604_00FF,
+                    0xFFFF_0000, // v_and_b32 v2, 0xFFFF0000, v0
+                    0xF800_180F,
+                    0x0202_0202, // exp mrt0, v2, v2, v2, v2 done vm
+                    S_ENDPGM,
+                ],
+            ),
+            (
+                "v_bfe_u32 hi16 after lo16 write",
+                &[
+                    0x7E00_14F2, // v_cvt_f16_f32 v0, 1.0
+                    0xD548_0002,
+                    256 | (0x90 << 9) | (0x90 << 18), // v_bfe_u32 v2, v0, 16, 16
+                    0xF800_180F,
+                    0x0202_0202, // exp mrt0, v2, v2, v2, v2 done vm
+                    S_ENDPGM,
+                ],
+            ),
+        ];
+        for &(label, words) in neg_cases {
+            let Err(crate::ShaderError::Unsupported { what, .. }) = lower_ps(words, false) else {
+                panic!("{label}: expected refusal");
+            };
+            assert_eq!(what, "barycentrics read directly", "{label}");
+        }
     }
 
     #[test]

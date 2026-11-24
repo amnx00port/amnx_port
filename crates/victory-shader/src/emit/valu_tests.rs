@@ -5,7 +5,7 @@
 //! `v_med3_f32`/`v_med3_f16` with NaN operands, `v_fract_f32`/`v_fract_f16`
 //! near `1.0`, and turn-range reduction for `v_sin_*`/`v_cos_*`.
 
-use super::host::{Dispatch, Host, Root, View};
+use super::host::{Dispatch, Draw, Host, Root, View};
 use super::{HostShader, lower, validator};
 use crate::native::{
     ComputeIo, HwStage, NativeProgram, ResourceType, RootParam, RootType, StageIo, UsedResource,
@@ -1009,4 +1009,252 @@ fn reachability_overwritten_missing_phis_match_on_host_and_warp() {
             );
         });
     }
+}
+
+/// Builds a fullscreen-triangle vertex shader for pixel-shader VALU readback tests.
+fn build_fullscreen_vs() -> HostShader {
+    use super::bitcode::{Attr, Term};
+    use super::container::SigElement;
+    use super::shader::Shader;
+    let mut s = Shader::new(false);
+    let b = s.entry;
+    s.inputs.push(SigElement {
+        name: "POSITION".into(),
+        index: 0,
+        kind: 0,
+        comp: 9,
+        interp: 0,
+        row: Some(0),
+        col: 0,
+        cols: 4,
+        usage: 0xF,
+        half: false,
+    });
+    s.outputs.push(SigElement {
+        name: "SV_Position".into(),
+        index: 0,
+        kind: 3,
+        comp: 9,
+        interp: 4,
+        row: Some(0),
+        col: 0,
+        cols: 4,
+        usage: 0xF,
+        half: false,
+    });
+    let f32t = s.t.f32;
+    let void = s.t.void;
+    let undef = s.m.undef(s.t.i32);
+    let zero = s.m.i32(0);
+    for col in 0..4u8 {
+        let col_v = s.m.i8(col);
+        let loaded = s.op(
+            b,
+            "loadInput.f32",
+            Attr::ReadNone,
+            f32t,
+            4,
+            &[zero, zero, col_v, undef],
+        );
+        s.op(
+            b,
+            "storeOutput.f32",
+            Attr::NoUnwind,
+            void,
+            5,
+            &[zero, zero, col_v, loaded],
+        );
+    }
+    s.m.terminate(b, Term::Ret);
+    HostShader {
+        stage: HwStage::Vs,
+        dxil: s.finish(),
+        user_data: Vec::new(),
+        samplers: Vec::new(),
+        static_samplers: Vec::new(),
+        root_cbvs: Vec::new(),
+        root_srvs: Vec::new(),
+    }
+}
+
+fn build_valu_ps(words: &[u32]) -> HostShader {
+    use super::container::SigElement;
+    let code: Vec<u8> = words.iter().flat_map(|w| w.to_le_bytes()).collect();
+    let native = NativeProgram {
+        stage: HwStage::Ps,
+        wave64: false,
+        vgprs: 8,
+        layout: vec![RootParam {
+            root: RootType::Constants,
+            table_offset_dwords: 0,
+            sgprs: 4,
+            base_register: 0,
+            user_data: 0,
+            slot: 0,
+        }],
+        used: vec![],
+        io: StageIo::Ps {
+            inputs: vec![],
+            input_addr: 1 << 1, // PERSP_CENTER: v0/v1 start as Input::Barycentric
+            db_shader_control: 0,
+            patches: vec![],
+        },
+        code,
+    };
+    let p = ir::build(&native.code, native.wave64, native.vgprs).expect("ir::build");
+    let st = structure::structure(&p).expect("structure");
+    let res =
+        resource::track(&p, &native.layout, native.stage, Some(&st)).expect("resource::track");
+    let io = io::raise(&p, &native).expect("io::raise");
+    let outputs = vec![SigElement {
+        name: "SV_Target".into(),
+        index: 0,
+        kind: 16,
+        comp: 9,
+        interp: 0,
+        row: Some(0),
+        col: 0,
+        cols: 4,
+        usage: 0,
+        half: false,
+    }];
+    let lowered = lower::lower(&lower::Parts {
+        native: &native,
+        p: &p,
+        st: &st,
+        io: &io,
+        res: &res,
+        inputs: Vec::new(),
+        outputs,
+        prims: Vec::new(),
+        mesh_stride: 0,
+    })
+    .expect("lower ps");
+
+    let shader = HostShader {
+        stage: HwStage::Ps,
+        dxil: lowered.dxil,
+        user_data: lowered.user_data,
+        samplers: lowered.samplers,
+        static_samplers: Vec::new(),
+        root_cbvs: lowered.root_cbvs,
+        root_srvs: lowered.root_srvs,
+    };
+
+    if let Ok(mut v) = validator::Validator::load(validator::Validator::default_path().as_deref()) {
+        let mut copy = shader.dxil.clone();
+        let ours = copy[4..20].to_vec();
+        v.validate(&mut copy).expect("DXIL validation failed");
+        assert_eq!(copy[4..20], ours[..], "container hash mismatch");
+    }
+
+    shader
+}
+
+#[test]
+fn pixel_barycentric_reuse_16bit_and_sdwa_match_on_host_and_warp() {
+    let vs = build_fullscreen_vs();
+    // Positive 1: Reuse entry barycentric v0 via write_16(lo) (`v_cvt_f16_f32 v0, s0`),
+    // then read only v0.lo16 via `v_cvt_f32_f16`, `v_and_b32(..., 0xFFFF)`,
+    // `v_bfe_u32(..., 0, 16)`, and SDWA `src0_sel:WORD_0`.
+    let ps_lo16_reads = build_valu_ps(&[
+        0x7E00_1400, // v_cvt_f16_f32 v0, s0
+        0x7E04_1700, // v_cvt_f32_f16 v2, v0
+        0x3606_00FF,
+        0x0000_FFFF, // v_and_b32 v3, 0xFFFF, v0
+        0xD548_0004,
+        256 | (0x80 << 9) | (0x90 << 18), // v_bfe_u32 v4, v0, 0, 16
+        0x7E0A_02F9,
+        0x0004_0600, // v_mov_b32_sdwa v5, v0 dst_sel:DWORD dst_unused:UNUSED_PAD src0_sel:WORD_0
+        vop1(0x006, 3, vgpr(3)), // v_cvt_f32_u32 v3, v3 (avoid denorm flush on RT export)
+        vop1(0x006, 4, vgpr(4)), // v_cvt_f32_u32 v4, v4
+        vop1(0x006, 5, vgpr(5)), // v_cvt_f32_u32 v5, v5
+        0xF800_180F,
+        0x0504_0302, // exp mrt0, v2, v3, v4, v5 done vm
+        S_ENDPGM,
+    ]);
+    // Positive 2: Reuse entry barycentrics v0 (via write_16(lo) then write_16(hi)) and
+    // v1 (via SDWA WORD_0 then WORD_1 UNUSED_PRESERVE), then export full 32-bit v0 and v1.
+    let ps_full_overwrite = build_valu_ps(&[
+        0x7E00_1400, // v_cvt_f16_f32 v0, s0
+        0xD58A_4000,
+        0x0000_0001, // v_cvt_f16_f32 v0, s1 op_sel:[0,0,0,1]
+        0x7E02_02F9,
+        0x0086_1402, // v_mov_b32_sdwa v1, s2 dst_sel:WORD_0 dst_unused:UNUSED_PRESERVE src0_sel:DWORD
+        0x7E02_02F9,
+        0x0086_1503, // v_mov_b32_sdwa v1, s3 dst_sel:WORD_1 dst_unused:UNUSED_PRESERVE src0_sel:DWORD
+        0xF800_180F,
+        0x0100_0100, // exp mrt0, v0, v1, v0, v1 done vm
+        S_ENDPGM,
+    ]);
+
+    let vertices = [
+        -1.0f32, -1.0, 0.5, 1.0, //
+        -1.0, 3.0, 0.5, 1.0, //
+        3.0, -1.0, 0.5, 1.0,
+    ];
+    let _one = ONE_AT_A_TIME.lock().unwrap_or_else(|e| e.into_inner());
+    let mut ran = 0;
+    for (label, warp) in [("hardware", false), ("warp", true)] {
+        let Ok(host) = Host::new(warp) else {
+            eprintln!("no SM 6.6 {label} device; skipped");
+            continue;
+        };
+        for (name, ps, consts, want) in [
+            (
+                "lo16_reads",
+                &ps_lo16_reads,
+                [1.5f32.to_bits(), 0, 0, 0],
+                [1.5f32, 15872.0, 15872.0, 15872.0],
+            ),
+            (
+                "full_overwrite",
+                &ps_full_overwrite,
+                [1.5f32.to_bits(), (-2.0f32).to_bits(), 0x1234, 0x5678],
+                [
+                    f32::from_bits(0xC000_3E00),
+                    f32::from_bits(0x5678_1234),
+                    f32::from_bits(0xC000_3E00),
+                    f32::from_bits(0x5678_1234),
+                ],
+            ),
+        ] {
+            let (root, pso) = host
+                .pipeline(&vs, ps)
+                .unwrap_or_else(|e| panic!("{label} {name}: pipeline failed: {e}"));
+            let mut ud = vec![0u32; ps.user_data_dwords().max(1) as usize];
+            for u in &ps.user_data {
+                ud[u.index as usize] = consts[u.dword as usize];
+            }
+            let pixels = host
+                .draw(
+                    &root,
+                    &pso,
+                    &Draw {
+                        roots: vec![(1, Root::Constants(ud))],
+                        textures: &[],
+                        samplers: &[],
+                        vertices: &vertices,
+                        stride: 16,
+                        size: (4, 4),
+                        mesh_groups: 0,
+                    },
+                )
+                .unwrap_or_else(|e| panic!("{label} {name}: draw failed: {e}"));
+            assert_eq!(pixels.len(), 16);
+            for (p_idx, px) in pixels.iter().enumerate() {
+                for c in 0..4 {
+                    assert_eq!(
+                        px[c].to_bits(),
+                        want[c].to_bits(),
+                        "{label} {name} pixel {p_idx} ch {c}: got {:#010x}, want {:#010x}",
+                        px[c].to_bits(),
+                        want[c].to_bits()
+                    );
+                }
+            }
+        }
+        ran += 1;
+    }
+    assert!(ran > 0, "neither hardware nor WARP SM 6.6 device available");
 }
