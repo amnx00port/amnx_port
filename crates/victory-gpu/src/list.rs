@@ -623,7 +623,7 @@ extern "system" fn resolve(
     {
         use windows::Win32::Foundation::RECT;
         use windows::Win32::Graphics::Direct3D12::{
-            D3D12_RESOLVE_MODE_AVERAGE, ID3D12GraphicsCommandList1,
+            D3D12_RESOLVE_MODE_AVERAGE, D3D12_RESOURCE_DESC, ID3D12GraphicsCommandList1,
         };
         use windows::Win32::Graphics::Dxgi::Common::DXGI_FORMAT;
         use windows::core::Interface;
@@ -634,11 +634,17 @@ extern "system" fn resolve(
         crate::texture::host_written(dst);
         #[cfg(feature = "diagnostics")]
         list.note_op(|| format!("resolve {src:?} to {dst:?} format {format}"));
+        let extent = |d: D3D12_RESOURCE_DESC, subresource: u32| {
+            // Mips are the low-order component of an array or plane subresource index.
+            let mip = subresource % u32::from(d.MipLevels);
+            ((d.Width >> mip).max(1), (d.Height >> mip).max(1))
+        };
         // SAFETY: an open list and live textures; the region is inside both.
         unsafe {
-            let (a, b) = (to.GetDesc(), from.GetDesc());
+            let (dst_width, dst_height) = extent(to.GetDesc(), dst_sub);
+            let (src_width, src_height) = extent(from.GetDesc(), src_sub);
             let format = DXGI_FORMAT(format as i32);
-            if (a.Width, a.Height) == (b.Width, b.Height) {
+            if (dst_width, dst_height) == (src_width, src_height) {
                 list.list
                     .ResolveSubresource(to, dst_sub, from, src_sub, format);
             } else if let Ok(list1) = list.list.cast::<ID3D12GraphicsCommandList1>() {
@@ -646,8 +652,8 @@ extern "system" fn resolve(
                 let rect = RECT {
                     left: 0,
                     top: 0,
-                    right: a.Width.min(b.Width) as i32,
-                    bottom: a.Height.min(b.Height) as i32,
+                    right: dst_width.min(src_width) as i32,
+                    bottom: dst_height.min(src_height) as i32,
                 };
                 list1.ResolveSubresourceRegion(
                     to,
@@ -1404,6 +1410,272 @@ static NEWER_LIST_FUNCTIONS: Table<160> = Table(list_table(true));
 mod tests {
     use super::*;
     use crate::object::slot;
+
+    #[cfg(windows)]
+    #[test]
+    fn resolve_uses_the_selected_mip_dimensions() {
+        use windows::Win32::Foundation::RECT;
+        use windows::Win32::Graphics::Direct3D12::*;
+        use windows::Win32::Graphics::Dxgi::Common::*;
+        use windows::core::Interface;
+
+        struct Held(This);
+        impl Drop for Held {
+            fn drop(&mut self) {
+                slot::<extern "system" fn(This) -> u32>(self.0, 0x10)(self.0);
+            }
+        }
+
+        let Some(host) = crate::host::host() else {
+            return;
+        };
+        let device = &host.device;
+        let format = DXGI_FORMAT_R8G8B8A8_UNORM;
+        let null = std::ptr::null();
+        let iid = ID3D12Resource::IID;
+        let heap = D3D12_HEAP_PROPERTIES {
+            Type: D3D12_HEAP_TYPE_DEFAULT,
+            ..Default::default()
+        };
+        let make = |width: u32, mips, slices, samples| {
+            let desc = D3D12_RESOURCE_DESC {
+                Dimension: D3D12_RESOURCE_DIMENSION_TEXTURE2D,
+                Width: u64::from(width),
+                Height: width,
+                MipLevels: mips,
+                DepthOrArraySize: slices,
+                Format: format,
+                SampleDesc: DXGI_SAMPLE_DESC {
+                    Count: samples,
+                    Quality: 0,
+                },
+                Flags: D3D12_RESOURCE_FLAG_ALLOW_RENDER_TARGET,
+                ..Default::default()
+            };
+            let mut resource = null;
+            assert_eq!(
+                crate::resource::create_committed(
+                    null,
+                    (&raw const heap).cast(),
+                    0,
+                    (&raw const desc).cast(),
+                    D3D12_RESOURCE_STATE_RENDER_TARGET.0 as u32,
+                    null.cast(),
+                    (&raw const iid).cast(),
+                    &mut resource,
+                ),
+                S_OK
+            );
+            Held(resource)
+        };
+        let source_pixel = |x: u32, y: u32| {
+            [
+                (x * 64) as u8,
+                (y * 64) as u8,
+                (32 + x * 16 + y * 4) as u8,
+                255,
+            ]
+        };
+
+        for (size, mips, slice, mip, extent) in [
+            (4, 2, 0, 1, 2),
+            (8, 3, 0, 2, 2),
+            (8, 2, 0, 1, 4),
+            (4, 2, 1, 1, 2),
+            (4, 0, 0, 1, 2),
+        ] {
+            let mut allocator = null;
+            assert_eq!(
+                create_allocator(null, 0, &ALLOCATOR_IIDS[0], &mut allocator),
+                S_OK
+            );
+            let allocator = Held(allocator);
+            let mut list = null;
+            assert_eq!(
+                create_list(null, 0, 0, allocator.0, null, &LIST_IIDS[1], &mut list),
+                S_OK
+            );
+            let list = Held(list);
+            let recorded = host_list(list.0).expect("host command list");
+            let src = make(4, 1, 1, 4);
+            let dst = make(size, mips, slice + 1, 1);
+            let src_tex = crate::resource::host_resource(src.0).expect("4x MSAA source");
+            let dst_tex = crate::resource::host_resource(dst.0).expect("single-sample destination");
+            // SAFETY: a live host resource. GetDesc reports the actual mip count.
+            let actual_mips = unsafe { dst_tex.GetDesc() }.MipLevels;
+            assert_eq!(actual_mips, if mips == 0 { 3 } else { mips });
+
+            let source_rtv = host.rtv(src_tex, None);
+            for y in 0..4 {
+                for x in 0..4 {
+                    let rect = RECT {
+                        left: x,
+                        top: y,
+                        right: x + 1,
+                        bottom: y + 1,
+                    };
+                    let color = source_pixel(x as u32, y as u32).map(|v| f32::from(v) / 255.0);
+                    // SAFETY: the one-pixel rect lies inside the live multisample target.
+                    unsafe {
+                        recorded
+                            .list
+                            .ClearRenderTargetView(source_rtv, &color, Some(&[rect]))
+                    };
+                }
+            }
+            for (target_mip, color) in [(0, [0.0, 1.0, 1.0, 1.0]), (mip, [1.0, 0.0, 1.0, 1.0])] {
+                let (dimension, view) = if slice == 0 {
+                    (
+                        D3D12_RTV_DIMENSION_TEXTURE2D,
+                        D3D12_RENDER_TARGET_VIEW_DESC_0 {
+                            Texture2D: D3D12_TEX2D_RTV {
+                                MipSlice: target_mip,
+                                PlaneSlice: 0,
+                            },
+                        },
+                    )
+                } else {
+                    (
+                        D3D12_RTV_DIMENSION_TEXTURE2DARRAY,
+                        D3D12_RENDER_TARGET_VIEW_DESC_0 {
+                            Texture2DArray: D3D12_TEX2D_ARRAY_RTV {
+                                MipSlice: target_mip,
+                                FirstArraySlice: u32::from(slice),
+                                ArraySize: 1,
+                                PlaneSlice: 0,
+                            },
+                        },
+                    )
+                };
+                let desc = D3D12_RENDER_TARGET_VIEW_DESC {
+                    Format: format,
+                    ViewDimension: dimension,
+                    Anonymous: view,
+                };
+                let rtv = host.rtv(dst_tex, Some(&desc));
+                // SAFETY: the view is live and its subresource begins in RENDER_TARGET.
+                unsafe { recorded.list.ClearRenderTargetView(rtv, &color, None) };
+            }
+            assert_eq!(host.log_messages(), None);
+
+            let render_target = D3D12_RESOURCE_STATE_RENDER_TARGET.0 as u32;
+            ensure_state(recorded, src.0, render_target);
+            ensure_state(recorded, dst.0, render_target);
+            let first = u32::from(slice) * u32::from(actual_mips);
+            resolve(list.0, dst.0, first + mip, src.0, 0, format.0 as u32);
+            assert_eq!(host.log_messages(), None);
+
+            ensure_state(recorded, dst.0, D3D12_RESOURCE_STATE_COPY_SOURCE.0 as u32);
+            let reads = [first, first + mip].map(|sub| {
+                // SAFETY: the list is open and the destination is in COPY_SOURCE.
+                unsafe { read_resolve_test_mip(device, &recorded.list, dst_tex, sub) }
+            });
+            assert_eq!(close(list.0), S_OK);
+            host.execute(&[recorded]);
+            assert_eq!(host.log_messages(), None);
+
+            for ((buffer, fp), (dim, resolved)) in
+                reads.into_iter().zip([(size, false), (extent, true)])
+            {
+                let f = fp.Footprint;
+                assert_eq!((f.Width, f.Height), (dim, dim));
+                let mut pixels = std::ptr::null_mut();
+                // SAFETY: submission has finished and all offsets stay inside the footprint.
+                unsafe {
+                    buffer.Map(0, None, Some(&mut pixels)).unwrap();
+                    for y in 0..dim {
+                        for x in 0..dim {
+                            let offset = fp.Offset as usize + (y * f.RowPitch + x * 4) as usize;
+                            let expected = if resolved {
+                                source_pixel(x, y)
+                            } else {
+                                [0, 255, 255, 255]
+                            };
+                            let actual =
+                                std::slice::from_raw_parts(pixels.cast::<u8>().add(offset), 4);
+                            assert_eq!(
+                                actual, expected,
+                                "{size}x{size} mips={mips} slice={slice} mip={mip} at ({x},{y})"
+                            );
+                        }
+                    }
+                    buffer.Unmap(0, None);
+                }
+            }
+        }
+    }
+
+    #[cfg(windows)]
+    unsafe fn read_resolve_test_mip(
+        device: &windows::Win32::Graphics::Direct3D12::ID3D12Device,
+        list: &windows::Win32::Graphics::Direct3D12::ID3D12GraphicsCommandList,
+        texture: &windows::Win32::Graphics::Direct3D12::ID3D12Resource,
+        subresource: u32,
+    ) -> (
+        windows::Win32::Graphics::Direct3D12::ID3D12Resource,
+        windows::Win32::Graphics::Direct3D12::D3D12_PLACED_SUBRESOURCE_FOOTPRINT,
+    ) {
+        use windows::Win32::Graphics::Direct3D12::*;
+        use windows::Win32::Graphics::Dxgi::Common::DXGI_SAMPLE_DESC;
+        let mut footprint = D3D12_PLACED_SUBRESOURCE_FOOTPRINT::default();
+        let mut total = 0;
+        // SAFETY: a live single-sample texture and an open list with the mip in COPY_SOURCE.
+        unsafe {
+            device.GetCopyableFootprints(
+                &texture.GetDesc(),
+                subresource,
+                1,
+                0,
+                Some(&mut footprint),
+                None,
+                None,
+                Some(&mut total),
+            );
+            let mut buffer = None;
+            device
+                .CreateCommittedResource(
+                    &D3D12_HEAP_PROPERTIES {
+                        Type: D3D12_HEAP_TYPE_READBACK,
+                        ..Default::default()
+                    },
+                    D3D12_HEAP_FLAG_NONE,
+                    &D3D12_RESOURCE_DESC {
+                        Dimension: D3D12_RESOURCE_DIMENSION_BUFFER,
+                        Width: total,
+                        Height: 1,
+                        DepthOrArraySize: 1,
+                        MipLevels: 1,
+                        SampleDesc: DXGI_SAMPLE_DESC {
+                            Count: 1,
+                            Quality: 0,
+                        },
+                        Layout: D3D12_TEXTURE_LAYOUT_ROW_MAJOR,
+                        ..Default::default()
+                    },
+                    D3D12_RESOURCE_STATE_COPY_DEST,
+                    None,
+                    &mut buffer,
+                )
+                .unwrap();
+            let buffer: ID3D12Resource = buffer.unwrap();
+            let to = D3D12_TEXTURE_COPY_LOCATION {
+                pResource: std::mem::transmute_copy(&buffer),
+                Type: D3D12_TEXTURE_COPY_TYPE_PLACED_FOOTPRINT,
+                Anonymous: D3D12_TEXTURE_COPY_LOCATION_0 {
+                    PlacedFootprint: footprint,
+                },
+            };
+            let from = D3D12_TEXTURE_COPY_LOCATION {
+                pResource: std::mem::transmute_copy(texture),
+                Type: D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX,
+                Anonymous: D3D12_TEXTURE_COPY_LOCATION_0 {
+                    SubresourceIndex: subresource,
+                },
+            };
+            list.CopyTextureRegion(&to, 0, 0, 0, &from, None);
+            (buffer, footprint)
+        }
+    }
 
     #[test]
     fn every_inline_command_falls_back_to_the_table() {
