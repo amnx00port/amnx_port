@@ -19,10 +19,11 @@
 //! ever needs a sync.
 #![allow(clippy::not_unsafe_ptr_arg_deref)]
 
+use std::collections::BTreeSet;
 use std::ffi::{CString, c_char, c_void};
 use std::io::Write as _;
 use std::path::{Path, PathBuf};
-use std::sync::Mutex;
+use std::sync::{Condvar, Mutex};
 
 use super::xasync::{self, AsyncBlock, E_INVALIDARG};
 use super::xgameruntime::{
@@ -73,6 +74,66 @@ static SAVES: Mutex<()> = Mutex::new(());
 
 fn saves_lock() -> std::sync::MutexGuard<'static, ()> {
     SAVES.lock().unwrap_or_else(|e| e.into_inner())
+}
+
+/// Preserves FIFO submission order across async save operations offloaded onto
+/// `xasync::pending_with`, even when multiple async calls are queued back to
+/// back without waiting.
+struct SaveOrder {
+    next_ticket: u64,
+    serving: u64,
+    skipped: BTreeSet<u64>,
+}
+
+static ORDER: Mutex<SaveOrder> = Mutex::new(SaveOrder {
+    next_ticket: 0,
+    serving: 0,
+    skipped: BTreeSet::new(),
+});
+static ORDER_TURN: Condvar = Condvar::new();
+
+struct SaveTicket {
+    ticket: u64,
+    entered: bool,
+}
+
+impl SaveTicket {
+    fn claim() -> Self {
+        let mut order = ORDER.lock().unwrap_or_else(|e| e.into_inner());
+        let ticket = order.next_ticket;
+        order.next_ticket += 1;
+        SaveTicket {
+            ticket,
+            entered: false,
+        }
+    }
+
+    fn wait(&mut self) {
+        let order = ORDER.lock().unwrap_or_else(|e| e.into_inner());
+        let _order = ORDER_TURN
+            .wait_while(order, |o| o.serving != self.ticket)
+            .unwrap_or_else(|e| e.into_inner());
+        self.entered = true;
+    }
+}
+
+impl Drop for SaveTicket {
+    fn drop(&mut self) {
+        let mut order = ORDER.lock().unwrap_or_else(|e| e.into_inner());
+        if self.entered {
+            order.serving += 1;
+        } else {
+            order.skipped.insert(self.ticket);
+        }
+        loop {
+            let serving = order.serving;
+            if !order.skipped.remove(&serving) {
+                break;
+            }
+            order.serving += 1;
+        }
+        ORDER_TURN.notify_all();
+    }
 }
 
 /// `name` as a file name: letters, digits, `-` and `_` stay, every other
@@ -256,8 +317,9 @@ fn commit(
         match source {
             Source::Data(data) => write(path, data)?,
             // Files are never changed in place, so sharing one is safe.
-            Source::Kept(from) => std::fs::hard_link(from, &path)
-                .or_else(|_| std::fs::copy(from, &path).map(drop))?,
+            Source::Kept(from) => {
+                std::fs::hard_link(from, &path).or_else(|_| std::fs::copy(from, &path).map(drop))?
+            }
         }
         step();
     }
@@ -333,10 +395,12 @@ fn used_bytes(root: &Path) -> u64 {
 struct Provider {
     root: PathBuf,
 }
+#[derive(Clone)]
 struct Container {
     name: String,
     dir: PathBuf,
 }
+#[derive(Clone)]
 struct Update {
     name: String,
     dir: PathBuf,
@@ -371,11 +435,6 @@ impl Provider {
         let _saves = saves_lock();
         containers(&root); // converts old containers now
         Ok(Provider { root })
-    }
-
-    fn remaining(&self) -> u64 {
-        let _saves = saves_lock();
-        remaining(&self.root)
     }
 
     fn container(&self, name: &str) -> Container {
@@ -442,7 +501,9 @@ impl Update {
         }
         let replaced: u64 = current.as_ref().map_or(0, |v| {
             let sizes = v.sizes();
-            let changed = sizes.iter().filter(|(n, _)| self.changes.iter().any(|(c, _)| c == n));
+            let changed = sizes
+                .iter()
+                .filter(|(n, _)| self.changes.iter().any(|(c, _)| c == n));
             changed.map(|(_, size)| size).sum()
         });
         let root = self.dir.parent().unwrap_or(&self.dir);
@@ -494,7 +555,11 @@ fn read(c: &Container, names: Option<Vec<String>>) -> Result<Vec<(String, Vec<u8
     names
         .into_iter()
         .map(|name| {
-            let i = version.blobs.iter().position(|b| *b == name).ok_or(BLOB_NOT_FOUND)?;
+            let i = version
+                .blobs
+                .iter()
+                .position(|b| *b == name)
+                .ok_or(BLOB_NOT_FOUND)?;
             let data = std::fs::read(version.blob(i)).map_err(|e| io_error(&c.dir, &e))?;
             Ok((name, data))
         })
@@ -554,7 +619,12 @@ pub struct BlobInfo {
 
 /// Calls `callback` with the information of each container that passes
 /// `keep` until it returns false; never under our lock (it may call us).
-fn report(root: &Path, keep: impl Fn(&str) -> bool, context: *mut c_void, callback: ContainerCallback) {
+fn report(
+    root: &Path,
+    keep: impl Fn(&str) -> bool,
+    context: *mut c_void,
+    callback: ContainerCallback,
+) {
     let infos: Vec<(CString, CString, u32, u64, i64)> = {
         let _saves = saves_lock();
         containers(root)
@@ -606,12 +676,16 @@ extern "system" fn initialize_async(
     block: *mut AsyncBlock,
 ) -> HRESULT {
     let saves = runtime::title().saves();
-    let result = if saves.parent().is_none_or(|p| p.as_os_str().is_empty()) {
-        Err(NO_ACCESS)
-    } else {
-        Provider::open(&saves, text(config).as_deref()).map(|p| xasync::bytes(give(p)))
-    };
-    xasync::finished_with(block, (&raw const INIT).cast(), result)
+    let config = text(config);
+    let mut ticket = SaveTicket::claim();
+    xasync::pending_with(block, (&raw const INIT).cast(), move || {
+        ticket.wait();
+        if saves.parent().is_none_or(|p| p.as_os_str().is_empty()) {
+            Err(NO_ACCESS)
+        } else {
+            Provider::open(&saves, config.as_deref()).map(|p| xasync::bytes(give(p)))
+        }
+    })
 }
 extern "system" fn initialize_result(
     _: This,
@@ -629,10 +703,15 @@ extern "system" fn quota_async(
     provider: *const Provider,
     block: *mut AsyncBlock,
 ) -> HRESULT {
-    let result = get(provider)
-        .ok_or(E_INVALIDARG)
-        .map(|p| xasync::bytes(p.remaining() as i64));
-    xasync::finished_with(block, (&raw const QUOTA_CALL).cast(), result)
+    let Some(root) = get(provider).map(|p| p.root.clone()) else {
+        return xasync::finished_with(block, (&raw const QUOTA_CALL).cast(), Err(E_INVALIDARG));
+    };
+    let mut ticket = SaveTicket::claim();
+    xasync::pending_with(block, (&raw const QUOTA_CALL).cast(), move || {
+        ticket.wait();
+        let _saves = saves_lock();
+        Ok(xasync::bytes(remaining(&root) as i64))
+    })
 }
 extern "system" fn quota_result(_: This, block: *mut AsyncBlock, out: *mut i64) -> HRESULT {
     xasync::result(block, (&raw const QUOTA_CALL).cast(), out)
@@ -644,12 +723,18 @@ extern "system" fn delete_async(
     name: *const c_char,
     block: *mut AsyncBlock,
 ) -> HRESULT {
-    let hr = match (get(provider), text(name)) {
-        (Some(p), Some(name)) if valid_container(&name) => delete(&p.root, &name),
-        (Some(_), Some(_)) => INVALID_CONTAINER_NAME,
-        _ => E_INVALIDARG,
+    let (Some(root), Some(name)) = (get(provider).map(|p| p.root.clone()), text(name)) else {
+        return xasync::finished(block, (&raw const DELETE).cast(), E_INVALIDARG);
     };
-    xasync::finished(block, (&raw const DELETE).cast(), hr)
+    if !valid_container(&name) {
+        return xasync::finished(block, (&raw const DELETE).cast(), INVALID_CONTAINER_NAME);
+    }
+    let mut ticket = SaveTicket::claim();
+    xasync::pending_with(block, (&raw const DELETE).cast(), move || {
+        ticket.wait();
+        let hr = delete(&root, &name);
+        if hr < 0 { Err(hr) } else { Ok(Vec::new()) }
+    })
 }
 extern "system" fn delete_result(_: This, block: *mut AsyncBlock) -> HRESULT {
     let none = std::ptr::null_mut();
@@ -762,8 +847,8 @@ extern "system" fn read_blobs(
     put(count, blobs.len() as u32)
 }
 
-/// Read at once; the result holds the layout with pointers relative to the
-/// title's buffer, fixed up when the title takes it.
+/// Reads blobs off-thread; the result holds the layout with pointers relative
+/// to the title's buffer, fixed up when the title takes it.
 extern "system" fn read_async(
     _: This,
     container: *const Container,
@@ -771,11 +856,15 @@ extern "system" fn read_async(
     count: u32,
     block: *mut AsyncBlock,
 ) -> HRESULT {
-    let result = match get(container) {
-        Some(c) => read(c, names(blob_names, count)).map(|blobs| layout(&blobs, 0)),
-        None => Err(E_INVALIDARG),
+    let Some(c) = get(container).cloned() else {
+        return xasync::finished_with(block, (&raw const READ).cast(), Err(E_INVALIDARG));
     };
-    xasync::finished_with(block, (&raw const READ).cast(), result)
+    let wanted = names(blob_names, count);
+    let mut ticket = SaveTicket::claim();
+    xasync::pending_with(block, (&raw const READ).cast(), move || {
+        ticket.wait();
+        read(&c, wanted).map(|blobs| layout(&blobs, 0))
+    })
 }
 extern "system" fn read_result(
     _: This,
@@ -870,8 +959,15 @@ extern "system" fn delete_blob(_: This, update: *mut Update, name: *const c_char
 }
 
 extern "system" fn submit_async(_: This, update: *const Update, block: *mut AsyncBlock) -> HRESULT {
-    let hr = get(update).map_or(E_INVALIDARG, Update::submit);
-    xasync::finished(block, (&raw const SUBMIT).cast(), hr)
+    let Some(snapshot) = get(update).cloned() else {
+        return xasync::finished(block, (&raw const SUBMIT).cast(), E_INVALIDARG);
+    };
+    let mut ticket = SaveTicket::claim();
+    xasync::pending_with(block, (&raw const SUBMIT).cast(), move || {
+        ticket.wait();
+        let hr = snapshot.submit();
+        if hr < 0 { Err(hr) } else { Ok(Vec::new()) }
+    })
 }
 extern "system" fn submit_result(_: This, block: *mut AsyncBlock) -> HRESULT {
     let none = std::ptr::null_mut();
@@ -968,18 +1064,28 @@ mod tests {
     }
 
     fn old_state() -> Option<(String, Vec<(String, String)>)> {
-        Some(("one".into(), vec![("a".into(), "old a".into()), ("b".into(), "old b".into())]))
+        Some((
+            "one".into(),
+            vec![("a".into(), "old a".into()), ("b".into(), "old b".into())],
+        ))
     }
 
     /// Run by the crash test in a child process; does nothing otherwise.
     #[test]
     fn crash_child() {
-        let (Ok(root), Ok(op)) = (std::env::var("VICTORY_SAVE_CHILD"), std::env::var("VICTORY_SAVE_OP")) else {
+        let (Ok(root), Ok(op)) = (
+            std::env::var("VICTORY_SAVE_CHILD"),
+            std::env::var("VICTORY_SAVE_OP"),
+        ) else {
             return;
         };
         let root = PathBuf::from(root);
         let hr = if op == "update" {
-            update(&root, "two", &[("a", Some("new a")), ("b", None), ("c", Some("new c"))])
+            update(
+                &root,
+                "two",
+                &[("a", Some("new a")), ("b", None), ("c", Some("new c"))],
+            )
         } else {
             delete(&root, "Slot")
         };
@@ -992,15 +1098,25 @@ mod tests {
     /// new one.
     #[test]
     fn a_kill_at_any_step_leaves_old_or_new() {
-        let new = Some(("two".into(), vec![("a".into(), "new a".into()), ("c".into(), "new c".into())]));
+        let new = Some((
+            "two".into(),
+            vec![("a".into(), "new a".into()), ("c".into(), "new c".into())],
+        ));
         for (op, after) in [("update", new), ("delete", None)] {
             let mut seen = (0, 0);
             for stop in 1.. {
                 let dir = tempfile::tempdir().unwrap();
                 let root = dir.path();
-                assert_eq!(update(root, "one", &[("a", Some("old a")), ("b", Some("old b"))]), S_OK);
+                assert_eq!(
+                    update(root, "one", &[("a", Some("old a")), ("b", Some("old b"))]),
+                    S_OK
+                );
                 let mut child = std::process::Command::new(std::env::current_exe().unwrap())
-                    .args(["--exact", "modules::xgamesave::tests::crash_child", "--nocapture"])
+                    .args([
+                        "--exact",
+                        "modules::xgamesave::tests::crash_child",
+                        "--nocapture",
+                    ])
                     .args(["--test-threads=1"])
                     .env("VICTORY_SAVE_CHILD", root)
                     .env("VICTORY_SAVE_OP", op)
@@ -1045,16 +1161,35 @@ mod tests {
         for good in ["Profile/Slot_1", "a/b/Save-2.sav", "x", &"a".repeat(256)] {
             assert!(valid_container(good), "{good}");
         }
-        for bad in ["a b", "", "a/", "a.", "a..b", "a.b/c", "a-b/c", &"a".repeat(257)] {
+        for bad in [
+            "a b",
+            "",
+            "a/",
+            "a.",
+            "a..b",
+            "a.b/c",
+            "a-b/c",
+            &"a".repeat(257),
+        ] {
             assert!(!valid_container(bad), "{bad}");
         }
 
         // Containers and blobs differing only in case, reserved device
         // names, characters the host forbids, long names: all distinct.
         let dir = tempfile::tempdir().unwrap();
-        let p = Provider { root: dir.path().into() };
+        let p = Provider {
+            root: dir.path().into(),
+        };
         let long = "n".repeat(300);
-        let blobs = ["A", "a", "CON", "nul.txt", "x/y:z*?\"<>|", long.as_str(), "end. "];
+        let blobs = [
+            "A",
+            "a",
+            "CON",
+            "nul.txt",
+            "x/y:z*?\"<>|",
+            long.as_str(),
+            "end. ",
+        ];
         for container in ["Save", "save", "SAVE/CON.x"] {
             let c = p.container(container);
             let u = Update {
@@ -1086,7 +1221,10 @@ mod tests {
     #[test]
     fn the_old_layout_moves_over() {
         let saves = tempfile::tempdir().unwrap();
-        let root = saves.path().join(format!("{:016X}", xuser::XUID)).join("scid");
+        let root = saves
+            .path()
+            .join(format!("{:016X}", xuser::XUID))
+            .join("scid");
         let old = root.join("Player");
         std::fs::create_dir_all(&old).unwrap();
         std::fs::write(old.join("Save%20Game%20Data"), b"data").unwrap();
@@ -1154,7 +1292,10 @@ mod tests {
             S_OK
         );
         type Delete = extern "system" fn(This, *mut Update, *const c_char) -> HRESULT;
-        assert_eq!(method::<Delete>(&OBJECT, 0xd0)(this, update, c"gone".as_ptr()), S_OK);
+        assert_eq!(
+            method::<Delete>(&OBJECT, 0xd0)(this, update, c"gone".as_ptr()),
+            S_OK
+        );
         type Submit = extern "system" fn(This, *const Update, *mut AsyncBlock) -> HRESULT;
         let mut b = block();
         assert_eq!(method::<Submit>(&OBJECT, 0xe0)(this, update, &mut b), S_OK);
@@ -1269,6 +1410,7 @@ mod tests {
         // Quota counts the blobs; deleting the container frees it.
         let mut b = block();
         assert_eq!(quota_async(this, provider, &mut b), S_OK);
+        assert_eq!(xasync::XAsyncGetStatus(&mut b, true), S_OK);
         let mut left = 0i64;
         assert_eq!(quota_result(this, &mut b, &mut left), S_OK);
         assert!(left as u64 <= QUOTA - 7);
@@ -1277,6 +1419,7 @@ mod tests {
             delete_async(this, provider, c"Slot_1".as_ptr(), &mut b),
             S_OK
         );
+        assert_eq!(xasync::XAsyncGetStatus(&mut b, true), S_OK);
         assert_eq!(delete_result(this, &mut b), S_OK);
         found.clear();
         let context = (&raw mut found).cast();
@@ -1285,6 +1428,108 @@ mod tests {
             S_OK
         );
         assert!(found.is_empty());
+        close_container(this, container);
+        close_provider(this, provider);
+    }
+
+    #[test]
+    fn async_saves_offload_and_preserve_fifo_order() {
+        let this: This = &OBJECT;
+        let saves = tempfile::tempdir().unwrap();
+        let provider = give(Provider::open(saves.path(), Some("scid")).unwrap());
+        let mut container = std::ptr::null_mut();
+        assert_eq!(
+            create_container(this, provider, c"AsyncSlot".as_ptr(), &mut container),
+            S_OK
+        );
+
+        // 1. Holding `SAVES` on the caller thread must NOT block `submit_async`.
+        let mut u1 = std::ptr::null_mut();
+        assert_eq!(
+            create_update(this, container, c"v1".as_ptr(), &mut u1),
+            S_OK
+        );
+        assert_eq!(
+            write_blob(this, u1, c"k".as_ptr(), b"first".as_ptr(), 5),
+            S_OK
+        );
+        let mut b1 = block();
+        {
+            let _held = saves_lock();
+            assert_eq!(submit_async(this, u1, &mut b1), S_OK);
+            // Closing the update immediately is safe because `submit_async`
+            // snapshotted it synchronously before returning.
+            close_update(this, u1);
+            assert_eq!(xasync::XAsyncGetStatus(&mut b1, false), xasync::E_PENDING);
+        }
+        assert_eq!(xasync::XAsyncGetStatus(&mut b1, true), S_OK);
+        assert_eq!(submit_result(this, &mut b1), S_OK);
+
+        // 2. A rejected AsyncBlock (null) must not stall subsequent tickets.
+        let mut u_bad = std::ptr::null_mut();
+        assert_eq!(
+            create_update(this, container, c"bad".as_ptr(), &mut u_bad),
+            S_OK
+        );
+        assert_eq!(
+            submit_async(this, u_bad, std::ptr::null_mut()),
+            E_INVALIDARG
+        );
+        close_update(this, u_bad);
+
+        // 3. Back-to-back submits + read queued without waiting execute in FIFO order.
+        let mut u2 = std::ptr::null_mut();
+        assert_eq!(
+            create_update(this, container, c"v2".as_ptr(), &mut u2),
+            S_OK
+        );
+        assert_eq!(
+            write_blob(this, u2, c"k".as_ptr(), b"second".as_ptr(), 6),
+            S_OK
+        );
+        let mut u3 = std::ptr::null_mut();
+        assert_eq!(
+            create_update(this, container, c"v3".as_ptr(), &mut u3),
+            S_OK
+        );
+        assert_eq!(
+            write_blob(this, u3, c"k".as_ptr(), b"third!".as_ptr(), 6),
+            S_OK
+        );
+        let mut b2 = block();
+        let mut b3 = block();
+        let mut br = block();
+        let wanted = [c"k".as_ptr()];
+        assert_eq!(submit_async(this, u2, &mut b2), S_OK);
+        close_update(this, u2);
+        assert_eq!(submit_async(this, u3, &mut b3), S_OK);
+        close_update(this, u3);
+        assert_eq!(
+            read_async(this, container, wanted.as_ptr(), 1, &mut br),
+            S_OK
+        );
+
+        assert_eq!(xasync::XAsyncGetStatus(&mut b2, true), S_OK);
+        assert_eq!(xasync::XAsyncGetStatus(&mut b3, true), S_OK);
+        assert_eq!(xasync::XAsyncGetStatus(&mut br, true), S_OK);
+        let mut size = 0;
+        assert_eq!(xasync::XAsyncGetResultSize(&mut br, &mut size), S_OK);
+        let mut buf = vec![0u64; size.div_ceil(8)];
+        let mut count = 0;
+        assert_eq!(
+            read_result(this, &mut br, size, buf.as_mut_ptr().cast(), &mut count),
+            S_OK
+        );
+        assert_eq!(count, 1);
+        // SAFETY: `read_result` populated 1 `BLOB` entry in `buf`.
+        let data = unsafe {
+            let entry = buf.as_ptr().cast::<u8>();
+            let len = entry.add(8).cast::<u32>().read_unaligned() as usize;
+            let ptr = entry.add(16).cast::<*const u8>().read_unaligned();
+            std::slice::from_raw_parts(ptr, len).to_vec()
+        };
+        assert_eq!(data, b"third!");
+
         close_container(this, container);
         close_provider(this, provider);
     }

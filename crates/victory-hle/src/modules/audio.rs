@@ -19,7 +19,7 @@
 use std::alloc::Layout;
 use std::collections::{BTreeMap, VecDeque};
 use std::ffi::c_void;
-use std::sync::{Mutex, MutexGuard, OnceLock, RwLock, RwLockReadGuard};
+use std::sync::{Mutex, MutexGuard, OnceLock, RwLock, RwLockReadGuard, RwLockWriteGuard};
 use std::time::Instant;
 
 use super::xasync::E_INVALIDARG;
@@ -55,12 +55,20 @@ struct Heap {
     created: bool,
 }
 
-static HEAP: Mutex<Heap> = Mutex::new(Heap {
+static HEAP: RwLock<Heap> = RwLock::new(Heap {
     blocks: BTreeMap::new(),
     by_apu: BTreeMap::new(),
     free: BTreeMap::new(),
     created: false,
 });
+
+fn heap_read() -> RwLockReadGuard<'static, Heap> {
+    HEAP.read().unwrap_or_else(|e| e.into_inner())
+}
+
+fn heap_write() -> RwLockWriteGuard<'static, Heap> {
+    HEAP.write().unwrap_or_else(|e| e.into_inner())
+}
 
 /// Device addresses start above 0, which means "none" to titles.
 const APU_BASE: u32 = 0x0001_0000;
@@ -98,12 +106,30 @@ impl Heap {
         }
         self.free.insert(start, end);
     }
+    /// Raw pointer to `len` bytes inside a single live heap block; valid only
+    /// while the caller holds a read guard on `HEAP` (blocking `ApuFree`).
+    fn ptr(&self, apu: u32, len: usize) -> Option<*mut u8> {
+        let (&start, &host) = self.by_apu.range(..=apu).next_back()?;
+        let offset = (apu - start) as usize;
+        offset
+            .checked_add(len)
+            .is_some_and(|end| end <= self.blocks[&host].size)
+            .then(|| (host + offset) as *mut u8)
+    }
+
+    /// `len` bytes of title memory at a device address, tied to the `HEAP`
+    /// read guard so `ApuFree` cannot unmap the block underneath.
+    fn slice(&self, apu: u32, len: usize) -> Option<&[u8]> {
+        let ptr = self.ptr(apu, len)?;
+        // SAFETY: inside a live heap block pinned by `&self` (`HEAP` read lock).
+        Some(unsafe { std::slice::from_raw_parts(ptr, len) })
+    }
 }
 
 /// Zeroed host memory and its device address.
 fn heap_alloc(size: usize, align: usize) -> Option<(*mut u8, u32)> {
     let layout = Layout::from_size_align(size.max(1), align.max(16)).ok()?;
-    let mut heap = lock(&HEAP);
+    let mut heap = heap_write();
     let apu = heap.take(u32::try_from(layout.size()).ok()?, align as u32)?;
     // SAFETY: non-zero size.
     let ptr = unsafe { std::alloc::alloc_zeroed(layout) };
@@ -118,14 +144,15 @@ fn heap_alloc(size: usize, align: usize) -> Option<(*mut u8, u32)> {
 }
 
 fn heap_free(ptr: *mut u8) {
-    let mut heap = lock(&HEAP);
+    let mut heap = heap_write();
     let Some(block) = heap.blocks.remove(&(ptr as usize)) else {
         return;
     };
     heap.by_apu.remove(&block.apu);
     heap.give_back(block.apu, block.apu + block.layout.size() as u32);
     drop(heap);
-    // SAFETY: allocated by `heap_alloc` with this layout.
+    // SAFETY: allocated by `heap_alloc` with this layout; acquiring the write
+    // lock above ensured every active `HEAP` reader finished before removal.
     unsafe { std::alloc::dealloc(ptr, block.layout) };
 }
 
@@ -139,7 +166,7 @@ pub extern "system" fn ApuCreateHeap(cached: u32, _non_cached: u32) -> HRESULT {
     if cached == 0 {
         return E_INVALIDARG;
     }
-    let mut heap = lock(&HEAP);
+    let mut heap = heap_write();
     if heap.created {
         return ALREADY_ALLOCATED;
     }
@@ -155,7 +182,7 @@ pub extern "system" fn ApuMapApuAddress(apu: u32) -> *mut c_void {
 
 /// The device address of any byte of a heap block, 0 elsewhere.
 fn heap_map(ptr: usize) -> u32 {
-    let heap = lock(&HEAP);
+    let heap = heap_read();
     match heap.blocks.range(..=ptr).next_back() {
         Some((&start, block)) if ptr < start + block.size.max(1) => {
             block.apu + (ptr - start) as u32
@@ -166,23 +193,11 @@ fn heap_map(ptr: usize) -> u32 {
 
 /// The host address of a device address, if a heap block holds it.
 fn heap_unmap(apu: u32) -> Option<*mut u8> {
-    let heap = lock(&HEAP);
+    let heap = heap_read();
     let (&start, &host) = heap.by_apu.range(..=apu).next_back()?;
     let block = &heap.blocks[&host];
     (apu < start.saturating_add(block.size.max(1) as u32))
         .then(|| (host + (apu - start) as usize) as *mut u8)
-}
-
-/// `len` bytes of title memory at a device address, if one heap block holds
-/// them all.
-fn heap_bytes<'a>(apu: u32, len: usize) -> Option<&'a mut [u8]> {
-    let heap = lock(&HEAP);
-    let (&start, &host) = heap.by_apu.range(..=apu).next_back()?;
-    let offset = (apu - start) as usize;
-    (offset + len <= heap.blocks[&host].size)
-        // SAFETY: inside a live heap block, which the title and the audio
-        // hardware share like on the console.
-        .then(|| unsafe { std::slice::from_raw_parts_mut((host + offset) as *mut u8, len) })
 }
 
 pub extern "system" fn ApuAlloc(
@@ -321,6 +336,8 @@ const INPUT_INVALID: u32 = 4;
 struct Voice {
     decoder: Option<xma::Decoder>,
     pcm: VecDeque<i16>,
+    /// Reusable per-frame decode buffer to avoid allocating on every XMA frame.
+    scratch: Vec<i16>,
     /// Samples per channel still to drop (start or loop subframe skips).
     skip: usize,
     ended: bool,
@@ -420,6 +437,7 @@ impl Xma {
         *slot = Some(Voice {
             decoder: None,
             pcm: VecDeque::new(),
+            scratch: Vec::with_capacity(xma::FRAME_SAMPLES * context.channels()),
             skip: context.field(1, 24, 3) as usize * xma::SUBFRAME_SAMPLES,
             ended: false,
             trace: Trace {
@@ -491,9 +509,10 @@ impl Xma {
         let start = Instant::now();
         let mut active = 0;
         for index in 0..self.voices.len() as u32 {
-            if let (Some(context), Some(voice)) =
-                (self.context(index), &mut *lock(&self.voices[index as usize]))
-            {
+            if let (Some(context), Some(voice)) = (
+                self.context(index),
+                &mut *lock(&self.voices[index as usize]),
+            ) {
                 pump(context, voice);
                 active += 1;
             }
@@ -510,20 +529,29 @@ fn pump(context: Context, voice: &mut Voice) {
     if size == 0 {
         return;
     }
+    // Hold one shared read guard across the refill pass so `ApuFree` cannot
+    // unmap input/output blocks mid-decode and we do not relock every 256 bytes.
+    let heap = heap_read();
     while context.field(1, 31, 1) == 1 {
-        if voice.pcm.len() < SAMPLES_PER_BLOCK && !decode(context, voice) {
+        if voice.pcm.len() < SAMPLES_PER_BLOCK && !decode(context, voice, &heap) {
             return;
         }
         let write = context.field(0, 27, 5);
-        let address = context.get(7) as usize + write as usize * BLOCK_BYTES;
-        let Some(out) = heap_bytes(address as u32, BLOCK_BYTES) else {
+        let Some(address) = context.get(7).checked_add(write * BLOCK_BYTES as u32) else {
             return;
         };
-        for pair in out.as_chunks_mut::<2>().0 {
+        let Some(out) = heap.ptr(address, BLOCK_BYTES) else {
+            return;
+        };
+        let mut block = [0u8; BLOCK_BYTES];
+        for pair in block.as_chunks_mut::<2>().0 {
             let sample = voice.pcm.pop_front().unwrap_or(0);
             voice.trace.peak = voice.trace.peak.max(sample.saturating_abs());
             pair.copy_from_slice(&sample.to_le_bytes());
         }
+        // SAFETY: `out` points to `BLOCK_BYTES` inside a live heap block pinned
+        // by `heap`; this voice's lock serializes writes to its output ring.
+        unsafe { std::ptr::copy_nonoverlapping(block.as_ptr(), out, BLOCK_BYTES) };
         voice.trace.produced += SAMPLES_PER_BLOCK / context.channels();
         let write = (write + 1) % size;
         context.set_field(0, 27, 5, write);
@@ -536,7 +564,7 @@ fn pump(context: Context, voice: &mut Voice) {
 
 /// Decodes the next frame of the current input into `voice.pcm`; false
 /// when there is nothing left to decode.
-fn decode(context: Context, voice: &mut Voice) -> bool {
+fn decode(context: Context, voice: &mut Voice, heap: &Heap) -> bool {
     if voice.ended {
         return false;
     }
@@ -547,9 +575,9 @@ fn decode(context: Context, voice: &mut Voice) -> bool {
         if valid & (1 << (1 - current)) == 0 {
             // Out of input: the overlap tail, then nothing.
             if let Some(decoder) = &mut voice.decoder {
-                let mut tail = Vec::new();
-                decoder.flush(&mut tail);
-                voice.pcm.extend(tail);
+                voice.scratch.clear();
+                decoder.flush(&mut voice.scratch);
+                voice.pcm.extend(voice.scratch.drain(..));
             }
             voice.ended = true;
             voice.trace.ended_ms = Some(voice.trace.since.elapsed().as_millis());
@@ -565,7 +593,7 @@ fn decode(context: Context, voice: &mut Voice) -> bool {
         0 => (context.get(5), context.field(0, 0, 12)),
         _ => (context.get(6), context.field(1, 0, 12)),
     };
-    let Some(data) = heap_bytes(address & !0x7ff, packets as usize * xma::PACKET_BYTES) else {
+    let Some(data) = heap.slice(address & !0x7ff, packets as usize * xma::PACKET_BYTES) else {
         context.set_field(0, 20 + current, 1, 0);
         return true;
     };
@@ -582,9 +610,9 @@ fn decode(context: Context, voice: &mut Voice) -> bool {
         const RATES: [u32; 4] = [24_000, 32_000, 44_100, 48_000];
         xma::Decoder::new(channels, RATES[context.field(1, 27, 2) as usize])
     });
-    let mut pcm = Vec::with_capacity(xma::FRAME_SAMPLES * channels);
+    voice.scratch.clear();
     voice.trace.frames += 1;
-    if let Err(e) = decoder.decode(&frame.data, frame.bits, &mut pcm) {
+    if let Err(e) = decoder.decode(&frame.data, frame.bits, &mut voice.scratch) {
         voice.trace.bad_frames += 1;
         if voice.trace.bad_frames <= 2 {
             tracing::debug!(
@@ -604,16 +632,16 @@ fn decode(context: Context, voice: &mut Voice) -> bool {
             || (frame.start < loop_end && frame.next.is_none_or(|n| loop_end < n)));
     if loops > 0 && ends_loop {
         let keep = (context.field(1, 12, 2) as usize + 1) * xma::SUBFRAME_SAMPLES * channels;
-        pcm.truncate(keep);
+        voice.scratch.truncate(keep);
         next = context.field(3, 0, 26) as usize;
         voice.skip = context.field(1, 17, 3) as usize * xma::SUBFRAME_SAMPLES;
         if loops != 255 {
             context.set_field(0, 12, 8, loops - 1);
         }
     }
-    let skip = (voice.skip * channels).min(pcm.len());
+    let skip = (voice.skip * channels).min(voice.scratch.len());
     voice.skip -= skip / channels;
-    voice.pcm.extend(&pcm[skip..]);
+    voice.pcm.extend(&voice.scratch[skip..]);
     if next == 0 {
         context.set_field(0, 20 + current, 1, 0);
     }
@@ -636,13 +664,18 @@ fn dump_input(index: u32, context: Context) {
     }
     let dir = std::path::PathBuf::from(dir);
     let words: Vec<u8> = (0..16).flat_map(|w| context.get(w).to_le_bytes()).collect();
-    let input = heap_bytes(
-        context.get(5) & !0x7ff,
-        context.field(0, 0, 12) as usize * xma::PACKET_BYTES,
-    );
+    let input = heap_read()
+        .slice(
+            context.get(5) & !0x7ff,
+            context.field(0, 0, 12) as usize * xma::PACKET_BYTES,
+        )
+        .map(<[u8]>::to_vec);
     let _ = std::fs::create_dir_all(&dir);
     let _ = std::fs::write(dir.join(format!("{n:02}-{index}.ctx")), words);
-    let _ = std::fs::write(dir.join(format!("{n:02}-{index}.xma")), input.unwrap_or_default());
+    let _ = std::fs::write(
+        dir.join(format!("{n:02}-{index}.xma")),
+        input.unwrap_or_default(),
+    );
 }
 
 /// Starts the decoding thread on the first enabled voice, and has it fill
@@ -845,11 +878,13 @@ extern "system" fn submit(
         done[12..].copy_from_slice(&state.frame().to_le_bytes());
         state.post(COMMAND_COMPLETED, &done);
     }
-    if notification != 0
-        && let Some(word) = heap_unmap(notification)
-    {
-        // SAFETY: a u32 in a heap block, which the title reads as volatile.
-        unsafe { word.cast::<u32>().write_volatile(1) };
+    if notification != 0 {
+        let heap = heap_read();
+        if let Some(word) = heap.ptr(notification, size_of::<u32>()) {
+            // SAFETY: a u32 in a live heap block pinned by `heap`, which the
+            // title reads as volatile.
+            unsafe { word.cast::<u32>().write_volatile(1) };
+        }
     }
     S_OK
 }
@@ -951,7 +986,7 @@ mod tests {
         assert_eq!(ApuAlloc(&mut c, &mut apu_c, 0x800, 0x800, 1), S_OK);
         // The freed range is free again, whichever part `c` took.
         assert!(
-            lock(&HEAP)
+            heap_read()
                 .free
                 .iter()
                 .any(|(&s, &e)| s <= apu_a + 0x800 && apu_a + 0x1000 <= e)
@@ -1154,6 +1189,92 @@ mod tests {
         assert_eq!((m.disconnect)(acp), S_OK);
         assert_eq!((m.message_count)(acp), 1, "disconnected");
         (m.release)(acp);
+        assert_eq!(AcpHalReleaseShapeContexts(), S_OK);
+    }
+
+    #[test]
+    fn heap_rwlock_pins_memory_and_voice_reuses_scratch_buffer() {
+        use std::sync::Arc;
+        use std::sync::atomic::{AtomicBool, Ordering};
+
+        let _serial = lock(&CONTEXT_TESTS);
+        let (mut ptr, mut apu) = (std::ptr::null_mut(), 0);
+        assert_eq!(ApuAlloc(&mut ptr, &mut apu, 0x200, 0x100, 1), S_OK);
+
+        // Overflowing length is rejected without panicking.
+        {
+            let heap = heap_read();
+            assert!(heap.slice(apu, 0x200).is_some());
+            assert!(heap.slice(apu, 0x201).is_none());
+            assert!(heap.ptr(apu, usize::MAX).is_none());
+        }
+
+        // `ApuFree` waits until an active `HEAP` reader releases its read guard.
+        let freed = Arc::new(AtomicBool::new(false));
+        let freed_flag = freed.clone();
+        let addr = ptr as usize;
+        let reader = heap_read();
+        assert!(reader.slice(apu, 0x200).is_some());
+        let closer = std::thread::spawn(move || {
+            ApuFree(addr as *mut c_void);
+            freed_flag.store(true, Ordering::Release);
+        });
+        std::thread::sleep(std::time::Duration::from_millis(20));
+        assert!(
+            !freed.load(Ordering::Acquire),
+            "ApuFree must not deallocate while a HEAP reader holds its guard"
+        );
+        drop(reader);
+        closer.join().unwrap();
+        assert!(freed.load(Ordering::Acquire));
+        assert_eq!(ApuMapVirtualAddress(ptr), 0);
+
+        // Voice scratch buffer is reused across decoded XMA frames.
+        let mut request = ShapeContexts {
+            counts: [0, 0, 0, 0, 2, 0],
+            arrays: [std::ptr::null_mut(); 6],
+            apu: [0; 6],
+        };
+        assert_eq!(AcpHalAllocateShapeContexts(&mut request), S_OK);
+        let context = Context(request.arrays[4].cast::<u32>());
+        let (mut input, mut input_apu) = (std::ptr::null_mut(), 0);
+        assert_eq!(ApuAlloc(&mut input, &mut input_apu, 0x1000, 0x800, 1), S_OK);
+        let stream = silent_stream();
+        // SAFETY: two packets were allocated.
+        unsafe { std::ptr::copy_nonoverlapping(stream.as_ptr(), input.cast(), stream.len()) };
+        let (mut output, mut output_apu) = (std::ptr::null_mut(), 0);
+        assert_eq!(
+            ApuAlloc(&mut output, &mut output_apu, 0x400, 0x100, 2),
+            S_OK
+        );
+        context.set(0, 2 | 1 << 20 | 4 << 22);
+        context.set(1, 1 << 31 | 3 << 27);
+        context.set(2, 32);
+        context.set(5, input_apu);
+        context.set(7, output_apu);
+
+        let x = xma();
+        x.enable(0);
+        let (scratch_ptr, scratch_cap) = {
+            let slot = lock(&x.voices[0]);
+            let v = slot.as_ref().unwrap();
+            (v.scratch.as_ptr(), v.scratch.capacity())
+        };
+        assert!(scratch_cap >= xma::FRAME_SAMPLES);
+        x.pump();
+        {
+            let slot = lock(&x.voices[0]);
+            let v = slot.as_ref().unwrap();
+            assert!(v.trace.frames >= 1);
+            assert_eq!(
+                (v.scratch.as_ptr(), v.scratch.capacity()),
+                (scratch_ptr, scratch_cap)
+            );
+        }
+        x.disable(0);
+        drop(x);
+        ApuFree(input);
+        ApuFree(output);
         assert_eq!(AcpHalReleaseShapeContexts(), S_OK);
     }
 }

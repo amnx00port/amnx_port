@@ -743,57 +743,94 @@ pub fn finished_with(
     hr
 }
 
-/// Like [`finished_with`], but the result comes from `work`, run on a
-/// thread of ours; the call stays pending until it returns (a dialog, say).
+/// Like [`finished_with`], but the result comes from `work`, run on the
+/// thread pool; the call stays pending until it returns (disk I/O, a dialog).
 pub fn pending_with(
     block: *mut AsyncBlock,
     identity: *const c_void,
     work: impl FnOnce() -> Result<Vec<u8>, HRESULT> + Send + 'static,
 ) -> HRESULT {
-    type Data = Mutex<(Option<Box<dyn FnOnce() -> Result<Vec<u8>, HRESULT> + Send>>, Vec<u8>)>;
+    type PendingWork = Box<dyn FnOnce() -> Result<Vec<u8>, HRESULT> + Send>;
+    struct State {
+        work: Mutex<Option<PendingWork>>,
+        result: Mutex<Vec<u8>>,
+        canceled: AtomicBool,
+    }
+    extern "system" fn run_job(ctx: *mut c_void, _canceled: bool) {
+        // SAFETY: boxed in `OP_BEGIN` for this single pool task.
+        let job = unsafe { Box::from_raw(ctx.cast::<Box<dyn FnOnce() + Send>>()) };
+        job();
+    }
     extern "system" fn provider(op: u32, data: *const ProviderData) -> HRESULT {
-        // SAFETY: the runtime passes valid provider data; the context is the
-        // boxed state until cleanup frees it.
+        // SAFETY: the runtime passes valid provider data; the context is an
+        // `Arc<State>` raw pointer until cleanup drops it.
         let data = unsafe { &*data };
-        let state = data.context.cast::<Data>();
+        let state_ptr = data.context.cast::<State>();
         match op {
-            // SAFETY: boxed in `pending_with`; nothing runs after cleanup.
-            OP_CLEANUP => drop(unsafe { Box::from_raw(state) }),
+            // SAFETY: created with `Arc::into_raw` in `pending_with`; nothing
+            // runs on this call after cleanup.
+            OP_CLEANUP => drop(unsafe { Arc::from_raw(state_ptr) }),
+            OP_CANCEL => {
+                // SAFETY: alive until `OP_CLEANUP`.
+                unsafe { &*state_ptr }
+                    .canceled
+                    .store(true, Ordering::Release);
+            }
             OP_BEGIN => {
-                // SAFETY: as above; cleanup waits for completion.
-                let work = unsafe { &*state }.lock().unwrap_or_else(|e| e.into_inner()).0.take();
-                let (block, state) = (data.block as usize, state as usize);
-                std::thread::spawn(move || {
+                // SAFETY: alive until `OP_CLEANUP`; we clone the `Arc` for the
+                // worker so cancellation cannot free `State` while `work` runs.
+                let state = unsafe {
+                    Arc::increment_strong_count(state_ptr);
+                    Arc::from_raw(state_ptr)
+                };
+                let work = lock(&state.work).take();
+                let block = data.block as usize;
+                let job: Box<dyn FnOnce() + Send> = Box::new(move || {
                     let result = work.map_or(Err(E_ABORT), |work| work());
+                    if state.canceled.load(Ordering::Acquire) {
+                        return;
+                    }
                     let (hr, len) = match &result {
                         Ok(bytes) => (S_OK, bytes.len()),
                         Err(hr) => (*hr, 0),
                     };
                     if let Ok(bytes) = result {
-                        // SAFETY: the call is pending, so its state lives.
-                        let state = unsafe { &*(state as *const Data) };
-                        state.lock().unwrap_or_else(|e| e.into_inner()).1 = bytes;
+                        *lock(&state.result) = bytes;
                     }
-                    XAsyncComplete(block as *mut AsyncBlock, hr, len);
+                    if !state.canceled.load(Ordering::Acquire) {
+                        XAsyncComplete(block as *mut AsyncBlock, hr, len);
+                    }
                 });
+                let ctx = Box::into_raw(Box::new(job)).cast();
+                POOL.submit(Task::new(ctx, run_job));
             }
             // SAFETY: as above; the runtime checked the buffer's size.
             OP_GET_RESULT => unsafe {
-                let state = (*state).lock().unwrap_or_else(|e| e.into_inner());
+                let bytes = lock(&(*state_ptr).result);
                 data.buffer
                     .cast::<u8>()
-                    .copy_from(state.1.as_ptr(), state.1.len());
+                    .copy_from(bytes.as_ptr(), bytes.len());
             },
             _ => {}
         }
         S_OK
     }
-    let state: Box<Data> = Box::new(Mutex::new((Some(Box::new(work)), Vec::new())));
-    let context = Box::into_raw(state);
-    let hr = XAsyncBegin(block, context.cast(), identity, std::ptr::null(), Some(provider));
+    let state = Arc::new(State {
+        work: Mutex::new(Some(Box::new(work))),
+        result: Mutex::new(Vec::new()),
+        canceled: AtomicBool::new(false),
+    });
+    let context = Arc::into_raw(state);
+    let hr = XAsyncBegin(
+        block,
+        context.cast_mut().cast(),
+        identity,
+        std::ptr::null(),
+        Some(provider),
+    );
     if hr < 0 {
         // SAFETY: refused before the call existed; still ours.
-        drop(unsafe { Box::from_raw(context) });
+        drop(unsafe { Arc::from_raw(context) });
     }
     hr
 }
@@ -1207,5 +1244,46 @@ mod tests {
             E_ABORT
         );
         XTaskQueueCloseHandle(q);
+    }
+
+    #[test]
+    fn pending_with_runs_on_pool_and_handles_cancel_without_uaf() {
+        let started = Arc::new((Mutex::new(false), Condvar::new()));
+        let release = Arc::new((Mutex::new(false), Condvar::new()));
+        let finished = Arc::new((Mutex::new(false), Condvar::new()));
+        let (s, r, f) = (started.clone(), release.clone(), finished.clone());
+
+        let mut block = AsyncBlock {
+            queue: std::ptr::null(),
+            context: std::ptr::null_mut(),
+            callback: None,
+            internal: [0; 4],
+        };
+        static ID: u8 = 0;
+        assert_eq!(
+            pending_with(&mut block, (&raw const ID).cast(), move || {
+                *lock(&s.0) = true;
+                s.1.notify_all();
+                let g = lock(&r.0);
+                drop(r.1.wait_while(g, |open| !*open));
+                *lock(&f.0) = true;
+                f.1.notify_all();
+                Ok(vec![1, 2, 3, 4])
+            }),
+            S_OK
+        );
+        // Wait until the worker is actively running on the pool.
+        let g = lock(&started.0);
+        drop(started.1.wait_while(g, |running| !*running));
+        assert_eq!(XAsyncGetStatus(&mut block, false), E_PENDING);
+        // Cancel while work is still in flight (triggers OP_CLEANUP).
+        XAsyncCancel(&mut block);
+        assert_eq!(XAsyncGetStatus(&mut block, false), E_ABORT);
+        // Let the worker finish after OP_CLEANUP; must not UAF or overwrite status.
+        *lock(&release.0) = true;
+        release.1.notify_all();
+        let g = lock(&finished.0);
+        drop(finished.1.wait_while(g, |done| !*done));
+        assert_eq!(XAsyncGetStatus(&mut block, false), E_ABORT);
     }
 }
