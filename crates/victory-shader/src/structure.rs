@@ -57,8 +57,10 @@ pub enum Atom {
 pub struct Bools {
     /// (variable, low, high); nodes 0 and 1 are the constants.
     nodes: Vec<(u32, Bool, Bool)>,
-    unique: Map<(u32, Bool, Bool), Bool>,
-    memo: Map<(Bool, Bool, Bool), Bool>,
+    /// Node numbers by a hash of the node, open addressing; 0 is empty.
+    unique: Vec<u32>,
+    /// Results of [`Bools::ite`] and [`Bools::implies`].
+    memo: Memo,
     atoms: Vec<Atom>,
     /// Reverse-postorder index of the block that defines each atom.
     born: Vec<usize>,
@@ -97,6 +99,49 @@ impl Hasher for Fx {
     }
 }
 
+/// A hash whose low bits depend on every bit of the key.
+fn mix(key: [u32; 3]) -> usize {
+    let mut fx = Fx::default();
+    for n in key {
+        fx.write_u32(n);
+    }
+    (fx.0 ^ fx.0 >> 32) as usize
+}
+
+/// Recent results by their operands: a direct-mapped cache, as large as the
+/// diagrams it serves. A lost entry costs a recomputation, which finds the
+/// same nodes again (they are unique), so results do not depend on it.
+#[derive(Debug, Clone, Default)]
+struct Memo(Vec<([u32; 3], u32)>);
+
+impl Memo {
+    /// First operand of a [`Bools::implies`] entry: no node has this number.
+    const IMPLIES: u32 = u32::MAX - 1;
+    const EMPTY: ([u32; 3], u32) = ([u32::MAX; 3], 0);
+
+    fn get(&self, key: [u32; 3]) -> Option<u32> {
+        let (k, result) = self.0[mix(key) & (self.0.len() - 1)];
+        (k == key).then_some(result)
+    }
+
+    fn put(&mut self, key: [u32; 3], result: u32) {
+        let at = mix(key) & (self.0.len() - 1);
+        self.0[at] = (key, result);
+    }
+
+    /// Makes room for the results of `nodes` nodes.
+    fn fit(&mut self, nodes: usize) {
+        if self.0.len() < nodes {
+            let larger = vec![Self::EMPTY; nodes.next_power_of_two()];
+            for (key, result) in std::mem::replace(&mut self.0, larger) {
+                if key != Self::EMPTY.0 {
+                    self.put(key, result);
+                }
+            }
+        }
+    }
+}
+
 const TERMINAL: u32 = u32::MAX;
 const MAX_NODES: usize = 1 << 21;
 /// Case splits [`Bools::meet`] makes before it gives up.
@@ -104,13 +149,15 @@ const MAX_MEET: usize = 1 << 16;
 
 impl Bools {
     fn new() -> Self {
+        let mut memo = Memo::default();
+        memo.fit(256);
         Bools {
             nodes: vec![
                 (TERMINAL, Bool::FALSE, Bool::FALSE),
                 (TERMINAL, Bool::TRUE, Bool::TRUE),
             ],
-            unique: Map::default(),
-            memo: Map::default(),
+            unique: vec![0; 256],
+            memo,
             atoms: Vec::new(),
             born: Vec::new(),
             ids: Map::default(),
@@ -161,8 +208,13 @@ impl Bools {
         if lo == hi {
             return lo;
         }
-        if let Some(&b) = self.unique.get(&(v, lo, hi)) {
-            return b;
+        let mask = self.unique.len() - 1;
+        let mut at = mix([v, lo.0, hi.0]) & mask;
+        while self.unique[at] != 0 {
+            if self.nodes[self.unique[at] as usize] == (v, lo, hi) {
+                return Bool(self.unique[at]);
+            }
+            at = (at + 1) & mask;
         }
         if self.nodes.len() >= MAX_NODES {
             // The caller fails once it sees `overflow`.
@@ -171,8 +223,25 @@ impl Bools {
         }
         let b = Bool(self.nodes.len() as u32);
         self.nodes.push((v, lo, hi));
-        self.unique.insert((v, lo, hi), b);
+        self.unique[at] = b.0;
+        if self.nodes.len() > self.unique.len() / 2 {
+            self.grow();
+        }
         b
+    }
+
+    /// Doubles the tables.
+    fn grow(&mut self) {
+        let mask = 2 * self.unique.len() - 1;
+        self.unique = vec![0; mask + 1];
+        for (n, &(v, lo, hi)) in self.nodes.iter().enumerate().skip(2) {
+            let mut at = mix([v, lo.0, hi.0]) & mask;
+            while self.unique[at] != 0 {
+                at = (at + 1) & mask;
+            }
+            self.unique[at] = n as u32;
+        }
+        self.memo.fit(self.nodes.len());
     }
 
     /// Cofactors of `b` for `v`, which is `b`'s top variable or above it.
@@ -183,7 +252,20 @@ impl Bools {
         }
     }
 
-    fn ite(&mut self, f: Bool, g: Bool, h: Bool) -> Bool {
+    fn ite(&mut self, mut f: Bool, mut g: Bool, mut h: Bool) -> Bool {
+        // One form per conjunction and disjunction, so that they share
+        // results.
+        if g == f {
+            g = Bool::TRUE;
+        }
+        if h == f {
+            h = Bool::FALSE;
+        }
+        if h == Bool::FALSE && g < f {
+            std::mem::swap(&mut f, &mut g);
+        } else if g == Bool::TRUE && h < f {
+            std::mem::swap(&mut f, &mut h);
+        }
         if f == Bool::TRUE || g == h {
             return g;
         }
@@ -193,8 +275,8 @@ impl Bools {
         if (g, h) == (Bool::TRUE, Bool::FALSE) {
             return f;
         }
-        if let Some(&r) = self.memo.get(&(f, g, h)) {
-            return r;
+        if let Some(r) = self.memo.get([f.0, g.0, h.0]) {
+            return Bool(r);
         }
         let top = |b: Bool| self.nodes[b.0 as usize].0;
         let v = top(f).min(top(g)).min(top(h));
@@ -202,7 +284,7 @@ impl Bools {
         let lo = self.ite(f0, g0, h0);
         let hi = self.ite(f1, g1, h1);
         let r = self.mk(v, lo, hi);
-        self.memo.insert((f, g, h), r);
+        self.memo.put([f.0, g.0, h.0], r.0);
         r
     }
 
@@ -227,37 +309,32 @@ impl Bools {
     /// `b` where `holds`, its negation where not. Yes when the search grows
     /// too large to finish.
     pub fn meet(&self, all: &[(Bool, bool)]) -> bool {
-        let mut budget = MAX_MEET;
-        self.meet_in(all.to_vec(), &mut budget)
+        let all = all.iter().map(|&(b, holds)| b.0 << 1 | u32::from(!holds));
+        let mut search = Meet {
+            bools: self,
+            budget: MAX_MEET,
+            failed: HashSet::default(),
+        };
+        search.run(all.collect())
     }
 
-    fn meet_in(&self, mut all: Vec<(Bool, bool)>, budget: &mut usize) -> bool {
-        let fails = |&(b, holds): &(Bool, bool)| b == if holds { Bool::FALSE } else { Bool::TRUE };
-        if all.iter().any(fails) {
-            return false;
-        }
-        all.retain(|&(b, _)| b != Bool::FALSE && b != Bool::TRUE);
-        if all.is_empty() || *budget == 0 {
+    /// Whether `b` holds wherever `a` does. Builds no nodes.
+    fn implies(&mut self, a: Bool, b: Bool) -> bool {
+        if a == Bool::FALSE || b == Bool::TRUE || a == b {
             return true;
         }
-        *budget -= 1;
-        let top = |b: Bool| self.nodes[b.0 as usize].0;
-        let v = all.iter().map(|&(b, _)| top(b)).min().expect("not empty");
-        [false, true].into_iter().any(|value| {
-            let next = all
-                .iter()
-                .map(|&(b, holds)| {
-                    let (lo, hi) = self.split(b, v);
-                    (if value { hi } else { lo }, holds)
-                })
-                .collect();
-            self.meet_in(next, budget)
-        })
-    }
-
-    fn implies(&mut self, a: Bool, b: Bool) -> bool {
-        let nb = self.not(b);
-        self.and(a, nb) == Bool::FALSE
+        if a == Bool::TRUE || b == Bool::FALSE {
+            return false;
+        }
+        let key = [Memo::IMPLIES, a.0, b.0];
+        if let Some(r) = self.memo.get(key) {
+            return r != 0;
+        }
+        let v = self.nodes[a.0 as usize].0.min(self.nodes[b.0 as usize].0);
+        let ((a0, a1), (b0, b1)) = (self.split(a, v), self.split(b, v));
+        let r = self.implies(a0, b0) && self.implies(a1, b1);
+        self.memo.put(key, u32::from(r));
+        r
     }
 
     /// `b` with every atom born at reverse-postorder index `from` or later
@@ -311,6 +388,68 @@ impl Bools {
             }
         }
         b
+    }
+}
+
+/// The search of [`Bools::meet`]. A state is the diagrams that must hold, a
+/// node number times two, plus one where its negation must. What it comes to
+/// depends on nothing else, so one that failed is not searched again.
+struct Meet<'a> {
+    bools: &'a Bools,
+    /// States it may still split.
+    budget: usize,
+    failed: HashSet<State, BuildHasherDefault<Fx>>,
+}
+
+/// Sorted, without repeats and constants.
+#[derive(PartialEq, Eq)]
+struct State(Vec<u32>);
+
+impl std::hash::Hash for State {
+    fn hash<H: Hasher>(&self, state: &mut H) {
+        let h = self.0.iter().fold(0, |h: usize, &x| {
+            mix([h as u32, (h as u64 >> 32) as u32, x])
+        });
+        state.write_usize(h);
+    }
+}
+
+impl Meet<'_> {
+    fn run(&mut self, mut all: Vec<u32>) -> bool {
+        const HOLDS: [u32; 2] = [Bool::TRUE.0 << 1, Bool::FALSE.0 << 1 | 1];
+        const FAILS: [u32; 2] = [Bool::FALSE.0 << 1, Bool::TRUE.0 << 1 | 1];
+        if all.iter().any(|x| FAILS.contains(x)) {
+            return false;
+        }
+        all.retain(|x| !HOLDS.contains(x));
+        all.sort_unstable();
+        all.dedup();
+        if all.windows(2).any(|w| w[0] ^ 1 == w[1]) {
+            return false;
+        }
+        // One diagram alone is no constant: some lane satisfies it.
+        if all.len() < 2 || self.budget == 0 {
+            return true;
+        }
+        let all = State(all);
+        if self.failed.contains(&all) {
+            return false;
+        }
+        self.budget -= 1;
+        let bools = self.bools;
+        let top = |x: u32| bools.nodes[(x >> 1) as usize].0;
+        let v = all.0.iter().map(|&x| top(x)).min().expect("not empty");
+        let met = [false, true].into_iter().any(|value| {
+            let side = |&x: &u32| {
+                let (lo, hi) = bools.split(Bool(x >> 1), v);
+                (if value { hi } else { lo }).0 << 1 | x & 1
+            };
+            self.run(all.0.iter().map(side).collect())
+        });
+        if !met {
+            self.failed.insert(all);
+        }
+        met
     }
 }
 
@@ -1110,6 +1249,71 @@ mod tests {
 
     fn guarded(s: &Structured) -> usize {
         s.guards.iter().flatten().filter(|g| g.is_some()).count()
+    }
+
+    /// `b` where exactly the atoms set in `lane` hold.
+    fn holds(b: &Bools, mut x: Bool, lane: u32) -> bool {
+        while x > Bool::TRUE {
+            let (v, lo, hi) = b.nodes[x.0 as usize];
+            x = if lane >> v & 1 != 0 { hi } else { lo };
+        }
+        x == Bool::TRUE
+    }
+
+    /// `n` atoms in variable order.
+    fn variables(b: &mut Bools, n: u32) -> Vec<Bool> {
+        (0..n).map(|v| b.atom(Atom::Uniform(Value(v)), 0)).collect()
+    }
+
+    #[test]
+    fn lane_conditions_agree_with_their_truth_tables() {
+        const ATOMS: u32 = 9;
+        let lanes = || 0..1u32 << ATOMS;
+        let mut b = Bools::new();
+        let mut all = variables(&mut b, ATOMS);
+        let mut random = 1u32;
+        let mut next = |n: usize| {
+            random = random.wrapping_mul(1_664_525).wrapping_add(1_013_904_223);
+            (random >> 16) as usize % n
+        };
+        // Far more diagrams than the smallest tables hold.
+        for _ in 0..1500 {
+            let [f, g, h] = [(); 3].map(|()| all[next(all.len())]);
+            let r = b.ite(f, g, h);
+            let want = |l| holds(&b, if holds(&b, f, l) { g } else { h }, l);
+            assert!(lanes().all(|l| holds(&b, r, l) == want(l)));
+            all.push(r);
+        }
+        assert!(b.nodes.len() > 2048, "{}", b.nodes.len());
+        // Equal functions are equal nodes.
+        let unique: HashSet<_> = b.nodes.iter().collect();
+        assert_eq!(unique.len(), b.nodes.len());
+        for _ in 0..1500 {
+            let [x, y] = [(); 2].map(|()| all[next(all.len())]);
+            let nodes = b.nodes.len();
+            let want = lanes().all(|l| !holds(&b, x, l) || holds(&b, y, l));
+            assert_eq!(b.implies(x, y), want);
+            assert_eq!(b.nodes.len(), nodes, "a question builds nothing");
+            let set: Vec<_> = (0..2 + next(4))
+                .map(|_| (all[next(all.len())], next(2) != 0))
+                .collect();
+            let want = lanes().any(|l| set.iter().all(|&(x, v)| holds(&b, x, l) == v));
+            assert_eq!(b.meet(&set), want, "{set:?}");
+        }
+    }
+
+    #[test]
+    fn conditions_that_exclude_each_other_are_told_apart_however_many_atoms_they_have() {
+        // Three parities, the third that of the other two's atoms together:
+        // the case splits are 2^40, the states among them a few hundred.
+        let mut b = Bools::new();
+        let x = variables(&mut b, 40);
+        let mut parity = |x: &[Bool]| x.iter().fold(Bool::FALSE, |p, &x| b.xor(p, x));
+        let (low, high, both) = (parity(&x[..20]), parity(&x[20..]), parity(&x));
+        assert!(!b.meet(&[(low, true), (high, true), (both, true)]));
+        assert!(!b.meet(&[(low, true), (high, false), (both, false)]));
+        assert!(b.meet(&[(low, true), (high, true), (both, false)]));
+        assert!(b.meet(&[(low, false), (high, true), (both, true)]));
     }
 
     #[test]

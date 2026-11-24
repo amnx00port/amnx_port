@@ -59,8 +59,9 @@ pub(crate) struct Parts<'a> {
 }
 
 enum Stop {
-    /// A phi whose incoming value has no DXIL form was read: redo with it missing.
-    Retry(Value, Why),
+    /// Phis whose incoming value has no DXIL form were read: redo with them
+    /// missing.
+    Retry(Vec<(Value, Why)>),
     Fail(ShaderError),
 }
 
@@ -69,12 +70,14 @@ pub(crate) fn lower(parts: &Parts) -> Result<Lowered, ShaderError> {
     loop {
         match Lower::new(parts, &bad).run() {
             Ok(l) => return Ok(l),
-            Err(Stop::Retry(v, why)) => {
-                if bad.insert(v, why).is_some() {
-                    return Err(ShaderError::Unsupported {
-                        offset: 0,
-                        what: "a phi that does not settle",
-                    });
+            Err(Stop::Retry(phis)) => {
+                for (v, why) in phis {
+                    if bad.insert(v, why).is_some() {
+                        return Err(ShaderError::Unsupported {
+                            offset: 0,
+                            what: "a phi that does not settle",
+                        });
+                    }
                 }
             }
             Err(Stop::Fail(e)) => return Err(e),
@@ -6880,6 +6883,48 @@ impl<'a> Lower<'a> {
         e
     }
 
+    /// The read phis a value with no DXIL form reaches, directly or through
+    /// other read phis (each would be found by a redo of its own: a missing
+    /// value stays missing when more are).
+    fn missing_phis(&self) -> Vec<(Value, Why)> {
+        let p = self.x.p;
+        let mut found = Vec::new();
+        let mut missing = HashMap::new();
+        loop {
+            let before = found.len();
+            for &(_, b, i) in &self.data_phis {
+                let phi = &p.blocks[b].phis[i];
+                if !self.read_phis.contains(&phi.value) || missing.contains_key(&phi.value) {
+                    continue;
+                }
+                let bit = phi.reg == Reg::Scc;
+                let why = p.blocks[b]
+                    .preds
+                    .iter()
+                    .zip(&phi.args)
+                    .find_map(|(&q, arg)| {
+                        self.tail[q]?;
+                        if let Some(&why) = missing.get(arg) {
+                            return Some(why);
+                        }
+                        match (self.vals.get(arg), bit) {
+                            (Some(Val::I32(_)), false) | (Some(Val::Bit(_)), true) => None,
+                            (Some(Val::Bit(_)), false) => Some("an SCC joined with SGPR values"),
+                            (Some(&Val::Missing(why)), _) => Some(why),
+                            _ => Some("a join of mismatched values"),
+                        }
+                    });
+                if let Some(why) = why {
+                    missing.insert(phi.value, why);
+                    found.push((phi.value, why));
+                }
+            }
+            if found.len() == before {
+                return found;
+            }
+        }
+    }
+
     fn fill_phis(&mut self) -> Result<(), Stop> {
         let p = self.x.p;
         // A phi that only another read phi consumes is live too. Without this, a value with no DXIL form that
@@ -6896,6 +6941,10 @@ impl<'a> Lower<'a> {
                 }
             }
         }
+        let missing = self.missing_phis();
+        if !missing.is_empty() {
+            return Err(Stop::Retry(missing));
+        }
         for (v, b, i) in std::mem::take(&mut self.data_phis) {
             let phi = &p.blocks[b].phis[i];
             let bit = phi.reg == Reg::Scc;
@@ -6906,15 +6955,6 @@ impl<'a> Lower<'a> {
                 let arg = phi.args[n];
                 let x = match (self.vals.get(&arg).copied(), bit) {
                     (Some(Val::I32(x)), false) | (Some(Val::Bit(x)), true) => x,
-                    (Some(Val::Bit(_)), false) if self.read_phis.contains(&phi.value) => {
-                        return Err(Stop::Retry(phi.value, "an SCC joined with SGPR values"));
-                    }
-                    (Some(Val::Missing(why)), _) if self.read_phis.contains(&phi.value) => {
-                        return Err(Stop::Retry(phi.value, why));
-                    }
-                    _ if self.read_phis.contains(&phi.value) => {
-                        return Err(Stop::Retry(phi.value, "a join of mismatched values"));
-                    }
                     _ if bit => self.s.m.bool(false),
                     _ => self.s.m.i32(0),
                 };
