@@ -70,7 +70,7 @@ const PORTABLE_VIEWS: u32 = 1_000_000;
 const DYNAMIC: u32 = 1 << 18;
 
 /// The dynamic slots of a heap whose host would not take [`DYNAMIC`] more
-/// (a capped heap, NVIDIA): the title's slots keep their room first.
+/// below [`PORTABLE_VIEWS`].
 const MIN_DYNAMIC: u32 = 1 << 16;
 
 impl HostHeap {
@@ -103,19 +103,32 @@ impl HostHeap {
                     return None;
                 }
             }
-        } else if let Ok(heap) = make(count + DYNAMIC) {
+        } else if let Some(total) = count.checked_add(DYNAMIC)
+            && let Ok(heap) = make(total)
+        {
             (heap, count, DYNAMIC)
+        } else if count.saturating_add(DYNAMIC) > PORTABLE_VIEWS
+            && let Ok(heap) = make(PORTABLE_VIEWS)
+        {
+            // shortcut: descriptors past `PORTABLE_VIEWS - DYNAMIC` are
+            // remapped to dynamic slots; keeping the full `DYNAMIC` range
+            // prevents world draws from dropping on 1M-capped hosts (#1496).
+            tracing::warn!(
+                count,
+                capped = PORTABLE_VIEWS - DYNAMIC,
+                dynamic = DYNAMIC,
+                "host view heap capped at {PORTABLE_VIEWS}"
+            );
+            (heap, PORTABLE_VIEWS - DYNAMIC, DYNAMIC)
         } else {
-            match make(count + MIN_DYNAMIC) {
-                Ok(heap) => (heap, count, MIN_DYNAMIC),
-                Err(e) if count + MIN_DYNAMIC > PORTABLE_VIEWS => {
-                    // shortcut: descriptors past the host's limit are left
-                    // out; a title that reaches them needs remapping.
-                    tracing::warn!(error = %e, count, "host view heap capped at {PORTABLE_VIEWS}");
-                    (make(PORTABLE_VIEWS).ok()?, PORTABLE_VIEWS - MIN_DYNAMIC, MIN_DYNAMIC)
-                }
-                Err(e) => {
+            match count.checked_add(MIN_DYNAMIC).map(make) {
+                Some(Ok(heap)) => (heap, count, MIN_DYNAMIC),
+                Some(Err(e)) => {
                     tracing::warn!(error = %e, count, sampler, "no host descriptor heap");
+                    return None;
+                }
+                None => {
+                    tracing::warn!(count, sampler, "descriptor heap count overflow");
                     return None;
                 }
             }
@@ -972,5 +985,16 @@ mod tests {
         heap.release(a, 50);
         assert_eq!(heap.dynamic(50), Some(4));
         assert_eq!(heap.dynamic(40), Some(4 + heap.dynamic - 40));
+    }
+
+    /// A title heap that hits `PORTABLE_VIEWS` keeps the full `DYNAMIC`
+    /// range (`2^18` slots) rather than shrinking to `MIN_DYNAMIC`.
+    #[test]
+    fn capped_heap_keeps_full_dynamic_range() {
+        let Some(heap) = HostHeap::new(false, PORTABLE_VIEWS) else {
+            return; // no host GPU
+        };
+        assert_eq!(heap.dynamic, DYNAMIC);
+        assert!(heap.count + heap.dynamic >= PORTABLE_VIEWS);
     }
 }
