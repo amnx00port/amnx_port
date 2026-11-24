@@ -495,31 +495,27 @@ impl Lanes {
         }
     }
 
-    /// Starts the next read of the class with the least virtual time, from
-    /// its lane that has started the fewest bytes, if the staging buffer
-    /// has room for it (or nothing else holds any).
+    /// Starts the next read in scheduler order. If it must wait for
+    /// staging, an unstaged read at the head of another queue can run
+    /// without using the space the waiting read needs.
     fn start(&mut self) -> Option<Job> {
-        let busy = || self.lanes.iter().filter(|(_, l)| !l.reads.is_empty());
-        let (_, class) = busy().map(|(_, l)| (self.clock[l.class], l.class)).min()?;
-        let (_, _, id) = busy()
-            .filter(|(_, l)| l.class == class)
-            .filter_map(|(&id, l)| Some((l.clock, l.reads.front()?.0, id)))
-            .min()?;
-        let lane = self.lanes.get_mut(&id)?;
-        let &(seq, request) = lane.reads.front()?;
-        let staging = staging_bytes(&request);
-        if self.staged > 0 && self.staged + staging > self.staging {
+        let (mut id, mut staging) = self.next_read(|_| true)?;
+        if staging != 0 && self.staged > 0 && self.staged + staging > self.staging {
             self.starved = true;
             self.refused += 1;
-            return None;
+            (id, staging) = self.next_read(|bytes| bytes == 0)?;
         }
-        lane.reads.pop_front();
+        let lane = self.lanes.get_mut(&id)?;
+        let (seq, request) = lane.reads.pop_front()?;
         lane.running.insert(seq);
         self.staged += staging;
+        let class = lane.class;
         let size = u64::from(request.destination_size.max(request.source_size)).max(1);
-        self.now = self.clock[class];
+        // Starting an unstaged read can temporarily skip an older virtual
+        // time. Keep the clocks used by newly active queues moving forward.
+        self.now = self.now.max(self.clock[class]);
         self.clock[class] += size * COST[class];
-        self.lane_now[class] = lane.clock;
+        self.lane_now[class] = self.lane_now[class].max(lane.clock);
         lane.clock += size;
         Some(Job {
             lane: id,
@@ -527,6 +523,25 @@ impl Lanes {
             request,
             staging,
         })
+    }
+
+    fn next_read(&self, eligible: impl Fn(u64) -> bool) -> Option<(u64, u64)> {
+        self.lanes
+            .iter()
+            .filter_map(|(&id, lane)| {
+                let (seq, request) = lane.reads.front()?;
+                let staging = staging_bytes(request);
+                eligible(staging).then_some((
+                    self.clock[lane.class],
+                    lane.class,
+                    lane.clock,
+                    *seq,
+                    id,
+                    staging,
+                ))
+            })
+            .min()
+            .map(|(_, _, _, _, id, staging)| (id, staging))
     }
 
     fn finish(&mut self, job: &Job, result: Result<(), HRESULT>) {
@@ -1321,6 +1336,54 @@ mod tests {
         assert!(l.start().is_none());
         l.finish(&second, Ok(()));
         assert!(l.start().is_some());
+    }
+
+    #[test]
+    fn staging_wait_does_not_block_an_independent_raw_read() {
+        let mut l = lanes(100);
+        l.lanes.insert(0, Lane::new(1, 64));
+        l.lanes.insert(1, Lane::new(-1, 64));
+        l.lanes.insert(2, Lane::new(1, 64));
+        read(&mut l, 0, ZLIB, 60);
+        l.submit(0);
+        let active = l.start().unwrap();
+
+        read(&mut l, 1, ZLIB, 60);
+        read(&mut l, 1, 0, 1000);
+        l.submit(1);
+        read(&mut l, 2, 0, 1000);
+        read(&mut l, 2, ZLIB, 10);
+        l.submit(2);
+
+        let raw = l.start().expect("independent raw read uses no staging");
+        assert_eq!((raw.lane, raw.staging), (2, 0));
+        assert_eq!(l.staged, 60);
+        assert!(l.starved);
+        assert!(
+            l.start().is_none(),
+            "the waiting request keeps first claim on staging"
+        );
+
+        let now = l.now;
+        l.finish(&active, Ok(()));
+        let buffered = l.start().unwrap();
+        assert_eq!((buffered.lane, buffered.staging), (1, 60));
+        assert_eq!(l.now, now);
+    }
+
+    #[test]
+    fn oversized_buffered_read_can_run_alongside_an_unstaged_read() {
+        let mut l = lanes(100);
+        l.lanes.insert(0, Lane::new(0, 64));
+        read(&mut l, 0, ZLIB, 120);
+        read(&mut l, 0, ZLIB | MEMORY_SOURCE, 1000);
+        l.submit(0);
+
+        let oversized = l.start().unwrap();
+        assert_eq!(oversized.staging, 120);
+        let memory = l.start().expect("memory source uses no staging");
+        assert_eq!(memory.staging, 0);
+        assert_eq!(l.staged, 120);
     }
 
     #[test]
