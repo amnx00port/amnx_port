@@ -228,8 +228,18 @@ fn footprint(desc: &ResourceDesc) -> Option<AllocationInfo> {
 
 /// A format as the host has it. The console's 16-bit depth with stencil
 /// (and its typeless views) has no PC format: the 24-bit ones stand in.
+///
+/// The console's packed 16-bit colour targets have no host format either:
+/// `B5G5R5A1_UNORM` (86) takes no unordered access and `B4G4R4A4_UNORM`
+/// (115) takes no render target, so both fail to create when the title asks
+/// for a render target or UAV view. Their 8-bit RGBA stand-in is a superset
+/// of both in range, so a target that only carries colour through the
+/// pipeline loses nothing but the packing. Without this the title's UI
+/// composition targets fail to create and the whole UI layer goes missing.
 pub(crate) fn pc_format(format: u32) -> u32 {
     match format {
+        86 => 28,
+        115 => 28,
         118 => 45,
         119 => 46,
         120 => 47,
