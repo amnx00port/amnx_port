@@ -233,19 +233,32 @@ impl Instruction {
             }
             Encoding::Sopp => Fields::Sopp { imm: w0 as u16 },
             Encoding::Smem => {
-                let data = match name {
-                    "s_gl1_inv" | "s_dcache_inv" | "s_dcache_wb" => None,
-                    n if n.starts_with("s_dcache_discard") => None,
-                    "s_memtime" | "s_memrealtime" => Some(2),
-                    _ => Some(data_dwords(name)),
+                let sdata = (w0 >> 6 & 0x7F) as u8;
+                // s_atc_probe*: SDATA is a 7-bit immediate, not an SGPR. The
+                // buffer form's resource is 4 dwords. GLC and DLC are not operands.
+                let probe = matches!(name, "s_atc_probe" | "s_atc_probe_buffer");
+                let data = if probe {
+                    Some(Operand::Literal(u32::from(sdata)))
+                } else {
+                    match name {
+                        "s_gl1_inv" | "s_dcache_inv" | "s_dcache_wb" => None,
+                        n if n.starts_with("s_dcache_discard") => None,
+                        "s_memtime" | "s_memrealtime" => Some(scalar(sdata, 2)),
+                        _ => Some(scalar(sdata, data_dwords(name))),
+                    }
                 };
-                let base = 2 + 2 * u8::from(name.starts_with("s_buffer_"));
+                let base =
+                    2 + 2 * u8::from(name.starts_with("s_buffer_") || name == "s_atc_probe_buffer");
                 Fields::Smem {
-                    data: data.map(|d| scalar((w0 >> 6 & 0x7F) as u8, d)),
+                    data,
                     base: scalar(((w0 & 0x3F) << 1) as u8, base),
                     offset: (w1 << 11) as i32 >> 11,
                     soffset: scalar((w1 >> 25) as u8, 1),
-                    cache: cache(bit(w0, 16), false, bit(w0, 14)),
+                    cache: if probe {
+                        Cache::default()
+                    } else {
+                        cache(bit(w0, 16), false, bit(w0, 14))
+                    },
                 }
             }
             Encoding::Vop1 | Encoding::Vop2 | Encoding::Vopc | Encoding::Vop3 | Encoding::Vop3p => {
@@ -790,6 +803,7 @@ fn image_addr_dwords(name: &str, dim: u8, a16: bool) -> u8 {
         _ => {}
     }
     let (mut whole, mut derivs, mut packed): (u8, u8, u8) = (0, 0, coords);
+    let mut g16 = false;
     if let Some(rest) = name
         .strip_prefix("image_sample")
         .or_else(|| name.strip_prefix("image_gather4"))
@@ -799,15 +813,36 @@ fn image_addr_dwords(name: &str, dim: u8, a16: bool) -> u8 {
                 "o" | "b" | "c" => whole += 1,
                 "d" | "cd" => derivs = grads,
                 "l" | "cl" => packed += 1,
+                "g16" => g16 = true,
                 _ => {}
             }
         }
     } else if name.contains("_mip") {
         packed += 1;
     }
-    if a16 {
-        whole + 2 * derivs.div_ceil(2) + packed.div_ceil(2)
+    // Derivatives are 16-bit (each direction padded to a dword) only in the
+    // `_g16` opcodes; `a16` alone leaves them 32-bit and packs the rest.
+    let derivs = if g16 {
+        2 * derivs.div_ceil(2)
     } else {
-        whole + 2 * derivs + packed
+        2 * derivs
+    };
+    whole + derivs + if a16 { packed.div_ceil(2) } else { packed }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::image_addr_dwords;
+
+    #[test]
+    fn a16_keeps_derivatives_32bit_outside_g16() {
+        // 2D: four 32-bit derivatives plus the packed (u, v).
+        assert_eq!(image_addr_dwords("image_sample_d", 1, true), 5);
+        assert_eq!(image_addr_dwords("image_sample_d", 1, false), 6);
+        // g16: one dword per direction, then the coordinates.
+        assert_eq!(image_addr_dwords("image_sample_d_g16", 1, true), 3);
+        assert_eq!(image_addr_dwords("image_sample_d_g16", 1, false), 4);
+        // The bias keeps its own dword with a16.
+        assert_eq!(image_addr_dwords("image_sample_b", 1, true), 2);
     }
 }

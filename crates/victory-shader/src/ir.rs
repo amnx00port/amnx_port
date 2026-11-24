@@ -76,6 +76,21 @@ pub enum Exit {
 }
 
 impl Exit {
+    fn successor_at(&self, index: usize) -> Option<usize> {
+        match (*self, index) {
+            (Exit::Jump(b), 0)
+            | (Exit::Branch { taken: b, .. }, 0) => Some(b),
+            (Exit::Branch { not_taken, .. }, 1) => Some(not_taken),
+            _ => None,
+        }
+    }
+
+    fn successor_iter(&self) -> impl Iterator<Item = usize> {
+        self.successor_at(0)
+            .into_iter()
+            .chain(self.successor_at(1))
+    }
+
     pub fn successors(&self) -> Vec<usize> {
         match *self {
             Exit::Jump(b) => vec![b],
@@ -186,12 +201,11 @@ pub fn build(code: &[u8], wave64: bool, vgprs: u16) -> Result<Program, ShaderErr
             };
         }
         if let Some((reads, writes)) = effects(&machine, &fields, name, lanes, vgprs)? {
-            let unset = |regs: Vec<Reg>| regs.into_iter().map(|r| (r, NONE)).collect();
             blocks[b].insts.push(Inst {
                 machine,
                 fields,
-                reads: unset(reads),
-                writes: unset(writes),
+                reads,
+                writes,
             });
         }
     }
@@ -323,8 +337,8 @@ pub(crate) fn reverse_postorder(blocks: &[Block]) -> Vec<usize> {
     while let Some(top) = stack.last_mut() {
         let (b, i) = *top;
         top.1 += 1;
-        match blocks[b].exit.successors().get(i) {
-            Some(&s) if !seen[s] => {
+        match blocks[b].exit.successor_at(i) {
+            Some(s) if !seen[s] => {
                 seen[s] = true;
                 stack.push((s, 0));
             }
@@ -345,7 +359,7 @@ fn link(blocks: &mut [Block]) {
         block.preds.clear();
     }
     for b in 0..blocks.len() {
-        for s in blocks[b].exit.successors() {
+        for s in blocks[b].exit.successor_iter() {
             blocks[s].preds.push(b);
         }
     }
@@ -362,7 +376,7 @@ pub(crate) fn irreducible_edge(
     let &entry = order.first()?;
     let idom = idoms(blocks, order, index);
     for &b in order {
-        for s in blocks[b].exit.successors() {
+        for s in blocks[b].exit.successor_iter() {
             if index[s] > index[b] {
                 continue;
             }
@@ -456,7 +470,7 @@ fn split_irreducible(blocks: &mut Vec<Block>) -> Result<(), ShaderError> {
             }
             copy[b] = blocks.len() + copied.len();
             copied.push(b);
-            for s in blocks[b].exit.successors() {
+            for s in blocks[b].exit.successor_iter() {
                 if region[s] && s != header {
                     stack.push(s);
                 }
@@ -500,16 +514,16 @@ fn multi_entry_loop(blocks: &[Block], inside: &[bool]) -> Option<(Vec<bool>, Vec
         let mut seen = vec![false; blocks.len()];
         let mut stack = vec![from];
         while let Some(b) = stack.pop() {
-            let next = if forward {
-                blocks[b].exit.successors()
-            } else {
-                blocks[b].preds.clone()
-            };
-            for n in next {
+            let mut visit = |n: usize| {
                 if inside[n] && !seen[n] {
                     seen[n] = true;
                     stack.push(n);
                 }
+            };
+            if forward {
+                blocks[b].exit.successor_iter().for_each(&mut visit);
+            } else {
+                blocks[b].preds.iter().copied().for_each(&mut visit);
             }
         }
         seen
@@ -571,7 +585,7 @@ fn liveness(blocks: &[Block], order: &[usize]) -> (Vec<RegSet>, Vec<RegSet>) {
         changed = false;
         for &b in order.iter().rev() {
             let mut out = empty;
-            for s in blocks[b].exit.successors() {
+            for s in blocks[b].exit.successor_iter() {
                 for (o, i) in out.iter_mut().zip(&live_in[s]) {
                     *o |= i;
                 }
@@ -659,8 +673,9 @@ const DROPPED: &[&str] = &[
     "v_clrexcp",
 ];
 
-/// Registers read, registers written.
-type Effects = (Vec<Reg>, Vec<Reg>);
+/// Registers read, registers written, each with a placeholder value the
+/// SSA pass fills in.
+type Effects = (Vec<(Reg, Value)>, Vec<(Reg, Value)>);
 
 /// Registers an instruction reads and writes, one per dword, or `None` if
 /// the IR drops it.
@@ -678,9 +693,9 @@ fn effects(
         offset: inst.offset,
         what: name,
     };
-    let mask = |code: u8| (0..lanes).map(move |i| Reg::S(code + i));
+    let mask = |code: u8| (0..lanes).map(move |i| (Reg::S(code + i), NONE));
     let (mut r, mut w) = (Vec::new(), Vec::new());
-    let regs = |op: &Operand, out: &mut Vec<Reg>| {
+    let regs = |op: &Operand, out: &mut Vec<(Reg, Value)>| {
         add_regs(op, lanes, out).map_err(|_| ShaderError::Isa {
             offset: inst.offset,
             reason: "register range out of bounds",
@@ -715,21 +730,21 @@ fn effects(
                 || name.starts_with("s_cselect_")
                 || name.starts_with("s_cmov_")
             {
-                r.push(Reg::Scc);
+                r.push((Reg::Scc, NONE));
             }
             if name.contains("saveexec") || name.contains("wrexec") {
                 r.extend(mask(EXEC));
                 w.extend(mask(EXEC));
             }
             if writes_scc(inst.encoding, name) {
-                w.push(Reg::Scc);
+                w.push((Reg::Scc, NONE));
             }
         }
         Fields::Sopp { .. } => match name {
-            "s_cbranch_scc0" | "s_cbranch_scc1" => r.push(Reg::Scc),
+            "s_cbranch_scc0" | "s_cbranch_scc1" => r.push((Reg::Scc, NONE)),
             "s_cbranch_vccz" | "s_cbranch_vccnz" => r.extend(mask(VCC)),
             "s_cbranch_execz" | "s_cbranch_execnz" => r.extend(mask(EXEC)),
-            "s_sendmsg" | "s_sendmsghalt" => r.push(Reg::S(M0)),
+            "s_sendmsg" | "s_sendmsghalt" => r.push((Reg::S(M0), NONE)),
             "s_endpgm"
             | "s_endpgm_saved"
             | "s_endpgm_ordered_ps_done"
@@ -775,9 +790,9 @@ fn effects(
                 _ => (false, false),
             };
             // v[reg + M0] for any M0 that stays inside the program's VGPRs.
-            let indexed = |op: &Operand, out: &mut Vec<Reg>| match *op {
+            let indexed = |op: &Operand, out: &mut Vec<(Reg, Value)>| match *op {
                 Operand::Vector { reg, .. } if u16::from(reg) < vgprs => {
-                    out.extend((u16::from(reg)..vgprs).map(|r| Reg::V(r as u8)));
+                    out.extend((u16::from(reg)..vgprs).map(|r| (Reg::V(r as u8), NONE)));
                     Ok(())
                 }
                 _ => Err(ShaderError::Isa {
@@ -821,12 +836,12 @@ fn effects(
                 _ => {}
             }
             if name.starts_with("v_interp_") || src_indexed || dst_indexed {
-                r.push(Reg::S(M0));
+                r.push((Reg::S(M0), NONE));
             }
         }
         Fields::Vintrp { dst, src, .. } => {
             regs(src, &mut r)?;
-            r.push(Reg::S(M0));
+            r.push((Reg::S(M0), NONE));
             regs(dst, &mut w)?;
         }
         Fields::Ds {
@@ -847,7 +862,7 @@ fn effects(
                 || name.contains("addtid")
                 || matches!(name, "ds_ordered_count" | "ds_append" | "ds_consume")
             {
-                r.push(Reg::S(M0));
+                r.push((Reg::S(M0), NONE));
             }
         }
         Fields::Buffer {
@@ -867,7 +882,7 @@ fn effects(
             regs(rsrc, &mut r)?;
             regs(soffset, &mut r)?;
             if *lds {
-                r.push(Reg::S(M0));
+                r.push((Reg::S(M0), NONE));
             }
             if let Some(d) = data {
                 if name.contains("_load_") {
@@ -931,7 +946,7 @@ fn effects(
     if vector {
         r.extend(mask(EXEC));
         // Lanes disabled in EXEC keep the old value.
-        r.extend(w.iter().filter(|w| matches!(w, Reg::V(_))));
+        r.extend(w.iter().filter(|(w, _)| matches!(w, Reg::V(_))).cloned());
     }
     let mut seen = Vec::with_capacity(r.len());
     r.retain(|reg| {
@@ -1003,7 +1018,7 @@ fn atomic_result(data: &Operand, name: &str) -> Operand {
 
 /// Appends the register dwords an operand names; reading `vccz`, `execz`,
 /// `scc` or `lds_direct` reads the register behind it.
-fn add_regs(op: &Operand, lanes: u8, out: &mut Vec<Reg>) -> Result<(), ()> {
+fn add_regs(op: &Operand, lanes: u8, out: &mut Vec<(Reg, Value)>) -> Result<(), ()> {
     match *op {
         Operand::Scalar { code, .. } if code == gfx10::NULL => {}
         Operand::Scalar { code, dwords } => {
@@ -1011,18 +1026,18 @@ fn add_regs(op: &Operand, lanes: u8, out: &mut Vec<Reg>) -> Result<(), ()> {
             if end > 128 {
                 return Err(());
             }
-            out.extend((code..end as u8).map(Reg::S));
+            out.extend((code..end as u8).map(|c| (Reg::S(c), NONE)));
         }
         Operand::Vector { reg, dwords } => {
             if u16::from(reg) + u16::from(dwords) > 256 {
                 return Err(());
             }
-            out.extend((0..dwords).map(|i| Reg::V(reg + i)));
+            out.extend((0..dwords).map(|i| (Reg::V(reg + i), NONE)));
         }
-        Operand::Const(251) => out.extend((0..lanes).map(|i| Reg::S(VCC + i))),
-        Operand::Const(252) => out.extend((0..lanes).map(|i| Reg::S(EXEC + i))),
-        Operand::Const(253) => out.push(Reg::Scc),
-        Operand::Const(254) => out.push(Reg::S(M0)),
+        Operand::Const(251) => out.extend((0..lanes).map(|i| (Reg::S(VCC + i), NONE))),
+        Operand::Const(252) => out.extend((0..lanes).map(|i| (Reg::S(EXEC + i), NONE))),
+        Operand::Const(253) => out.push((Reg::Scc, NONE)),
+        Operand::Const(254) => out.push((Reg::S(M0), NONE)),
         Operand::Const(_) | Operand::Literal(_) | Operand::Attr { .. } => {}
     }
     Ok(())
@@ -1031,6 +1046,176 @@ fn add_regs(op: &Operand, lanes: u8, out: &mut Vec<Reg>) -> Result<(), ()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn reference_postorder(blocks: &[Block]) -> Vec<usize> {
+        let mut seen = vec![false; blocks.len()];
+        let mut post = Vec::with_capacity(blocks.len());
+        let mut stack = vec![(0, 0)];
+        seen[0] = true;
+        while let Some(top) = stack.last_mut() {
+            let (b, i) = *top;
+            top.1 += 1;
+            match blocks[b].exit.successors().get(i) {
+                Some(&s) if !seen[s] => {
+                    seen[s] = true;
+                    stack.push((s, 0));
+                }
+                Some(_) => {}
+                None => {
+                    post.push(b);
+                    stack.pop();
+                }
+            }
+        }
+        post.reverse();
+        post
+    }
+
+
+    #[test]
+    fn cfg_successors_preserve_order() {
+        for exit in [
+            Exit::End,
+            Exit::Indirect,
+            Exit::Jump(3),
+            Exit::Branch {
+                taken: 7,
+                not_taken: 2,
+            },
+            Exit::Branch {
+                taken: 4,
+                not_taken: 4,
+            },
+        ] {
+            assert_eq!(
+                exit.successor_iter().collect::<Vec<_>>(),
+                exit.successors()
+            );
+        }
+    }
+
+    fn synthetic_cfg(diamonds: usize) -> Vec<Block> {
+        let block = |exit| Block {
+            offset: 0,
+            preds: Vec::new(),
+            phis: Vec::new(),
+            insts: Vec::new(),
+            exit,
+        };
+
+        let mut blocks = Vec::new();
+
+        for i in 0..diamonds {
+            let base = i * 3;
+
+            blocks.push(block(Exit::Branch {
+                taken: base + 1,
+                not_taken: base + 2,
+            }));
+
+            blocks.push(block(Exit::Jump(base + 3)));
+
+            let exit = if i % 5 == 0 {
+                Exit::Branch {
+                    taken: base,
+                    not_taken: base + 3,
+                }
+            } else {
+                Exit::Jump(base + 3)
+            };
+
+            blocks.push(block(exit));
+        }
+
+        blocks.push(block(Exit::End));
+
+        // Unreachable block.
+        blocks.push(block(Exit::Jump(diamonds * 3 + 1)));
+
+        blocks
+    }
+
+    #[test]
+    fn cfg_postorder_matches_reference() {
+        for count in [0, 1, 2, 16, 128, 2048] {
+            let blocks = synthetic_cfg(count);
+
+            let expected = reference_postorder(&blocks);
+            let actual = reverse_postorder(&blocks);
+
+            assert_eq!(actual, expected);
+            assert_eq!(actual.len(), count * 3 + 1);
+        }
+    }
+
+    #[test]
+    #[ignore = "synthetic release microbenchmark"]
+    fn cfg_postorder_benchmark() {
+        use std::hint::black_box;
+        use std::time::Instant;
+
+        fn measure(
+            blocks: &[Block],
+            run: impl Fn(&[Block]) -> Vec<usize>,
+        ) -> f64 {
+            let start = Instant::now();
+
+            for _ in 0..128 {
+                black_box(run(black_box(blocks)));
+            }
+
+            start.elapsed().as_secs_f64() * 1000.0
+        }
+
+        for count in [256, 2048, 8192] {
+            let blocks = synthetic_cfg(count);
+
+            assert_eq!(
+                reference_postorder(&blocks),
+                reverse_postorder(&blocks)
+            );
+
+            black_box(measure(&blocks, reference_postorder));
+            black_box(measure(&blocks, reverse_postorder));
+
+            let mut original = Vec::new();
+            let mut candidate = Vec::new();
+
+            for round in 0..5 {
+                let (a, b) = if round % 2 == 0 {
+                    let a = measure(&blocks, reference_postorder);
+                    let b = measure(&blocks, reverse_postorder);
+                    (a, b)
+                } else {
+                    let b = measure(&blocks, reverse_postorder);
+                    let a = measure(&blocks, reference_postorder);
+                    (a, b)
+                };
+
+                original.push(a);
+                candidate.push(b);
+
+                println!(
+                    "blocks={} round={round}: \
+                    original={a:.3}ms candidate={b:.3}ms",
+                    blocks.len()
+                );
+            }
+
+            original.sort_by(f64::total_cmp);
+            candidate.sort_by(f64::total_cmp);
+
+            println!(
+                "MEDIAN blocks={}: \
+                 original={:.3}ms candidate={:.3}ms \
+                 speedup={:.3}x",
+                blocks.len(),
+                original[2],
+                candidate[2],
+                original[2] / candidate[2]
+            );
+        }
+    }
 
     const S_ENDPGM: u32 = 0xBF81_0000;
 
