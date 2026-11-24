@@ -40,8 +40,8 @@ pub struct Program {
     pub wave64: bool,
     /// VGPRs v0 up to this exist; bounds M0-relative access.
     pub vgprs: u16,
-    /// In code order, then copies made to give every loop one entry; block 0
-    /// is the entry.
+    /// In code order, then copies made to give every loop one entry. Block 0
+    /// is the entry, which can be an empty block before the code.
     pub blocks: Vec<Block>,
     /// Registers read before any write, with their value on entry: what the
     /// hardware or a called fetch routine set up (user SGPRs, system values,
@@ -52,7 +52,7 @@ pub struct Program {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Block {
     /// Byte offset of the block's first machine instruction (shared by a
-    /// block and its copies).
+    /// block and its copies). Zero for an empty entry block.
     pub offset: usize,
     pub preds: Vec<usize>,
     pub phis: Vec<Phi>,
@@ -76,6 +76,21 @@ pub enum Exit {
 }
 
 impl Exit {
+    fn successor_at(&self, index: usize) -> Option<usize> {
+        match (*self, index) {
+            (Exit::Jump(b), 0)
+            | (Exit::Branch { taken: b, .. }, 0) => Some(b),
+            (Exit::Branch { not_taken, .. }, 1) => Some(not_taken),
+            _ => None,
+        }
+    }
+
+    fn successor_iter(&self) -> impl Iterator<Item = usize> {
+        self.successor_at(0)
+            .into_iter()
+            .chain(self.successor_at(1))
+    }
+
     pub fn successors(&self) -> Vec<usize> {
         match *self {
             Exit::Jump(b) => vec![b],
@@ -119,11 +134,148 @@ impl Inst {
     }
 }
 
+/// The first user SGPR that the spill table of root arguments stands for.
+const SPILL_FIRST: u8 = 16;
+
+/// Rewrites loads from the spill table (`s[0:1]`, the high dword masked to a
+/// 40-bit address, usually through copies in `s2`/`s3`) into `s_mov_b32` from
+/// the user SGPRs the table's dwords stand for. Only loads with a constant
+/// offset, in code no branch joins after the pointer is set up, are rewritten.
+fn spill_loads(
+    list: Vec<Instruction>,
+    wave64: bool,
+    code_len: usize,
+) -> Result<Vec<Instruction>, ShaderError> {
+    use gfx10::Fields::{Smem, Sop, Valu};
+    let mut targets = std::collections::BTreeSet::new();
+    for inst in list.iter() {
+        let flow = gfx10::control(inst, code_len, |at| {
+            list[..list.partition_point(|i| i.offset < at)].last()
+        })?;
+        if let Flow::Jump(t) | Flow::Branch(t) = flow {
+            targets.insert(t);
+        }
+    }
+    // 1: a copy of s0, 2: a copy of s1 (masked to the address's high bits).
+    let mut tag = [0u8; 128];
+    tag[0] = 1;
+    tag[1] = 2;
+    let mut out = Vec::with_capacity(list.len());
+    let scalar = |o: &Operand| match *o {
+        Operand::Scalar { code, dwords } if code < 106 => Some((code, dwords.max(1))),
+        _ => None,
+    };
+    for inst in list {
+        if targets.contains(&inst.offset) {
+            tag = [0; 128];
+        }
+        let f = inst.fields(wave64);
+        let name = inst.name().unwrap_or("");
+        // The load of the table.
+        if let Smem {
+            data: Some(ref d),
+            ref base,
+            offset,
+            ref soffset,
+            ..
+        } = f
+            && name.starts_with("s_load_dword")
+            && let Some((a, 2)) = scalar(base)
+            && tag[a as usize] == 1
+            && tag[a as usize + 1] == 2
+            && offset >= 0
+            && offset % 4 == 0
+            && matches!(*soffset, Operand::Scalar { code: 125, .. })
+            && let Some((dst, n)) = scalar(d)
+        {
+            let first = u32::from(SPILL_FIRST) + (offset as u32) / 4;
+            if first + u32::from(n) <= 105 {
+                for k in 0..n {
+                    let mov =
+                        0xBE80_0000 | u32::from(dst + k) << 16 | 3 << 8 | (first + u32::from(k));
+                    let mut bytes = mov.to_le_bytes().to_vec();
+                    bytes.extend(0xBF81_0000u32.to_le_bytes()); // s_endpgm
+                    let mut one = gfx10::decode(&bytes)?.remove(0);
+                    one.offset = inst.offset;
+                    out.push(one);
+                }
+                for k in 0..n {
+                    tag[(dst + k) as usize] = 0;
+                }
+                continue;
+            }
+        }
+        // What this instruction does to the tracked registers.
+        let mut written: Vec<(u8, u8)> = Vec::new();
+        match &f {
+            Sop {
+                dst: Some(d), src, ..
+            } => {
+                if let Some((dc, dn)) = scalar(d) {
+                    let new = match (name, src.as_slice()) {
+                        ("s_mov_b32", [x]) => match scalar(x) {
+                            Some((c, _)) if tag[c as usize] != 0 => tag[c as usize],
+                            _ => 0,
+                        },
+                        ("s_and_b32", [x, y]) => {
+                            // `s1 & mask` with a small mask, either way round.
+                            let masked = |reg: &Operand, mask: &Operand| match (scalar(reg), mask) {
+                                (Some((c, _)), Operand::Literal(m)) => {
+                                    tag[c as usize] == 2 && *m <= 0xFFFF
+                                }
+                                (Some((c, _)), Operand::Const(k)) => {
+                                    tag[c as usize] == 2 && (129..=192).contains(k)
+                                }
+                                _ => false,
+                            };
+                            if masked(x, y) || masked(y, x) { 2 } else { 0 }
+                        }
+                        _ => 0,
+                    };
+                    if dn == 1 {
+                        tag[dc as usize] = new;
+                    } else {
+                        written.push((dc, dn));
+                    }
+                }
+            }
+            Smem { data: Some(d), .. } => written.extend(scalar(d)),
+            Valu(v) => {
+                written.extend(v.dst.as_ref().and_then(scalar));
+                written.extend(v.carry.as_ref().and_then(scalar));
+            }
+            _ => {}
+        }
+        for (c, n) in written {
+            for k in c..c.saturating_add(n).min(128) {
+                tag[k as usize] = 0;
+            }
+        }
+        out.push(inst);
+    }
+    Ok(out)
+}
+
 /// Decodes `code` and builds its SSA form; `vgprs` is the program's VGPR
 /// count. Fails on instructions the IR cannot express yet
 /// ([`ShaderError::Unsupported`]).
 pub fn build(code: &[u8], wave64: bool, vgprs: u16) -> Result<Program, ShaderError> {
-    let list = gfx10::decode(code)?;
+    build_with(code, wave64, vgprs, false)
+}
+
+/// [`build`]; with `spilled`, loads from the root-argument spill table that
+/// `s[0:1]` points to read the user SGPRs the table stands for (table dword
+/// `k` is user SGPR `16 + k`), as plain register copies.
+pub fn build_with(
+    code: &[u8],
+    wave64: bool,
+    vgprs: u16,
+    spilled: bool,
+) -> Result<Program, ShaderError> {
+    let mut list = gfx10::decode(code)?;
+    if spilled {
+        list = spill_loads(list, wave64, code.len())?;
+    }
     let lanes = 1 + u8::from(wave64);
     let isa = |offset, reason| ShaderError::Isa { offset, reason };
 
@@ -145,9 +297,17 @@ pub fn build(code: &[u8], wave64: bool, vgprs: u16) -> Result<Program, ShaderErr
     }
     leaders.sort_unstable();
     leaders.dedup();
+    // When the first instruction is a loop header, give SSA a separate
+    // entry edge to carry the initial register values into its phis.
+    let preheader = usize::from(
+        flows
+            .iter()
+            .any(|flow| matches!(flow, Flow::Jump(0) | Flow::Branch(0))),
+    );
     let block_at = |offset: usize| {
         leaders
             .binary_search(&offset)
+            .map(|b| b + preheader)
             .map_err(|_| isa(offset, "jump into a block"))
     };
 
@@ -161,11 +321,23 @@ pub fn build(code: &[u8], wave64: bool, vgprs: u16) -> Result<Program, ShaderErr
             exit: Exit::End,
         })
         .collect();
+    if preheader != 0 {
+        blocks.insert(
+            0,
+            Block {
+                offset: 0,
+                preds: Vec::new(),
+                phis: Vec::new(),
+                insts: Vec::new(),
+                exit: Exit::Jump(1),
+            },
+        );
+    }
     let next_offsets: Vec<Option<usize>> = (0..list.len())
         .map(|i| list.get(i + 1).map(|n| n.offset))
         .collect();
     for ((machine, flow), next) in list.into_iter().zip(flows).zip(next_offsets) {
-        let b = leaders.partition_point(|&l| l <= machine.offset) - 1;
+        let b = leaders.partition_point(|&l| l <= machine.offset) - 1 + preheader;
         let name = machine.name().ok_or(ShaderError::Unsupported {
             offset: machine.offset,
             what: "unknown opcode",
@@ -196,12 +368,6 @@ pub fn build(code: &[u8], wave64: bool, vgprs: u16) -> Result<Program, ShaderErr
         }
     }
     link(&mut blocks);
-    if !blocks[0].preds.is_empty() {
-        return Err(ShaderError::Unsupported {
-            offset: 0,
-            what: "a branch to the program entry",
-        });
-    }
     split_irreducible(&mut blocks)?;
 
     let order = reverse_postorder(&blocks);
@@ -323,8 +489,8 @@ pub(crate) fn reverse_postorder(blocks: &[Block]) -> Vec<usize> {
     while let Some(top) = stack.last_mut() {
         let (b, i) = *top;
         top.1 += 1;
-        match blocks[b].exit.successors().get(i) {
-            Some(&s) if !seen[s] => {
+        match blocks[b].exit.successor_at(i) {
+            Some(s) if !seen[s] => {
                 seen[s] = true;
                 stack.push((s, 0));
             }
@@ -345,7 +511,7 @@ fn link(blocks: &mut [Block]) {
         block.preds.clear();
     }
     for b in 0..blocks.len() {
-        for s in blocks[b].exit.successors() {
+        for s in blocks[b].exit.successor_iter() {
             blocks[s].preds.push(b);
         }
     }
@@ -362,7 +528,7 @@ pub(crate) fn irreducible_edge(
     let &entry = order.first()?;
     let idom = idoms(blocks, order, index);
     for &b in order {
-        for s in blocks[b].exit.successors() {
+        for s in blocks[b].exit.successor_iter() {
             if index[s] > index[b] {
                 continue;
             }
@@ -456,7 +622,7 @@ fn split_irreducible(blocks: &mut Vec<Block>) -> Result<(), ShaderError> {
             }
             copy[b] = blocks.len() + copied.len();
             copied.push(b);
-            for s in blocks[b].exit.successors() {
+            for s in blocks[b].exit.successor_iter() {
                 if region[s] && s != header {
                     stack.push(s);
                 }
@@ -500,16 +666,16 @@ fn multi_entry_loop(blocks: &[Block], inside: &[bool]) -> Option<(Vec<bool>, Vec
         let mut seen = vec![false; blocks.len()];
         let mut stack = vec![from];
         while let Some(b) = stack.pop() {
-            let next = if forward {
-                blocks[b].exit.successors()
-            } else {
-                blocks[b].preds.clone()
-            };
-            for n in next {
+            let mut visit = |n: usize| {
                 if inside[n] && !seen[n] {
                     seen[n] = true;
                     stack.push(n);
                 }
+            };
+            if forward {
+                blocks[b].exit.successor_iter().for_each(&mut visit);
+            } else {
+                blocks[b].preds.iter().copied().for_each(&mut visit);
             }
         }
         seen
@@ -571,7 +737,7 @@ fn liveness(blocks: &[Block], order: &[usize]) -> (Vec<RegSet>, Vec<RegSet>) {
         changed = false;
         for &b in order.iter().rev() {
             let mut out = empty;
-            for s in blocks[b].exit.successors() {
+            for s in blocks[b].exit.successor_iter() {
                 for (o, i) in out.iter_mut().zip(&live_in[s]) {
                     *o |= i;
                 }
@@ -818,6 +984,7 @@ fn effects(
                         indexed(d, &mut r)?;
                     }
                 }
+                "v_div_fmas_f32" | "v_div_fmas_f64" => r.extend(mask(VCC)),
                 _ => {}
             }
             if name.starts_with("v_interp_") || src_indexed || dst_indexed {
@@ -1032,6 +1199,176 @@ fn add_regs(op: &Operand, lanes: u8, out: &mut Vec<Reg>) -> Result<(), ()> {
 mod tests {
     use super::*;
 
+    fn reference_postorder(blocks: &[Block]) -> Vec<usize> {
+        let mut seen = vec![false; blocks.len()];
+        let mut post = Vec::with_capacity(blocks.len());
+        let mut stack = vec![(0, 0)];
+        seen[0] = true;
+        while let Some(top) = stack.last_mut() {
+            let (b, i) = *top;
+            top.1 += 1;
+            match blocks[b].exit.successors().get(i) {
+                Some(&s) if !seen[s] => {
+                    seen[s] = true;
+                    stack.push((s, 0));
+                }
+                Some(_) => {}
+                None => {
+                    post.push(b);
+                    stack.pop();
+                }
+            }
+        }
+        post.reverse();
+        post
+    }
+
+
+    #[test]
+    fn cfg_successors_preserve_order() {
+        for exit in [
+            Exit::End,
+            Exit::Indirect,
+            Exit::Jump(3),
+            Exit::Branch {
+                taken: 7,
+                not_taken: 2,
+            },
+            Exit::Branch {
+                taken: 4,
+                not_taken: 4,
+            },
+        ] {
+            assert_eq!(
+                exit.successor_iter().collect::<Vec<_>>(),
+                exit.successors()
+            );
+        }
+    }
+
+    fn synthetic_cfg(diamonds: usize) -> Vec<Block> {
+        let block = |exit| Block {
+            offset: 0,
+            preds: Vec::new(),
+            phis: Vec::new(),
+            insts: Vec::new(),
+            exit,
+        };
+
+        let mut blocks = Vec::new();
+
+        for i in 0..diamonds {
+            let base = i * 3;
+
+            blocks.push(block(Exit::Branch {
+                taken: base + 1,
+                not_taken: base + 2,
+            }));
+
+            blocks.push(block(Exit::Jump(base + 3)));
+
+            let exit = if i % 5 == 0 {
+                Exit::Branch {
+                    taken: base,
+                    not_taken: base + 3,
+                }
+            } else {
+                Exit::Jump(base + 3)
+            };
+
+            blocks.push(block(exit));
+        }
+
+        blocks.push(block(Exit::End));
+
+        // Unreachable block.
+        blocks.push(block(Exit::Jump(diamonds * 3 + 1)));
+
+        blocks
+    }
+
+    #[test]
+    fn cfg_postorder_matches_reference() {
+        for count in [0, 1, 2, 16, 128, 2048] {
+            let blocks = synthetic_cfg(count);
+
+            let expected = reference_postorder(&blocks);
+            let actual = reverse_postorder(&blocks);
+
+            assert_eq!(actual, expected);
+            assert_eq!(actual.len(), count * 3 + 1);
+        }
+    }
+
+    #[test]
+    #[ignore = "synthetic release microbenchmark"]
+    fn cfg_postorder_benchmark() {
+        use std::hint::black_box;
+        use std::time::Instant;
+
+        fn measure(
+            blocks: &[Block],
+            run: impl Fn(&[Block]) -> Vec<usize>,
+        ) -> f64 {
+            let start = Instant::now();
+
+            for _ in 0..128 {
+                black_box(run(black_box(blocks)));
+            }
+
+            start.elapsed().as_secs_f64() * 1000.0
+        }
+
+        for count in [256, 2048, 8192] {
+            let blocks = synthetic_cfg(count);
+
+            assert_eq!(
+                reference_postorder(&blocks),
+                reverse_postorder(&blocks)
+            );
+
+            black_box(measure(&blocks, reference_postorder));
+            black_box(measure(&blocks, reverse_postorder));
+
+            let mut original = Vec::new();
+            let mut candidate = Vec::new();
+
+            for round in 0..5 {
+                let (a, b) = if round % 2 == 0 {
+                    let a = measure(&blocks, reference_postorder);
+                    let b = measure(&blocks, reverse_postorder);
+                    (a, b)
+                } else {
+                    let b = measure(&blocks, reverse_postorder);
+                    let a = measure(&blocks, reference_postorder);
+                    (a, b)
+                };
+
+                original.push(a);
+                candidate.push(b);
+
+                println!(
+                    "blocks={} round={round}: \
+                    original={a:.3}ms candidate={b:.3}ms",
+                    blocks.len()
+                );
+            }
+
+            original.sort_by(f64::total_cmp);
+            candidate.sort_by(f64::total_cmp);
+
+            println!(
+                "MEDIAN blocks={}: \
+                 original={:.3}ms candidate={:.3}ms \
+                 speedup={:.3}x",
+                blocks.len(),
+                original[2],
+                candidate[2],
+                original[2] / candidate[2]
+            );
+        }
+    }
+
     const S_ENDPGM: u32 = 0xBF81_0000;
 
     fn build_words(words: &[u32], wave64: bool) -> Program {
@@ -1041,6 +1378,73 @@ mod tests {
 
     fn input(p: &Program, reg: Reg) -> Value {
         p.inputs.iter().find(|i| i.0 == reg).expect("input").1
+    }
+
+    /// A compute program whose root arguments are in the spill table `s[0:1]`
+    /// points to: the loads become copies of the user SGPRs the dwords stand for.
+    #[test]
+    fn spill_table_loads_read_user_sgprs() {
+        let code: Vec<u8> = [
+            0xBE82_0300u32, // s_mov_b32 s2, s0
+            0x8703_FF01,    // s_and_b32 s3, s1, lit
+            0x0000_00FF,    //   0xff
+            0xF408_0201,    // s_load_dwordx4 s[8:11], s[2:3], 0x10
+            0xFA00_0010,
+            0xBE86_0308, // s_mov_b32 s6, s8
+            S_ENDPGM,
+        ]
+        .iter()
+        .flat_map(|w| w.to_le_bytes())
+        .collect();
+        let plain = build_with(&code, false, 256, false).unwrap();
+        assert!(
+            plain
+                .blocks
+                .iter()
+                .flat_map(|b| &b.insts)
+                .any(|i| i.name() == "s_load_dwordx4")
+        );
+        let p = build_with(&code, false, 256, true).unwrap();
+        let insts: Vec<_> = p.blocks.iter().flat_map(|b| &b.insts).collect();
+        assert!(!insts.iter().any(|i| i.name().starts_with("s_load")));
+        // Table dwords 4..8 are user SGPRs 20..24.
+        for k in 0..4 {
+            assert!(
+                p.inputs.iter().any(|i| i.0 == Reg::S(20 + k)),
+                "s{} read",
+                20 + k
+            );
+        }
+        assert_eq!(
+            insts.iter().filter(|i| i.name() == "s_mov_b32").count(),
+            1 + 4 + 1
+        );
+    }
+
+    /// Loads from a pointer that is not the spill table stay loads.
+    #[test]
+    fn spill_table_leaves_other_loads() {
+        let code: Vec<u8> = [
+            0xF408_0A00u32, // s_load_dwordx4 s[8:11], s[0:1], 0 (s0:1 not yet copied: tagged)
+            0xFA00_0000,
+            0xBE82_0380, // s_mov_b32 s2, 0
+            0xF408_0201, // s_load_dwordx4 s[8:11], s[2:3], 0 (s2 overwritten)
+            0xFA00_0000,
+            S_ENDPGM,
+        ]
+        .iter()
+        .flat_map(|w| w.to_le_bytes())
+        .collect();
+        let p = build_with(&code, false, 256, true).unwrap();
+        let loads = p
+            .blocks
+            .iter()
+            .flat_map(|b| &b.insts)
+            .filter(|i| i.name().starts_with("s_load"))
+            .count();
+        // The first load is from s[0:1] itself, so it is rewritten; the second
+        // reads a pointer the program overwrote, so it stays.
+        assert_eq!(loads, 1);
     }
 
     #[test]
@@ -1149,6 +1553,46 @@ mod tests {
         assert_eq!(add.read(Reg::S(0)), Some(phi.value));
         assert_eq!(b1.insts[1].read(Reg::S(0)), add.write(Reg::S(0)));
         assert_eq!(b2.insts[0].name(), "s_endpgm");
+    }
+
+    #[test]
+    fn loops_can_branch_to_offset_zero() {
+        let p = build_words(
+            &[
+                0x8000_8100, // 0: s_add_u32 s0, s0, 1
+                0xBF07_8400, // s_cmp_lg_u32 s0, 4
+                0xBF85_FFFD, // s_cbranch_scc1 -> 0
+                S_ENDPGM,
+            ],
+            false,
+        );
+        let [entry, header, end] = &p.blocks[..] else {
+            panic!("{:?}", p.blocks);
+        };
+        assert!(entry.preds.is_empty());
+        assert!(entry.insts.is_empty());
+        assert_eq!(entry.exit, Exit::Jump(1));
+        assert_eq!(header.offset, 0);
+        assert_eq!(header.preds, [0, 1]);
+        assert_eq!(
+            header.exit,
+            Exit::Branch {
+                taken: 1,
+                not_taken: 2,
+            }
+        );
+        assert_eq!(end.exit, Exit::End);
+        let [phi] = &header.phis[..] else {
+            panic!("{:?}", header.phis);
+        };
+        let add = &header.insts[0];
+        assert_eq!(phi.reg, Reg::S(0));
+        assert_eq!(
+            phi.args,
+            [input(&p, Reg::S(0)), add.write(Reg::S(0)).unwrap()]
+        );
+        assert_eq!(add.read(Reg::S(0)), Some(phi.value));
+        assert!(crate::structure::structure(&p).is_ok());
     }
 
     #[test]

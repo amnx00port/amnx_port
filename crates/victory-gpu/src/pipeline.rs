@@ -78,9 +78,16 @@ static SHADERS: Mutex<Option<HashMap<[u8; 32], Arc<Shader>>>> = Mutex::new(None)
 fn shader(stage: &'static str, bytes: &[u8]) -> Arc<Shader> {
     let full = blake3::hash(bytes);
     let mut shaders = SHADERS.lock().unwrap_or_else(|e| e.into_inner());
-    shaders
+    let entry = shaders
         .get_or_insert_with(HashMap::new)
-        .entry(*full.as_bytes())
+        .entry(*full.as_bytes());
+    if matches!(entry, std::collections::hash_map::Entry::Occupied(_)) {
+        victory_profile::cache!("shader", "containers", Hit);
+    } else {
+        victory_profile::cache!("shader", "containers", Miss);
+        victory_profile::resident!("shader", "containers", bytes.len());
+    }
+    entry
         .or_insert_with(|| {
             Arc::new(Shader {
                 stage,
@@ -107,7 +114,20 @@ impl Shader {
     pub(crate) fn translated(&self) -> Option<&Translated> {
         self.translated
             .get_or_init(|| {
+                victory_profile::scope!("shader", "translate", self.container.len());
                 let done = translate(&self.container);
+                // Diagnostics: `VICTORY_SHADER_DUMP=<dir>` keeps each
+                // container and its DXIL as `<hash>.bin` / `<hash>.dxil`.
+                #[cfg(feature = "diagnostics")]
+                if let Some(dir) = std::env::var_os("VICTORY_SHADER_DUMP") {
+                    let dir = std::path::PathBuf::from(dir);
+                    let _ = std::fs::create_dir_all(&dir);
+                    let _ = std::fs::write(dir.join(format!("{}.bin", self.hash)), &self.container);
+                    if let Ok(t) = &done {
+                        let _ =
+                            std::fs::write(dir.join(format!("{}.dxil", self.hash)), &t.host.dxil);
+                    }
+                }
                 match &done {
                     Ok(t) => tracing::info!(
                         stage = self.stage,
@@ -198,7 +218,15 @@ pub(crate) fn host_pipeline<'a>(this: This) -> Option<&'a host::HostPipeline> {
     if this.is_null() {
         return None;
     }
-    make::ready(&pipeline(this).host)
+    let p = pipeline(this);
+    if victory_profile::on() {
+        if make::is_made(&p.host) {
+            victory_profile::cache!("gpu", "host pipelines", Hit);
+        } else {
+            victory_profile::cache!("gpu", "host pipelines", Miss);
+        }
+    }
+    make::ready(&p.host)
 }
 
 /// Host pipelines queued and not made yet.
@@ -283,7 +311,9 @@ pub(crate) fn note_why(why: String) {
 pub(crate) fn take_drops() -> Vec<(String, u64)> {
     let drops = DROPS.lock().unwrap_or_else(|e| e.into_inner()).take();
     let mut drops: Vec<(String, u64)> = drops.into_iter().flatten().collect();
-    drops.sort_by_key(|d| std::cmp::Reverse(d.1));
+    // Frame reports only show the first 40 reasons. Keep ties ordered so
+    // a HashMap iteration order change cannot change which reasons appear.
+    drops.sort_unstable_by(|a, b| b.1.cmp(&a.1).then_with(|| a.0.cmp(&b.0)));
     drops
 }
 
@@ -620,3 +650,6 @@ mod tests {
         }
     }
 }
+
+#[cfg(all(test, windows))]
+mod depth_bounds_test;

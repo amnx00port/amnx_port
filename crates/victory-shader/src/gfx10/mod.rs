@@ -183,11 +183,16 @@ fn far_jump<'a>(
             (Encoding::Sop1, Some("s_getpc_b64")) if sdst == n => {
                 let Some(delta) = delta else { break };
                 // s_getpc_b64 yields the address of the instruction after it.
-                return usize::try_from(prev.offset as i64 + 4 + delta)
+                let target = usize::try_from(prev.offset as i64 + 4 + delta)
                     .ok()
                     .filter(|&t| t < len)
-                    .map(Some)
-                    .ok_or(isa(setpc.offset, "far jump target outside the code"));
+                    .ok_or(isa(setpc.offset, "far jump target outside the code"))?;
+                // Instructions are dword aligned; a literal that is not a
+                // multiple of 4 would decode from the middle of a dword.
+                if !target.is_multiple_of(4) {
+                    return Err(isa(setpc.offset, "far jump target is not dword aligned"));
+                }
+                return Ok(Some(target));
             }
             _ => {}
         }
@@ -290,36 +295,43 @@ fn instruction(code: &[u8], offset: usize) -> Result<Instruction, ShaderError> {
     })
 }
 
+impl Encoding {
+    fn table(self) -> &'static [(u16, &'static str)] {
+        use opcodes as t;
+        match self {
+            Self::Sop2 => t::SOP2,
+            Self::Sopk => t::SOPK,
+            Self::Sop1 => t::SOP1,
+            Self::Sopc => t::SOPC,
+            Self::Sopp => t::SOPP,
+            Self::Smem => t::SMEM,
+            Self::Vop2 => t::VOP2,
+            Self::Vop1 => t::VOP1,
+            Self::Vopc => t::VOPC,
+            Self::Vop3 => t::VOP3,
+            Self::Vop3p => t::VOP3P,
+            Self::Vintrp => t::VINTRP,
+            Self::Ds => t::DS,
+            Self::Mubuf => t::MUBUF,
+            Self::Mtbuf => t::MTBUF,
+            Self::Mimg => t::MIMG,
+            Self::Exp => &[(0, "exp")],
+            Self::Flat => t::FLAT,
+            Self::Global => t::GLOBAL,
+            Self::Scratch => t::SCRATCH,
+        }
+    }
+}
+
 fn name(encoding: Encoding, opcode: u16) -> Option<&'static str> {
-    use opcodes as t;
-    let (table, op) = match encoding {
-        Encoding::Sop2 => (t::SOP2, opcode),
-        Encoding::Sopk => (t::SOPK, opcode),
-        Encoding::Sop1 => (t::SOP1, opcode),
-        Encoding::Sopc => (t::SOPC, opcode),
-        Encoding::Sopp => (t::SOPP, opcode),
-        Encoding::Smem => (t::SMEM, opcode),
-        Encoding::Vop2 => (t::VOP2, opcode),
-        Encoding::Vop1 => (t::VOP1, opcode),
-        Encoding::Vopc => (t::VOPC, opcode),
-        // VOP3 also encodes the VOPC, VOP2 and VOP1 opcodes at fixed bases.
-        Encoding::Vop3 => match opcode {
-            0x000..0x100 => (t::VOPC, opcode),
-            0x100..0x140 => (t::VOP2, opcode - 0x100),
-            0x180..0x200 => (t::VOP1, opcode - 0x180),
-            _ => (t::VOP3, opcode),
-        },
-        Encoding::Vop3p => (t::VOP3P, opcode),
-        Encoding::Vintrp => (t::VINTRP, opcode),
-        Encoding::Ds => (t::DS, opcode),
-        Encoding::Mubuf => (t::MUBUF, opcode),
-        Encoding::Mtbuf => (t::MTBUF, opcode),
-        Encoding::Mimg => (t::MIMG, opcode),
-        Encoding::Exp => return Some("exp"),
-        Encoding::Flat => (t::FLAT, opcode),
-        Encoding::Global => (t::GLOBAL, opcode),
-        Encoding::Scratch => (t::SCRATCH, opcode),
+    // VOP3 also encodes the VOPC, VOP2 and VOP1 opcodes at fixed bases.
+    let (encoding, op) = match (encoding, opcode) {
+        (Encoding::Vop3, 0x000..0x100) => (Encoding::Vopc, opcode),
+        (Encoding::Vop3, 0x100..0x140) => (Encoding::Vop2, opcode - 0x100),
+        (Encoding::Vop3, 0x180..0x200) => (Encoding::Vop1, opcode - 0x180),
+        _ => (encoding, opcode),
     };
+    let table = encoding.table();
     table
         .binary_search_by_key(&op, |&(o, _)| o)
         .ok()
@@ -331,18 +343,34 @@ fn isa(offset: usize, reason: &'static str) -> ShaderError {
 }
 
 #[cfg(test)]
-mod tests {
-    use super::*;
+pub(crate) mod test_asm {
+    use super::Encoding;
 
-    const S_ENDPGM: u32 = 0xBF81_0000;
+    pub const S_ENDPGM: u32 = 0xBF81_0000;
     /// s_branch / s_cbranch_scc0 with a dword offset relative to the next instruction.
-    const fn sopp(op: u32, simm16: i16) -> u32 {
+    pub const fn sopp(op: u32, simm16: i16) -> u32 {
         0xBF80_0000 | op << 16 | simm16 as u16 as u32
     }
 
-    fn bytes(words: &[u32]) -> Vec<u8> {
+    pub fn bytes(words: &[u32]) -> Vec<u8> {
         words.iter().flat_map(|w| w.to_le_bytes()).collect()
     }
+
+    pub const ENCODINGS: &[Encoding] = &[
+        Encoding::Sop2, Encoding::Sopk, Encoding::Sop1, Encoding::Sopc, Encoding::Sopp,
+        Encoding::Smem, Encoding::Vop2, Encoding::Vop1, Encoding::Vopc, Encoding::Vop3,
+        Encoding::Vop3p, Encoding::Vintrp, Encoding::Ds, Encoding::Mubuf, Encoding::Mtbuf,
+        Encoding::Mimg, Encoding::Exp, Encoding::Flat, Encoding::Global, Encoding::Scratch,
+    ];
+
+    pub fn opcodes() -> impl Iterator<Item = (Encoding, u16, &'static str)> {
+        ENCODINGS.iter().flat_map(|&e| e.table().iter().map(move |&(op, name)| (e, op, name)))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{test_asm::*, *};
 
     fn summary(code: &[u32]) -> Vec<(usize, usize, &'static str)> {
         decode(&bytes(code))
@@ -354,27 +382,7 @@ mod tests {
 
     #[test]
     fn tables_are_sorted() {
-        for t in [
-            opcodes::SOP2,
-            opcodes::SOPK,
-            opcodes::SOP1,
-            opcodes::SOPC,
-            opcodes::SOPP,
-            opcodes::SMEM,
-            opcodes::VOP2,
-            opcodes::VOP1,
-            opcodes::VOPC,
-            opcodes::VOP3,
-            opcodes::VOP3P,
-            opcodes::VINTRP,
-            opcodes::DS,
-            opcodes::MUBUF,
-            opcodes::MTBUF,
-            opcodes::MIMG,
-            opcodes::FLAT,
-            opcodes::GLOBAL,
-            opcodes::SCRATCH,
-        ] {
+        for t in ENCODINGS.iter().map(|e| e.table()) {
             assert!(t.windows(2).all(|w| w[0].0 < w[1].0));
         }
     }
@@ -406,6 +414,30 @@ mod tests {
                 (44, 1, "s_endpgm"),
             ]
         );
+    }
+
+    #[test]
+    fn image_address_dwords_by_form() {
+        // 2D: offset, bias and reference a dword each; 16-bit derivatives
+        // (g16 opcodes) two per dword, each direction its own; a16 packs
+        // the coordinates and the level, not the derivatives (the counts
+        // with a16 are those of LLVM's gfx10_asm_mimg.s).
+        for (op, a16, n) in [
+            (0x22u32, false, 6), // image_sample_d
+            (0x22, true, 5),     // image_sample_d, a16
+            (0x23, true, 6),     // image_sample_d_cl, a16
+            (0xA2, false, 4),    // image_sample_d_g16
+            (0xA2, true, 3),     // image_sample_d_g16, a16
+            (0xBB, false, 7),    // image_sample_c_d_cl_o_g16
+            (0x33, true, 7),     // image_sample_d_cl_o, a16
+        ] {
+            let w0 = 0xF000_0000 | (op & 0x7F) << 18 | op >> 7 | 1 << 3 | 1 << 8;
+            let d = decode(&bytes(&[w0, u32::from(a16) << 30, S_ENDPGM])).unwrap();
+            let Fields::Image { addr, .. } = d[0].fields(false) else {
+                panic!("{:?}", d[0].name())
+            };
+            assert_eq!(addr, [Operand::Vector { reg: 0, dwords: n }], "{:?}", d[0].name());
+        }
     }
 
     #[test]
@@ -492,5 +524,95 @@ mod tests {
         );
         // s_cbranch_scc0 into the literal of the s_mov_b32 at 4.
         assert!(decode(&bytes(&[sopp(0x04, 1), 0xBE80_03FF, S_ENDPGM, S_ENDPGM])).is_err());
+    }
+
+    /// The offset and reason `decode` refuses `code` with.
+    fn refused(code: &[u32]) -> (usize, &'static str) {
+        match decode(&bytes(code)) {
+            Err(ShaderError::Isa { offset, reason }) => (offset, reason),
+            other => panic!("expected an ISA error, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn each_refusal_names_its_reason_and_offset() {
+        assert_eq!(
+            decode(&[0; 6]),
+            Err(isa(6, "code size is not a multiple of 4"))
+        );
+        // s_branch +100 from the end of a one-dword program.
+        assert_eq!(
+            refused(&[sopp(0x02, 100)]),
+            (0, "branch target outside the code")
+        );
+        // s_branch -2 from offset 0: before the start of the code.
+        assert_eq!(
+            refused(&[sopp(0x02, -2), S_ENDPGM]),
+            (0, "branch target outside the code")
+        );
+        // s_call_b64 s[0:1], +100: a call follows the same range check.
+        assert_eq!(
+            refused(&[0xBB00_0064, S_ENDPGM]),
+            (0, "branch target outside the code")
+        );
+        // s_mov_b32 s0, literal with the literal missing, after a full one.
+        assert_eq!(
+            refused(&[0xBE80_03FF, 0, 0xBE80_03FF]),
+            (8, "instruction runs past the end of the code")
+        );
+        // Code that runs off the end without s_endpgm.
+        assert_eq!(
+            refused(&[0x0600_0000]),
+            (4, "instruction runs past the end of the code")
+        );
+        // A VOP3 whose second dword is missing.
+        assert_eq!(
+            refused(&[0xD54B_0000]),
+            (0, "instruction runs past the end of the code")
+        );
+        // An MTBUF reads its second dword for the opcode's high bit.
+        assert_eq!(
+            refused(&[0xE800_0000]),
+            (0, "instruction runs past the end of the code")
+        );
+        // FLAT with segment 3.
+        assert_eq!(
+            refused(&[0xDC00_C000, 0, S_ENDPGM]),
+            (0, "reserved FLAT segment")
+        );
+        assert_eq!(refused(&[0xE400_0000, 0]), (0, "unknown encoding"));
+        // s_cbranch_scc0 into the literal of the s_mov_b32 at 4.
+        assert_eq!(
+            refused(&[sopp(0x04, 1), 0xBE80_03FF, S_ENDPGM, S_ENDPGM]),
+            (8, "a branch lands inside an instruction")
+        );
+    }
+
+    #[test]
+    fn rejects_far_jumps_off_the_code_or_off_a_dword() {
+        // s_getpc_b64 s[8:9]; s_add_u32 s8, s8, lit; s_addc_u32; s_setpc_b64.
+        let jump = |literal: u32| {
+            [
+                0xBE88_1F00,
+                0x8008_FF08,
+                literal,
+                0x8209_8009,
+                0xBE80_2008,
+                S_ENDPGM,
+            ]
+        };
+        assert_eq!(summary(&jump(16)).last(), Some(&(20, 1, "s_endpgm")));
+        assert_eq!(refused(&jump(20)), (16, "far jump target outside the code"));
+        assert_eq!(
+            refused(&jump(0xFFFF_FFF0)),
+            (16, "far jump target outside the code")
+        );
+        for literal in [13, 14, 15, 17] {
+            assert_eq!(
+                refused(&jump(literal)),
+                (16, "far jump target is not dword aligned"),
+                "literal {literal}"
+            );
+        }
     }
 }

@@ -3,6 +3,7 @@
 //! Every command reads the user's own files and writes only to stdout or to
 //! the user's cache directory (outside the repository).
 
+mod agility;
 mod census;
 mod inspect;
 mod run;
@@ -78,7 +79,7 @@ enum Command {
         /// Also create a host D3D12 pipeline for each emitted shader.
         #[arg(long)]
         pipelines: bool,
-        /// Print one line per program and outcome.
+        /// Include runtime hashes and duplicate DXIL containers in the per-program listing.
         #[arg(long)]
         list: bool,
         /// Worker threads (default: every logical core).
@@ -180,6 +181,16 @@ fn show_config() -> Result<()> {
     );
     println!("game_dir    : {}", status(&cfg.game_dir));
     println!("cache_dir   : {}", cfg.cache_dir.display());
+    match agility::runtime_dir().map(|d| d.join("D3D12Core.dll")) {
+        Some(dll) if dll.exists() => println!(
+            "d3d12 sdk   : {} (version {})",
+            dll.display(),
+            agility::D3D12SDKVersion
+        ),
+        _ => println!(
+            "d3d12 sdk   : not beside the executable (needed on Windows 10: `cargo xtask agility`)"
+        ),
+    }
     for t in &cfg.test_titles {
         println!("test_title  : {}", status(&Some(t.clone())));
     }

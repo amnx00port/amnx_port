@@ -9,13 +9,14 @@ use super::container::{self, Binding, Psv, SigElement};
 pub const USER_DATA_SPACE: u32 = 0;
 /// Where immediate samplers are bound: `s<n>` in this space.
 pub const SAMPLER_SPACE: u32 = 0;
-/// Where root CBVs and SRVs are bound: `b<root parameter index>` and
-/// `t<root parameter index>` in this space.
+/// Where root CBVs, SRVs and UAVs are bound: `b<root parameter index>`,
+/// `t<root parameter index>` and `u<root parameter index>` in this space.
 pub const ROOT_CBV_SPACE: u32 = 1;
 
 /// `ShaderFlags` bits (metadata) and their `SFI0` feature bits.
 pub(crate) mod flags {
     pub const RAW_BUFFERS: u64 = 1 << 4;
+    pub const STENCIL_REF: u64 = 1 << 11;
     pub const TYPED_UAV_LOADS: u64 = 1 << 13;
     pub const WAVE_OPS: u64 = 1 << 19;
     pub const INT64: u64 = 1 << 20;
@@ -64,6 +65,8 @@ pub(crate) struct Shader {
     pub root_cbvs: Vec<(u8, V)>,
     /// Root SRVs (raw buffers) read, likewise.
     pub root_srvs: Vec<(u8, V)>,
+    /// Root UAVs (raw buffers) read and written, likewise.
+    pub root_uavs: Vec<(u8, V)>,
     pub flags: u64,
     /// A compute shader with this thread-group size.
     pub threads: Option<[u32; 3]>,
@@ -117,6 +120,7 @@ impl Shader {
             cmp_samplers: 0,
             root_cbvs: Vec::new(),
             root_srvs: Vec::new(),
+            root_uavs: Vec::new(),
             flags: 0,
             threads: None,
             wave_size: None,
@@ -232,6 +236,31 @@ impl Shader {
         h
     }
 
+    /// The handle of the root UAV (a raw buffer) of root parameter `slot`.
+    pub fn root_uav_handle(&mut self, slot: u8) -> V {
+        if let Some(&(_, h)) = self.root_uavs.iter().find(|r| r.0 == slot) {
+            return h;
+        }
+        let r = self.m.i32(u32::from(slot));
+        let bind = [r, r, self.m.i32(ROOT_CBV_SPACE), self.m.i8(1)];
+        let bind = self.m.aggregate(self.t.bind, &bind);
+        let f = self.m.bool(false);
+        let block = self.entry;
+        let h = self.op(
+            block,
+            "createHandleFromBinding",
+            Attr::ReadNone,
+            self.t.handle,
+            217,
+            &[bind, r, f],
+        );
+        // A raw buffer, as a UAV.
+        let h = self.annotate(block, h, 11 | 0x1000, 0);
+        self.flags |= flags::RAW_BUFFERS;
+        self.root_uavs.push((slot, h));
+        h
+    }
+
     /// The handle of immediate sampler `n` (a comparison sampler when its
     /// bit in `cmp_samplers` is set).
     pub fn sampler_handle(&mut self, block: usize, n: u32) -> V {
@@ -305,6 +334,7 @@ impl Shader {
             || self.samplers > 0
             || !self.root_cbvs.is_empty()
             || !self.root_srvs.is_empty()
+            || !self.root_uavs.is_empty()
         {
             let empty = self.m.md_str("");
             let mut cbvs = None;
@@ -388,6 +418,42 @@ impl Shader {
                 }
                 srvs = Some(self.m.md_node(list));
             }
+            let mut uavs = None;
+            if !self.root_uavs.is_empty() {
+                let ty = self
+                    .m
+                    .named_struct("struct.RWByteAddressBuffer", vec![self.t.i32]);
+                let p = self.m.ptr(ty);
+                let u = self.m.undef(p);
+                let no = self.m.bool(false);
+                let no = self.m.md_value(no);
+                let mut list = Vec::new();
+                for (n, (slot, _)) in self.root_uavs.clone().into_iter().enumerate() {
+                    // Shape, then: globally coherent, a counter, a
+                    // rasterizer-ordered view.
+                    let ops = vec![
+                        Some(i32c(&mut self, n as u32)),
+                        Some(self.m.md_value(u)),
+                        Some(empty),
+                        Some(i32c(&mut self, ROOT_CBV_SPACE)),
+                        Some(i32c(&mut self, u32::from(slot))),
+                        Some(i32c(&mut self, 1)),
+                        Some(i32c(&mut self, 11)),
+                        Some(no),
+                        Some(no),
+                        Some(no),
+                        None,
+                    ];
+                    list.push(Some(self.m.md_node(ops)));
+                    bindings.push(Binding {
+                        kind: 7,
+                        space: ROOT_CBV_SPACE,
+                        register: u32::from(slot),
+                        dxil_kind: 11,
+                    });
+                }
+                uavs = Some(self.m.md_node(list));
+            }
             let mut samplers = None;
             if self.samplers > 0 {
                 let ty = self.m.named_struct("struct.SamplerState", vec![self.t.i32]);
@@ -417,12 +483,14 @@ impl Shader {
                 }
                 samplers = Some(self.m.md_node(list));
             }
-            resources = Some(self.m.md_node(vec![srvs, None, cbvs, samplers]));
-            // PSV0 lists them as the module does: CBVs, samplers, SRVs.
+            resources = Some(self.m.md_node(vec![srvs, uavs, cbvs, samplers]));
+            // PSV0 lists them as the module does: CBVs, samplers, SRVs,
+            // UAVs.
             bindings.sort_by_key(|b| match b.kind {
                 2 => 0,
                 1 => 1,
-                _ => 2,
+                4 => 2,
+                _ => 3,
             });
         }
         if let Some(r) = resources {
@@ -471,6 +539,10 @@ impl Shader {
         } else {
             None
         };
+        // A pixel shader with an SV_StencilRef output (as DXC collects it).
+        if self.pixel && self.outputs.iter().any(|o| o.kind == 20) {
+            self.flags |= flags::STENCIL_REF;
+        }
         // Entry properties: shader flags (tag 0), thread-group size (4),
         // wave size (11).
         let mut props = Vec::new();
@@ -549,6 +621,9 @@ impl Shader {
         dxil.extend(&bitcode);
 
         let mut features = 0u64;
+        if self.flags & flags::STENCIL_REF != 0 {
+            features |= 0x200;
+        }
         if self.flags & flags::TYPED_UAV_LOADS != 0 {
             features |= 0x800;
         }

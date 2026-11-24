@@ -117,11 +117,11 @@ pub(crate) fn signature(elements: &[SigElement], input: bool) -> Vec<u8> {
 /// A resource bound by register, as `PSV0` lists it.
 #[derive(Debug, Clone, Copy)]
 pub(crate) struct Binding {
-    /// PSV resource type: 1 sampler, 2 CBV.
+    /// PSV resource type: 1 sampler, 2 CBV, 4 raw SRV, 7 raw UAV.
     pub kind: u32,
     pub space: u32,
     pub register: u32,
-    /// DXIL resource kind (13 cbuffer, 14 sampler).
+    /// DXIL resource kind (11 raw buffer, 13 cbuffer, 14 sampler).
     pub dxil_kind: u32,
 }
 
@@ -161,6 +161,15 @@ pub(crate) fn psv(p: &Psv) -> Vec<u8> {
     u32s(&mut out, &[48]);
     let mut info = [0u8; 48];
     info[0] = u8::from(p.flag);
+    if p.stage == 0 {
+        // PSInfo.SampleFrequency: an input interpolated per sample, or the
+        // sample index.
+        info[1] = u8::from(
+            p.inputs
+                .iter()
+                .any(|e| matches!(e.interp, 6 | 7) || e.kind == 12),
+        );
+    }
     let (min, max) = p.wave_size.map_or((0, u32::MAX), |n| (n, n));
     info[16..20].copy_from_slice(&min.to_le_bytes());
     info[20..24].copy_from_slice(&max.to_le_bytes());

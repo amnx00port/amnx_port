@@ -1,0 +1,25 @@
+[package]
+name = "victory-profile"
+description = "Opt-in profiling: frame times, timed scopes, caches, loads and memory, logged and written to files."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+publish.workspace = true
+
+[dependencies]
+victory-core.workspace = true
+tracing.workspace = true
+
+[target.'cfg(windows)'.dependencies]
+windows-sys = { workspace = true, features = [
+    "Win32_Foundation",
+    "Win32_System_ProcessStatus",
+    "Win32_System_Threading",
+] }
+
+[dev-dependencies]
+tempfile.workspace = true
+
+[lints]
+workspace = true

@@ -1,0 +1,28 @@
+name: Windows integration
+
+on:
+  push:
+    branches: [pr-integration]
+
+permissions:
+  contents: read
+
+jobs:
+  windows:
+    name: Windows workspace
+    runs-on: windows-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v5
+        with:
+          persist-credentials: false
+      - name: Install the repository toolchain
+        run: rustup toolchain install
+      - name: Check all targets and features
+        run: cargo check --workspace --all-targets --all-features --locked
+      - name: Check the asset policy
+        run: cargo xtask policy
+      - name: Run workspace tests
+        env:
+          VICTORY_WARP: '1'
+        run: cargo test --workspace --locked -- --test-threads=1

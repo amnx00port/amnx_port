@@ -359,14 +359,24 @@ fn take<T>(handle: *mut T) {
         drop(unsafe { Box::from_raw(handle) });
     }
 }
+/// Nulls a handle the title asked for before anything can fail: the GDK
+/// documents these as null on failure (`_Outptr_result_nullonfailure_`),
+/// and titles close whatever handle they hold, without checking that the
+/// call that should have given it worked.
+fn clear<T>(out: *mut *mut T) {
+    let _ = put(out, std::ptr::null_mut());
+}
 
 impl Provider {
     /// The provider for the only user and `config` (the service
-    /// configuration id), under `saves`.
+    /// configuration id), under `saves`. An empty id names no
+    /// configuration, like none: as a folder name it would be the user's
+    /// folder itself, where the other configurations' folders are.
     fn open(saves: &Path, config: Option<&str>) -> Result<Provider, HRESULT> {
+        let config = config.filter(|c| !c.is_empty()).unwrap_or("default");
         let root = saves
             .join(format!("{:016X}", xuser::XUID))
-            .join(file_name(config.unwrap_or("default")));
+            .join(file_name(config));
         std::fs::create_dir_all(&root).map_err(|_| NO_ACCESS)?;
         let _saves = saves_lock();
         containers(&root); // converts old containers now
@@ -618,6 +628,7 @@ extern "system" fn initialize_result(
     block: *mut AsyncBlock,
     out: *mut *mut Provider,
 ) -> HRESULT {
+    clear(out);
     xasync::result(block, (&raw const INIT).cast(), out)
 }
 extern "system" fn close_provider(_: This, provider: *mut Provider) {
@@ -695,6 +706,7 @@ extern "system" fn create_container(
     name: *const c_char,
     out: *mut *mut Container,
 ) -> HRESULT {
+    clear(out);
     let (Some(p), Some(name)) = (get(provider), text(name)) else {
         return E_INVALIDARG;
     };
@@ -814,6 +826,7 @@ extern "system" fn create_update(
     display: *const c_char,
     out: *mut *mut Update,
 ) -> HRESULT {
+    clear(out);
     let Some(c) = get(container) else {
         return E_INVALIDARG;
     };
@@ -1106,6 +1119,67 @@ mod tests {
         );
         let v = current_named(&c.dir, "Player").unwrap().unwrap();
         assert_eq!((v.number, v.display.as_str()), (1, "Chapter 1"));
+    }
+
+    /// An empty configuration id names none. As a folder name it would be
+    /// the folder every configuration lives in, whose folders then look
+    /// like containers of the old layout and are converted away.
+    #[test]
+    fn an_empty_configuration_id_is_the_default_one() {
+        let saves = tempfile::tempdir().unwrap();
+        let scid = Provider::open(saves.path(), Some("scid")).unwrap();
+        assert_eq!(update(&scid.root, "one", &[("a", Some("kept"))]), S_OK);
+        let kept = Some(("one".into(), vec![("a".into(), "kept".into())]));
+        assert_eq!(state(&scid.root), kept);
+
+        let empty = Provider::open(saves.path(), Some("")).unwrap();
+        assert!(scid.root.is_dir(), "another configuration's saves are gone");
+        assert_eq!(state(&scid.root), kept);
+        let default = Provider::open(saves.path(), None).unwrap();
+        assert_eq!(empty.root, default.root);
+
+        // Named configurations stay apart, from it and from each other.
+        assert_ne!(empty.root, scid.root);
+        assert_eq!(state(&empty.root), None);
+        let other = Provider::open(saves.path(), Some("other")).unwrap();
+        assert_eq!(state(&other.root), None);
+        assert_eq!(state(&scid.root), kept);
+    }
+
+    #[test]
+    fn a_failed_create_leaves_a_null_handle() {
+        let this: This = &OBJECT;
+        let saves = tempfile::tempdir().unwrap();
+        let provider = give(Provider::open(saves.path(), Some("scid")).unwrap());
+        // What an uninitialized handle variable may hold.
+        fn garbage<T>() -> *mut T {
+            std::ptr::without_provenance_mut(0x1234)
+        }
+
+        let mut container = garbage();
+        let bad = c"bad name".as_ptr();
+        let hr = create_container(this, provider, bad, &mut container);
+        assert_eq!(hr, INVALID_CONTAINER_NAME);
+        assert!(container.is_null());
+
+        let mut update = garbage();
+        let hr = create_update(this, std::ptr::null(), c"x".as_ptr(), &mut update);
+        assert_eq!(hr, E_INVALIDARG);
+        assert!(update.is_null());
+
+        // A provider that could not be opened (its folder could not be made).
+        let mut b = block();
+        xasync::finished_with(&mut b, (&raw const INIT).cast(), Err(NO_ACCESS));
+        let mut opened = garbage();
+        let hr = initialize_result(this, &mut b, &mut opened);
+        assert_eq!(hr, NO_ACCESS);
+        assert!(opened.is_null());
+
+        // So closing what the title holds, as it does, is harmless.
+        close_container(this, container);
+        close_update(this, update);
+        close_provider(this, opened);
+        close_provider(this, provider);
     }
 
     #[test]

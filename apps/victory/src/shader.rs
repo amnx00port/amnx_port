@@ -38,16 +38,22 @@ impl Source<'_> {
 /// The packed records of SGD5 data, and every container stored as is (the
 /// executable keeps some records uncompressed), found by its magic.
 pub(crate) fn sources(data: &[u8]) -> Vec<Source<'_>> {
-    let mut out: Vec<Source<'_>> = Vec::new();
-    if sgd5::is_sgd5(data) {
-        out.extend(sgd5::records(data).map(Source::Packed));
-    }
+    let records: Vec<_> = if sgd5::is_sgd5(data) {
+        sgd5::records(data).collect()
+    } else {
+        Vec::new()
+    };
+    // A container stored as is inside a record's packed bytes (deflate
+    // stored blocks) is that record's, already counted.
     let raw = memchr::memmem::find_iter(data, b"DXBC")
+        .filter(|&offset| !sgd5::in_record(&records, offset))
         .filter(|&offset| Container::parse(&data[offset..]).is_ok())
         .map(|offset| Source::Raw {
             offset,
             data: &data[offset..],
-        });
+        })
+        .collect::<Vec<_>>();
+    let mut out: Vec<Source<'_>> = records.into_iter().map(Source::Packed).collect();
     out.extend(raw);
     out
 }
@@ -113,6 +119,11 @@ pub fn run(paths: Vec<PathBuf>, verbose: bool, disasm: bool) -> Result<()> {
                         for n in &programs {
                             *t.native_stages.entry(n.stage).or_default() += 1;
                             list.push(format!("{:?} {} B", n.stage, n.code.len()));
+                            if disasm {
+                                listing.push(format!("    {:?} stage I/O: {:?}", n.stage, n.io));
+                                listing.extend(n.layout.iter().map(|p| format!("    {p:?}")));
+                                listing.extend(n.used.iter().map(|u| format!("    {u:?}")));
+                            }
                             match gfx10::decode(&n.code) {
                                 Ok(insts) => {
                                     t.decoded += 1;
@@ -122,9 +133,6 @@ pub fn run(paths: Vec<PathBuf>, verbose: bool, disasm: bool) -> Result<()> {
                                         *t.unnamed.entry(key).or_default() += 1;
                                     }
                                     if disasm {
-                                        listing
-                                            .extend(n.layout.iter().map(|p| format!("    {p:?}")));
-                                        listing.extend(n.used.iter().map(|u| format!("    {u:?}")));
                                         listing.extend(
                                             insts.iter().map(|i| format_instruction(i, n.wave64)),
                                         );

@@ -5,8 +5,8 @@
 //! user data the translated shaders read, the host copies of the buffers
 //! and descriptors they read, and the states of the textures involved.
 //! State the host keeps across draws (viewports, scissors, blend factor,
-//! stencil reference, topology, targets) is set on the host list as the
-//! title sets it.
+//! stencil reference, depth bounds, topology, targets) is set on the host
+//! list as the title sets it.
 
 use std::sync::atomic::{AtomicU64, Ordering};
 
@@ -64,6 +64,8 @@ pub(crate) struct State {
     /// Bound render target and depth resources, for their host states.
     targets: Vec<usize>,
     depth: usize,
+    /// None leaves the host list's default bounds (0..1) in place.
+    depth_bounds: Option<(f32, f32)>,
     /// The title's primitive topology (the host's may differ).
     topology: u32,
     /// What the host list has: pipeline, root signature, heaps.
@@ -325,6 +327,21 @@ impl State {
             .find(|h| h.index(handle).is_some())
     }
 
+    pub(crate) fn set_depth_bounds(&mut self, list: &HostList, min: f32, max: f32) {
+        self.depth_bounds = Some((min, max));
+        if list.depth_bounds.is_none() {
+            crate::host::warn_depth_bounds();
+        }
+        self.apply_depth_bounds(list);
+    }
+
+    fn apply_depth_bounds(&self, list: &HostList) {
+        if let (Some(list), Some((min, max))) = (&list.depth_bounds, self.depth_bounds) {
+            // SAFETY: the host supports depth bounds and the list is open.
+            unsafe { list.OMSetDepthBounds(min, max) };
+        }
+    }
+
     /// Brings the host list up to date for a draw; false if the draw cannot
     /// run on the host.
     fn prepare(&mut self, list: &HostList, indexed: bool) -> bool {
@@ -403,7 +420,7 @@ impl State {
     /// What draws and dispatches share: heaps, our root signature, the
     /// pipeline, and per stage the user data, root views and the
     /// descriptors its tables hold.
-    fn bind(&mut self, list: &HostList, p: &HostPipeline, compute: bool) {
+    pub(crate) fn bind(&mut self, list: &HostList, p: &HostPipeline, compute: bool) {
         let l = &list.list;
         // Heaps first: a root signature with directly indexed heaps must be
         // set after them.
@@ -412,8 +429,14 @@ impl State {
                 .heaps
                 .iter()
                 .filter(|&&h| h != 0)
-                .filter_map(|&h| crate::descriptor::heap(h as This).host())
-                .map(|h| Some(h.heap.clone()))
+                .filter_map(|&h| {
+                    let title = crate::descriptor::heap(h as This);
+                    let heap = title.host()?;
+                    if !title.samplers() {
+                        list.use_view_heap(heap);
+                    }
+                    Some(Some(heap.heap.clone()))
+                })
                 .collect();
             heaps.iter().flatten().for_each(|h| list.keep(h));
             // SAFETY: an open list and shader-visible heaps.
@@ -438,6 +461,10 @@ impl State {
         if self.host_pipeline != p.pso.as_raw() as usize {
             // SAFETY: an open list and a live pipeline.
             unsafe { l.SetPipelineState(&p.pso) };
+            // Also reached after the indirect clamp invalidates the pipeline.
+            if !compute {
+                self.apply_depth_bounds(list);
+            }
             self.host_pipeline = p.pso.as_raw() as usize;
             list.used_pipeline(&p.name);
             // The title may release the pipeline before it submits the list.
@@ -577,6 +604,7 @@ impl State {
             };
         if !ran {
             DROPPED.fetch_add(1, Ordering::Relaxed);
+            list.missed_draw();
             #[cfg(feature = "diagnostics")]
             dropped(self.pipeline);
         }
@@ -606,23 +634,16 @@ impl State {
         }
     }
 
-    /// The descriptors a shader reads through tables. Tables holding a
-    /// constant buffer are made afresh for the draw in dynamic slots, with
-    /// the constant data copied to upload memory when the list is
-    /// submitted: the host wants constant buffers 256-byte aligned, the
-    /// console only 16. Returns those tables' new byte offsets by root
-    /// parameter; the other tables' slots are made from the title's.
-    ///
-    /// Within a list, the same table holding the same descriptors is made
-    /// once: its constant data is copied at submission either way, and the
-    /// big tables the world binds would otherwise take hundreds of slots per
-    /// draw, wrapping the dynamic slots onto lists not yet submitted.
+    /// Gives tables with shader resources or constants slots owned by the
+    /// command list. Later title descriptor writes cannot change what a
+    /// recorded draw samples. Constants also get 256-byte-aligned storage,
+    /// filled at submission. Identical descriptors share slots within a list.
     fn tables(&mut self, list: &HostList, used: &[UsedResource], compute: bool) -> Vec<(u8, u32)> {
         let tables = |u: &&UsedResource| u.root == RootType::Table;
         let mut fresh: Vec<u8> = used
             .iter()
             .filter(tables)
-            .filter(|u| u.kind == ResourceType::Cbv)
+            .filter(|u| matches!(u.kind, ResourceType::Cbv | ResourceType::Srv))
             .map(|u| u.slot)
             .collect();
         // Tables reaching past a host heap smaller than the title's (the
@@ -674,6 +695,13 @@ impl State {
                 .map(|u| u.table_offset_dwords / 8 + 1)
                 .max()
                 .unwrap_or(1);
+            let last = table + u64::from(n - 1) * 32;
+            if heap.index(last).is_none() {
+                for u in entries {
+                    self.table_entry(list, u, compute);
+                }
+                continue;
+            }
             // The table and what its entries hold (record words).
             let key = {
                 use std::hash::{Hash, Hasher};
@@ -696,6 +724,10 @@ impl State {
                 continue;
             }
             let Some(first) = host.dynamic(n) else {
+                once!(n, "descriptor table did not fit in command-list slots");
+                for u in entries {
+                    self.table_entry(list, u, compute);
+                }
                 continue;
             };
             self.fresh_tables.insert(key, first);
@@ -830,6 +862,7 @@ impl State {
         }
         if !ran {
             DROPPED.fetch_add(1, Ordering::Relaxed);
+            list.missed_draw();
             #[cfg(feature = "diagnostics")]
             dropped(self.pipeline);
         }
@@ -917,6 +950,7 @@ impl State {
         }
         if !ran {
             DROPPED.fetch_add(1, Ordering::Relaxed);
+            list.missed_draw();
             #[cfg(feature = "diagnostics")]
             dropped(self.pipeline);
         }

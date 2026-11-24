@@ -4,9 +4,11 @@
 //! Every title import that takes a path is bound here. A path on a virtual
 //! drive (`X:\..`, `X:/..`, `X:`, `\\?\X:\..`) is rewritten to the host
 //! folder behind it and handed to the host's own function; any other path
-//! goes to the host unchanged. A rewritten narrow path goes to the wide
-//! twin, so host folders outside the ANSI code page work. Letters are
-//! chosen among those the host does not use, so no host drive is hidden.
+//! goes to the host unchanged. A rewritten narrow path goes to the host's
+//! wide twin, so host folders outside the ANSI code page work; never to our
+//! wide wrapper, which would rewrite the host path a second time when its
+//! drive letter is mounted too. Letters are chosen among those the host
+//! does not use, so no host drive is hidden.
 #![allow(non_snake_case)]
 #![allow(clippy::not_unsafe_ptr_arg_deref)]
 #![allow(clippy::too_many_arguments)]
@@ -116,21 +118,30 @@ fn verbatim(root: &[u16], tail: &[u16]) -> Vec<u16> {
     while out.last() == Some(&backslash) {
         out.pop();
     }
+    for part in parts(tail) {
+        out.push(backslash);
+        out.extend_from_slice(part);
+    }
+    out
+}
+
+const PARENT: [u16; 2] = [b'.' as u16; 2];
+
+/// The names in the title's `tail`, cleaned up as the host would on a drive
+/// of its own: no empty parts, no `.`, and `..` takes the name before it,
+/// or nothing at the root.
+fn parts(tail: &[u16]) -> Vec<&[u16]> {
     let dot = u16::from(b'.');
     let mut parts: Vec<&[u16]> = Vec::new();
     for part in tail.split(|c| SEPARATORS.contains(c)) {
         match part {
             [] => {}
             [d] if *d == dot => {}
-            [d, e] if [*d, *e] == [dot; 2] => drop(parts.pop()),
+            _ if part == PARENT => drop(parts.pop()),
             _ => parts.push(part),
         }
     }
-    for part in parts {
-        out.push(backslash);
-        out.extend_from_slice(part);
-    }
-    out
+    parts
 }
 
 /// The host path, NUL-terminated, for `path` (without its NUL) if it is on
@@ -153,6 +164,28 @@ pub(crate) fn translate(path: &[u16]) -> Option<Vec<u16>> {
     let tail = &rest[2..];
     if prefix.is_empty() && root.len() + tail.len() >= LONG {
         let mut out = verbatim(root, tail);
+        out.push(0);
+        return Some(out);
+    }
+    // The host resolves `..` against the host folder, which has a parent;
+    // to the title the root is a drive's, where `..` stops. So those are
+    // resolved here. (After `\\?\` they are names, to the host as well.)
+    let separator = |c: &u16| SEPARATORS.contains(c);
+    if prefix.is_empty() && tail.split(separator).any(|part| part == PARENT) {
+        let backslash = u16::from(b'\\');
+        let mut out = root.to_vec();
+        while out.last().is_some_and(separator) {
+            out.pop();
+        }
+        let parts = parts(tail);
+        for part in &parts {
+            out.push(backslash);
+            out.extend_from_slice(part);
+        }
+        // The root itself, and a path that ended in a separator, end in one.
+        if parts.is_empty() || tail.last().is_some_and(separator) {
+            out.push(backslash);
+        }
         out.push(0);
         return Some(out);
     }
@@ -282,15 +315,17 @@ pub extern "system" fn CreateFileA(
     template: Handle,
 ) -> Handle {
     match narrow(path) {
-        Some(p) => CreateFileW(
-            p.as_ptr(),
-            access,
-            share,
-            security,
-            disposition,
-            flags,
-            template,
-        ),
+        Some(p) => {
+            host!("kernel32.dll", "CreateFileW": extern "system" fn(*const u16, u32, u32, *const c_void, u32, u32, Handle) -> Handle)(
+                p.as_ptr(),
+                access,
+                share,
+                security,
+                disposition,
+                flags,
+                template,
+            )
+        }
         None => {
             host!("kernel32.dll", "CreateFileA": extern "system" fn(*const c_char, u32, u32, *const c_void, u32, u32, Handle) -> Handle)(
                 path,
@@ -354,7 +389,11 @@ pub extern "system" fn SetFileAttributesW(path: *const u16, attributes: u32) -> 
 
 pub extern "system" fn GetFileAttributesA(path: *const c_char) -> u32 {
     match narrow(path) {
-        Some(p) => GetFileAttributesW(p.as_ptr()),
+        Some(p) => {
+            host!("kernel32.dll", "GetFileAttributesW": extern "system" fn(*const u16) -> u32)(
+                p.as_ptr(),
+            )
+        }
         None => {
             host!("kernel32.dll", "GetFileAttributesA": extern "system" fn(*const c_char) -> u32)(
                 path,
@@ -521,14 +560,37 @@ pub extern "system" fn ReadFile(
     overlapped: *mut c_void,
 ) -> i32 {
     victory_gpu::kernel_will_write(buffer as usize, len as usize);
-    host!("kernel32.dll", "ReadFile": extern "system" fn(*mut c_void, *mut u8, u32, *mut u32, *mut c_void) -> i32)(
+    let started = victory_profile::on().then(std::time::Instant::now);
+    let done = host!("kernel32.dll", "ReadFile": extern "system" fn(*mut c_void, *mut u8, u32, *mut u32, *mut c_void) -> i32)(
         file, buffer, len, read, overlapped,
-    )
+    );
+    if let Some(started) = started {
+        let took = started.elapsed();
+        victory_profile::record!("hle", "ReadFile", len, took);
+        // Big or slow reads are loads worth naming.
+        if len >= 1 << 20 || took >= std::time::Duration::from_millis(5) {
+            victory_profile::load("file", || handle_path(file), u64::from(len), took);
+        }
+    }
+    done
+}
+
+/// For `VICTORY_PROFILE`: the path of an open file.
+fn handle_path(file: *mut c_void) -> String {
+    use windows_sys::Win32::Storage::FileSystem::GetFinalPathNameByHandleW;
+    let mut path = vec![0u16; 1024];
+    // SAFETY: a handle the title passed; a buffer of that length.
+    let n = unsafe { GetFinalPathNameByHandleW(file, path.as_mut_ptr(), path.len() as u32, 0) };
+    match usize::try_from(n) {
+        Ok(n) if n > 0 && n < path.len() => String::from_utf16_lossy(&path[..n]),
+        _ => format!("file handle {file:p}"),
+    }
 }
 
 /// The host CRT reads large requests straight into the caller's buffer.
 pub extern "C" fn fread(buffer: *mut u8, size: usize, count: usize, stream: File) -> usize {
     victory_gpu::kernel_will_write(buffer as usize, size.saturating_mul(count));
+    victory_profile::scope!("hle", "fread", size.saturating_mul(count));
     host!("ucrtbase.dll", "fread": extern "C" fn(*mut u8, usize, usize, File) -> usize)(
         buffer, size, count, stream,
     )
@@ -536,7 +598,10 @@ pub extern "C" fn fread(buffer: *mut u8, size: usize, count: usize, stream: File
 
 pub extern "C" fn fopen(path: *const c_char, mode: *const c_char) -> File {
     match narrow(path) {
-        Some(p) => _wfopen(p.as_ptr(), widen(mode).as_ptr()),
+        Some(p) => host!("ucrtbase.dll", "_wfopen": extern "C" fn(*const u16, *const u16) -> File)(
+            p.as_ptr(),
+            widen(mode).as_ptr(),
+        ),
         None => {
             host!("ucrtbase.dll", "fopen": extern "C" fn(*const c_char, *const c_char) -> File)(
                 path, mode,
@@ -547,7 +612,13 @@ pub extern "C" fn fopen(path: *const c_char, mode: *const c_char) -> File {
 
 pub extern "C" fn fopen_s(out: *mut File, path: *const c_char, mode: *const c_char) -> i32 {
     match narrow(path) {
-        Some(p) => _wfopen_s(out, p.as_ptr(), widen(mode).as_ptr()),
+        Some(p) => {
+            host!("ucrtbase.dll", "_wfopen_s": extern "C" fn(*mut File, *const u16, *const u16) -> i32)(
+                out,
+                p.as_ptr(),
+                widen(mode).as_ptr(),
+            )
+        }
         None => {
             host!("ucrtbase.dll", "fopen_s": extern "C" fn(*mut File, *const c_char, *const c_char) -> i32)(
                 out, path, mode,
@@ -640,7 +711,13 @@ extern "C" fn fiopen_wide(path: *const u16, mode: i32, protection: i32) -> File 
 /// `_Fiopen(const char* path, ios_base::openmode, int protection)`.
 extern "C" fn fiopen(path: *const c_char, mode: i32, protection: i32) -> File {
     match narrow(path) {
-        Some(p) => fiopen_wide(p.as_ptr(), mode, protection),
+        Some(p) => {
+            host!("msvcp140.dll", "?_Fiopen@std@@YAPEAU_iobuf@@PEB_WHH@Z": extern "C" fn(*const u16, i32, i32) -> File)(
+                p.as_ptr(),
+                mode,
+                protection,
+            )
+        }
         None => {
             host!("msvcp140.dll", "?_Fiopen@std@@YAPEAU_iobuf@@PEBDHH@Z": extern "C" fn(*const c_char, i32, i32) -> File)(
                 path, mode, protection,
@@ -781,6 +858,59 @@ mod tests {
         );
     }
 
+    /// To the title a virtual drive's root is a drive root, where `..`
+    /// stops; the host folder behind it has a parent.
+    #[test]
+    fn parent_parts_stop_at_the_drive_root() {
+        let dir = tempfile::tempdir().unwrap();
+        let title = dir.path().join("title");
+        std::fs::create_dir(&title).unwrap();
+        let root = title.to_string_lossy().into_owned();
+        let letter = mount(&title).unwrap();
+        // Through a call: the file lands in the drive's folder, not beside it.
+        const GENERIC_WRITE: u32 = 0x4000_0000;
+        const CREATE_ALWAYS: u32 = 2;
+        let close = host!("kernel32.dll", "CloseHandle": extern "system" fn(Handle) -> i32);
+        let null = std::ptr::null_mut();
+        let path = w(&format!(r"{letter}:\..\outside.bin"));
+        let h = CreateFileW(
+            path.as_ptr(),
+            GENERIC_WRITE,
+            0,
+            null,
+            CREATE_ALWAYS,
+            0,
+            null,
+        );
+        assert_ne!(h as isize, -1);
+        close(h);
+        assert!(!dir.path().join("outside.bin").exists(), "left the drive");
+        assert!(title.join("outside.bin").is_file());
+
+        let tr = |s: String| translate(&w(&s)[..s.encode_utf16().count()]).map(|v| text(&v));
+        for (path, host) in [
+            (r":\..\outside.bin", r"\outside.bin"),
+            (r":/../outside.bin", r"\outside.bin"),
+            (r":..\outside.bin", r"\outside.bin"),
+            (r":\a\..\..\b\c.bin", r"\b\c.bin"),
+            (r":\a\.\..\..\..\b\", r"\b\"),
+            (r":\..", r"\"),
+            // Inside the drive: the file it always named.
+            (r":\a\..\b.bin", r"\b.bin"),
+        ] {
+            assert_eq!(
+                tr(format!("{letter}{path}")),
+                Some(format!("{root}{host}")),
+                "{path}"
+            );
+        }
+        // Names that only contain dots are names.
+        assert_eq!(
+            tr(format!(r"{letter}:\a..b\..c")),
+            Some(format!(r"{root}\a..b\..c"))
+        );
+    }
+
     #[test]
     fn long_title_paths_work_on_the_host() {
         let dir = tempfile::tempdir().unwrap();
@@ -865,5 +995,54 @@ mod tests {
         assert!(!f.is_null());
         fclose(f);
         assert!(dir.path().join("plain.txt").is_file());
+    }
+
+    /// A narrow path is rewritten once, as its wide twin is. The inner
+    /// drive's folder lies on the outer virtual drive, as the title folder
+    /// does when it sits on a host `G:` drive and is mounted as `G:`. The
+    /// outer letter is no host drive, so the host finds nothing there; a
+    /// narrow call that reaches the outer folder rewrote the path twice.
+    #[test]
+    fn narrow_paths_are_rewritten_once() {
+        let dir = tempfile::tempdir().unwrap();
+        let folder = dir.path().join("inner");
+        std::fs::create_dir(&folder).unwrap();
+        std::fs::write(folder.join("present.txt"), b"").unwrap();
+        let outer = mount(dir.path()).unwrap();
+        let inner = mount(Path::new(&format!(r"{outer}:\inner"))).unwrap();
+        let path = |name: &str| format!("{inner}:/{name}\0");
+
+        const INVALID_FILE_ATTRIBUTES: u32 = u32::MAX;
+        let wide = GetFileAttributesW(w(&format!("{inner}:/present.txt")).as_ptr());
+        assert_eq!(wide, INVALID_FILE_ATTRIBUTES);
+        let narrow = GetFileAttributesA(path("present.txt").as_ptr().cast());
+        assert_eq!(narrow, wide, "GetFileAttributesA agrees with its wide twin");
+
+        const GENERIC_WRITE: u32 = 0x4000_0000;
+        const CREATE_ALWAYS: u32 = 2;
+        let null = std::ptr::null_mut();
+        let h = CreateFileA(
+            path("a.bin").as_ptr().cast(),
+            GENERIC_WRITE,
+            0,
+            null,
+            CREATE_ALWAYS,
+            0,
+            null,
+        );
+        assert_eq!(h as isize, -1);
+        assert!(fopen(path("b.txt").as_ptr().cast(), c"wb".as_ptr()).is_null());
+        let mut f: File = std::ptr::null_mut();
+        let error = fopen_s(&mut f, path("c.txt").as_ptr().cast(), c"wb".as_ptr());
+        assert_ne!(error, 0);
+        const OUT: i32 = 2;
+        assert!(fiopen(path("d.txt").as_ptr().cast(), OUT, 0x40).is_null());
+
+        // Nothing was made behind a path rewritten twice.
+        let names: Vec<_> = std::fs::read_dir(&folder)
+            .unwrap()
+            .map(|e| e.unwrap().file_name())
+            .collect();
+        assert_eq!(names, ["present.txt"]);
     }
 }

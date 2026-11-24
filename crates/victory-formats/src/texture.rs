@@ -13,7 +13,7 @@
 //! (`ComputeSurfaceInfoMacroTiled`, `ComputeThinBlockDimension`,
 //! `GetMipTailDim`, `GetMaxNumMipsInTail`, `HwlComputeSurfaceInfoLinear`,
 //! `ComputeSurfaceAddrFromCoordMacroTiled`), and the 256-byte micro tile
-//! patterns in [`MICRO`] from `gfx10SwizzlePattern.h` (the RB+ tables, as on
+//! patterns in `MICRO` from `gfx10SwizzlePattern.h` (the RB+ tables, as on
 //! RDNA2). addrlib carries this notice:
 //!
 //! Copyright (C) 2007-2026 Advanced Micro Devices, Inc. All rights reserved.
@@ -644,11 +644,19 @@ impl Layout {
         }
         let n = self.desc.element_bytes as usize;
         let bytes = m.width as usize * n;
+        let slice_bytes = (m.height as usize - 1)
+            .checked_mul(row_pitch)
+            .and_then(|offset| offset.checked_add(bytes))
+            .ok_or(Error::TooSmall)?;
+
+        // Multiple depth slices must not overwrite each other.
+        if depth > 1 && depth_pitch < slice_bytes {
+            return Err(Error::TooSmall);
+        }
+
         let need = (depth as usize - 1)
             .checked_mul(depth_pitch)
-            .zip((m.height as usize - 1).checked_mul(row_pitch))
-            .and_then(|(depth_offset, row_offset)| depth_offset.checked_add(row_offset))
-            .and_then(|offset| offset.checked_add(bytes))
+            .and_then(|offset| offset.checked_add(slice_bytes))
             .ok_or(Error::TooSmall)?;
         if tiled_len < self.size as usize || linear_len < need || row_pitch < bytes {
             return Err(Error::TooSmall);
@@ -701,8 +709,10 @@ pub struct Format {
     pub stencil: bool,
 }
 
-/// By DXGI format number. `None` for 96-bit, 1-bit, packed 4:2:2 and video
-/// formats.
+/// By DXGI format number, with the console's own numbers: 116/117 (10-bit
+/// float color), 118-120 (16-bit depth with 8-bit stencil), 189
+/// (R10G10B10_SNORM_A2_UNORM) and 190 (R4G4_UNORM). `None` for 96-bit,
+/// 1-bit, packed 4:2:2 and video formats.
 ///
 /// shortcut: those formats have no layout here; add them when a title uses
 /// one.
@@ -711,10 +721,10 @@ pub fn format(dxgi: u32) -> Option<Format> {
         1..=4 => (16, 1, false),
         9..=18 => (8, 1, false),
         19..=22 | 44..=47 => (4, 1, true),
-        23..=43 | 67 | 87..=93 | 116 | 117 => (4, 1, false),
+        23..=43 | 67 | 87..=93 | 116 | 117 | 189 => (4, 1, false),
         48..=59 | 85 | 86 | 115 => (2, 1, false),
         118..=120 => (2, 1, true),
-        60..=65 => (1, 1, false),
+        60..=65 | 190 => (1, 1, false),
         70..=72 | 79..=81 => (8, 4, false),
         73..=78 | 82..=84 | 94..=99 => (16, 4, false),
         _ => return None,
@@ -753,18 +763,41 @@ pub struct Plane {
 }
 
 /// Every data plane of a texture (depth, then stencil), placed one after
-/// the other.
-///
-/// shortcut: no compression metadata planes (HTILE, CMASK, FMASK, DCC);
-/// the console adds them to render targets and depth buffers unless the
-/// description denies them, so those are smaller here than on the console.
-/// The host GPU renders them, so nothing reads that memory; add the planes
-/// if a title sizes a pool from console sizes and runs out.
+/// the other. `size` covers the data planes only: the host GPU has no use
+/// for the console's compression metadata, and [`metadata`] sizes that
+/// memory separately for callers that reserve console-sized pools.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Texture {
     pub planes: Vec<Plane>,
     pub size: u64,
     pub alignment: u64,
+}
+
+/// The alignment and the minimum reservation for a metadata plane. The
+/// console's metadata is bank-aligned and its smallest block is 4 KiB.
+pub const METADATA_ALIGNMENT: u64 = 64 << 10;
+
+/// Bytes the console reserves for a render target's compression metadata
+/// (HTILE for depth, CMASK and DCC for color), in addition to its data
+/// planes. Only render-capable textures get any; sampled textures have no
+/// metadata to allocate.
+///
+/// The console's exact HTILE, CMASK and DCC forms depend on the GPU's pipe
+/// configuration and are not published here, so this is an upper bound:
+/// one eighth of the data for depth, one sixteenth for color, rounded up to
+/// a metadata block. A title that sizes a pool from the layout gets at
+/// least as much room as it would on the console; the host keeps rendering
+/// into the data planes with no metadata of its own.
+pub fn metadata(desc: &TextureDesc, texture: &Texture, depth: bool, render: bool) -> u64 {
+    if !render || texture.size == 0 || desc.dimension == Dimension::Tex1d {
+        return 0;
+    }
+    let divisor = if depth { 8 } else { 16 };
+    texture
+        .size
+        .checked_div(divisor)
+        .unwrap_or(0)
+        .next_multiple_of(METADATA_ALIGNMENT)
 }
 
 impl Texture {
@@ -833,6 +866,25 @@ mod tests {
         }
     }
 
+    fn texture_desc(d: &Desc) -> TextureDesc {
+        TextureDesc {
+            dimension: d.dimension,
+            width: d.width,
+            height: d.height,
+            depth_or_array: d.depth,
+            mips: d.mips,
+            format: match d.element_bytes {
+                1 => 60,
+                2 => 48,
+                8 => 9,
+                16 => 1,
+                _ => 23,
+            },
+            samples: d.samples,
+            swizzle: d.swizzle,
+        }
+    }
+
     /// Sizes past the hardware's 16384 texels per side are refused instead
     /// of overflowing the size arithmetic (found by random-input testing).
     #[test]
@@ -852,6 +904,44 @@ mod tests {
             deep.depth = u32::MAX;
             assert_eq!(Layout::new(&deep), Err(Error::Invalid));
         }
+    }
+
+    #[test]
+    fn metadata_reserves_room_only_for_render_targets() {
+        let d = desc(1920, 1080, 1, 4, Swizzle::SW_64KB_R_X);
+        let td = texture_desc(&d);
+        let t = Texture::new(&td).unwrap();
+        assert_eq!(metadata(&td, &t, false, false), 0, "a sampled texture");
+        let color = metadata(&td, &t, false, true);
+        let depth = metadata(&td, &t, true, true);
+        assert!(color > 0 && color.is_multiple_of(METADATA_ALIGNMENT));
+        assert!(depth > color, "HTILE is larger than color metadata");
+        assert_eq!(
+            depth / METADATA_ALIGNMENT,
+            (t.size / 8 + METADATA_ALIGNMENT - 1) / METADATA_ALIGNMENT
+        );
+        let one_d = texture_desc(&Desc {
+            dimension: Dimension::Tex1d,
+            ..desc(256, 1, 1, 4, Swizzle::LINEAR)
+        });
+        assert_eq!(metadata(&one_d, &Texture::new(&one_d).unwrap(), false, true), 0);
+    }
+
+    #[test]
+    fn metadata_never_overlaps_or_overflows() {
+        for (w, h, bpe) in [(1, 1, 1), (17, 9, 2), (4096, 4096, 16), (16384, 16384, 16)] {
+            let td = texture_desc(&desc(w, h, 1, bpe, Swizzle::SW_64KB_Z_X));
+            let t = Texture::new(&td).unwrap();
+            let m = metadata(&td, &t, true, true);
+            let offset = t.size.next_multiple_of(METADATA_ALIGNMENT);
+            assert!(offset >= t.size, "metadata starts after the data");
+            assert!(m > 0 && offset.checked_add(m).is_some(), "{w}x{h}");
+        }
+        // Round-up must not overflow even for an absurd reported size.
+        let huge = texture_desc(&desc(u32::MAX, 1, 1, 4, Swizzle::SW_64KB_R_X));
+        let fake = Texture { planes: Vec::new(), size: u64::MAX, alignment: 1 };
+        let m = metadata(&huge, &fake, true, true);
+        assert!(m > 0 && m.is_multiple_of(METADATA_ALIGNMENT));
     }
 
     #[test]
@@ -1010,6 +1100,50 @@ mod tests {
         assert!(!t.planes[0].layout.addressable());
     }
 
+    /// The console's own format numbers have element sizes, so their
+    /// textures get a console layout like any other.
+    #[test]
+    fn console_formats_have_layouts() {
+        let element = |bytes, stencil| {
+            Some(Format {
+                bytes,
+                block: 1,
+                stencil,
+            })
+        };
+        for (dxgi, want) in [
+            // R10G10B10_7E3_A2_FLOAT, R10G10B10_6E4_A2_FLOAT.
+            (116, element(4, false)),
+            (117, element(4, false)),
+            // D16_UNORM_S8_UINT and its typeless views: 16-bit depth, then
+            // a stencil plane.
+            (118, element(2, true)),
+            (119, element(2, true)),
+            (120, element(2, true)),
+            // R10G10B10_SNORM_A2_UNORM, R4G4_UNORM.
+            (189, element(4, false)),
+            (190, element(1, false)),
+        ] {
+            assert_eq!(format(dxgi), want, "format {dxgi}");
+            let t = Texture::new(&TextureDesc {
+                dimension: Dimension::Tex2d,
+                width: 256,
+                height: 256,
+                depth_or_array: 1,
+                mips: 0,
+                format: dxgi,
+                samples: 1,
+                swizzle: Swizzle::SW_64KB_R_X,
+            })
+            .unwrap_or_else(|e| panic!("format {dxgi}: {e:?}"));
+            assert_eq!(t.planes[0].layout.desc.element_bytes, want.unwrap().bytes);
+        }
+        // Video and 1-bit formats still have none.
+        for dxgi in [66, 103, 130] {
+            assert_eq!(format(dxgi), None, "format {dxgi}");
+        }
+    }
+
     #[test]
     fn texture_copies_reject_overflowing_pitches() {
         let layout = Layout::new(&desc(4, 2, 1, 4, Swizzle::LINEAR)).unwrap();
@@ -1023,6 +1157,81 @@ mod tests {
             layout.tile(&mut tiled, 0, 0, &linear, usize::MAX, 0),
             Err(Error::TooSmall)
         );
+    }
+
+    fn volume_pitch_layout(swizzle: Swizzle) -> Layout {
+        Layout::new(&Desc {
+            dimension: Dimension::Tex3d,
+            depth: 2,
+            ..desc(4, 2, 1, 4, swizzle)
+        })
+        .unwrap()
+    }
+
+    #[test]
+    fn depth_pitch_rejects_overlapping_detile() {
+        for swizzle in [Swizzle::LINEAR, Swizzle::SW_4KB_S] {
+            let l = volume_pitch_layout(swizzle);
+            let tiled = vec![0x42; l.size as usize];
+            let mut linear = [0xcc; 72];
+
+            for pitch in [0, 16, 35] {
+                assert_eq!(
+                    l.detile(&tiled, 0, 0, &mut linear, 20, pitch),
+                    Err(Error::TooSmall),
+                    "{swizzle:?}, pitch {pitch}"
+                );
+
+                assert_eq!(linear, [0xcc; 72]);
+            }
+        }
+    }
+
+    #[test]
+    fn depth_pitch_rejects_overlapping_tile() {
+        for swizzle in [Swizzle::LINEAR, Swizzle::SW_4KB_S] {
+            let l = volume_pitch_layout(swizzle);
+            let mut tiled = vec![0xcc; l.size as usize];
+            let linear = [0x42; 72];
+
+            for pitch in [0, 16, 35] {
+                assert_eq!(
+                    l.tile(&mut tiled, 0, 0, &linear, 20, pitch),
+                    Err(Error::TooSmall),
+                    "{swizzle:?}, pitch {pitch}"
+                );
+
+                assert!(tiled.iter().all(|&b| b == 0xcc));
+            }
+        }
+    }
+
+    #[test]
+    fn depth_pitch_accepts_exact_and_padded_slices() {
+        for swizzle in [Swizzle::LINEAR, Swizzle::SW_4KB_S] {
+            let l = volume_pitch_layout(swizzle);
+
+            for pitch in [36usize, 40, 64] {
+                let len = pitch + 36;
+                let mut tiled = vec![0; l.size as usize];
+
+                let linear: Vec<u8> = (0..len).map(|i| i as u8).collect();
+
+                let mut back = vec![0xcc; len];
+
+                l.tile(&mut tiled, 0, 0, &linear, 20, pitch).unwrap();
+
+                l.detile(&tiled, 0, 0, &mut back, 20, pitch).unwrap();
+
+                for z in 0..2 {
+                    for y in 0..2 {
+                        let start = z * pitch + y * 20;
+
+                        assert_eq!(back[start..start + 16], linear[start..start + 16]);
+                    }
+                }
+            }
+        }
     }
 
     #[test]
