@@ -30,9 +30,57 @@ pub(crate) struct HostHeap {
     /// released the resource may still be read, and a freed host resource
     /// read there is a GPU page fault (the console reads stale memory).
     kept: Mutex<Vec<Option<ID3D12Resource>>>,
-    /// Where the search for free dynamic slots starts, and which are taken
-    /// (by lists not yet reset).
-    next: Mutex<(u32, Vec<bool>)>,
+    /// Dynamic slot allocator segregating single-slot (`n == 1`) from
+    /// multi-slot table (`n > 1`) allocations until lists are reset.
+    next: Mutex<DynamicPool>,
+}
+
+/// Free-slot tracker separating top-down single-slot (`n == 1`) and bottom-up
+/// multi-slot (`n > 1`) allocations inside the dynamic descriptor range.
+struct DynamicPool {
+    /// Bottom-up search cursor for multi-slot tables (`n > 1`).
+    head: usize,
+    /// Top-down search cursor for single-slot allocations (`n == 1`) so
+    /// single-slot views do not fragment multi-slot table space.
+    tail: usize,
+    taken: Vec<bool>,
+}
+
+impl DynamicPool {
+    fn new(cap: usize) -> Self {
+        Self {
+            head: 0,
+            tail: cap,
+            taken: vec![false; cap],
+        }
+    }
+
+    fn alloc(&mut self, n: usize) -> Option<usize> {
+        if n == 0 || n > self.taken.len() {
+            return None;
+        }
+        let first = if n == 1 {
+            let slot = free_single(&self.taken, self.tail)?;
+            self.taken[slot] = true;
+            self.tail = slot;
+            slot
+        } else {
+            let first = free_table(&self.taken, self.head, n)?;
+            self.taken[first..first + n].fill(true);
+            self.head = (first + n) % self.taken.len();
+            first
+        };
+        Some(first)
+    }
+
+    fn release(&mut self, at: u32, n: u32) {
+        let cap = self.taken.len();
+        let start = (at as usize).min(cap);
+        let end = (at.saturating_add(n) as usize).min(cap);
+        if start < end {
+            self.taken[start..end].fill(false);
+        }
+    }
 }
 
 /// Host heaps' GPU ranges (start, bytes, bytes per slot, sampler), for
@@ -71,7 +119,7 @@ const DYNAMIC: u32 = 1 << 18;
 
 /// The dynamic slots of a heap whose host would not take [`DYNAMIC`] more
 /// (a capped heap, NVIDIA): the title's slots keep their room first.
-const MIN_DYNAMIC: u32 = 1 << 16;
+const MIN_DYNAMIC: u32 = 1 << 17;
 
 impl HostHeap {
     pub(crate) fn new(sampler: bool, count: u32) -> Option<Self> {
@@ -145,7 +193,7 @@ impl HostHeap {
             sampler,
             made: Mutex::new(vec![0; count as usize]),
             kept: Mutex::new(vec![None; (count + extra) as usize]),
-            next: Mutex::new((0, vec![false; extra as usize])),
+            next: Mutex::new(DynamicPool::new(extra as usize)),
         };
         // A slot never written is undefined: shaders reading one (a slot
         // the title wrote in a way we do not know, or a table entry no
@@ -227,33 +275,21 @@ impl HostHeap {
         if self.sampler || n == 0 || n > self.dynamic {
             return None;
         }
-        let mut guard = self.next.lock().unwrap_or_else(|e| e.into_inner());
-        let (next, taken) = &mut *guard;
-        let n = n as usize;
-        // Search from `next` on, then from the start.
-        let starts = (*next as usize..self.dynamic as usize).chain(0..*next as usize);
-        let mut run = 0;
-        let mut found = None;
-        let mut last = usize::MAX;
-        for at in starts {
-            // A run cannot wrap past the end.
-            if at != last.wrapping_add(1) {
-                run = 0;
-            }
-            last = at;
-            run = if taken[at] { 0 } else { run + 1 };
-            if run == n {
-                found = Some(at + 1 - n);
-                break;
-            }
-        }
-        let Some(first) = found else {
+        let mut pool = self.next.lock().unwrap_or_else(|e| e.into_inner());
+        let Some(first) = pool.alloc(n as usize) else {
             static ONCE: std::sync::Once = std::sync::Once::new();
-            ONCE.call_once(|| tracing::warn!(n, "no free dynamic descriptor slots: a table is not made"));
+            ONCE.call_once(|| {
+                let (free, longest) = free_space(&pool.taken);
+                tracing::warn!(
+                    n,
+                    cap = pool.taken.len(),
+                    free,
+                    longest,
+                    "no free dynamic descriptor slots: a table is not made"
+                );
+            });
             return None;
         };
-        taken[first..first + n].fill(true);
-        *next = ((first + n) % self.dynamic as usize) as u32;
         Some(self.count + first as u32)
     }
 
@@ -271,11 +307,10 @@ impl HostHeap {
         let Some(at) = first.checked_sub(self.count) else {
             return;
         };
-        let mut guard = self.next.lock().unwrap_or_else(|e| e.into_inner());
-        let end = (at + n).min(self.dynamic) as usize;
-        if let Some(slots) = guard.1.get_mut(at as usize..end) {
-            slots.fill(false);
-        }
+        self.next
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .release(at, n);
     }
 
     /// Makes slot `index` (a dynamic one) from `view`; a null view if the
@@ -919,6 +954,44 @@ fn null_view(at: D3D12_CPU_DESCRIPTOR_HANDLE) {
     };
 }
 
+/// Total free slots and the longest contiguous run in the dynamic pool.
+fn free_space(taken: &[bool]) -> (usize, usize) {
+    let mut free = 0;
+    let mut longest = 0;
+    for gap in taken.split(|&held| held) {
+        free += gap.len();
+        longest = longest.max(gap.len());
+    }
+    (free, longest)
+}
+
+/// Top-down scan from `cursor` for single-slot allocations (`n == 1`) so
+/// per-view dynamic slots cluster away from bottom-up multi-slot tables.
+fn free_single(taken: &[bool], cursor: usize) -> Option<usize> {
+    let split = cursor.min(taken.len());
+    (0..split)
+        .rev()
+        .chain((split..taken.len()).rev())
+        .find(|&i| !taken[i])
+}
+
+/// First contiguous run of `n` free slots from `cursor`, wrapping from slot 0
+/// without crossing the end of `taken`.
+fn free_table(taken: &[bool], cursor: usize, n: usize) -> Option<usize> {
+    let end = taken.len().checked_sub(n)? + 1;
+    let split = cursor.min(end);
+    for starts in [split..end, 0..split] {
+        let mut first = starts.start;
+        while first < starts.end {
+            match taken[first..first + n].iter().position(|&held| held) {
+                Some(offset) => first += offset + 1,
+                None => return Some(first),
+            }
+        }
+    }
+    None
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -972,5 +1045,184 @@ mod tests {
         heap.release(a, 50);
         assert_eq!(heap.dynamic(50), Some(4));
         assert_eq!(heap.dynamic(40), Some(4 + heap.dynamic - 40));
+    }
+
+    #[test]
+    fn free_space_counts_separate_runs_at_the_heap_ends() {
+        assert_eq!(free_space(&[true; 8]), (0, 0));
+        assert_eq!(free_space(&[false; 8]), (8, 8));
+        let fragmented = [false, false, true, false, true, false, false, false];
+        assert_eq!(free_space(&fragmented), (6, 3));
+    }
+
+    #[test]
+    fn free_table_chooses_the_first_contiguous_fit_in_cursor_order() {
+        for mask in 0u16..256 {
+            let taken: [bool; 8] = std::array::from_fn(|slot| mask & (1 << slot) != 0);
+            for cursor in 0..taken.len() {
+                for n in 1..=taken.len() {
+                    let expected = (cursor..taken.len()).chain(0..cursor).find(|&start| {
+                        taken
+                            .get(start..start + n)
+                            .is_some_and(|table| table.iter().all(|&held| !held))
+                    });
+                    assert_eq!(
+                        free_table(&taken, cursor, n),
+                        expected,
+                        "{mask:#x} {cursor} {n}"
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn dynamic_pool_segregates_singles_and_tables_to_exhaustion_without_overlap() {
+        let cap = 64usize;
+        let mut pool = DynamicPool::new(cap);
+        let mut held = vec![false; cap];
+        let mark = |held: &mut [bool], first: usize, n: usize, used: bool| {
+            for (offset, cell) in held[first..first + n].iter_mut().enumerate() {
+                assert_ne!(
+                    *cell, used,
+                    "slot {} overlap or double-free",
+                    first + offset
+                );
+                *cell = used;
+            }
+        };
+
+        // 1-slot allocations start from the top; multi-slot tables from the bottom.
+        let s0 = pool.alloc(1).unwrap();
+        let s1 = pool.alloc(1).unwrap();
+        assert_eq!((s0, s1), (cap - 1, cap - 2));
+        mark(&mut held, s0, 1, true);
+        mark(&mut held, s1, 1, true);
+
+        let t0 = pool.alloc(13).unwrap();
+        let t1 = pool.alloc(13).unwrap();
+        assert_eq!((t0, t1), (0, 13));
+        mark(&mut held, t0, 13, true);
+        mark(&mut held, t1, 13, true);
+
+        // Freeing single-slot holes leaves the contiguous middle range intact for tables.
+        pool.release(s0 as u32, 1);
+        mark(&mut held, s0, 1, false);
+        let s2 = pool.alloc(1).unwrap();
+        assert_eq!(s2, cap - 3);
+        mark(&mut held, s2, 1, true);
+
+        // Fill remaining contiguous table room cleanly up to the single-slot boundary,
+        // leaving one boundary slot plus the released top slot for final singles.
+        let t2 = pool.alloc(34).unwrap();
+        assert_eq!(t2, 26);
+        mark(&mut held, t2, 34, true);
+        assert_eq!(pool.alloc(2), None, "only two isolated 1-slot holes remain");
+
+        // Re-claiming the released top slot plus the 1-slot boundary fills every slot.
+        let s3 = pool.alloc(1).unwrap();
+        let s4 = pool.alloc(1).unwrap();
+        assert_eq!(s3, cap - 4);
+        assert_eq!(s4, cap - 1);
+        mark(&mut held, s3, 1, true);
+        mark(&mut held, s4, 1, true);
+        assert_eq!(free_space(&held), (0, 0));
+        assert_eq!(pool.alloc(1), None);
+        assert_eq!(pool.alloc(2), None);
+
+        // Releasing a multi-slot range and a single slot restores both allocation paths.
+        pool.release(t1 as u32, 13);
+        mark(&mut held, t1, 13, false);
+        pool.release(s2 as u32, 1);
+        mark(&mut held, s2, 1, false);
+        assert_eq!(pool.alloc(1), Some(s2));
+        mark(&mut held, s2, 1, true);
+        assert_eq!(pool.alloc(13), Some(t1));
+        mark(&mut held, t1, 13, true);
+        assert_eq!(free_space(&held), (0, 0));
+        assert_eq!(pool.taken, held);
+    }
+
+    #[test]
+    fn a_free_table_can_straddle_the_search_cursor() {
+        let Some(heap) = HostHeap::new(false, 4) else {
+            return;
+        };
+        let cap = heap.dynamic;
+        let left = heap.dynamic(4).unwrap();
+        let right = heap.dynamic(5).unwrap();
+        let tail = heap.dynamic(cap - 9).unwrap();
+
+        heap.release(left, 4);
+        assert_eq!(heap.dynamic(4), Some(left));
+        heap.release(right, 5);
+        heap.release(left, 4);
+        assert_eq!(heap.dynamic(9), Some(left));
+        assert_eq!(heap.dynamic(1), None, "the tail is still held");
+
+        heap.release(tail, cap - 9);
+        assert_eq!(heap.dynamic(cap - 9), Some(tail));
+    }
+
+    #[test]
+    fn single_slot_allocations_do_not_fragment_multi_slot_tables() {
+        let Some(heap) = HostHeap::new(false, 4) else {
+            return;
+        };
+        let cap = heap.dynamic;
+        let single_a = heap.dynamic(1).unwrap();
+        let single_b = heap.dynamic(1).unwrap();
+        assert_eq!(single_a, heap.count + cap - 1);
+        assert_eq!(single_b, heap.count + cap - 2);
+
+        let table_a = heap.dynamic(13).unwrap();
+        let table_b = heap.dynamic(13).unwrap();
+        assert_eq!(table_a, heap.count);
+        assert_eq!(table_b, heap.count + 13);
+
+        // Interleaved 1-slot churn stays at the top and leaves contiguous
+        // multi-slot room at the bottom of the dynamic pool.
+        let mut singles = vec![single_a, single_b];
+        let mut tables = vec![table_a, table_b];
+        for i in 0..32 {
+            singles.push(heap.dynamic(1).unwrap());
+            if i % 4 == 0 {
+                tables.push(heap.dynamic(13).unwrap());
+            }
+        }
+        for (i, slot) in singles.iter().enumerate() {
+            if i % 2 == 0 {
+                heap.release(*slot, 1);
+            }
+        }
+        let big = cap / 2;
+        let contig = heap.dynamic(big);
+        assert!(contig.is_some(), "single-slot holes blocked multi-slot allocation");
+        if let Some(first) = contig {
+            heap.release(first, big);
+        }
+        for (i, slot) in singles.into_iter().enumerate() {
+            if i % 2 != 0 {
+                heap.release(slot, 1);
+            }
+        }
+        for slot in tables {
+            heap.release(slot, 13);
+        }
+    }
+
+    #[test]
+    fn capped_view_heap_uses_128k_min_dynamic() {
+        const {
+            assert!(MIN_DYNAMIC == 1 << 17);
+            assert!(MIN_DYNAMIC < PORTABLE_VIEWS);
+        }
+        let Some(heap) = HostHeap::new(false, PORTABLE_VIEWS + 1) else {
+            return;
+        };
+        assert!(
+            heap.dynamic == DYNAMIC
+                || (heap.dynamic == MIN_DYNAMIC && heap.count == PORTABLE_VIEWS - MIN_DYNAMIC)
+        );
     }
 }
