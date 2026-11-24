@@ -93,6 +93,7 @@ victory census [paths...] [--missing] [--strict]
 victory lib-exports <import.lib> [--list]
 victory shader-info [paths...] [--verbose] [--disasm]
 victory translate [paths...] [--validate] [--pipelines] [--list] [--jobs N]
+victory shader-coverage <runtime.log> [paths...]
 victory run <exe> [--execute] [--unimplemented trap|zero] [--strict]
             [--console series-x|series-s] [-- <title arguments>]
 victory config
@@ -100,6 +101,24 @@ victory config
 
 Logging: `VICTORY_LOG=victory_loader=trace,info` (a release build logs
 info and above).
+
+To compare runtime shader translation failures with an offline scan,
+capture the runtime's stderr to a UTF-8 text log outside the repository,
+then run:
+
+```
+victory shader-coverage <runtime.log> [paths...]
+```
+
+Use the same build and translation settings for both runs. The command
+deduplicates failing 16-digit hashes and replays only matching byte
+extents through the shader emitter. It reports emitted, failed and
+unmatched hashes, plus unique hashes per runtime failure reason. Counts
+are not draw counts. An unmatched hash can mean an inaccessible archive,
+a skipped file or a different bytecode length, not necessarily a missing
+shader. Offline emission does not imply DXIL validation, successful
+host pipeline creation or playability. Logs and shader bytes must stay
+outside the repository; the comparison itself writes only to stdout.
 
 ## Debugging
 
