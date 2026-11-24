@@ -937,3 +937,23 @@ fn v_cmp_class_f16_matches_rdna2() {
         );
     });
 }
+
+#[test]
+fn vop3_output_modifier_flushes_negative_zero() {
+    // v_add_f32_e64 v0, v1, v2, 0 mul:4. RDNA2 OMOD flushes -0 to +0.
+    let [w0, mut w1] = vop3(0x003, 0, vgpr(1), vgpr(2), 0);
+    w1 |= 2 << 27; // OMOD = multiply by four.
+    let shader = build_valu_cs(&[w0, w1]);
+    let cases = [[0x8000_0000, 0x8000_0000, 0, 0]];
+
+    // This integration check needs SM 6.6; some local adapters and WARP
+    // versions only expose 6.5 or earlier.
+    if Host::new(false).is_err() && Host::new(true).is_err() {
+        eprintln!("no SM 6.6 host or WARP device; skipped");
+        return;
+    }
+
+    run_cases(&shader, &cases, |backend, _, _, got| {
+        assert_eq!(got, 0, "{backend}: OMOD must turn -0 into +0");
+    });
+}

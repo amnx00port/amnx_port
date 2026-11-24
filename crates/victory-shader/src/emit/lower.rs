@@ -1795,6 +1795,17 @@ impl<'a> Lower<'a> {
                 let factor = [1.0f32, 2.0, 4.0, 0.5][usize::from(k)];
                 let c = self.s.m.f32(factor.to_bits());
                 f = self.s.m.bin(self.cur, Bin::Mul, f, c);
+                let bits = self.as_int(f);
+                let negative_zero = self.s.m.i32(0x8000_0000);
+                let is_negative_zero = self
+                    .s
+                    .m
+                    .cmp(self.cur, pred::EQ, bits, negative_zero);
+                let positive_zero = self.s.m.f32(0.0f32.to_bits());
+                f = self
+                    .s
+                    .m
+                    .select(self.cur, is_negative_zero, positive_zero, f);
             }
         }
         if v.clamp {
