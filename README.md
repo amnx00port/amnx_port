@@ -46,28 +46,34 @@ What each part does today and what it still needs:
 
 ## Getting started
 
-Requirements: Windows 10/11 x64, a CPU with AVX2, a Direct3D 12 GPU with
-shader model 6.6 (and mesh shaders for the world), Rust (pinned in
-`rust-toolchain.toml`).
+Requirements: Windows 10/11 x64, a CPU with AVX2, and a Direct3D 12 GPU with
+shader model 6.6 (and mesh shaders for the world). Install Rust via rustup
+and the Visual Studio C++ build tools with the Windows SDK. Rustup uses the
+version pinned in `rust-toolchain.toml`.
 
 The title also needs several GiB of available Windows commit at startup.
 Check **Committed** under **Task Manager → Performance → Memory**. If
 `crashes.log` reports Windows error 1455, close other applications or increase
 the Windows paging file size, then retry.
 
-```powershell
-cargo xtask install-hooks                # asset-policy check on every commit
-copy victory.example.toml victory.toml   # then set your paths (outside the repo)
-cargo test --workspace                   # needs no game data
-cargo run -p victory -- config           # check your paths
-```
-
-Run the title:
+From the repository root, build and check the paths in PowerShell. Replace the
+example path with the folder containing your title files. Keep that folder
+outside the repository. The environment variable applies to this PowerShell
+session. For persistent local paths, copy `victory.example.toml` to
+`victory.toml` and edit it.
 
 ```powershell
+$env:VICTORY_GAME_DIR = 'D:\Xbox Titles\My Game'
 cargo build --release -p victory
-target\release\victory.exe run <game dir>\<the title's exe> --execute
+.\target\release\victory.exe config
+.\target\release\victory.exe run (Join-Path $env:VICTORY_GAME_DIR 'game_scarlett_master.exe') --execute
 ```
+
+Replace the executable name if your title uses a different one. If you are
+working on the source, run `cargo xtask install-hooks` to enable the asset
+policy check before committing. Run `cargo test --workspace` to test the
+project without game data.
+
 
 The window caption shows the framerate. Saves, settings and `crashes.log`
 are kept under the data folder (default `%LOCALAPPDATA%\victory\data`), derived
