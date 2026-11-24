@@ -23,6 +23,10 @@ use windows_sys::Win32::Storage::FileSystem::GetLogicalDrives;
 
 use crate::{HleExport, HleModule, hle_export};
 
+mod diagram;
+pub(crate) use diagram::controller_diagram;
+pub use diagram::use_controller_diagram;
+
 /// The host's own function: what the import would have been bound to.
 macro_rules! host {
     ($dll:literal, $name:literal: $ty:ty) => {{

@@ -21,7 +21,7 @@ use std::borrow::Cow;
 use std::collections::{BTreeMap, BTreeSet, HashMap, VecDeque};
 use std::ffi::{CStr, c_char, c_void};
 use std::os::windows::fs::FileExt;
-use std::os::windows::io::FromRawHandle;
+use std::os::windows::io::{FromRawHandle, IntoRawHandle};
 use std::sync::atomic::{AtomicBool, AtomicI32, AtomicU32, AtomicU64, Ordering};
 use std::sync::{Condvar, Mutex, MutexGuard, OnceLock};
 
@@ -121,20 +121,23 @@ extern "system" fn open_file(_: Factory, path: *const u16, iid: *const Guid, out
     if path.is_null() {
         return E_INVALIDARG;
     }
-    // Goes through `files`, so paths on our virtual drives work too.
-    let handle = super::files::CreateFileW(
-        path,
-        GENERIC_READ,
-        FILE_SHARE_READ,
-        std::ptr::null(),
-        OPEN_EXISTING,
-        0,
-        std::ptr::null_mut(),
-    );
     // SAFETY: the title passes a NUL-terminated path.
     let name = unsafe {
         let len = (0..).take_while(|&i| *path.add(i) != 0).count();
         String::from_utf16_lossy(std::slice::from_raw_parts(path, len))
+    };
+    let handle = match super::files::controller_diagram(&name) {
+        Some(file) => file.into_raw_handle(),
+        // Goes through `files`, so paths on our virtual drives work too.
+        None => super::files::CreateFileW(
+            path,
+            GENERIC_READ,
+            FILE_SHARE_READ,
+            std::ptr::null(),
+            OPEN_EXISTING,
+            0,
+            std::ptr::null_mut(),
+        ),
     };
     if handle as isize == -1 {
         let error = std::io::Error::last_os_error();
@@ -1141,6 +1144,24 @@ mod tests {
         assert_eq!(std::mem::offset_of!(Request, source_size), 0x30);
         assert_eq!(std::mem::offset_of!(Request, name), 0x40);
         assert_eq!(std::mem::offset_of!(QueueDesc, unknown), 0x18);
+    }
+
+    #[test]
+    fn directstorage_reads_configured_diagram_through_its_file_object() {
+        let dir = tempfile::tempdir().unwrap();
+        let name = r"G:\test\synthetic-controls.bin";
+        super::super::files::use_controller_diagram(name, dir.path().to_owned());
+        for profile in ["xbox", "playstation", "nintendo", "steam"] {
+            let folder = dir.path().join(profile);
+            std::fs::create_dir(&folder).unwrap();
+            std::fs::write(folder.join("synthetic-controls.bin"), b"new diagram").unwrap();
+        }
+        let file = open(std::path::Path::new(name));
+        let mut bytes = [0; 7];
+        let read = request(0, bytes.as_mut_ptr().cast(), 7, file, 4, 7);
+        read_into(&read, &mut bytes).unwrap();
+        assert_eq!(&bytes, b"diagram");
+        release::<File>(file.cast());
     }
 
     #[test]

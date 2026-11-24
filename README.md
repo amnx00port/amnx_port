@@ -85,6 +85,22 @@ title's window has focus:
 | F / H | stick clicks |
 | Esc, Tab | Menu, View |
 
+### Controller diagram
+
+With the SDL3 gamepad backend, VIctory tracks the last physical controller
+used. To supply alternate artwork for the controls screen, set
+`VICTORY_GLYPH_DIR` to a directory outside the repository. Put a compatible
+`platform.ttpf` in the `playstation`, `nintendo`, `steam` or `xbox` subdirectory
+for each profile you use. For example, a DualSense uses
+`%VICTORY_GLYPH_DIR%\playstation\platform.ttpf`. XInput uses the Xbox profile.
+
+When DirectStorage opens `G:\data\ttdb\ui\platform.ttpf`, VIctory tries the
+active profile's file and falls back to the package. The replacement must match
+the title's expected layout and read offsets. Each open handle keeps its
+original file. The profile takes effect the next time the title opens the
+diagram. HUD and menu button symbols live in a separately cached Scaleform
+movie inside an archive. This option applies only to the loose diagram.
+
 ## Commands
 
 ```
