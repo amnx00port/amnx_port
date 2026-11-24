@@ -6,7 +6,7 @@
 use std::ffi::{CStr, c_char, c_void};
 
 use super::xgameruntime::{
-    Guid, HRESULT, Interface, Methods, Object, S_OK, add_ref, missing, put, text, token,
+    Guid, HRESULT, Interface, Methods, Object, S_OK, add_ref, put, text, token,
 };
 use crate::runtime;
 
@@ -58,6 +58,42 @@ pub const INTERFACES: &[Interface] = &[
 
 type This = *const Object;
 
+const E_NOINTERFACE: HRESULT = 0x8000_4002_u32 as i32;
+const E_POINTER: HRESULT = 0x8000_4003_u32 as i32;
+const IID_IUNKNOWN: Guid = Guid::new(0, 0, 0, [0xc0, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x46]);
+
+/// `IUnknown::QueryInterface`: each static object serves `IUnknown` and its
+/// own interface. Reference counting is already a no-op for these objects.
+extern "system" fn query_interface(this: This, iid: *const Guid, out: *mut *mut c_void) -> HRESULT {
+    if out.is_null() {
+        return E_POINTER;
+    }
+    // SAFETY: checked non-null; the title passes room for a pointer.
+    unsafe { out.write(std::ptr::null_mut()) };
+    if iid.is_null() {
+        return E_POINTER;
+    }
+    // SAFETY: checked non-null; the title passes a GUID.
+    let iid = unsafe { *iid };
+    let own = if std::ptr::eq(this, &TITLE_OBJECT) {
+        TITLE_IID
+    } else if std::ptr::eq(this, &FEATURES_OBJECT) {
+        FEATURES
+    } else if std::ptr::eq(this, &INVITES_OBJECT) {
+        INVITES
+    } else if std::ptr::eq(this, &EVENTS_OBJECT) {
+        EVENTS
+    } else {
+        return E_NOINTERFACE;
+    };
+    if iid != IID_IUNKNOWN && iid != own {
+        return E_NOINTERFACE;
+    }
+    // SAFETY: checked non-null; the title passes room for a pointer.
+    unsafe { out.write(this.cast_mut().cast()) };
+    S_OK
+}
+
 extern "system" fn title_id(_: This, out: *mut u32) -> HRESULT {
     put(out, runtime::title().id)
 }
@@ -74,7 +110,10 @@ extern "system" fn launch_new_game(
     args: *const c_char,
     _user: *const c_void,
 ) {
-    let (exe, args) = (text(exe).unwrap_or_default(), text(args).unwrap_or_default());
+    let (exe, args) = (
+        text(exe).unwrap_or_default(),
+        text(args).unwrap_or_default(),
+    );
     tracing::info!(exe, args, "XLaunchNewGame");
     let current = runtime::main_image()
         .and_then(runtime::image_path)
@@ -159,7 +198,7 @@ extern "system" fn write_event(
 }
 
 static TITLE_VTABLE: Methods<5> = Methods([
-    missing::<0> as *const (),
+    query_interface as *const (),
     add_ref as *const (),
     add_ref as *const (),
     title_id as *const (),        // 0x18
@@ -167,14 +206,14 @@ static TITLE_VTABLE: Methods<5> = Methods([
 ]);
 
 static FEATURES_VTABLE: Methods<4> = Methods([
-    missing::<0> as *const (),
+    query_interface as *const (),
     add_ref as *const (),
     add_ref as *const (),
     is_feature_available as *const (), // 0x18
 ]);
 
 static INVITES_VTABLE: Methods<5> = Methods([
-    missing::<0> as *const (),
+    query_interface as *const (),
     add_ref as *const (),
     add_ref as *const (),
     register as *const (),   // 0x18
@@ -182,7 +221,7 @@ static INVITES_VTABLE: Methods<5> = Methods([
 ]);
 
 static EVENTS_VTABLE: Methods<4> = Methods([
-    missing::<0> as *const (),
+    query_interface as *const (),
     add_ref as *const (),
     add_ref as *const (),
     write_event as *const (), // 0x18
@@ -195,27 +234,99 @@ mod tests {
 
     #[test]
     fn a_relaunch_keeps_our_options() {
-        let ours: Vec<std::ffi::OsString> =
-            ["run", "G:/game.exe", "--execute", "--console", "series-s", "--", "-old"]
-                .map(Into::into)
-                .into();
+        let ours: Vec<std::ffi::OsString> = [
+            "run",
+            "G:/game.exe",
+            "--execute",
+            "--console",
+            "series-s",
+            "--",
+            "-old",
+        ]
+        .map(Into::into)
+        .into();
         let current = std::ffi::OsStr::new("G:/game.exe");
         let again = relaunch_args(ours.clone(), current, "G:/game.exe", " -config=x  -y ");
-        let expected = ["run", "G:/game.exe", "--execute", "--console", "series-s", "--"];
+        let expected = [
+            "run",
+            "G:/game.exe",
+            "--execute",
+            "--console",
+            "series-s",
+            "--",
+        ];
         assert_eq!(again[..6], expected.map(std::ffi::OsString::from));
-        assert_eq!(again[6..], ["-config=x", "-y"].map(std::ffi::OsString::from));
+        assert_eq!(
+            again[6..],
+            ["-config=x", "-y"].map(std::ffi::OsString::from)
+        );
         let other = relaunch_args(ours, current, "G:/other.exe", "");
         assert_eq!(other.len(), 5);
         assert_eq!(other[1], "G:/other.exe");
     }
 
     #[test]
+    fn query_interface_supports_unknown_and_each_own_interface() {
+        type Query = extern "system" fn(This, *const Guid, *mut *mut c_void) -> HRESULT;
+        type Ref = extern "system" fn(This) -> u32;
+        let unknown = Guid::new(1, 2, 3, [4; 8]);
+        for (object, own) in [
+            (&TITLE_OBJECT, TITLE_IID),
+            (&FEATURES_OBJECT, FEATURES),
+            (&INVITES_OBJECT, INVITES),
+            (&EVENTS_OBJECT, EVENTS),
+        ] {
+            let query = method::<Query>(object, 0);
+            let expected = std::ptr::from_ref(object).cast_mut().cast();
+            for iid in [IID_IUNKNOWN, own] {
+                let mut out = std::ptr::null_mut();
+                assert_eq!(query(object, &iid, &mut out), S_OK);
+                assert_eq!(out, expected);
+            }
+
+            let mut out = std::ptr::dangling_mut::<c_void>();
+            assert_eq!(query(object, &unknown, &mut out), E_NOINTERFACE);
+            assert!(out.is_null());
+
+            let mut out = std::ptr::dangling_mut::<c_void>();
+            assert_eq!(query(object, std::ptr::null(), &mut out), E_POINTER);
+            assert!(out.is_null());
+            assert_eq!(query(object, &own, std::ptr::null_mut()), E_POINTER);
+
+            assert_eq!(method::<Ref>(object, 0x08)(object), 1);
+            assert_eq!(method::<Ref>(object, 0x10)(object), 1);
+        }
+    }
+
+    #[test]
+    fn title_id_requires_an_output() {
+        type Get = extern "system" fn(This, *mut u32) -> HRESULT;
+        let get = method::<Get>(&TITLE_OBJECT, 0x18);
+        let mut id = 0;
+        assert_eq!(get(&TITLE_OBJECT, &mut id), S_OK);
+        assert_eq!(id, runtime::title().id);
+        assert_eq!(
+            get(&TITLE_OBJECT, std::ptr::null_mut()),
+            super::super::xasync::E_INVALIDARG
+        );
+    }
+
+    #[test]
     fn served_areas_are_available_others_not() {
         type Check = extern "system" fn(This, u32) -> bool;
         let check = method::<Check>(&FEATURES_OBJECT, 0x18);
-        assert!(check(&FEATURES_OBJECT, 18), "users");
-        assert!(!check(&FEATURES_OBJECT, 21), "game streaming");
+        for feature in 0..=21 {
+            assert_eq!(
+                check(&FEATURES_OBJECT, feature),
+                AVAILABLE.contains(&feature),
+                "feature {feature}"
+            );
+        }
+        assert!(!check(&FEATURES_OBJECT, u32::MAX));
+    }
 
+    #[test]
+    fn invite_registration_returns_tokens_and_validates_output() {
         type Register = extern "system" fn(
             This,
             *const c_void,
@@ -232,10 +343,50 @@ mod tests {
             S_OK
         );
         assert_ne!(token, 0);
-        assert!(method::<Unregister>(&INVITES_OBJECT, 0x20)(
-            &INVITES_OBJECT,
-            token,
-            true
-        ));
+        assert_eq!(
+            register(&INVITES_OBJECT, null, null as _, null, std::ptr::null_mut()),
+            super::super::xasync::E_INVALIDARG
+        );
+        let unregister = method::<Unregister>(&INVITES_OBJECT, 0x20);
+        assert!(unregister(&INVITES_OBJECT, token, false));
+        assert!(unregister(&INVITES_OBJECT, token, true));
+    }
+
+    #[test]
+    fn game_events_are_accepted_and_dropped() {
+        type Write = extern "system" fn(
+            This,
+            *const c_void,
+            *const c_char,
+            *const c_char,
+            *const c_char,
+            *const c_char,
+            *const c_char,
+        ) -> HRESULT;
+        let write = method::<Write>(&EVENTS_OBJECT, 0x18);
+        assert_eq!(
+            write(
+                &EVENTS_OBJECT,
+                std::ptr::null(),
+                c"service".as_ptr(),
+                c"session".as_ptr(),
+                c"synthetic-event".as_ptr(),
+                c"{}".as_ptr(),
+                c"{}".as_ptr(),
+            ),
+            S_OK
+        );
+        assert_eq!(
+            write(
+                &EVENTS_OBJECT,
+                std::ptr::null(),
+                c"service".as_ptr(),
+                c"session".as_ptr(),
+                c"synthetic-event".as_ptr(),
+                std::ptr::null(),
+                std::ptr::null(),
+            ),
+            S_OK
+        );
     }
 }
