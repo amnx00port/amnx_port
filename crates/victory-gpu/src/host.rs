@@ -501,6 +501,7 @@ impl Host {
         // Where each run's lists start in `lists`.
         let mut firsts = Vec::with_capacity(runs.len());
         let mut batch = Batch::default();
+        let sweep = crate::watch::sweep();
         for list in runs {
             list.run_deferred(&mut batch);
             firsts.push(lists.len());
@@ -510,6 +511,7 @@ impl Host {
             lists.push(list.list.cast().ok());
         }
         batch.flush();
+        drop(sweep);
         let prepared = std::time::Instant::now();
         // Diagnostics: each list on its own, timed (`VICTORY_GPU_TIMING`).
         #[cfg(feature = "diagnostics")]
@@ -1199,10 +1201,14 @@ impl HostList {
                     continue;
                 }
                 Step::Run(work) | Step::Host(work) => {
-                    if matches!(step, Step::Run(_)) {
+                    let is_run = matches!(step, Step::Run(_));
+                    if is_run {
                         batch.title_written();
                     }
                     work();
+                    if is_run {
+                        crate::watch::clear_sweep();
+                    }
                     #[cfg(feature = "diagnostics")]
                     {
                         add(C::Runs, 1);
@@ -1264,13 +1270,19 @@ impl Batch {
     }
 
     /// Before a step that writes title memory: pending refreshes are done
-    /// first, and textures are checked again after it.
+    /// first, and textures and the thread's write-watch sweep are cleared so
+    /// later askings see the new writes.
     fn title_written(&mut self) {
         self.flush();
         self.textures.clear();
+        crate::watch::clear_sweep();
     }
 
     fn flush(&mut self) {
+        // Largest range first so a parent buffer sweeps before nested child
+        // buffers, turning nested/child askings into journal-only hits.
+        self.refreshes
+            .sort_unstable_by_key(|&(_, from, to)| std::cmp::Reverse(to.saturating_sub(from)));
         for (shadow, from, to) in self.refreshes.drain(..) {
             let started = std::time::Instant::now();
             let copied = shadow.update(from, to - from);
