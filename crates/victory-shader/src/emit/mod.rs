@@ -75,6 +75,8 @@
 //!   the console's, without `SV_PrimitiveID` and `SV_CullPrimitive` (the
 //!   console never exports them).
 
+#[cfg(test)]
+mod bench_tests;
 mod bitcode;
 mod container;
 #[cfg(all(test, windows))]

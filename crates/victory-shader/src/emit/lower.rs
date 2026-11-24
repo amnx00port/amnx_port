@@ -6,7 +6,9 @@
 //! emitter cannot express is `Missing` with a reason, and only fails the
 //! program when something with an effect (an export, a branch) needs it.
 
-use std::collections::{BTreeMap, HashMap, HashSet};
+use std::collections::BTreeMap;
+
+use crate::hash::{Map, Set};
 
 use super::UserData;
 use super::bitcode::{Attr, Bin, Cast, Term, V, pred};
@@ -65,7 +67,7 @@ enum Stop {
 }
 
 pub(crate) fn lower(parts: &Parts) -> Result<Lowered, ShaderError> {
-    let mut bad = HashMap::new();
+    let mut bad = Map::default();
     loop {
         match Lower::new(parts, &bad).run() {
             Ok(l) => return Ok(l),
@@ -150,32 +152,32 @@ fn half_shift(width: u32) -> u32 {
 struct Lower<'a> {
     s: Shader,
     x: &'a Parts<'a>,
-    bad: &'a HashMap<Value, Why>,
-    lane_fail: HashMap<Value, Why>,
-    vals: HashMap<Value, Val>,
-    floats: HashMap<Value, V>,
+    bad: &'a Map<Value, Why>,
+    lane_fail: Map<Value, Why>,
+    vals: Map<Value, Val>,
+    floats: Map<Value, V>,
     /// DXIL block per IR block (unreachable: none).
     block: Vec<Option<usize>>,
     cur: usize,
-    bools: HashMap<(usize, Bool), V>,
-    lane_bits: HashMap<Value, V>,
+    bools: Map<(usize, Bool), V>,
+    lane_bits: Map<Value, V>,
     /// IR phi location by value.
-    phi_at: HashMap<Value, (usize, usize)>,
-    mask_phis: HashMap<Value, V>,
+    phi_at: Map<Value, (usize, usize)>,
+    mask_phis: Map<Value, V>,
     pending_masks: Vec<(V, usize, usize)>,
     data_phis: Vec<(V, usize, usize)>,
-    read_phis: HashSet<Value>,
-    params: HashMap<Value, (usize, u32)>,
+    read_phis: Set<Value>,
+    params: Map<Value, (usize, u32)>,
     user_data: Option<V>,
     user_reads: BTreeMap<u32, UserData>,
     samplers: Vec<[u32; 4]>,
-    descriptors: HashMap<(Site, bool), &'a Source>,
-    scalar: HashMap<Site, Address>,
-    exports: HashMap<Site, &'a Export>,
-    interps: HashMap<Site, &'a Interp>,
-    handles: HashMap<(usize, Site, u8, bool, u32), V>,
+    descriptors: Map<(Site, bool), &'a Source>,
+    scalar: Map<Site, Address>,
+    exports: Map<Site, &'a Export>,
+    interps: Map<Site, &'a Interp>,
+    handles: Map<(usize, Site, u8, bool, u32), V>,
     /// Blocks splitting the edge from one IR block to another.
-    edges: HashMap<(usize, usize), usize>,
+    edges: Map<(usize, usize), usize>,
     /// Per IR block: a `done` export is behind every lane entering it.
     exported: Vec<bool>,
     /// Reverse-postorder index per IR block.
@@ -192,34 +194,34 @@ struct Lower<'a> {
     /// Mesh: the thread index in the group (made in the entry block).
     flat: Option<V>,
     /// Mesh: IR blocks whose `s_barrier` is left out.
-    no_barrier: HashSet<usize>,
+    no_barrier: Set<usize>,
     /// Vertex and mesh outputs holding 16-bit values: row, whether two per
     /// dword, and the row packed after it.
-    half_outputs: HashMap<u8, (bool, Option<u8>)>,
+    half_outputs: Map<u8, (bool, Option<u8>)>,
     /// How lane masks become data.
     mask_data: MaskData,
     /// The instruction being lowered may read lane masks as data.
     mask_ok: bool,
     /// Ballots of masks read as data, by low dword: (low, high).
-    ballots: HashMap<Value, (V, V)>,
+    ballots: Map<Value, (V, V)>,
     /// Masks whose ballot is being built: a mask whose lane bit needs its
     /// own value as a number (an opaque mask keyed by a dword it shares
     /// with another) would otherwise recurse until the stack overflows.
-    balloting: HashSet<Value>,
+    balloting: Set<Value>,
     /// Block writing each value.
-    def_block: HashMap<Value, usize>,
+    def_block: Map<Value, usize>,
     /// IR block being lowered.
     cur_ir: usize,
     /// Whole-wave sections by block and start index.
-    sections: HashMap<usize, HashMap<usize, super::wave::Section>>,
+    sections: Map<usize, Map<usize, super::wave::Section>>,
     /// Values written in a section that code outside it reads.
-    section_out: HashSet<Value>,
+    section_out: Set<Value>,
     /// The program's constant table (the code from the first byte read
     /// through `s_getpc_b64` on): global, first byte, dwords.
     code_table: Option<(V, u32, u32)>,
     /// Loop headers' iteration counters (see [`LOOP_LIMIT`]): the phi by
     /// IR block, and its incoming (value, DXIL block) pairs.
-    counters: HashMap<usize, (V, Vec<(V, usize)>)>,
+    counters: Map<usize, (V, Vec<(V, usize)>)>,
     /// The block a loop stopped by [`LOOP_LIMIT`] leaves the program from.
     abort: Option<usize>,
 }
@@ -309,11 +311,11 @@ fn packed_half(elements: &[SigElement], a: u8, b: Option<u8>, h: u8) -> Option<(
 /// Vertex or mesh outputs of 16-bit values (see [`Lower::half_outputs`]):
 /// a packed row's partner is the next 16-bit row of the signature that no
 /// output entry names, taken in row order.
-fn half_outputs(io: &StageIo, outputs: &[SigElement]) -> HashMap<u8, (bool, Option<u8>)> {
+fn half_outputs(io: &StageIo, outputs: &[SigElement]) -> Map<u8, (bool, Option<u8>)> {
     let entries = match io {
         StageIo::Vs { outputs, .. } => outputs,
         StageIo::Ms(ms) => &ms.outputs,
-        _ => return HashMap::new(),
+        _ => return Map::default(),
     };
     let per_vertex = || entries.iter().filter(|o| o.param & 0x80 == 0);
     let mut free: Vec<u8> = outputs
@@ -343,9 +345,9 @@ fn unsupported(offset: usize, what: Why) -> Stop {
 }
 
 impl<'a> Lower<'a> {
-    fn new(x: &'a Parts<'a>, bad: &'a HashMap<Value, Why>) -> Self {
+    fn new(x: &'a Parts<'a>, bad: &'a Map<Value, Why>) -> Self {
         let p = x.p;
-        let mut phi_at = HashMap::new();
+        let mut phi_at = Map::default();
         for (b, block) in p.blocks.iter().enumerate() {
             for (i, phi) in block.phis.iter().enumerate() {
                 phi_at.insert(phi.value, (b, i));
@@ -404,7 +406,7 @@ impl<'a> Lower<'a> {
                 s.wave_size = Some(wave);
             }
         }
-        let mut no_barrier = HashSet::new();
+        let mut no_barrier = Set::default();
         if let StageIo::Ms(ms) = &x.native.io {
             s.prims = x.prims.clone();
             s.threads = Some([ms.threads, 1, 1]);
@@ -453,18 +455,18 @@ impl<'a> Lower<'a> {
             s,
             x,
             bad,
-            lane_fail: HashMap::new(),
-            vals: HashMap::new(),
-            floats: HashMap::new(),
+            lane_fail: Map::default(),
+            vals: Map::default(),
+            floats: Map::default(),
             block: vec![None; p.blocks.len()],
             cur: 0,
-            bools: HashMap::new(),
-            lane_bits: HashMap::new(),
+            bools: Map::default(),
+            lane_bits: Map::default(),
             phi_at,
-            mask_phis: HashMap::new(),
+            mask_phis: Map::default(),
             pending_masks: Vec::new(),
             data_phis: Vec::new(),
-            read_phis: HashSet::new(),
+            read_phis: Set::default(),
             params: x.res.params.iter().map(|&(v, p, d)| (v, (p, d))).collect(),
             user_data: None,
             user_reads: BTreeMap::new(),
@@ -478,8 +480,8 @@ impl<'a> Lower<'a> {
             scalar: x.res.scalar.iter().copied().collect(),
             exports: x.io.exports.iter().map(|e| (e.site, e)).collect(),
             interps: x.io.interps.iter().map(|(s, i)| (*s, i)).collect(),
-            handles: HashMap::new(),
-            edges: HashMap::new(),
+            handles: Map::default(),
+            edges: Map::default(),
             exported: vec![false; p.blocks.len()],
             rpo: vec![usize::MAX; p.blocks.len()],
             tail: vec![None; p.blocks.len()],
@@ -495,8 +497,8 @@ impl<'a> Lower<'a> {
                 _ => MaskData::None,
             },
             mask_ok: false,
-            ballots: HashMap::new(),
-            balloting: HashSet::new(),
+            ballots: Map::default(),
+            balloting: Set::default(),
             def_block: p
                 .blocks
                 .iter()
@@ -510,10 +512,10 @@ impl<'a> Lower<'a> {
                 })
                 .collect(),
             cur_ir: 0,
-            sections: HashMap::new(),
-            section_out: HashSet::new(),
+            sections: Map::default(),
+            section_out: Set::default(),
             code_table: None,
-            counters: HashMap::new(),
+            counters: Map::default(),
             abort: None,
         }
     }
@@ -671,7 +673,7 @@ impl<'a> Lower<'a> {
     /// Finds the whole-wave sections and the values they leave.
     fn find_sections(&mut self) {
         let p = self.x.p;
-        let mut inside: HashMap<Value, (usize, usize, usize)> = HashMap::new();
+        let mut inside: Map<Value, (usize, usize, usize)> = Map::default();
         for b in 0..p.blocks.len() {
             let found = super::wave::sections(p, b);
             for (&start, sec) in &found {
@@ -927,7 +929,7 @@ impl<'a> Lower<'a> {
 
     /// Values of the program's input registers.
     fn inputs(&mut self) -> Result<(), Stop> {
-        let io_inputs: HashMap<Value, Input> = self.x.io.inputs.iter().copied().collect();
+        let io_inputs: Map<Value, Input> = self.x.io.inputs.iter().copied().collect();
         for &(reg, v) in &self.x.p.inputs {
             let val = match reg {
                 Reg::S(_) if self.params.contains_key(&v) => continue, // loaded on first use
@@ -2880,7 +2882,7 @@ impl<'a> Lower<'a> {
             }
             _ => None,
         };
-        let mut rows: HashMap<u32, V> = HashMap::new();
+        let mut rows: Map<u32, V> = Map::default();
         for k in 0..count {
             let x = match constant {
                 Some(base) => {
