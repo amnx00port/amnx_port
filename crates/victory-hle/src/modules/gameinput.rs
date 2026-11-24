@@ -111,8 +111,15 @@ trait Source: Send {
     fn pad(&mut self, slot: usize) -> Option<PadState>;
     /// Keys held down; none while the title's window lacks focus.
     fn keys(&mut self) -> Vec<KeyState>;
-    /// Motor speeds: low frequency (left), high frequency (right).
-    fn rumble(&mut self, slot: usize, low: u16, high: u16);
+    /// Motor speeds: low frequency (left), high frequency (right), left trigger, right trigger.
+    fn rumble(
+        &mut self,
+        slot: usize,
+        low: u16,
+        high: u16,
+        left_trigger: u16,
+        right_trigger: u16,
+    );
 }
 
 fn fallback(keys: &[KeyState]) -> PadState {
@@ -201,8 +208,8 @@ impl Device {
             id,
             root_id: id,
             supported_input: kind(index),
-            // Low and high frequency.
-            rumble_motors: if index < PADS { 0x3 } else { 0 },
+            // Low and high frequency, plus left and right trigger.
+            rumble_motors: if index < PADS { 0xF } else { 0 },
             ..Default::default()
         };
         Device {
@@ -525,7 +532,7 @@ fn host() -> Box<dyn Source> {
         fn keys(&mut self) -> Vec<KeyState> {
             Vec::new()
         }
-        fn rumble(&mut self, _: usize, _: u16, _: u16) {}
+        fn rumble(&mut self, _: usize, _: u16, _: u16, _: u16, _: u16) {}
     }
     Box::new(Nothing)
 }
@@ -908,24 +915,28 @@ extern "system" fn device_status(this: *const Device) -> u32 {
         0
     }
 }
-// shortcut: trigger motors are dropped (XInput has none). The host API that
-// drives them without a redistributable is Windows.Gaming.Input (WinRT
-// `Gamepad.Vibration`), which needs WinRT bindings this crate lacks outside
-// diagnostics builds; Grand Theft Auto VI sends trigger levels in slot 0x50.
+// Trigger motors: driven via XInputSetStateEx (ordinal 100) on Windows where
+// available, or standard XInputSetState (low/high only) on legacy fallbacks.
 extern "system" fn set_rumble(this: *const Device, params: *const [f32; 4]) {
     // SAFETY: one of our devices.
     let device = unsafe { &*this };
     if device.index >= PADS {
         return;
     }
-    let [low, high, ..] = if params.is_null() {
+    let [low, high, left_trigger, right_trigger] = if params.is_null() {
         [0.0; 4]
     } else {
         // SAFETY: checked non-null; four motor levels.
         unsafe { *params }
     };
     let speed = |level: f32| (level.clamp(0.0, 1.0) * f32::from(u16::MAX)) as u16;
-    lock(&device.hub().source).rumble(device.index, speed(low), speed(high));
+    lock(&device.hub().source).rumble(
+        device.index,
+        speed(low),
+        speed(high),
+        speed(left_trigger),
+        speed(right_trigger),
+    );
 }
 extern "system" fn unsupported<const SLOT: usize>(_: *const c_void) -> HRESULT {
     tracing::warn!(
@@ -1174,7 +1185,54 @@ mod host {
                 .collect()
         }
 
-        fn rumble(&mut self, slot: usize, low: u16, high: u16) {
+        fn rumble(
+            &mut self,
+            slot: usize,
+            low: u16,
+            high: u16,
+            left_trigger: u16,
+            right_trigger: u16,
+        ) {
+            #[repr(C)]
+            struct XInputVibrationEx {
+                wLeftMotorSpeed: u16,
+                wRightMotorSpeed: u16,
+                wLeftTriggerMotorSpeed: u16,
+                wRightTriggerMotorSpeed: u16,
+            }
+            type XInputSetStateExFn =
+                unsafe extern "system" fn(u32, *const XInputVibrationEx) -> u32;
+
+            static XINPUT_SET_STATE_EX: LazyLock<Option<XInputSetStateExFn>> = LazyLock::new(|| {
+                use windows_sys::Win32::System::LibraryLoader::{
+                    GetModuleHandleA, GetProcAddress, LoadLibraryA,
+                };
+                unsafe {
+                    let mut handle = GetModuleHandleA(b"xinput1_4.dll\0".as_ptr());
+                    if handle.is_null() {
+                        handle = LoadLibraryA(b"xinput1_4.dll\0".as_ptr());
+                    }
+                    if handle.is_null() {
+                        return None;
+                    }
+                    let proc = GetProcAddress(handle, 100 as *const u8);
+                    proc.map(|p| std::mem::transmute::<_, XInputSetStateExFn>(p))
+                }
+            });
+
+            if let Some(set_state_ex) = *XINPUT_SET_STATE_EX {
+                let speeds_ex = XInputVibrationEx {
+                    wLeftMotorSpeed: low,
+                    wRightMotorSpeed: high,
+                    wLeftTriggerMotorSpeed: left_trigger,
+                    wRightTriggerMotorSpeed: right_trigger,
+                };
+                // Ordinal 100 succeeds with ERROR_SUCCESS (0).
+                if unsafe { set_state_ex(slot as u32, &speeds_ex) } == 0 {
+                    return;
+                }
+            }
+
             let speeds = XINPUT_VIBRATION {
                 wLeftMotorSpeed: low,
                 wRightMotorSpeed: high,
@@ -1270,7 +1328,7 @@ mod tests {
     struct FakeHost {
         pads: [Option<PadState>; PADS],
         keys: Vec<KeyState>,
-        rumble: Vec<(usize, u16, u16)>,
+        rumble: Vec<(usize, u16, u16, u16, u16)>,
     }
 
     struct Fake(Arc<Mutex<FakeHost>>);
@@ -1282,8 +1340,19 @@ mod tests {
         fn keys(&mut self) -> Vec<KeyState> {
             self.0.lock().unwrap().keys.clone()
         }
-        fn rumble(&mut self, slot: usize, low: u16, high: u16) {
-            self.0.lock().unwrap().rumble.push((slot, low, high));
+        fn rumble(
+            &mut self,
+            slot: usize,
+            low: u16,
+            high: u16,
+            left_trigger: u16,
+            right_trigger: u16,
+        ) {
+            self.0
+                .lock()
+                .unwrap()
+                .rumble
+                .push((slot, low, high, left_trigger, right_trigger));
         }
     }
 
@@ -1607,9 +1676,20 @@ mod tests {
 
         type Rumble = extern "system" fn(*const Device, *const [f32; 4]);
         let rumble = slot::<Rumble, _>(device, 0x50);
-        rumble(device, &[0.5, 1.0, 1.0, 1.0]);
+        rumble(device, &[0.5, 1.0, 0.25, 0.75]);
         rumble(&hub.devices[FALLBACK], &[1.0; 4]);
         rumble(device, std::ptr::null());
-        assert_eq!(host.lock().unwrap().rumble, [(2, 32767, 65535), (2, 0, 0)]);
+        assert_eq!(
+            host.lock().unwrap().rumble,
+            [
+                (2, 32767, 65535, 16383, 49151),
+                (2, 0, 0, 0, 0),
+            ]
+        );
+
+        let motors = unsafe {
+            *(info(device).add(std::mem::offset_of!(DeviceInfo, rumble_motors)) as *const u32)
+        };
+        assert_eq!(motors, 0xF);
     }
 }
