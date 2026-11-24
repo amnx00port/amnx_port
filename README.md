@@ -53,7 +53,9 @@ shader model 6.6 (and mesh shaders for the world), Rust (pinned in
 The title also needs several GiB of available Windows commit at startup.
 Check **Committed** under **Task Manager → Performance → Memory**. If
 `crashes.log` reports Windows error 1455, close other applications or increase
-the Windows paging file size, then retry.
+the Windows paging file size, then retry. `victory run` prints the host's
+commit headroom as its `commit` line; the title's first boot asks for 6.1 GiB
+in one mapping.
 
 ```powershell
 cargo xtask install-hooks                # asset-policy check on every commit
