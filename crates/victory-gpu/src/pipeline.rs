@@ -589,7 +589,7 @@ mod tests {
             &cache.get(live_hash, "compute", b"live", true)
         ));
         let recreated = cache.get(idle_hash, "compute", b"idle", true);
-        assert_eq!(recreated.container, b"idle");
+        assert_eq!(recreated.container.as_slice(), b"idle");
         assert_eq!(recreated.hash, idle_hash.to_hex()[..16]);
     }
 
@@ -609,6 +609,22 @@ mod tests {
         assert_eq!(cache.misses_since_trim, 0);
         assert!(!cache.entries.contains_key(old.as_bytes()));
         assert_eq!(cache.entries.len(), 1);
+    }
+
+    #[test]
+    fn idle_shader_trim_reduces_retained_container_bytes() {
+        let retained = |trim| {
+            let mut cache = ShaderCache::default();
+            let mut bytes = vec![0; 64 * 1024];
+            for index in 0..SHADER_TRIM_INTERVAL {
+                bytes[..8].copy_from_slice(&(index as u64).to_le_bytes());
+                drop(cache.get(blake3::hash(&bytes), "compute", &bytes, trim));
+            }
+            cache.entries.values().map(|shader| shader.container.len()).sum::<usize>()
+        };
+        // Synthetic payloads only; no shader translation or GPU is involved.
+        assert_eq!(retained(false), SHADER_TRIM_INTERVAL * 64 * 1024);
+        assert_eq!(retained(true), 64 * 1024);
     }
 
     #[test]
