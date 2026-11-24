@@ -715,6 +715,47 @@ fn v_cvt_u16_and_i16_f16_saturate() {
 }
 
 #[test]
+fn s_mul_and_s_mul_hi_match_rdna2() {
+    // s_mul_i32 (SOP2 0x26), s_mul_hi_u32 (0x35), s_mul_hi_i32 (0x36) s6, s0, s1.
+    type Pick = fn(u32, u32) -> u32;
+    let ops: [(&str, u8, Pick); 3] = [
+        ("s_mul_i32", 0x26, u32::wrapping_mul),
+        ("s_mul_hi_u32", 0x35, |a, b| {
+            ((u64::from(a) * u64::from(b)) >> 32) as u32
+        }),
+        ("s_mul_hi_i32", 0x36, |a, b| {
+            ((i64::from(a as i32) * i64::from(b as i32)) >> 32) as u32
+        }),
+    ];
+    let values = [
+        0u32,
+        1,
+        0xFFFF,
+        0x1_0000,
+        0x7FFF_FFFF,
+        0x8000_0000,
+        0xFFFF_FFFF,
+    ];
+    let mut cases = Vec::new();
+    for a in values {
+        for b in values {
+            cases.push([a, b, 0, 0]);
+        }
+    }
+    for (name, op, pick) in ops {
+        let shader = build_valu_cs(&[sop2(op, 6, 0, 1), vop1(0x001, 0, sgpr(6))]);
+        run_cases(&shader, &cases, |backend, _, inp, got| {
+            let want = pick(inp[0], inp[1]);
+            assert_eq!(
+                got, want,
+                "{backend}: {name}({:#010x}, {:#010x}) = {got:#010x}, want {want:#010x}",
+                inp[0], inp[1],
+            );
+        });
+    }
+}
+
+#[test]
 fn v_sin_and_v_cos_f16_reduce_large_turns() {
     let sin_shader = build_valu_cs(&[vop1(0x060, 0, vgpr(1))]);
     let cos_shader = build_valu_cs(&[vop1(0x061, 0, vgpr(1))]);
