@@ -275,6 +275,77 @@ impl HostHeap {
         self.keep(index, None);
     }
 
+    /// Makes slot `index` a null descriptor matching the resource kind and
+    /// buffer/texture class (`dwords == 4` -> buffer, `8` -> texture) that
+    /// the translated shader declares for that slot. Avoids GPU device
+    /// removal on NVIDIA when an unwritten slot is read as a UAV, CBV, or
+    /// buffer SRV instead of a 2D texture SRV.
+    pub(crate) fn make_null_for_used(
+        &self,
+        index: u32,
+        used: Option<&victory_shader::UsedResource>,
+    ) {
+        use victory_shader::ResourceType;
+        if self.sampler {
+            self.make_null(index);
+            return;
+        }
+        let Some(u) = used else {
+            self.make_null(index);
+            return;
+        };
+        let is_buffer = u.dwords == 4;
+        // Sentinel keys have generation == 0 (real view keys start at generation 1).
+        let sentinel: u64 = match (u.kind, is_buffer) {
+            (ResourceType::Cbv, _) => 1,
+            (ResourceType::Srv, true) => 2,
+            (ResourceType::Srv, false) => 3,
+            (ResourceType::Uav, true) => 4,
+            (ResourceType::Uav, false) => 5,
+            (ResourceType::Sampler | ResourceType::Other(_), _) => return,
+        };
+        if (index as usize) < self.count as usize {
+            let mut made = self.made.lock().unwrap_or_else(|e| e.into_inner());
+            if made[index as usize] == sentinel {
+                return;
+            }
+            made[index as usize] = sentinel;
+        }
+        self.keep(index, None);
+        let at = self.cpu(index);
+        let Some(host) = host() else { return };
+        match (u.kind, is_buffer) {
+            (ResourceType::Cbv, _) => {
+                let desc = D3D12_CONSTANT_BUFFER_VIEW_DESC::default();
+                // SAFETY: a slot of our heap; zero location makes a null CBV.
+                unsafe { host.device.CreateConstantBufferView(Some(&desc), at) };
+            }
+            (ResourceType::Srv, true) => null_buffer_view(at),
+            (ResourceType::Srv, false) => null_view(at),
+            (ResourceType::Uav, true) | (ResourceType::Uav, false) => {
+                let desc = D3D12_UNORDERED_ACCESS_VIEW_DESC {
+                    Format: DXGI_FORMAT_R32_UINT,
+                    ViewDimension: if is_buffer {
+                        D3D12_UAV_DIMENSION_BUFFER
+                    } else {
+                        D3D12_UAV_DIMENSION_TEXTURE2D
+                    },
+                    ..Default::default()
+                };
+                // SAFETY: a slot of our heap; null resource is valid with a desc.
+                unsafe {
+                    host.device.CreateUnorderedAccessView(
+                        None::<&ID3D12Resource>,
+                        None::<&ID3D12Resource>,
+                        Some(&desc),
+                        at,
+                    );
+                }
+            }
+            (ResourceType::Sampler | ResourceType::Other(_), _) => {}
+        }
+    }
+
     /// Slot `index` now views `resource` (or nothing of the host's).
     fn keep(&self, index: u32, resource: Option<ID3D12Resource>) {
         let mut kept = self.kept.lock().unwrap_or_else(|e| e.into_inner());
@@ -583,6 +654,14 @@ fn fits(texture: &ID3D12Resource, mut format: Option<&mut DXGI_FORMAT>, unordere
         format.0 = linear as i32;
     }
     let view = format.as_ref().map_or(0, |f| f.0 as u32);
+    // Packed 16-bit color textures stored as R16_TYPELESS (53) on NVIDIA.
+    if own == 53 && matches!(view, 0 | 86 | 115) {
+        if let Some(format) = format {
+            format.0 = if unordered { 57 } else { 56 }; // R16_UINT / R16_UNORM
+            return true;
+        }
+        return false;
+    }
     if view == 0 {
         return !typeless;
     }
@@ -596,6 +675,92 @@ fn fits(texture: &ID3D12Resource, mut format: Option<&mut DXGI_FORMAT>, unordere
         *format = d.Format;
     }
     true
+}
+
+/// Stand-in UAV scratch texture for a depth-stencil texture (PC strips
+/// `ALLOW_UNORDERED_ACCESS` from depth targets; NVIDIA removes the device
+/// if the shader then accesses a null descriptor in that slot).
+fn depth_scratch(
+    device: &ID3D12Device,
+    texture: &ID3D12Resource,
+    desc: Option<D3D12_UNORDERED_ACCESS_VIEW_DESC>,
+    at: D3D12_CPU_DESCRIPTOR_HANDLE,
+) -> Option<Kept> {
+    use windows::core::Interface;
+    // SAFETY: a live resource.
+    let d = unsafe { texture.GetDesc() };
+    if d.Flags.0 & D3D12_RESOURCE_FLAG_ALLOW_DEPTH_STENCIL.0 == 0 {
+        return None;
+    }
+    let (res_fmt, uav_fmt) = match d.Format.0 as u32 {
+        53 | 55 => (DXGI_FORMAT_R16_TYPELESS, DXGI_FORMAT_R16_UINT),
+        _ => (DXGI_FORMAT_R32_TYPELESS, DXGI_FORMAT_R32_UINT),
+    };
+    static SCRATCH: std::sync::OnceLock<Mutex<std::collections::HashMap<usize, ID3D12Resource>>> =
+        std::sync::OnceLock::new();
+    let key = texture.as_raw() as usize;
+    let scratch = {
+        let mut map = SCRATCH
+            .get_or_init(|| Mutex::new(std::collections::HashMap::new()))
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        if let Some(existing) = map.get(&key) {
+            existing.clone()
+        } else {
+            let mut sd = d;
+            sd.Format = res_fmt;
+            sd.Flags = D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS;
+            let heap = D3D12_HEAP_PROPERTIES {
+                Type: D3D12_HEAP_TYPE_DEFAULT,
+                ..Default::default()
+            };
+            let mut made: Option<ID3D12Resource> = None;
+            // SAFETY: valid heap and resource description.
+            let ok = unsafe {
+                device.CreateCommittedResource(
+                    &heap,
+                    D3D12_HEAP_FLAG_NONE,
+                    &sd,
+                    D3D12_RESOURCE_STATE_UNORDERED_ACCESS,
+                    None,
+                    &mut made,
+                )
+            };
+            if let Err(e) = ok {
+                once!(error = %e, format = d.Format.0, "depth UAV scratch creation failed");
+                return None;
+            }
+            let res = made?;
+            crate::host::name(&res, || {
+                format!("depth UAV scratch {}x{} f{}", d.Width, d.Height, res_fmt.0)
+            });
+            once!(
+                format = d.Format.0,
+                width = d.Width,
+                height = d.Height,
+                "depth UAV: scratch stand-in"
+            );
+            map.insert(key, res.clone());
+            res
+        }
+    };
+    let mut uav = desc.unwrap_or_else(|| D3D12_UNORDERED_ACCESS_VIEW_DESC {
+        Format: uav_fmt,
+        ViewDimension: D3D12_UAV_DIMENSION_TEXTURE2D,
+        ..Default::default()
+    });
+    uav.Format = uav_fmt;
+    // Non-planar scratch formats (R16_TYPELESS / R32_TYPELESS) only allow PlaneSlice 0.
+    match uav.ViewDimension {
+        D3D12_UAV_DIMENSION_TEXTURE2D => uav.Anonymous.Texture2D.PlaneSlice = 0,
+        D3D12_UAV_DIMENSION_TEXTURE2DARRAY => uav.Anonymous.Texture2DArray.PlaneSlice = 0,
+        _ => {}
+    }
+    // SAFETY: a live scratch texture and a slot of our heap.
+    unsafe {
+        device.CreateUnorderedAccessView(&scratch, None::<&ID3D12Resource>, Some(&uav), at);
+    }
+    Some(Some(scratch))
 }
 
 /// Makes the host descriptor for `view` at `at`: the host resource it
@@ -658,7 +823,7 @@ fn make(view: &View, at: D3D12_CPU_DESCRIPTOR_HANDLE) -> Option<Kept> {
             };
             let mut desc = desc.as_ref().map(uav_desc);
             if !fits(texture, desc.as_mut().map(|d| &mut d.Format), true) {
-                return None;
+                return depth_scratch(device, texture, desc, at);
             }
             // SAFETY: a live texture and a slot of our heap.
             unsafe {
