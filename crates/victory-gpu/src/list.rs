@@ -294,7 +294,9 @@ pub(crate) struct Barrier {
 #[cfg(windows)]
 fn host_barrier(list: &crate::host::HostList, b: &Barrier) -> Option<Barrier> {
     use windows::core::Interface;
-    let host = |r: This| crate::resource::host_resource(r).map(|h| h.as_raw().cast_const().cast());
+    let host = |r: This| {
+        crate::resource::existing_host_resource(r).map(|h| h.as_raw().cast_const().cast())
+    };
     match b.kind {
         0 => {
             // A split barrier's first half: its second half transitions.
@@ -302,6 +304,8 @@ fn host_barrier(list: &crate::host::HostList, b: &Barrier) -> Option<Barrier> {
             if b.flags & BEGIN_ONLY != 0 {
                 return None;
             }
+            // Do not materialize an unused texture just to transition it.
+            crate::resource::existing_host_resource(b.first)?;
             // shortcut: whole resources, from the state the list tracked
             // (`HostList::transition`); subresources are not told apart.
             let wanted = crate::host::texture_state(b.last as u32);

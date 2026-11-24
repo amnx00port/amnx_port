@@ -745,10 +745,16 @@ struct Resource {
     heap: HeapProperties,
     heap_flags: u32,
     backing: Backing,
-    /// Textures also live on the host GPU (decision 0007); buffers do not
-    /// yet.
+    /// Initial state and clear value kept so the host copy can be made on
+    /// first use instead of at resource creation.
     #[cfg(windows)]
-    host: Option<std::sync::Arc<HostTexture>>,
+    initial_state: u32,
+    #[cfg(windows)]
+    clear_value: Option<[u32; 5]>,
+    /// Textures also live on the host GPU (decision 0007), made on first use;
+    /// buffers do not yet.
+    #[cfg(windows)]
+    host: std::sync::OnceLock<Option<std::sync::Arc<HostTexture>>>,
 }
 
 /// A title texture's host copy and the state it is in. The title's barriers
@@ -763,19 +769,44 @@ pub(crate) struct HostTexture {
     pub(crate) state: std::sync::atomic::AtomicU32,
 }
 
+#[cfg(windows)]
+impl Resource {
+    /// The host texture copy, made on first use so textures registered during
+    /// streaming that no view, copy, or draw touches yet do not claim VRAM.
+    fn host_entry(&self) -> Option<&std::sync::Arc<HostTexture>> {
+        self.host
+            .get_or_init(|| {
+                let texture = host_texture(
+                    &self.desc,
+                    self.initial_state,
+                    self.clear_value.as_ref(),
+                )?;
+                let state = crate::host::legal_state(
+                    &texture,
+                    crate::host::texture_state(self.initial_state),
+                );
+                Some(std::sync::Arc::new(HostTexture {
+                    texture,
+                    state: state.into(),
+                }))
+            })
+            .as_ref()
+    }
+}
+
 /// Moves the host texture to `wanted` (a host texture state); the host
 /// resource and the state it leaves, if that is a change.
 #[cfg(windows)]
 pub(crate) fn host_transition(this: This, wanted: u32) -> Option<(*mut c_void, u32)> {
     use windows::core::Interface;
-    let host = resource(this).host.as_ref()?;
+    let host = resource(this).host_entry()?;
     let before = host
         .state
         .swap(wanted, std::sync::atomic::Ordering::Relaxed);
     (before != wanted).then(|| (host.texture.as_raw(), before))
 }
 
-/// The host GPU's copy of a title resource, if it has one.
+/// The host GPU's copy of a title resource, if it has one (made on first use).
 #[cfg(windows)]
 pub(crate) fn host_resource<'a>(
     this: This,
@@ -783,7 +814,23 @@ pub(crate) fn host_resource<'a>(
     if this.is_null() {
         return None;
     }
-    resource(this).host.as_deref().map(|h| &h.texture)
+    resource(this).host_entry().map(|h| &h.texture)
+}
+
+/// The host GPU's copy of a title resource only if already made, without
+/// creating one (used by barriers so unused textures do not claim VRAM).
+#[cfg(windows)]
+pub(crate) fn existing_host_resource<'a>(
+    this: This,
+) -> Option<&'a windows::Win32::Graphics::Direct3D12::ID3D12Resource> {
+    if this.is_null() {
+        return None;
+    }
+    resource(this)
+        .host
+        .get()?
+        .as_deref()
+        .map(|h| &h.texture)
 }
 
 /// A title texture's host copy, shared, for a list to hold.
@@ -792,7 +839,7 @@ pub(crate) fn host_copy(this: This) -> Option<std::sync::Arc<HostTexture>> {
     if this.is_null() {
         return None;
     }
-    resource(this).host.clone()
+    resource(this).host_entry().cloned()
 }
 
 /// A host texture like the title's: same description, in GPU memory,
@@ -801,7 +848,7 @@ pub(crate) fn host_copy(this: This) -> Option<std::sync::Arc<HostTexture>> {
 fn host_texture(
     desc: &ResourceDesc,
     state: u32,
-    clear: *const c_void,
+    clear_value: Option<&[u32; 5]>,
 ) -> Option<windows::Win32::Graphics::Direct3D12::ID3D12Resource> {
     use windows::Win32::Graphics::Direct3D12::*;
     const PC_FLAGS: u32 = 0xf; // render target, depth, UAV, no shader access
@@ -834,14 +881,6 @@ fn host_texture(
     if d.flags & UNORDERED != 0 && SRGB.iter().any(|&(srgb, _)| srgb == d.format) {
         d.format = family(d.format);
     }
-    // The clear value names the format too: format, then color or depth
-    // and stencil (5 words).
-    let clear_value = (!clear.is_null()).then(|| {
-        // SAFETY: the title passes a whole clear value.
-        let mut value = unsafe { clear.cast::<[u32; 5]>().read_unaligned() };
-        value[0] = pc_format(value[0]);
-        value
-    });
     let heap = D3D12_HEAP_PROPERTIES {
         Type: D3D12_HEAP_TYPE_DEFAULT,
         ..Default::default()
@@ -858,7 +897,7 @@ fn host_texture(
                 crate::host::legal_for(d.flags, crate::host::texture_state(state)) as i32,
             ),
             // The same layout: format, then color or depth and stencil.
-            clear_value.as_ref().map(|v| std::ptr::from_ref(v).cast()),
+            clear_value.map(|v| std::ptr::from_ref(v).cast()),
             &mut texture,
         )
     };
@@ -928,7 +967,14 @@ fn hand_out_resource(
     #[cfg(not(windows))]
     let _ = (state, clear);
     #[cfg(windows)]
-    let host = host_texture(&desc, state, clear);
+    // The clear value names the format too: format, then color or depth
+    // and stencil (5 words). Copy it now while the caller's pointer is live.
+    let clear_value = (desc.dimension != BUFFER && !clear.is_null()).then(|| {
+        // SAFETY: the title passes a whole clear value.
+        let mut value = unsafe { clear.cast::<[u32; 5]>().read_unaligned() };
+        value[0] = pc_format(value[0]);
+        value
+    });
     let resource = Box::new(Resource {
         object: Object::new(&RESOURCE_FUNCTIONS),
         desc,
@@ -936,13 +982,11 @@ fn hand_out_resource(
         heap_flags,
         backing,
         #[cfg(windows)]
-        host: host.map(|texture| {
-            let state = crate::host::legal_state(&texture, crate::host::texture_state(state));
-            std::sync::Arc::new(HostTexture {
-                texture,
-                state: state.into(),
-            })
-        }),
+        initial_state: state,
+        #[cfg(windows)]
+        clear_value,
+        #[cfg(windows)]
+        host: std::sync::OnceLock::new(),
     });
     #[cfg(windows)]
     if desc.dimension == BUFFER {
@@ -958,7 +1002,8 @@ impl Drop for Resource {
         #[cfg(feature = "diagnostics")]
         if self
             .host
-            .as_ref()
+            .get()
+            .and_then(|h| h.as_ref())
             .is_some_and(|h| std::sync::Arc::strong_count(h) > 1)
         {
             // Before lists held their textures, this freed a texture that
@@ -1174,7 +1219,7 @@ pub(crate) fn texture_at(address: u64, desc: &[u32; 14]) -> Option<This> {
         return None;
     }
     map.insert((address, *desc), out as usize);
-    resource(out).host.is_some().then_some(out)
+    host_resource(out).is_some().then_some(out)
 }
 
 pub(crate) extern "system" fn create_placed(
@@ -1840,5 +1885,238 @@ mod tests {
         // The resource keeps the heap alive.
         assert_eq!(slot::<Release>(heap, 0x10)(heap), 1);
         assert_eq!(slot::<Release>(placed, 0x10)(placed), 0);
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn host_texture_is_made_on_first_use() {
+        let desc = ResourceDesc {
+            dimension: 3, // TEXTURE2D
+            alignment: 0,
+            width: 64,
+            height: 64,
+            depth_or_array_size: 1,
+            mip_levels: 1,
+            format: 28, // R8G8B8A8_UNORM
+            sample_count: 1,
+            sample_quality: 0,
+            layout: 0,
+            flags: 0,
+        };
+        let null = std::ptr::null();
+        let mut image = null;
+        let hr = create_committed(
+            null,
+            &PROPERTIES,
+            0,
+            &desc,
+            0,
+            null.cast(),
+            &RESOURCE_IIDS[0],
+            &mut image,
+        );
+        assert_eq!(hr, S_OK);
+        // Creating the title resource must not allocate a host GPU texture yet.
+        assert!(existing_host_resource(image).is_none());
+        if crate::host::host().is_some() {
+            assert!(host_resource(image).is_some());
+            assert!(existing_host_resource(image).is_some());
+        }
+        assert_eq!(slot::<Release>(image, 0x10)(image), 0);
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn clear_value_survives_lazy_materialization() {
+        use windows::Win32::Graphics::Direct3D12::*;
+        use windows::Win32::Graphics::Dxgi::Common::DXGI_FORMAT_UNKNOWN;
+        use windows::core::Interface;
+
+        let rgba = [0.25f32, 0.5, 0.75, 1.0];
+        let expected_clear: [u32; 5] = [
+            28, // DXGI_FORMAT_R8G8B8A8_UNORM
+            rgba[0].to_bits(),
+            rgba[1].to_bits(),
+            rgba[2].to_bits(),
+            rgba[3].to_bits(),
+        ];
+        let mut caller_clear = expected_clear;
+        let desc = ResourceDesc {
+            dimension: 3, // TEXTURE2D
+            alignment: 0,
+            width: 4,
+            height: 4,
+            depth_or_array_size: 1,
+            mip_levels: 1,
+            format: 28, // R8G8B8A8_UNORM
+            sample_count: 1,
+            sample_quality: 0,
+            layout: 0,
+            flags: 1, // ALLOW_RENDER_TARGET
+        };
+        let null = std::ptr::null();
+        let mut rt = null;
+        let hr = create_committed(
+            null,
+            &PROPERTIES,
+            0,
+            &desc,
+            0,
+            caller_clear.as_ptr().cast(),
+            &RESOURCE_IIDS[0],
+            &mut rt,
+        );
+        assert_eq!(hr, S_OK);
+
+        // Overwrite the caller's stack storage before the host texture is made.
+        caller_clear = [0xDEAD_BEEF; 5];
+        std::hint::black_box(&caller_clear);
+        assert!(existing_host_resource(rt).is_none());
+        assert_eq!(resource(rt).clear_value, Some(expected_clear));
+
+        let Some(host) = crate::host::host() else {
+            assert_eq!(slot::<Release>(rt, 0x10)(rt), 0);
+            return;
+        };
+
+        let host_rt = host_resource(rt).expect("lazy host render target");
+        assert!(existing_host_resource(rt).is_some());
+
+        // SAFETY: plain 1-descriptor RTV heap creation on a live device.
+        let rtv_heap: ID3D12DescriptorHeap = unsafe {
+            host.device.CreateDescriptorHeap(&D3D12_DESCRIPTOR_HEAP_DESC {
+                Type: D3D12_DESCRIPTOR_HEAP_TYPE_RTV,
+                NumDescriptors: 1,
+                Flags: D3D12_DESCRIPTOR_HEAP_FLAG_NONE,
+                NodeMask: 0,
+            })
+        }
+        .unwrap();
+        // SAFETY: live descriptor heap.
+        let rtv_handle = unsafe { rtv_heap.GetCPUDescriptorHandleForHeapStart() };
+        // SAFETY: live render-target texture and 1-descriptor RTV heap.
+        unsafe {
+            host.device.CreateRenderTargetView(host_rt, None, rtv_handle);
+        }
+
+        let readback_heap = D3D12_HEAP_PROPERTIES {
+            Type: D3D12_HEAP_TYPE_READBACK,
+            ..Default::default()
+        };
+        let readback_desc = D3D12_RESOURCE_DESC {
+            Dimension: D3D12_RESOURCE_DIMENSION_BUFFER,
+            Width: 1024,
+            Height: 1,
+            DepthOrArraySize: 1,
+            MipLevels: 1,
+            Format: DXGI_FORMAT_UNKNOWN,
+            SampleDesc: windows::Win32::Graphics::Dxgi::Common::DXGI_SAMPLE_DESC {
+                Count: 1,
+                Quality: 0,
+            },
+            Layout: D3D12_TEXTURE_LAYOUT_ROW_MAJOR,
+            ..Default::default()
+        };
+        let mut readback: Option<ID3D12Resource> = None;
+        // SAFETY: plain readback buffer creation.
+        unsafe {
+            host.device
+                .CreateCommittedResource(
+                    &readback_heap,
+                    D3D12_HEAP_FLAG_NONE,
+                    &readback_desc,
+                    D3D12_RESOURCE_STATE_COPY_DEST,
+                    None,
+                    &mut readback,
+                )
+                .unwrap();
+        }
+        let readback = readback.unwrap();
+
+        #[repr(C)]
+        struct Location {
+            resource: This,
+            kind: u32,
+            footprint: PlacedFootprint,
+        }
+        let list = host.new_list().unwrap();
+        let out_to = Location {
+            resource: readback.as_raw().cast_const().cast(),
+            kind: 1,
+            footprint: PlacedFootprint {
+                offset: 0,
+                format: 28,
+                width: 4,
+                height: 4,
+                depth: 1,
+                row_pitch: 256,
+            },
+        };
+        let out_from = Location {
+            resource: host_rt.as_raw().cast_const().cast(),
+            kind: 0,
+            footprint: PlacedFootprint {
+                offset: 0,
+                format: 0,
+                width: 0,
+                height: 0,
+                depth: 0,
+                row_pitch: 0,
+            },
+        };
+        // SAFETY: open list, live resources, valid transitions and copy regions.
+        unsafe {
+            list.list.ResourceBarrier(&[crate::host::transition(
+                host_rt,
+                D3D12_RESOURCE_STATE_COMMON,
+                D3D12_RESOURCE_STATE_RENDER_TARGET,
+            )]);
+            list.list.ClearRenderTargetView(rtv_handle, &rgba, None);
+            list.list.ResourceBarrier(&[crate::host::transition(
+                host_rt,
+                D3D12_RESOURCE_STATE_RENDER_TARGET,
+                D3D12_RESOURCE_STATE_COPY_SOURCE,
+            )]);
+            list.list.CopyTextureRegion(
+                (&raw const out_to).cast(),
+                0,
+                0,
+                0,
+                (&raw const out_from).cast(),
+                None,
+            );
+        }
+        list.close();
+        host.execute(&[&list]);
+
+        let mut mapped = std::ptr::null_mut();
+        // SAFETY: execute waited for completion; readback buffer is 1024 bytes.
+        let read = unsafe {
+            readback
+                .Map(
+                    0,
+                    Some(&D3D12_RANGE { Begin: 0, End: 1024 }),
+                    Some(&mut mapped),
+                )
+                .unwrap();
+            std::slice::from_raw_parts(mapped.cast::<u8>(), 1024)
+        };
+        let expected_px: [u8; 4] = [64, 128, 191, 255];
+        for row in 0..4 {
+            for col in 0..4 {
+                let at = row * 256 + col * 4;
+                for ch in 0..4 {
+                    assert!(
+                        read[at + ch].abs_diff(expected_px[ch]) <= 1,
+                        "row {row} col {col} ch {ch}: got {}, expected {}",
+                        read[at + ch],
+                        expected_px[ch]
+                    );
+                }
+            }
+        }
+        // SAFETY: balanced unmap after reading.
+        unsafe { readback.Unmap(0, None) };
+        assert_eq!(slot::<Release>(rt, 0x10)(rt), 0);
     }
 }
