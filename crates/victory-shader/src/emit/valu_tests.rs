@@ -69,6 +69,13 @@ const fn vgpr(n: u8) -> u16 {
 /// 4 dwords of root constants in `s0..s3`, runs `body` (leaving its result in
 /// `v0`), and stores `v0` to dword 0 of the raw UAV at heap index 0.
 fn build_valu_cs(body: &[u32]) -> HostShader {
+    build_valu_cs_with(body, |parts| lower::lower(parts).expect("lower"))
+}
+
+fn build_valu_cs_with(
+    body: &[u32],
+    lower_shader: impl FnOnce(&lower::Parts) -> lower::Lowered,
+) -> HostShader {
     let mut words = Vec::new();
     // s[4:5] = descriptor table address (heap index 0 -> byte offset 0).
     words.push(s_mov_b32(5, 0x80)); // inline constant 0
@@ -127,7 +134,7 @@ fn build_valu_cs(body: &[u32]) -> HostShader {
     let res =
         resource::track(&p, &native.layout, native.stage, Some(&st)).expect("resource::track");
     let io = io::raise(&p, &native).expect("io::raise");
-    let lowered = lower::lower(&lower::Parts {
+    let lowered = lower_shader(&lower::Parts {
         native: &native,
         p: &p,
         st: &st,
@@ -137,8 +144,7 @@ fn build_valu_cs(body: &[u32]) -> HostShader {
         outputs: Vec::new(),
         prims: Vec::new(),
         mesh_stride: 0,
-    })
-    .expect("lower");
+    });
 
     let shader = HostShader {
         stage: HwStage::Cs,
@@ -374,6 +380,51 @@ fn v_med3_f16_matches_rdna2_with_nan() {
             ),
         }
     });
+}
+
+#[test]
+fn v_mad_f16_rounds_the_product_before_adding() {
+    let body = vop3(0x34b, 0, vgpr(1), vgpr(2), vgpr(3)); // v_fma_f16
+    let fused = build_valu_cs(&body);
+    // Use the same decoded operands to exercise the legacy lowering.
+    let unfused = build_valu_cs_with(&body, lower::lower_legacy_mad_f16);
+    let container = crate::Container::parse(&unfused.dxil).unwrap();
+    let features = container.part(crate::FourCC::SFI0).unwrap();
+    let features = u64::from_le_bytes(features.data.try_into().unwrap());
+    assert_eq!(features & (0x1 | 0x8000), 0, "DXIL double or INT64 feature");
+
+    // Inputs, expected unfused half, expected fused half.
+    let cases = [
+        // (1 + 2^-10)^2 - (1 + 2^-9). Only the fused result keeps 2^-20.
+        ([0x3c01, 0x3c01, 0xbc02, 0], 0x0000, 0x0010),
+        // 256 * 256 - 65504. The unfused product overflows before cancellation.
+        ([0x5c00, 0x5c00, 0xfbff, 0], 0x7c00, 0x5000),
+        ([0xdc00, 0x5c00, 0x7bff, 0], 0xfc00, 0xd000),
+        // 273 * 240 = 65520, the nearest-even overflow threshold.
+        ([0x5c44, 0x5b80, 0xfbff, 0], 0x7c00, 0x4c00),
+        // 3 * 2^-24 * 0.5 + 2^-24. The unfused product rounds up to the even subnormal.
+        ([0x0003, 0x3800, 0x0001, 0], 0x0003, 0x0002),
+        // (1 + 2^-10) * 1.5 rounds up to 1.5 + 2 * 2^-10.
+        ([0x3c01, 0x3e00, 0xbe02, 0], 0x0000, 0x9000),
+        // The product ties between the largest subnormal and smallest normal.
+        ([0x0400, 0x3bff, 0x8400, 0], 0x0000, 0x8000),
+        // Signed zero and ordinary arithmetic.
+        ([0x8000, 0x3c00, 0x8000, 0], 0x8000, 0x8000),
+        ([0x8000, 0x3c00, 0x0000, 0], 0x0000, 0x0000),
+        ([0x3e00, 0x4000, 0x3800, 0], 0x4300, 0x4300),
+        // The final sum 1 + 2^-11 is a normal tie.
+        ([0x3c00, 0x3c00, 0x1000, 0], 0x3c00, 0x3c00),
+        // The final sum ties above an odd significand and rounds up.
+        ([0x3c03, 0x3e00, 0x1600, 0], 0x3e06, 0x3e06),
+    ];
+    let inputs = cases.map(|(inputs, _, _)| inputs);
+    for (name, shader) in [("v_mad_f16", &unfused), ("v_fma_f16", &fused)] {
+        run_cases(shader, &inputs, |backend, i, inputs, out| {
+            let (_, mad, fma) = cases[i];
+            let expected = if name == "v_mad_f16" { mad } else { fma };
+            assert_eq!(out & 0xffff, expected, "{backend} {name} {inputs:04x?}");
+        });
+    }
 }
 
 /// `v_cmp_lg_*` is "less or greater": ordered and not equal, so false when
