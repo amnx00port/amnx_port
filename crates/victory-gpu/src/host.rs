@@ -53,6 +53,78 @@ pub(crate) struct Host {
     messages: Option<ID3D12InfoQueue>,
     next_rtv: AtomicU32,
     presenter: Mutex<Option<Presenter>>,
+    /// Why no presenter was made, and when to try again: a run with no
+    /// desktop to present on would otherwise ask DXGI at the frame rate.
+    present_retry: Mutex<Retry>,
+}
+
+/// A presenter that could not be made, and when to try again. Without this,
+/// a run behind a locked screen or a sleeping display retried every frame:
+/// 1,654 `no swap chain` lines in 60 seconds, and one DXGI call per frame,
+/// which buries the log and costs a submission's worth of work each time.
+struct Retry {
+    attempts: u32,
+    /// The next attempt is due at (or after) this instant; `None` with
+    /// `attempts == 0` means nothing has failed.
+    next: Option<std::time::Instant>,
+}
+
+impl Retry {
+    const fn new() -> Self {
+        Retry {
+            attempts: 0,
+            next: None,
+        }
+    }
+
+    /// Whether an attempt is due at `now`.
+    fn due(&self, now: std::time::Instant) -> bool {
+        self.next.is_none_or(|at| now >= at)
+    }
+
+    /// Records a failed attempt at `now` and when the next one may run.
+    fn failed(&mut self, now: std::time::Instant) {
+        self.attempts = self.attempts.saturating_add(1);
+        self.next = Some(now + retry_delay(self.attempts));
+    }
+
+    /// Clears the failure state after an attempt worked, returning how many
+    /// attempts had failed before it.
+    fn reset(&mut self) -> u32 {
+        let attempts = self.attempts;
+        *self = Retry::new();
+        attempts
+    }
+}
+
+/// How long to wait before retry number `attempts`: 100 ms, doubling, up to
+/// one second, so a state that clears still recovers within a second.
+fn retry_delay(attempts: u32) -> std::time::Duration {
+    const FIRST_MS: u64 = 100;
+    const MOST_MS: u64 = 1_000;
+    let doubling = FIRST_MS << attempts.saturating_sub(1).min(4);
+    std::time::Duration::from_millis(doubling.min(MOST_MS))
+}
+
+/// Which step of making a presenter failed, so the log says whether the
+/// window, the swap chain or its command list was refused.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum PresentStep {
+    Window,
+    Factory,
+    SwapChain,
+    List,
+}
+
+impl PresentStep {
+    fn name(self) -> &'static str {
+        match self {
+            PresentStep::Window => "window",
+            PresentStep::Factory => "DXGI factory",
+            PresentStep::SwapChain => "swap chain",
+            PresentStep::List => "copy list",
+        }
+    }
 }
 
 // SAFETY: D3D12 devices, queues, fences and descriptor heaps are
@@ -222,6 +294,7 @@ fn create() -> windows::core::Result<Host> {
             messages,
             next_rtv: AtomicU32::new(0),
             presenter: Mutex::new(None),
+            present_retry: Mutex::new(Retry::new()),
         })
     }
 }
@@ -1596,14 +1669,44 @@ impl Host {
         };
         let (width, height) = (desc.Width as u32, desc.Height);
         let mut presenter = self.presenter.lock().unwrap_or_else(|e| e.into_inner());
+        let mut retry = self.present_retry.lock().unwrap_or_else(|e| e.into_inner());
+        let now = std::time::Instant::now();
+        // After a failure, wait for the backoff: one attempt per state, not
+        // one per frame.
+        if !retry.due(now) {
+            return None;
+        }
         if presenter.is_none() {
-            *presenter = match self.presenter(width, height, format) {
-                Ok(p) => Some(p),
-                Err(e) => {
-                    tracing::warn!(error = %e, "no swap chain");
+            match self.presenter(width, height, format) {
+                Ok(p) => {
+                    let attempts = retry.reset();
+                    if attempts > 0 {
+                        tracing::info!(attempts, "swap chain created after the failed attempts");
+                    }
+                    *presenter = Some(p);
+                }
+                Err((step, e)) => {
+                    retry.failed(now);
+                    if retry.attempts == 1 {
+                        tracing::warn!(
+                            error = %e,
+                            step = step.name(),
+                            width,
+                            height,
+                            format = format.0,
+                            "no swap chain; the next attempt waits for the backoff"
+                        );
+                    } else {
+                        tracing::debug!(
+                            error = %e,
+                            step = step.name(),
+                            attempts = retry.attempts,
+                            "no swap chain"
+                        );
+                    }
                     return None;
                 }
-            };
+            }
         }
         let p = presenter.as_mut()?;
         if (p.width, p.height, p.format) != (width, height, format) {
@@ -1613,9 +1716,22 @@ impl Host {
                     .ResizeBuffers(BUFFERS, width, height, format, DXGI_SWAP_CHAIN_FLAG(0))
             };
             match resized {
-                Ok(()) => (p.width, p.height, p.format) = (width, height, format),
+                Ok(()) => {
+                    retry.reset();
+                    (p.width, p.height, p.format) = (width, height, format);
+                }
                 Err(e) => {
-                    tracing::warn!(error = %e, width, height, "swap chain not resized");
+                    retry.failed(now);
+                    if retry.attempts == 1 {
+                        tracing::warn!(
+                            error = %e,
+                            width,
+                            height,
+                            "swap chain not resized; the next attempt waits for the backoff"
+                        );
+                    } else {
+                        tracing::debug!(error = %e, attempts = retry.attempts, "swap chain not resized");
+                    }
                     return None;
                 }
             }
@@ -1674,14 +1790,15 @@ impl Host {
         width: u32,
         height: u32,
         format: DXGI_FORMAT,
-    ) -> windows::core::Result<Presenter> {
+    ) -> Result<Presenter, (PresentStep, windows::core::Error)> {
         let hwnd = match title_window() {
             Some(hwnd) => hwnd,
-            None => window(width, height)?,
+            None => window(width, height).map_err(|e| (PresentStep::Window, e))?,
         };
         // SAFETY: plain object creation for our window.
         unsafe {
-            let factory: IDXGIFactory2 = CreateDXGIFactory2(DXGI_CREATE_FACTORY_FLAGS(0))?;
+            let factory: IDXGIFactory2 = CreateDXGIFactory2(DXGI_CREATE_FACTORY_FLAGS(0))
+                .map_err(|e| (PresentStep::Factory, e))?;
             let desc = DXGI_SWAP_CHAIN_DESC1 {
                 Width: width,
                 Height: height,
@@ -1696,9 +1813,11 @@ impl Host {
                 ..Default::default()
             };
             let swap_chain = factory
-                .CreateSwapChainForHwnd(&self.queue, hwnd, &desc, None, None)?
-                .cast::<IDXGISwapChain3>()?;
-            let copy = self.new_list()?;
+                .CreateSwapChainForHwnd(&self.queue, hwnd, &desc, None, None)
+                .map_err(|e| (PresentStep::SwapChain, e))?
+                .cast::<IDXGISwapChain3>()
+                .map_err(|e| (PresentStep::SwapChain, e))?;
+            let copy = self.new_list().map_err(|e| (PresentStep::List, e))?;
             copy.close();
             tracing::info!(width, height, format = format.0, "presenting to a window");
             Ok(Presenter {
@@ -2051,5 +2170,85 @@ mod batch {   // Batch::texture_due lives here; `mod tests` is already taken at 
             SIZE >> 20,
             before.as_secs_f64() / after.as_secs_f64()
         );
+    }
+}
+
+#[cfg(test)]
+mod present_retry {
+    use super::{PresentStep, Retry, retry_delay};
+    use std::time::{Duration, Instant};
+
+    #[test]
+    fn the_backoff_starts_short_and_stops_at_a_second() {
+        let schedule: Vec<u64> = (1..=7).map(|n| retry_delay(n).as_millis() as u64).collect();
+        assert_eq!(schedule, [100, 200, 400, 800, 1_000, 1_000, 1_000]);
+    }
+
+    #[test]
+    fn a_failed_attempt_waits_before_the_next_one() {
+        let start = Instant::now();
+        let mut retry = Retry::new();
+        // Nothing has failed, so an attempt is due.
+        assert!(retry.due(start));
+        retry.failed(start);
+        assert_eq!(retry.attempts, 1);
+        assert!(!retry.due(start));
+        assert!(!retry.due(start + Duration::from_millis(99)));
+        assert!(retry.due(start + Duration::from_millis(100)));
+        // A second failure doubles the wait and counts.
+        let second = start + Duration::from_millis(100);
+        retry.failed(second);
+        assert_eq!(retry.attempts, 2);
+        assert!(!retry.due(second + Duration::from_millis(199)));
+        assert!(retry.due(second + Duration::from_millis(200)));
+    }
+
+    #[test]
+    fn a_working_attempt_clears_the_state_and_reports_the_failures() {
+        let start = Instant::now();
+        let mut retry = Retry::new();
+        for _ in 0..3 {
+            retry.failed(start);
+        }
+        assert_eq!(retry.attempts, 3);
+        assert_eq!(retry.reset(), 3);
+        assert_eq!(retry.attempts, 0);
+        assert!(retry.due(start));
+        // A later failure starts the schedule over.
+        retry.failed(start);
+        assert!(!retry.due(start + Duration::from_millis(99)));
+    }
+
+    /// A minute behind a desktop that never appears: one attempt per backoff
+    /// instead of one per presented frame.
+    #[test]
+    fn a_minute_without_a_desktop_asks_a_bounded_number_of_times() {
+        let mut retry = Retry::new();
+        let mut now = Instant::now();
+        let mut attempts = 0u32;
+        for _ in 0..1_200 {
+            // 60 s at 20 fps.
+            if retry.due(now) {
+                attempts += 1;
+                retry.failed(now);
+            }
+            now += Duration::from_millis(50);
+        }
+        assert!(
+            (59..=64).contains(&attempts),
+            "{attempts} attempts in a minute, one per backoff expected"
+        );
+    }
+
+    #[test]
+    fn every_step_of_a_presenter_has_a_name() {
+        for step in [
+            PresentStep::Window,
+            PresentStep::Factory,
+            PresentStep::SwapChain,
+            PresentStep::List,
+        ] {
+            assert!(!step.name().is_empty());
+        }
     }
 }
