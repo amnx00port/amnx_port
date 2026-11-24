@@ -502,6 +502,14 @@ fn buffer_srv(
     mut desc: D3D12_SHADER_RESOURCE_VIEW_DESC,
     at: D3D12_CPU_DESCRIPTOR_HANDLE,
 ) -> Option<Kept> {
+    // SAFETY: a buffer view's union member.
+    if unsafe { desc.Anonymous.Buffer.NumElements } == 0 {
+        once!(
+            address = format_args!("{address:#x}"),
+            "buffer shader view of zero elements"
+        );
+        return None;
+    }
     let shadow = crate::shadow::find(address, len)?;
     let element = element_size(&desc);
     // SAFETY: a buffer view's union member.
@@ -536,6 +544,14 @@ fn buffer_uav(
     mut desc: D3D12_UNORDERED_ACCESS_VIEW_DESC,
     at: D3D12_CPU_DESCRIPTOR_HANDLE,
 ) -> Option<Kept> {
+    // SAFETY: a buffer view's union member.
+    if unsafe { desc.Anonymous.Buffer.NumElements } == 0 {
+        once!(
+            address = format_args!("{address:#x}"),
+            "unordered buffer view of zero elements"
+        );
+        return None;
+    }
     let shadow = crate::shadow::find(address, len)?;
     // SAFETY: a live buffer.
     let flags = unsafe { shadow.buffer.GetDesc() }.Flags;
@@ -554,7 +570,11 @@ fn buffer_uav(
     };
     let offset = shadow.offset(address);
     if element == 0 || offset % element != 0 {
-        once!(offset, element, "unordered buffer view not on an element of its host copy");
+        once!(
+            offset,
+            element,
+            "unordered buffer view not on an element of its host copy"
+        );
         return None;
     }
     buffer.FirstElement += offset / element;
@@ -562,8 +582,12 @@ fn buffer_uav(
     let host = host()?;
     // SAFETY: a live buffer and a slot of our heap.
     unsafe {
-        host.device
-            .CreateUnorderedAccessView(&shadow.buffer, None::<&ID3D12Resource>, Some(&desc), at)
+        host.device.CreateUnorderedAccessView(
+            &shadow.buffer,
+            None::<&ID3D12Resource>,
+            Some(&desc),
+            at,
+        )
     };
     Some(Some(shadow.buffer.clone()))
 }
@@ -720,7 +744,10 @@ fn make(view: &View, at: D3D12_CPU_DESCRIPTOR_HANDLE) -> Option<Kept> {
                 // shortcut: unordered access to a texture the title placed
                 // itself is not mirrored; give it a resource as shader
                 // views of such textures get when a dispatch writes one.
-                once!(dimension = resource[0], "placed unordered texture view not mirrored");
+                once!(
+                    dimension = resource[0],
+                    "placed unordered texture view not mirrored"
+                );
                 return None;
             }
             // The resource description's width, after the alignment.
@@ -756,6 +783,10 @@ pub(crate) fn placed_texture(view: &View) -> Option<View> {
 /// view. Writes to it are dropped, reads give zeros.
 fn null_for(view: &View, at: D3D12_CPU_DESCRIPTOR_HANDLE) {
     let Some(host) = host() else { return };
+    null_for_on(&host.device, view, at);
+}
+
+fn null_for_on(device: &ID3D12Device, view: &View, at: D3D12_CPU_DESCRIPTOR_HANDLE) {
     let is_buffer = |r: &usize| crate::resource::buffer_bytes(*r as crate::object::This).is_some();
     // Unordered views: whether a buffer, and the title's view dimension.
     let (buffer, dimension) = match view {
@@ -769,21 +800,23 @@ fn null_for(view: &View, at: D3D12_CPU_DESCRIPTOR_HANDLE) {
         // the hardware does not survive in general (GPU-based validation
         // reports it).
         View::Shader(r, desc) if is_buffer(r) || desc.is_some_and(|d| d[1] == 1) => {
-            return null_buffer_view(at);
+            return null_buffer_view_on(device, at);
         }
-        View::Placed(false, resource, _) if resource[0] == 1 => return null_buffer_view(at),
+        View::Placed(false, resource, _) if resource[0] == 1 => {
+            return null_buffer_view_on(device, at);
+        }
         // Textures: a null view of the title's dimension (1D, arrays, 3D,
         // cubes), not always 2D.
-        View::Shader(_, Some(desc)) => return null_like(desc, at),
+        View::Shader(_, Some(desc)) => return null_like_on(device, desc, at),
         View::Placed(false, _, desc) => {
-            return null_like(desc[..10].try_into().unwrap_or(&[0; 10]), at);
+            return null_like_on(device, desc[..10].try_into().unwrap_or(&[0; 10]), at);
         }
         View::Constant(..) => {
             let desc = D3D12_CONSTANT_BUFFER_VIEW_DESC::default();
             // SAFETY: a slot of our heap; a zero location makes a null view.
-            return unsafe { host.device.CreateConstantBufferView(Some(&desc), at) };
+            return unsafe { device.CreateConstantBufferView(Some(&desc), at) };
         }
-        _ => return null_view(at),
+        _ => return null_view_on(device, at),
     };
     let desc = if buffer {
         D3D12_UNORDERED_ACCESS_VIEW_DESC {
@@ -796,7 +829,7 @@ fn null_for(view: &View, at: D3D12_CPU_DESCRIPTOR_HANDLE) {
     };
     // SAFETY: a slot of our heap; a null resource is allowed with a desc.
     unsafe {
-        host.device.CreateUnorderedAccessView(
+        device.CreateUnorderedAccessView(
             None::<&ID3D12Resource>,
             None::<&ID3D12Resource>,
             Some(&desc),
@@ -847,8 +880,7 @@ fn null_uav_desc(dimension: Option<u32>) -> D3D12_UNORDERED_ACCESS_VIEW_DESC {
 
 /// A buffer view that reads zeros (raw, as translated shaders mostly read
 /// buffers).
-fn null_buffer_view(at: D3D12_CPU_DESCRIPTOR_HANDLE) {
-    let Some(host) = host() else { return };
+fn null_buffer_view_on(device: &ID3D12Device, at: D3D12_CPU_DESCRIPTOR_HANDLE) {
     let desc = D3D12_SHADER_RESOURCE_VIEW_DESC {
         Format: DXGI_FORMAT_R32_TYPELESS,
         ViewDimension: D3D12_SRV_DIMENSION_BUFFER,
@@ -863,19 +895,17 @@ fn null_buffer_view(at: D3D12_CPU_DESCRIPTOR_HANDLE) {
     };
     // SAFETY: a slot of our heap; a null resource is allowed with a desc.
     unsafe {
-        host.device
-            .CreateShaderResourceView(None::<&ID3D12Resource>, Some(&desc), at)
-    };
+        device.CreateShaderResourceView(None::<&ID3D12Resource>, Some(&desc), at);
+    }
 }
 
 /// A texture view that reads zeros with the dimension (and mip and array
 /// counts) of the title's description `words`; 2D if it names none.
-fn null_like(words: &[u32; 10], at: D3D12_CPU_DESCRIPTOR_HANDLE) {
+fn null_like_on(device: &ID3D12Device, words: &[u32; 10], at: D3D12_CPU_DESCRIPTOR_HANDLE) {
     const TEXTURES: std::ops::RangeInclusive<u32> = 2..=10;
     if !TEXTURES.contains(&words[1]) {
-        return null_view(at);
+        return null_view_on(device, at);
     }
-    let Some(host) = host() else { return };
     // One mip, one slice or cube, plane 0: fields a null view still checks.
     let mut w = [0u32; 10];
     w[1] = words[1];
@@ -890,9 +920,8 @@ fn null_like(words: &[u32; 10], at: D3D12_CPU_DESCRIPTOR_HANDLE) {
     desc.Shader4ComponentMapping = D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING;
     // SAFETY: a slot of our heap; a null resource is allowed with a desc.
     unsafe {
-        host.device
-            .CreateShaderResourceView(None::<&ID3D12Resource>, Some(&desc), at)
-    };
+        device.CreateShaderResourceView(None::<&ID3D12Resource>, Some(&desc), at);
+    }
 }
 
 /// A view that reads zeros, for slots whose view the host cannot make.
@@ -901,6 +930,10 @@ fn null_like(words: &[u32; 10], at: D3D12_CPU_DESCRIPTOR_HANDLE) {
 /// page faults (2026-11-24, run w10), so they are not the cause.
 fn null_view(at: D3D12_CPU_DESCRIPTOR_HANDLE) {
     let Some(host) = host() else { return };
+    null_view_on(&host.device, at);
+}
+
+fn null_view_on(device: &ID3D12Device, at: D3D12_CPU_DESCRIPTOR_HANDLE) {
     let desc = D3D12_SHADER_RESOURCE_VIEW_DESC {
         Format: DXGI_FORMAT_R8G8B8A8_UNORM,
         ViewDimension: D3D12_SRV_DIMENSION_TEXTURE2D,
@@ -914,9 +947,8 @@ fn null_view(at: D3D12_CPU_DESCRIPTOR_HANDLE) {
     };
     // SAFETY: a slot of our heap; a null resource is allowed with a desc.
     unsafe {
-        host.device
-            .CreateShaderResourceView(None::<&ID3D12Resource>, Some(&desc), at)
-    };
+        device.CreateShaderResourceView(None::<&ID3D12Resource>, Some(&desc), at);
+    }
 }
 
 #[cfg(test)]
@@ -972,5 +1004,584 @@ mod tests {
         heap.release(a, 50);
         assert_eq!(heap.dynamic(50), Some(4));
         assert_eq!(heap.dynamic(40), Some(4 + heap.dynamic - 40));
+    }
+
+    fn placed_buffer_view(unordered: bool, address: u64, len: u64, elements: u32) -> View {
+        let mut resource = [0u32; 14];
+        resource[0] = 1; // D3D12_RESOURCE_DIMENSION_BUFFER
+        resource[4] = len as u32;
+        resource[5] = (len >> 32) as u32;
+        let words: [u32; 10] = if unordered {
+            let uav = D3D12_UNORDERED_ACCESS_VIEW_DESC {
+                Format: DXGI_FORMAT_R32_TYPELESS,
+                ViewDimension: D3D12_UAV_DIMENSION_BUFFER,
+                Anonymous: D3D12_UNORDERED_ACCESS_VIEW_DESC_0 {
+                    Buffer: D3D12_BUFFER_UAV {
+                        NumElements: elements,
+                        Flags: D3D12_BUFFER_UAV_FLAG_RAW,
+                        ..Default::default()
+                    },
+                },
+            };
+            // SAFETY: 40-byte POD view description read as 10 u32 words.
+            unsafe {
+                std::ptr::from_ref(&uav)
+                    .cast::<[u32; 10]>()
+                    .read_unaligned()
+            }
+        } else {
+            let srv = D3D12_SHADER_RESOURCE_VIEW_DESC {
+                Format: DXGI_FORMAT_R32_TYPELESS,
+                ViewDimension: D3D12_SRV_DIMENSION_BUFFER,
+                Shader4ComponentMapping: D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING,
+                Anonymous: D3D12_SHADER_RESOURCE_VIEW_DESC_0 {
+                    Buffer: D3D12_BUFFER_SRV {
+                        NumElements: elements,
+                        Flags: D3D12_BUFFER_SRV_FLAG_RAW,
+                        ..Default::default()
+                    },
+                },
+            };
+            // SAFETY: 40-byte POD view description read as 10 u32 words.
+            unsafe {
+                std::ptr::from_ref(&srv)
+                    .cast::<[u32; 10]>()
+                    .read_unaligned()
+            }
+        };
+        let mut desc = [0u32; 16];
+        desc[..10].copy_from_slice(&words);
+        desc[10] = address as u32;
+        desc[11] = (address >> 32) as u32;
+        View::Placed(unordered, resource, desc)
+    }
+
+    /// Zero-element buffer SRVs and UAVs become null buffer descriptors
+    /// instead of removing the host D3D12 device (`0x887A0001`).
+    #[test]
+    fn buffer_views_of_no_elements_are_null() {
+        let Some(host) = host() else {
+            return; // no host GPU
+        };
+        let Some(heap) = HostHeap::new(false, 8) else {
+            return;
+        };
+        let backing = vec![0u32; 1024];
+        let addr = backing.as_ptr() as u64;
+        let res_id = backing.as_ptr() as usize;
+        crate::shadow::register(res_id, addr, 4096);
+
+        let slot0 = heap.dynamic(4).unwrap();
+        heap.make_at(slot0, &placed_buffer_view(false, addr, 256, 1));
+        heap.make_at(slot0 + 1, &placed_buffer_view(true, addr, 256, 1));
+        heap.make_at(slot0 + 2, &placed_buffer_view(false, addr, 256, 0));
+        heap.make_at(slot0 + 3, &placed_buffer_view(true, addr, 256, 0));
+
+        {
+            let kept = heap.kept.lock().unwrap_or_else(|e| e.into_inner());
+            assert!(
+                kept[slot0 as usize].is_some(),
+                "1-element SRV must keep shadow"
+            );
+            assert!(
+                kept[(slot0 + 1) as usize].is_some(),
+                "1-element UAV must keep shadow"
+            );
+            assert!(
+                kept[(slot0 + 2) as usize].is_none(),
+                "0-element SRV must be null"
+            );
+            assert!(
+                kept[(slot0 + 3) as usize].is_none(),
+                "0-element UAV must be null"
+            );
+        }
+
+        heap.release(slot0, 4);
+        crate::shadow::unregister(res_id, addr);
+        // SAFETY: plain D3D12 device status query.
+        assert!(unsafe { host.device.GetDeviceRemovedReason() }.is_ok());
+    }
+
+    /// Runs a synthetic compute dispatch reading and writing zero-element and
+    /// non-zero-element buffer views under the D3D12 debug layer across every
+    /// SM 6.6 hardware adapter and WARP.
+    #[test]
+    fn zero_element_buffer_views_dispatch_cleanly_across_adapters() {
+        const CHILD_ENV: &str = "VICTORY_ZERO_BUF_DEBUG_CHILD";
+        if std::env::var_os(CHILD_ENV).is_none() {
+            let exe = std::env::current_exe().expect("current_exe");
+            let out = std::process::Command::new(exe)
+                .env(CHILD_ENV, "1")
+                .args([
+                    "--exact",
+                    "descriptor::host::tests::zero_element_buffer_views_dispatch_cleanly_across_adapters",
+                    "--nocapture",
+                ])
+                .output()
+                .expect("spawn debug-layer child");
+            let stdout = String::from_utf8_lossy(&out.stdout);
+            let stderr = String::from_utf8_lossy(&out.stderr);
+            eprint!("{stdout}{stderr}");
+            assert!(
+                out.status.success(),
+                "debug-layer child failed ({}):\n{stdout}\n{stderr}",
+                out.status
+            );
+            return;
+        }
+
+        use victory_shader::native::{
+            ComputeIo, HwStage, NativeProgram, ResourceType, RootParam, RootType, StageIo,
+            UsedResource,
+        };
+        use victory_shader::{dxbc, emit, io, ir, resource, structure};
+        use windows::Win32::Graphics::Direct3D::{D3D_FEATURE_LEVEL_12_0, ID3DBlob};
+        use windows::Win32::Graphics::Dxgi::{
+            CreateDXGIFactory2, DXGI_ADAPTER_FLAG_SOFTWARE, DXGI_CREATE_FACTORY_FLAGS,
+            IDXGIAdapter, IDXGIFactory4,
+        };
+        use windows::core::Interface;
+
+        // Enable D3D12 debug layer in this fresh child process before creating any device.
+        let mut debug_enabled = false;
+        // SAFETY: called before any D3D12 device exists in this child process.
+        unsafe {
+            let mut dbg: Option<ID3D12Debug> = None;
+            if D3D12GetDebugInterface(&mut dbg).is_ok()
+                && let Some(d) = dbg
+            {
+                d.EnableDebugLayer();
+                debug_enabled = true;
+            }
+        }
+        eprintln!("D3D12 debug layer enabled in child: {debug_enabled}");
+
+        // Verify `HostHeap::make_at` on `host()` under the debug layer as well.
+        if let Some(h) = host()
+            && let Some(heap) = HostHeap::new(false, 4)
+        {
+            let backing = vec![0u32; 1024];
+            let addr = backing.as_ptr() as u64;
+            let res_id = backing.as_ptr() as usize;
+            crate::shadow::register(res_id, addr, 4096);
+            let iq = h.device.cast::<ID3D12InfoQueue>().ok();
+            if let Some(iq) = &iq {
+                // SAFETY: clearing info queue messages on our device.
+                unsafe { iq.ClearStoredMessages() };
+            }
+            let s = heap.dynamic(4).unwrap();
+            heap.make_at(s, &placed_buffer_view(false, addr, 256, 0));
+            heap.make_at(s + 1, &placed_buffer_view(true, addr, 256, 0));
+            heap.make_at(s + 2, &placed_buffer_view(false, addr, 256, 2));
+            heap.make_at(s + 3, &placed_buffer_view(true, addr, 256, 2));
+            heap.release(s, 4);
+            crate::shadow::unregister(res_id, addr);
+            // SAFETY: plain device status query.
+            assert!(unsafe { h.device.GetDeviceRemovedReason() }.is_ok());
+            if let Some(iq) = &iq {
+                assert_no_d3d12_errors("HostHeap(default)", iq);
+            }
+        }
+
+        // Build synthetic GFX10 compute shader:
+        //   slot 0: 0-element raw SRV -> reads 0 into v1
+        //   slot 1: 2-element raw SRV -> reads 0x1234_5678 into v2
+        //   slot 2: 0-element raw UAV -> drops store of 0xDEAD_BEEF
+        //   slot 3: 4-element raw UAV -> stores [v1, v2, 0xCAFE_BABE]
+        let s_mov = |dst: u8, src: u8| 0xBE80_0300u32 | (dst as u32) << 16 | src as u32;
+        let s_add = |dst: u8, s0: u8, s1: u8| {
+            0x8000_0000u32 | (dst as u32) << 16 | (s1 as u32) << 8 | s0 as u32
+        };
+        let s_load4 = |dst: u8, base: u8| {
+            [
+                0x3D << 26 | 0x02 << 18 | (dst as u32) << 6 | (base as u32 >> 1),
+                125 << 25,
+            ]
+        };
+        let buf_load = |vdst: u8, srsrc: u8, off: u16| {
+            [
+                0x38 << 26 | 0x0C << 18 | (off as u32 & 0xFFF),
+                0x80 << 24 | ((srsrc as u32 >> 2) & 0x1F) << 16 | (vdst as u32) << 8,
+            ]
+        };
+        let buf_store = |vsrc: u8, srsrc: u8, off: u16| {
+            [
+                0x38 << 26 | 0x1C << 18 | (off as u32 & 0xFFF),
+                0x80 << 24 | ((srsrc as u32 >> 2) & 0x1F) << 16 | (vsrc as u32) << 8,
+            ]
+        };
+        let mut words = vec![s_mov(3, 0x80), s_mov(2, 0)];
+        words.extend_from_slice(&s_load4(4, 2)); // slot 0 (offset 0)
+        words.push(s_add(2, 0, 128 + 32));
+        words.extend_from_slice(&s_load4(8, 2)); // slot 1 (offset 32)
+        words.push(s_add(2, 0, 128 + 64));
+        words.extend_from_slice(&s_load4(12, 2)); // slot 2 (offset 64)
+        words.push(s_add(2, 2, 128 + 32));
+        words.extend_from_slice(&s_load4(16, 2)); // slot 3 (offset 96)
+        words.extend_from_slice(&buf_load(1, 4, 0));
+        words.extend_from_slice(&buf_load(2, 8, 0));
+        words.extend_from_slice(&[0x7E06_02FF, 0xDEAD_BEEF]); // v_mov_b32 v3, 0xDEAD_BEEF
+        words.extend_from_slice(&buf_store(3, 12, 0));
+        words.extend_from_slice(&[0x7E08_02FF, 0xCAFE_BABE]); // v_mov_b32 v4, 0xCAFE_BABE
+        words.extend_from_slice(&buf_store(1, 16, 0));
+        words.extend_from_slice(&buf_store(2, 16, 4));
+        words.extend_from_slice(&buf_store(4, 16, 8));
+        words.push(0xBF81_0000); // s_endpgm
+
+        let used_slot = |kind, off_dwords| UsedResource {
+            kind,
+            root: RootType::Table,
+            table_offset_dwords: off_dwords,
+            lower_bound: 0,
+            stride: 0,
+            dwords: 4,
+            user_data: 0,
+            slot: 0,
+        };
+        let native = NativeProgram {
+            stage: HwStage::Cs,
+            wave64: false,
+            vgprs: 8,
+            layout: vec![RootParam {
+                root: RootType::Table,
+                table_offset_dwords: 0,
+                sgprs: 1,
+                base_register: 0,
+                user_data: 0,
+                slot: 0,
+            }],
+            used: vec![
+                used_slot(ResourceType::Srv, 0),
+                used_slot(ResourceType::Srv, 8),
+                used_slot(ResourceType::Uav, 16),
+                used_slot(ResourceType::Uav, 24),
+            ],
+            io: StageIo::Cs(ComputeIo {
+                rsrc2: 1 << 1,
+                threads: [1, 1, 1],
+            }),
+            code: words.iter().flat_map(|w| w.to_le_bytes()).collect(),
+        };
+        let mut empty = vec![0u8; 32];
+        empty[..4].copy_from_slice(b"DXBC");
+        empty[20..22].copy_from_slice(&1u16.to_le_bytes());
+        empty[24..28].copy_from_slice(&32u32.to_le_bytes());
+        let container = dxbc::Container::parse(&empty).expect("empty container");
+        let prog = ir::build(&native.code, false, native.vgprs).expect("ir");
+        let st = structure::structure(&prog).expect("structure");
+        let res = resource::track(&prog, &native.layout, native.stage, Some(&st)).expect("track");
+        let raised = io::raise(&prog, &native).expect("io");
+        let cs = emit::emit(&container, &native, &prog, &st, &raised, &res).expect("emit");
+
+        // Enumerate all SM 6.6 hardware adapters + WARP.
+        let mut adapters: Vec<(String, ID3D12Device)> = Vec::new();
+        // SAFETY: plain DXGI/D3D12 enumeration and feature queries.
+        unsafe {
+            let Ok(factory) = CreateDXGIFactory2::<IDXGIFactory4>(DXGI_CREATE_FACTORY_FLAGS(0))
+            else {
+                return;
+            };
+            let check_dev = |dev: ID3D12Device| -> Option<ID3D12Device> {
+                let mut sm = D3D12_FEATURE_DATA_SHADER_MODEL {
+                    HighestShaderModel: D3D_SHADER_MODEL_6_6,
+                };
+                (dev.CheckFeatureSupport(
+                    D3D12_FEATURE_SHADER_MODEL,
+                    (&raw mut sm).cast(),
+                    size_of_val(&sm) as u32,
+                )
+                .is_ok()
+                    && sm.HighestShaderModel.0 >= D3D_SHADER_MODEL_6_6.0)
+                    .then_some(dev)
+            };
+            let mut i = 0;
+            while let Ok(ad) = factory.EnumAdapters1(i) {
+                i += 1;
+                let Ok(desc) = ad.GetDesc1() else { continue };
+                if desc.Flags & DXGI_ADAPTER_FLAG_SOFTWARE.0 as u32 != 0 {
+                    continue;
+                }
+                let len = desc
+                    .Description
+                    .iter()
+                    .position(|&c| c == 0)
+                    .unwrap_or(desc.Description.len());
+                let name = String::from_utf16_lossy(&desc.Description[..len]);
+                let mut dev: Option<ID3D12Device> = None;
+                if D3D12CreateDevice(&ad, D3D_FEATURE_LEVEL_12_0, &mut dev).is_ok()
+                    && let Some(d) = dev.and_then(check_dev)
+                {
+                    adapters.push((name, d));
+                }
+            }
+            if let Ok(warp) = factory.EnumWarpAdapter::<IDXGIAdapter>() {
+                let mut dev: Option<ID3D12Device> = None;
+                if D3D12CreateDevice(&warp, D3D_FEATURE_LEVEL_12_0, &mut dev).is_ok()
+                    && let Some(d) = dev.and_then(check_dev)
+                {
+                    adapters.push(("WARP".into(), d));
+                }
+            }
+        }
+        assert!(!adapters.is_empty(), "no SM 6.6 adapter available");
+
+        for (label, dev) in &adapters {
+            // SAFETY: valid D3D12 dispatch, resource, heap, and info-queue calls.
+            unsafe {
+                let iq = dev.cast::<ID3D12InfoQueue>().ok();
+                if let Some(iq) = &iq {
+                    iq.ClearStoredMessages();
+                }
+
+                let param = D3D12_ROOT_PARAMETER1 {
+                    ParameterType: D3D12_ROOT_PARAMETER_TYPE_32BIT_CONSTANTS,
+                    Anonymous: D3D12_ROOT_PARAMETER1_0 {
+                        Constants: D3D12_ROOT_CONSTANTS {
+                            ShaderRegister: 0,
+                            RegisterSpace: emit::USER_DATA_SPACE,
+                            Num32BitValues: 4,
+                        },
+                    },
+                    ShaderVisibility: D3D12_SHADER_VISIBILITY_ALL,
+                };
+                let rs_desc = D3D12_VERSIONED_ROOT_SIGNATURE_DESC {
+                    Version: D3D_ROOT_SIGNATURE_VERSION_1_1,
+                    Anonymous: D3D12_VERSIONED_ROOT_SIGNATURE_DESC_0 {
+                        Desc_1_1: D3D12_ROOT_SIGNATURE_DESC1 {
+                            NumParameters: 1,
+                            pParameters: &param,
+                            Flags: D3D12_ROOT_SIGNATURE_FLAG_CBV_SRV_UAV_HEAP_DIRECTLY_INDEXED,
+                            ..Default::default()
+                        },
+                    },
+                };
+                let mut blob: Option<ID3DBlob> = None;
+                D3D12SerializeVersionedRootSignature(&rs_desc, &mut blob, None)
+                    .expect("serialize root sig");
+                let blob = blob.unwrap();
+                let root: ID3D12RootSignature = dev
+                    .CreateRootSignature(
+                        0,
+                        std::slice::from_raw_parts(
+                            blob.GetBufferPointer().cast::<u8>(),
+                            blob.GetBufferSize(),
+                        ),
+                    )
+                    .expect("CreateRootSignature");
+                let pso: ID3D12PipelineState = dev
+                    .CreateComputePipelineState(&D3D12_COMPUTE_PIPELINE_STATE_DESC {
+                        pRootSignature: std::mem::transmute_copy(&root),
+                        CS: D3D12_SHADER_BYTECODE {
+                            pShaderBytecode: cs.dxil.as_ptr().cast(),
+                            BytecodeLength: cs.dxil.len(),
+                        },
+                        ..Default::default()
+                    })
+                    .unwrap_or_else(|e| panic!("{label}: CreateComputePipelineState: {e}"));
+
+                let make_buf = |heap_ty, width, flags, state| -> ID3D12Resource {
+                    let mut out: Option<ID3D12Resource> = None;
+                    dev.CreateCommittedResource(
+                        &D3D12_HEAP_PROPERTIES {
+                            Type: heap_ty,
+                            ..Default::default()
+                        },
+                        D3D12_HEAP_FLAG_NONE,
+                        &D3D12_RESOURCE_DESC {
+                            Dimension: D3D12_RESOURCE_DIMENSION_BUFFER,
+                            Width: width,
+                            Height: 1,
+                            DepthOrArraySize: 1,
+                            MipLevels: 1,
+                            SampleDesc: DXGI_SAMPLE_DESC {
+                                Count: 1,
+                                Quality: 0,
+                            },
+                            Layout: D3D12_TEXTURE_LAYOUT_ROW_MAJOR,
+                            Flags: flags,
+                            ..Default::default()
+                        },
+                        state,
+                        None,
+                        &mut out,
+                    )
+                    .expect("CreateCommittedResource");
+                    out.unwrap()
+                };
+
+                let srv_buf = make_buf(
+                    D3D12_HEAP_TYPE_UPLOAD,
+                    16,
+                    D3D12_RESOURCE_FLAG_NONE,
+                    D3D12_RESOURCE_STATE_GENERIC_READ,
+                );
+                let mut p = std::ptr::null_mut();
+                srv_buf.Map(0, None, Some(&mut p)).expect("Map srv_buf");
+                p.cast::<[u32; 2]>().write([0x1234_5678, 0x9ABC_DEF0]);
+                srv_buf.Unmap(0, None);
+
+                let uav_buf = make_buf(
+                    D3D12_HEAP_TYPE_DEFAULT,
+                    16,
+                    D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS,
+                    D3D12_RESOURCE_STATE_UNORDERED_ACCESS,
+                );
+                let rb_buf = make_buf(
+                    D3D12_HEAP_TYPE_READBACK,
+                    16,
+                    D3D12_RESOURCE_FLAG_NONE,
+                    D3D12_RESOURCE_STATE_COPY_DEST,
+                );
+
+                let heap: ID3D12DescriptorHeap = dev
+                    .CreateDescriptorHeap(&D3D12_DESCRIPTOR_HEAP_DESC {
+                        Type: D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV,
+                        NumDescriptors: 4,
+                        Flags: D3D12_DESCRIPTOR_HEAP_FLAG_SHADER_VISIBLE,
+                        ..Default::default()
+                    })
+                    .expect("CreateDescriptorHeap");
+                let step = dev
+                    .GetDescriptorHandleIncrementSize(D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV)
+                    as usize;
+                let base = heap.GetCPUDescriptorHandleForHeapStart();
+                let slot = |i: usize| D3D12_CPU_DESCRIPTOR_HANDLE {
+                    ptr: base.ptr + i * step,
+                };
+
+                // Slots 0 & 2: zero-element buffer SRV & UAV routed through `null_for_on`.
+                null_for_on(dev, &placed_buffer_view(false, 0x1000, 16, 0), slot(0));
+                null_for_on(dev, &placed_buffer_view(true, 0x1000, 16, 0), slot(2));
+
+                // Slots 1 & 3: non-zero-element buffer SRV (`NumElements = 2`) & UAV (`NumElements = 4`).
+                dev.CreateShaderResourceView(
+                    &srv_buf,
+                    Some(&D3D12_SHADER_RESOURCE_VIEW_DESC {
+                        Format: DXGI_FORMAT_R32_TYPELESS,
+                        ViewDimension: D3D12_SRV_DIMENSION_BUFFER,
+                        Shader4ComponentMapping: D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING,
+                        Anonymous: D3D12_SHADER_RESOURCE_VIEW_DESC_0 {
+                            Buffer: D3D12_BUFFER_SRV {
+                                NumElements: 2,
+                                Flags: D3D12_BUFFER_SRV_FLAG_RAW,
+                                ..Default::default()
+                            },
+                        },
+                    }),
+                    slot(1),
+                );
+                dev.CreateUnorderedAccessView(
+                    &uav_buf,
+                    None::<&ID3D12Resource>,
+                    Some(&D3D12_UNORDERED_ACCESS_VIEW_DESC {
+                        Format: DXGI_FORMAT_R32_TYPELESS,
+                        ViewDimension: D3D12_UAV_DIMENSION_BUFFER,
+                        Anonymous: D3D12_UNORDERED_ACCESS_VIEW_DESC_0 {
+                            Buffer: D3D12_BUFFER_UAV {
+                                NumElements: 4,
+                                Flags: D3D12_BUFFER_UAV_FLAG_RAW,
+                                ..Default::default()
+                            },
+                        },
+                    }),
+                    slot(3),
+                );
+
+                let queue: ID3D12CommandQueue = dev
+                    .CreateCommandQueue(&D3D12_COMMAND_QUEUE_DESC {
+                        Type: D3D12_COMMAND_LIST_TYPE_DIRECT,
+                        ..Default::default()
+                    })
+                    .expect("CreateCommandQueue");
+                let alloc: ID3D12CommandAllocator = dev
+                    .CreateCommandAllocator(D3D12_COMMAND_LIST_TYPE_DIRECT)
+                    .expect("CreateCommandAllocator");
+                let list: ID3D12GraphicsCommandList = dev
+                    .CreateCommandList(0, D3D12_COMMAND_LIST_TYPE_DIRECT, &alloc, &pso)
+                    .expect("CreateCommandList");
+
+                list.SetDescriptorHeaps(&[Some(heap.clone())]);
+                list.SetComputeRootSignature(&root);
+                let ud = [0u32; 4];
+                list.SetComputeRoot32BitConstants(0, 4, ud.as_ptr().cast(), 0);
+                list.Dispatch(1, 1, 1);
+                list.ResourceBarrier(&[D3D12_RESOURCE_BARRIER {
+                    Type: D3D12_RESOURCE_BARRIER_TYPE_TRANSITION,
+                    Anonymous: D3D12_RESOURCE_BARRIER_0 {
+                        Transition: std::mem::ManuallyDrop::new(
+                            D3D12_RESOURCE_TRANSITION_BARRIER {
+                                pResource: std::mem::transmute_copy(&uav_buf),
+                                Subresource: D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES,
+                                StateBefore: D3D12_RESOURCE_STATE_UNORDERED_ACCESS,
+                                StateAfter: D3D12_RESOURCE_STATE_COPY_SOURCE,
+                            },
+                        ),
+                    },
+                    ..Default::default()
+                }]);
+                list.CopyResource(&rb_buf, &uav_buf);
+                list.Close().expect("Close");
+                queue.ExecuteCommandLists(&[Some(list.cast().unwrap())]);
+                let fence: ID3D12Fence = dev.CreateFence(0, D3D12_FENCE_FLAG_NONE).unwrap();
+                queue.Signal(&fence, 1).unwrap();
+                while fence.GetCompletedValue() < 1 {
+                    std::thread::yield_now();
+                }
+
+                assert!(
+                    dev.GetDeviceRemovedReason().is_ok(),
+                    "{label}: device was removed"
+                );
+                if let Some(iq) = &iq {
+                    assert_no_d3d12_errors(label, iq);
+                }
+
+                let mut rp = std::ptr::null_mut();
+                rb_buf.Map(0, None, Some(&mut rp)).expect("Map rb_buf");
+                let got = rp.cast::<[u32; 3]>().read();
+                rb_buf.Unmap(0, None);
+                eprintln!(
+                    "zero-element buffer view dispatch on {label} (debug_layer={}, info_queue={}): got={got:#x?}",
+                    debug_enabled,
+                    iq.is_some()
+                );
+                assert_eq!(got, [0, 0x1234_5678, 0xCAFE_BABE], "{label}: readback");
+            }
+        }
+    }
+
+    fn assert_no_d3d12_errors(label: &str, iq: &ID3D12InfoQueue) {
+        // SAFETY: standard two-call D3D12 `GetMessage` pattern with exact buffer size.
+        unsafe {
+            let n = iq.GetNumStoredMessages();
+            let mut bad = Vec::new();
+            for i in 0..n {
+                let mut len = 0usize;
+                let _ = iq.GetMessage(i, None, &mut len);
+                if len == 0 {
+                    continue;
+                }
+                let mut buf = vec![0u8; len];
+                let msg = buf.as_mut_ptr().cast::<D3D12_MESSAGE>();
+                if iq.GetMessage(i, Some(msg), &mut len).is_ok() {
+                    let sev = (*msg).Severity;
+                    if matches!(
+                        sev,
+                        D3D12_MESSAGE_SEVERITY_CORRUPTION | D3D12_MESSAGE_SEVERITY_ERROR
+                    ) {
+                        let desc = std::slice::from_raw_parts(
+                            (*msg).pDescription,
+                            (*msg).DescriptionByteLength.saturating_sub(1),
+                        );
+                        bad.push(String::from_utf8_lossy(desc).into_owned());
+                    }
+                }
+            }
+            assert!(
+                bad.is_empty(),
+                "{label}: D3D12 debug layer reported errors: {bad:#?}"
+            );
+        }
     }
 }
