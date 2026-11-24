@@ -1,6 +1,6 @@
 //! `gameinput.dll`: input devices from the host. Gamepads come from XInput
-//! (host slots 0-3); while none is connected, the keyboard drives one
-//! stand-in gamepad (`FALLBACK_BUTTONS`). The keyboard is a device of its own
+//! (host slots 0-3); while none is active, the keyboard drives one stand-in
+//! gamepad (`FALLBACK_BUTTONS`). The keyboard is a device of its own
 //! too. A poll thread turns host state into readings (a new one per change)
 //! and runs device callbacks on connect and disconnect.
 #![allow(non_snake_case)]
@@ -91,6 +91,24 @@ struct PadState {
     left_y: f32,
     right_x: f32,
     right_y: f32,
+}
+
+/// XInput rest thresholds (`XINPUT_GAMEPAD_RIGHT_THUMB_DEADZONE` and
+/// `XINPUT_GAMEPAD_TRIGGER_THRESHOLD`), so virtual or untouched controllers
+/// do not silence the keyboard stand-in pad.
+const STICK_DEADZONE: f32 = 8689.0 / 32767.0;
+const TRIGGER_DEADZONE: f32 = 30.0 / 255.0;
+
+impl PadState {
+    fn is_active(&self) -> bool {
+        self.buttons != 0
+            || self.left_trigger > TRIGGER_DEADZONE
+            || self.right_trigger > TRIGGER_DEADZONE
+            || self.left_x.abs() > STICK_DEADZONE
+            || self.left_y.abs() > STICK_DEADZONE
+            || self.right_x.abs() > STICK_DEADZONE
+            || self.right_y.abs() > STICK_DEADZONE
+    }
 }
 
 /// One key held down: scan code (0xE0xx when extended), character, key.
@@ -320,6 +338,9 @@ struct Slot {
 
 struct State {
     slots: [Slot; DEVICES],
+    /// Host pad slots that have reported input outside rest thresholds since
+    /// connecting (cleared when all host pads are idle and fallback keys fire).
+    engaged: [bool; PADS],
     callbacks: Vec<Registration>,
     /// Asynchronous enumerations, delivered by the next poll.
     pending: Vec<Event>,
@@ -366,6 +387,7 @@ impl Hub {
             source: Mutex::new(source),
             state: Mutex::new(State {
                 slots: Default::default(),
+                engaged: [false; PADS],
                 callbacks: Vec::new(),
                 pending: Vec::new(),
                 running: Vec::new(),
@@ -454,11 +476,26 @@ impl State {
     ) -> Vec<Event> {
         let now = now();
         let mut events = std::mem::take(&mut self.pending);
-        let any_pad = pads.iter().any(Option::is_some);
+        let mut any_active = false;
+        for (slot, pad) in pads.iter().enumerate() {
+            match pad {
+                Some(p) if p.is_active() => {
+                    self.engaged[slot] = true;
+                    any_active = true;
+                }
+                None => self.engaged[slot] = false,
+                _ => {}
+            }
+        }
+        let stand_in = fallback(&keys);
+        if !any_active && stand_in != PadState::default() {
+            self.engaged = [false; PADS];
+        }
+        let using_pad = self.engaged.iter().any(|&e| e);
         for (slot, pad) in pads.into_iter().enumerate() {
             self.update(devices, slot, pad.map(Value::Pad), now, &mut events);
         }
-        let fallback = (!any_pad).then(|| Value::Pad(fallback(&keys)));
+        let fallback = (!using_pad).then_some(Value::Pad(stand_in));
         self.update(devices, FALLBACK, fallback, now, &mut events);
         self.update(devices, KEYBOARD, Some(Value::Keys(keys)), now, &mut events);
         events
@@ -602,7 +639,7 @@ extern "system" fn current_reading(
     };
     let found = if device.is_null() {
         (0..DEVICES)
-            .filter(|&i| state.slots[i].connected)
+            .filter(|&i| state.slots[i].connected && (i >= PADS || state.engaged[i]))
             .filter_map(newest)
             .max_by_key(|r| r.timestamp)
     } else {
@@ -818,7 +855,10 @@ extern "system" fn unregister_callback(this: This, token: u64, timeout: u64) -> 
             return true;
         }
         state = match deadline {
-            None => hub.returned.wait(state).unwrap_or_else(PoisonError::into_inner),
+            None => hub
+                .returned
+                .wait(state)
+                .unwrap_or_else(PoisonError::into_inner),
             Some(deadline) => {
                 let Some(left) = deadline.checked_duration_since(Instant::now()) else {
                     return false;
@@ -1564,7 +1604,16 @@ mod tests {
         let mut token = 0;
         let context = (&raw const hub.object).cast_mut().cast();
         assert_eq!(
-            register(&hub.object, std::ptr::null(), GAMEPAD_KIND, 1, 0, context, Some(slow), &mut token),
+            register(
+                &hub.object,
+                std::ptr::null(),
+                GAMEPAD_KIND,
+                1,
+                0,
+                context,
+                Some(slow),
+                &mut token
+            ),
             S_OK
         );
         host.lock().unwrap().pads[1] = Some(PadState::default());
@@ -1573,7 +1622,10 @@ mod tests {
             std::thread::sleep(Duration::from_millis(1));
         }
         let unregister = slot::<extern "system" fn(This, u64, u64) -> bool, _>(&hub.object, 0x68);
-        assert!(!unregister(&hub.object, token, 5000), "times out while it runs");
+        assert!(
+            !unregister(&hub.object, token, 5000),
+            "times out while it runs"
+        );
         let leave = std::thread::spawn(|| {
             std::thread::sleep(Duration::from_millis(50));
             LEAVE.store(true, Ordering::SeqCst);
@@ -1611,5 +1663,110 @@ mod tests {
         rumble(&hub.devices[FALLBACK], &[1.0; 4]);
         rumble(device, std::ptr::null());
         assert_eq!(host.lock().unwrap().rumble, [(2, 32767, 65535), (2, 0, 0)]);
+    }
+
+    fn current_any(hub: &Hub, kind: u32) -> Result<*const Reading, HRESULT> {
+        type Current = extern "system" fn(This, u32, *const Device, Out) -> HRESULT;
+        let mut out = std::ptr::null();
+        let hr =
+            slot::<Current, _>(&hub.object, 0x20)(&hub.object, kind, std::ptr::null(), &mut out);
+        result(hr, out)
+    }
+
+    #[test]
+    fn idle_host_pads_keep_the_keyboard_stand_in_until_active() {
+        let (hub, host) = fake();
+        let log = Log::default();
+        register(hub, GAMEPAD_KIND, 2, &log);
+        assert_eq!(*log.lock().unwrap(), [(FALLBACK, STATUS_CONNECTED, 0)]);
+
+        // 1. An all-zero virtual XInput pad (e.g. a keyboard presenting an unused
+        // XInput slot) connects its own slot without disconnecting `FALLBACK`.
+        host.lock().unwrap().pads[0] = Some(PadState::default());
+        hub.poll();
+        assert_eq!(log.lock().unwrap()[1..], [(0, STATUS_CONNECTED, 0)]);
+
+        host.lock().unwrap().keys = vec![key(0x0D), key(b'W')];
+        hub.poll();
+        let stand_in = current(hub, GAMEPAD_KIND, FALLBACK).unwrap();
+        assert_eq!(
+            pad(stand_in),
+            PadState {
+                buttons: A,
+                left_y: 1.0,
+                ..Default::default()
+            }
+        );
+        release(stand_in);
+
+        // Sub-deadzone stick/trigger drift on slot 0 does not steal null-device
+        // `GetCurrentReading(GAMEPAD_KIND, null)` away from `FALLBACK`.
+        std::thread::sleep(Duration::from_millis(2));
+        host.lock().unwrap().pads[0] = Some(PadState {
+            left_x: 0.15,
+            right_y: -0.20,
+            left_trigger: 0.05,
+            ..Default::default()
+        });
+        hub.poll();
+        let any = current_any(hub, GAMEPAD_KIND).unwrap();
+        assert_eq!(pad(any).buttons, A);
+        release(any);
+
+        // Releasing keys keeps `FALLBACK` connected and reports the neutral edge.
+        host.lock().unwrap().keys.clear();
+        hub.poll();
+        let rest = current(hub, GAMEPAD_KIND, FALLBACK).unwrap();
+        assert_eq!(pad(rest), PadState::default());
+        release(rest);
+
+        // 2. Real input outside deadzone on slot 1 disconnects `FALLBACK` and
+        // takes priority even while slot 0 keeps sub-deadzone jitter.
+        let active_pad = PadState {
+            buttons: B,
+            left_x: 0.6,
+            ..Default::default()
+        };
+        host.lock().unwrap().pads[1] = Some(active_pad);
+        hub.poll();
+        assert_eq!(
+            log.lock().unwrap()[2..],
+            [(1, STATUS_CONNECTED, 0), (FALLBACK, 0, STATUS_CONNECTED)]
+        );
+        assert_eq!(
+            current(hub, GAMEPAD_KIND, FALLBACK),
+            Err(DEVICE_DISCONNECTED)
+        );
+
+        std::thread::sleep(Duration::from_millis(2));
+        host.lock().unwrap().pads[0] = Some(PadState {
+            left_x: 0.12,
+            ..Default::default()
+        });
+        hub.poll();
+        let any = current_any(hub, GAMEPAD_KIND).unwrap();
+        assert_eq!(pad(any), active_pad);
+        release(any);
+
+        // Releasing the physical controller back to neutral keeps pad mode engaged
+        // without reconnecting `FALLBACK` between button presses.
+        host.lock().unwrap().pads[1] = Some(PadState::default());
+        hub.poll();
+        assert_eq!(
+            current(hub, GAMEPAD_KIND, FALLBACK),
+            Err(DEVICE_DISCONNECTED)
+        );
+        let neutral_pad = current_any(hub, GAMEPAD_KIND).unwrap();
+        assert_eq!(pad(neutral_pad), PadState::default());
+        release(neutral_pad);
+
+        // 3. Pressing a fallback key while all host pads are idle hands control
+        // back to `FALLBACK` cleanly.
+        host.lock().unwrap().keys = vec![key(0x0D)];
+        hub.poll();
+        assert_eq!(log.lock().unwrap()[4..], [(FALLBACK, STATUS_CONNECTED, 0)]);
+        let back = current_any(hub, GAMEPAD_KIND).unwrap();
+        assert_eq!(pad(back).buttons, A);
+        release(back);
     }
 }
