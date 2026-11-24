@@ -262,6 +262,15 @@ const OPTIONS: [u32; 16] = [
     2,  // resource heap tier
 ];
 
+/// Host DXGI format for feature queries, or `None` for console-only formats
+/// (`116`, `117`, and `189..=191`, whose numeric PC IDs mean other formats).
+#[cfg(windows)]
+fn host_format(format: u32) -> Option<windows::Win32::Graphics::Dxgi::Common::DXGI_FORMAT> {
+    (!matches!(format, 116 | 117 | 189..=191)).then(|| {
+        windows::Win32::Graphics::Dxgi::Common::DXGI_FORMAT(resource::pc_format(format) as i32)
+    })
+}
+
 extern "system" fn check_feature_support(
     _: This,
     feature: u32,
@@ -306,8 +315,34 @@ extern "system" fn check_feature_support(
         FORMAT_SUPPORT => {
             // SAFETY: checked size and non-null.
             let q = unsafe { &mut *data.cast::<[u32; 3]>() };
-            // shortcut: every use of every format; answer from the host
-            // device once there is one.
+            #[cfg(windows)]
+            if let Some(host) = crate::host::host() {
+                use windows::Win32::Graphics::Direct3D12::{
+                    D3D12_FEATURE_DATA_FORMAT_SUPPORT, D3D12_FEATURE_FORMAT_SUPPORT,
+                };
+                let Some(format) = host_format(q[0]) else {
+                    q[1..].fill(0);
+                    return S_OK;
+                };
+                let mut support = D3D12_FEATURE_DATA_FORMAT_SUPPORT {
+                    Format: format,
+                    ..Default::default()
+                };
+                // SAFETY: structure and size match D3D12_FEATURE_FORMAT_SUPPORT.
+                if let Err(error) = unsafe {
+                    host.device.CheckFeatureSupport(
+                        D3D12_FEATURE_FORMAT_SUPPORT,
+                        (&raw mut support).cast(),
+                        size_of_val(&support) as u32,
+                    )
+                } {
+                    return error.code().0;
+                }
+                q[1] = support.Support1.0 as u32;
+                q[2] = support.Support2.0 as u32;
+                return S_OK;
+            }
+            // Fallback when no host device is available.
             q[1] = 0x7fff_ffff;
             q[2] = 0xffff;
             S_OK
@@ -315,9 +350,43 @@ extern "system" fn check_feature_support(
         MULTISAMPLE => {
             // SAFETY: checked size and non-null.
             let q = unsafe { &mut *data.cast::<[u32; 4]>() };
-            // Format, sample count, flags in; one quality level out for the
-            // counts the hardware has.
-            q[3] = u32::from(matches!(q[1], 1 | 2 | 4 | 8));
+            // Format, sample count, flags in; console texture layouts support
+            // powers of two up to eight samples.
+            if !matches!(q[1], 1 | 2 | 4 | 8) {
+                q[3] = 0;
+                return S_OK;
+            }
+            #[cfg(windows)]
+            if let Some(host) = crate::host::host() {
+                use windows::Win32::Graphics::Direct3D12::{
+                    D3D12_FEATURE_DATA_MULTISAMPLE_QUALITY_LEVELS,
+                    D3D12_FEATURE_MULTISAMPLE_QUALITY_LEVELS,
+                    D3D12_MULTISAMPLE_QUALITY_LEVEL_FLAGS,
+                };
+                let Some(format) = host_format(q[0]) else {
+                    q[3] = 0;
+                    return S_OK;
+                };
+                let mut support = D3D12_FEATURE_DATA_MULTISAMPLE_QUALITY_LEVELS {
+                    Format: format,
+                    SampleCount: q[1],
+                    Flags: D3D12_MULTISAMPLE_QUALITY_LEVEL_FLAGS(q[2] as i32),
+                    NumQualityLevels: 0,
+                };
+                // SAFETY: structure and size match D3D12_FEATURE_MULTISAMPLE_QUALITY_LEVELS.
+                if let Err(error) = unsafe {
+                    host.device.CheckFeatureSupport(
+                        D3D12_FEATURE_MULTISAMPLE_QUALITY_LEVELS,
+                        (&raw mut support).cast(),
+                        size_of_val(&support) as u32,
+                    )
+                } {
+                    return error.code().0;
+                }
+                q[3] = support.NumQualityLevels;
+                return S_OK;
+            }
+            q[3] = 1;
             S_OK
         }
         _ => feature_levels(data),
@@ -528,5 +597,145 @@ mod tests {
         assert_eq!(query(&levels, 0x18), (S_OK, 0xc100));
         assert_eq!(query(&levels, 0x10).0, E_INVALIDARG);
         assert_eq!(query(&levels[4..], 0x18).0, UNSUPPORTED);
+    }
+
+    #[test]
+    fn format_support_matches_host_and_zeros_unmapped() {
+        type Check = extern "system" fn(This, u32, *mut c_void, u32) -> HRESULT;
+        let device = device();
+        let check = slot::<Check>(device, 0x68);
+        assert_eq!(check(device, 3, std::ptr::null_mut(), 12), E_INVALIDARG);
+        let mut bad = [28u32, 0, 0];
+        assert_eq!(check(device, 3, bad.as_mut_ptr().cast(), 8), E_INVALIDARG);
+        assert_eq!(check(device, 3, bad.as_mut_ptr().cast(), 16), E_INVALIDARG);
+
+        #[cfg(windows)]
+        {
+            let Some(host) = crate::host::host() else {
+                return;
+            };
+            use windows::Win32::Graphics::Direct3D12::{
+                D3D12_FEATURE_DATA_FORMAT_SUPPORT, D3D12_FEATURE_FORMAT_SUPPORT,
+                D3D12_FORMAT_SUPPORT1_DEPTH_STENCIL, D3D12_FORMAT_SUPPORT1_RENDER_TARGET,
+            };
+            use windows::Win32::Graphics::Dxgi::Common::DXGI_FORMAT;
+            const RENDER_TARGET: u32 = D3D12_FORMAT_SUPPORT1_RENDER_TARGET.0 as u32;
+            const DEPTH_STENCIL: u32 = D3D12_FORMAT_SUPPORT1_DEPTH_STENCIL.0 as u32;
+            const { assert!(RENDER_TARGET == 0x4000) };
+
+            for fmt in [28u32, 71, 20, 40, 45, 55, 118, 119, 120] {
+                let mut q = [fmt, 0xaaaa_aaaa, 0x5555_5555];
+                let hr = check(device, 3, q.as_mut_ptr().cast(), 12);
+                let mut native = D3D12_FEATURE_DATA_FORMAT_SUPPORT {
+                    Format: DXGI_FORMAT(resource::pc_format(fmt) as i32),
+                    ..Default::default()
+                };
+                // SAFETY: structure and size match D3D12_FEATURE_FORMAT_SUPPORT.
+                let res = unsafe {
+                    host.device.CheckFeatureSupport(
+                        D3D12_FEATURE_FORMAT_SUPPORT,
+                        (&raw mut native).cast(),
+                        size_of_val(&native) as u32,
+                    )
+                };
+                match res {
+                    Ok(()) => {
+                        assert_eq!(hr, S_OK, "format {fmt}");
+                        assert_eq!(q[0], fmt, "format {fmt}");
+                        assert_eq!(q[1], native.Support1.0 as u32, "format {fmt} support1");
+                        assert_eq!(q[2], native.Support2.0 as u32, "format {fmt} support2");
+                    }
+                    Err(err) => assert_eq!(hr, err.code().0, "format {fmt}"),
+                }
+                if fmt == 28 {
+                    assert_ne!(q[1] & RENDER_TARGET, 0);
+                } else {
+                    assert_eq!(q[1] & RENDER_TARGET, 0, "format {fmt} advertised as RT");
+                }
+                if matches!(fmt, 20 | 40 | 45 | 55 | 118) {
+                    assert_ne!(q[1] & DEPTH_STENCIL, 0, "format {fmt} missing DSV");
+                }
+            }
+
+            for fmt in [116u32, 117, 189, 190, 191] {
+                let mut q = [fmt, 0xdead_beef, 0xcafe_babe];
+                assert_eq!(check(device, 3, q.as_mut_ptr().cast(), 12), S_OK);
+                assert_eq!(q, [fmt, 0, 0]);
+            }
+        }
+    }
+
+    #[test]
+    fn multisample_quality_levels_match_host_and_sample_limits() {
+        type Check = extern "system" fn(This, u32, *mut c_void, u32) -> HRESULT;
+        let device = device();
+        let check = slot::<Check>(device, 0x68);
+        assert_eq!(check(device, 4, std::ptr::null_mut(), 16), E_INVALIDARG);
+        let mut bad = [28u32, 4, 0, 99];
+        assert_eq!(check(device, 4, bad.as_mut_ptr().cast(), 12), E_INVALIDARG);
+        assert_eq!(check(device, 4, bad.as_mut_ptr().cast(), 20), E_INVALIDARG);
+
+        for count in [0u32, 3, 16] {
+            let mut q = [28u32, count, 0, 99];
+            assert_eq!(check(device, 4, q.as_mut_ptr().cast(), 16), S_OK);
+            assert_eq!(q, [28, count, 0, 0]);
+        }
+
+        #[cfg(windows)]
+        {
+            let Some(host) = crate::host::host() else {
+                return;
+            };
+            use windows::Win32::Graphics::Direct3D12::{
+                D3D12_FEATURE_DATA_MULTISAMPLE_QUALITY_LEVELS,
+                D3D12_FEATURE_MULTISAMPLE_QUALITY_LEVELS, D3D12_MULTISAMPLE_QUALITY_LEVEL_FLAGS,
+            };
+            use windows::Win32::Graphics::Dxgi::Common::DXGI_FORMAT;
+
+            for fmt in [28u32, 71, 45, 118] {
+                for count in [1u32, 2, 4, 8] {
+                    for flags in [0u32, 1] {
+                        let mut q = [fmt, count, flags, 99];
+                        let hr = check(device, 4, q.as_mut_ptr().cast(), 16);
+                        let mut native = D3D12_FEATURE_DATA_MULTISAMPLE_QUALITY_LEVELS {
+                            Format: DXGI_FORMAT(resource::pc_format(fmt) as i32),
+                            SampleCount: count,
+                            Flags: D3D12_MULTISAMPLE_QUALITY_LEVEL_FLAGS(flags as i32),
+                            NumQualityLevels: 0,
+                        };
+                        // SAFETY: structure and size match D3D12_FEATURE_MULTISAMPLE_QUALITY_LEVELS.
+                        let res = unsafe {
+                            host.device.CheckFeatureSupport(
+                                D3D12_FEATURE_MULTISAMPLE_QUALITY_LEVELS,
+                                (&raw mut native).cast(),
+                                size_of_val(&native) as u32,
+                            )
+                        };
+                        match res {
+                            Ok(()) => {
+                                assert_eq!(hr, S_OK, "({fmt}, {count}, {flags})");
+                                assert_eq!(q[..3], [fmt, count, flags]);
+                                assert_eq!(
+                                    q[3], native.NumQualityLevels,
+                                    "({fmt}, {count}, {flags})"
+                                );
+                                if fmt == 71 && count > 1 {
+                                    assert_eq!(q[3], 0, "BC1 MSAA ({count}, {flags})");
+                                }
+                            }
+                            Err(err) => assert_eq!(hr, err.code().0, "({fmt}, {count}, {flags})"),
+                        }
+                    }
+                }
+            }
+
+            for fmt in [116u32, 117, 189, 190, 191] {
+                for flags in [0u32, 1] {
+                    let mut q = [fmt, 4, flags, 99];
+                    assert_eq!(check(device, 4, q.as_mut_ptr().cast(), 16), S_OK);
+                    assert_eq!(q, [fmt, 4, flags, 0]);
+                }
+            }
+        }
     }
 }
