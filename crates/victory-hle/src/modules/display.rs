@@ -94,7 +94,7 @@ extern "system" fn acquire_deferral(_: This, out: *mut *mut c_void) -> HRESULT {
     context.Reason.SimpleReasonString = reason.as_mut_ptr();
     // SAFETY: a valid context; the string is copied by the call.
     let request = unsafe { PowerCreateRequest(&context) };
-    if request as isize == -1 {
+    if request.is_null() || request as isize == -1 {
         return last_error();
     }
     // SAFETY: the request we just created.
@@ -111,7 +111,7 @@ extern "system" fn acquire_deferral(_: This, out: *mut *mut c_void) -> HRESULT {
 extern "system" fn close_deferral(_: This, handle: *mut c_void) {
     use windows_sys::Win32::Foundation::CloseHandle;
     use windows_sys::Win32::System::Power::{PowerClearRequest, PowerRequestDisplayRequired};
-    if !handle.is_null() {
+    if !handle.is_null() && handle as isize != -1 {
         // SAFETY: a request from `acquire_deferral`.
         unsafe {
             PowerClearRequest(handle, PowerRequestDisplayRequired);
@@ -185,11 +185,30 @@ mod tests {
         type Acquire = extern "system" fn(This, *mut *mut c_void) -> HRESULT;
         type Close = extern "system" fn(This, *mut c_void);
         let mut handle = std::ptr::null_mut();
+        match method::<Acquire>(&SHELL_OBJECT, 0x20)(&SHELL_OBJECT, &mut handle) {
+            S_OK => {
+                assert!(!handle.is_null());
+                method::<Close>(&SHELL_OBJECT, 0x28)(&SHELL_OBJECT, handle);
+            }
+            // Windows can reject display power requests on some hosts.
+            NOT_SUPPORTED => assert!(handle.is_null()),
+            hr => panic!("unexpected display deferral HRESULT {:#010x}", hr as u32),
+        }
+    }
+
+    #[test]
+    fn acquire_deferral_rejects_null_out() {
+        type Acquire = extern "system" fn(This, *mut *mut c_void) -> HRESULT;
         assert_eq!(
-            method::<Acquire>(&SHELL_OBJECT, 0x20)(&SHELL_OBJECT, &mut handle),
-            S_OK
+            method::<Acquire>(&SHELL_OBJECT, 0x20)(&SHELL_OBJECT, std::ptr::null_mut()),
+            super::super::xasync::E_INVALIDARG
         );
-        assert!(!handle.is_null());
-        method::<Close>(&SHELL_OBJECT, 0x28)(&SHELL_OBJECT, handle);
+    }
+
+    #[test]
+    fn close_deferral_handles_null_and_invalid() {
+        type Close = extern "system" fn(This, *mut c_void);
+        method::<Close>(&SHELL_OBJECT, 0x28)(&SHELL_OBJECT, std::ptr::null_mut());
+        method::<Close>(&SHELL_OBJECT, 0x28)(&SHELL_OBJECT, (-1isize) as *mut c_void);
     }
 }

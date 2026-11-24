@@ -96,12 +96,13 @@ impl Title {
                 .map(|(_, text)| text.as_str())
         };
         let id = get("Game/TitleId").and_then(|v| u32::from_str_radix(v, 16).ok());
-        let storage_mb = get("Game/PersistentLocalStorage/SizeMB").and_then(|v| v.parse().ok());
+        let storage_mb =
+            get("Game/PersistentLocalStorage/SizeMB").and_then(|v| v.parse::<u64>().ok());
         Title {
             id: id.unwrap_or(0),
             store_id: get("Game/StoreId").unwrap_or_default().to_owned(),
             storage: PathBuf::new(),
-            storage_bytes: storage_mb.unwrap_or(0) << 20,
+            storage_bytes: storage_mb.unwrap_or(0).saturating_mul(1024 * 1024),
         }
     }
 
@@ -127,7 +128,7 @@ fn elements(text: &str) -> Vec<(String, String)> {
         } else if rest.starts_with("<![CDATA[") {
             rest.find("]]>").map(|e| e + 3)
         } else {
-            rest.find('>').map(|e| e + 1)
+            tag_end(rest)
         };
         let Some(end) = end else { break };
         let tag = &rest[1..end - 1];
@@ -149,15 +150,36 @@ fn elements(text: &str) -> Vec<(String, String)> {
             .unwrap_or("");
         path.push(name);
         let body = rest[..rest.find('<').unwrap_or(rest.len())].trim();
-        let body = [("&lt;", "<"), ("&gt;", ">"), ("&quot;", "\""), ("&apos;", "'"), ("&amp;", "&")]
-            .iter()
-            .fold(body.to_owned(), |b, (entity, c)| b.replace(entity, c));
+        let body = [
+            ("&lt;", "<"),
+            ("&gt;", ">"),
+            ("&quot;", "\""),
+            ("&apos;", "'"),
+            ("&amp;", "&"),
+        ]
+        .iter()
+        .fold(body.to_owned(), |b, (entity, c)| b.replace(entity, c));
         out.push((path.join("/"), body));
         if closed {
             path.pop();
         }
     }
     out
+}
+
+/// Where the tag that starts `text` ends, past its `>`; a `>` in a quoted
+/// attribute value is part of the value (XML allows it there unescaped).
+fn tag_end(text: &str) -> Option<usize> {
+    let mut quote = None;
+    for (at, c) in text.char_indices() {
+        match (quote, c) {
+            (None, '"' | '\'') => quote = Some(c),
+            (Some(open), _) if c == open => quote = None,
+            (None, '>') => return Some(at + 1),
+            _ => {}
+        }
+    }
+    None
 }
 
 static TITLE: Mutex<Option<Title>> = Mutex::new(None);
@@ -211,6 +233,15 @@ mod tests {
     use super::*;
 
     #[test]
+    fn a_quoted_angle_bracket_does_not_end_its_tag() {
+        let text = "<Game><ShellVisuals DefaultDisplayName=\"A > B\" Description='x>y'/>\
+                    <TitleId>639AA8DD</TitleId>\
+                    <PersistentLocalStorage><SizeMB>64</SizeMB></PersistentLocalStorage></Game>";
+        let t = Title::from_manifest(text);
+        assert_eq!((t.id, t.storage_bytes), (0x639A_A8DD, 64 << 20));
+    }
+
+    #[test]
     fn reads_title_id_store_id_and_storage_quota() {
         let text = "\u{feff}<?xml version=\"1.0\"?>\n<Game configVersion=\"1\">\
                     <!-- <TitleId>00000000</TitleId> -->\
@@ -222,5 +253,24 @@ mod tests {
         assert_eq!((t.id, t.storage_bytes), (0x639A_A8DD, 1024 << 20));
         assert_eq!(t.store_id, "9&C");
         assert_eq!(Title::from_manifest("").storage_bytes, 0);
+    }
+
+    #[test]
+    fn storage_quota_saturates_when_megabytes_exceed_u64_bytes() {
+        let max_mb = u64::MAX / (1024 * 1024);
+
+        let at_limit = format!(
+            "<Game><PersistentLocalStorage><SizeMB>{max_mb}</SizeMB></PersistentLocalStorage></Game>"
+        );
+        assert_eq!(
+            Title::from_manifest(&at_limit).storage_bytes,
+            max_mb * 1024 * 1024
+        );
+
+        let above_limit = format!(
+            "<Game><PersistentLocalStorage><SizeMB>{}</SizeMB></PersistentLocalStorage></Game>",
+            max_mb + 1
+        );
+        assert_eq!(Title::from_manifest(&above_limit).storage_bytes, u64::MAX);
     }
 }
