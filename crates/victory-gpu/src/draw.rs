@@ -172,6 +172,24 @@ impl State {
         self.pipeline = pipeline as usize;
     }
 
+    pub(crate) fn clear(&mut self, pipeline: This) {
+        // Earlier draws can still read the dynamic slots owned by this list.
+        self.pipeline = pipeline as usize;
+        self.heaps = [0; 2];
+        self.graphics.clear();
+        self.compute.clear();
+        self.vertex = [VertexView::default(); 32];
+        self.index = IndexView::default();
+        self.targets.clear();
+        self.depth = 0;
+        self.topology = 0;
+        self.host_pipeline = 0;
+        self.host_roots = [0; 2];
+        self.host_heaps = [0; 2];
+        self.fresh_tables.clear();
+        self.table_failed = false;
+    }
+
     /// The title's topology; console-only ones become host lists (see
     /// [`crate::primitive`]).
     pub(crate) fn set_topology(&mut self, list: &HostList, topology: u32) {
@@ -1214,4 +1232,68 @@ pub(crate) fn blend_factor(list: &HostList, factor: Option<&[f32; 4]>) {
 pub(crate) fn stencil_ref(list: &HostList, reference: u32) {
     // SAFETY: an open list.
     unsafe { list.list.OMSetStencilRef(reference) };
+}
+
+#[cfg(test)]
+mod clear_state_tests {
+    use super::*;
+
+    #[test]
+    fn clear_resets_bindings_but_retains_dynamic_slots() {
+        // A synthetic allocation record with no registered heap.
+        let dynamic = (0, 64, 3);
+        let mut state = State {
+            pipeline: 1,
+            heaps: [2, 3],
+            graphics: vec![Root::Table(4)],
+            compute: vec![Root::View(5)],
+            vertex: [VertexView {
+                address: 6,
+                size: 64,
+                stride: 16,
+            }; 32],
+            index: IndexView {
+                address: 7,
+                size: 32,
+                format: 57,
+            },
+            targets: vec![8],
+            depth: 9,
+            topology: 4,
+            host_pipeline: 10,
+            host_roots: [11, 12],
+            host_heaps: [13, 14],
+            fresh_tables: [((4, 15), dynamic.1)].into(),
+            dynamic: vec![dynamic],
+            table_failed: true,
+        };
+        let pipeline: This = std::ptr::dangling();
+
+        state.clear(pipeline);
+
+        assert_eq!(state.pipeline, pipeline as usize);
+        assert_eq!(state.heaps, [0; 2]);
+        assert!(state.graphics.is_empty());
+        assert!(state.compute.is_empty());
+        assert_eq!(
+            state.vertex.map(|v| (v.address, v.size, v.stride)),
+            [(0, 0, 0); 32]
+        );
+        assert_eq!(
+            (state.index.address, state.index.size, state.index.format),
+            (0, 0, 0)
+        );
+        assert!(state.targets.is_empty());
+        assert_eq!(state.depth, 0);
+        assert_eq!(state.topology, 0);
+        assert_eq!(state.host_pipeline, 0);
+        assert_eq!(state.host_roots, [0; 2]);
+        assert_eq!(state.host_heaps, [0; 2]);
+        assert!(state.fresh_tables.is_empty());
+        assert!(!state.table_failed);
+        assert_eq!(state.dynamic, [dynamic]);
+
+        state.reset(std::ptr::null());
+        assert!(state.dynamic.is_empty());
+    }
 }
