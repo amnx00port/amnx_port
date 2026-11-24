@@ -214,14 +214,7 @@ fn instruction(code: &[u8], offset: usize) -> Result<Instruction, ShaderError> {
                 let mk_ak = name(Encoding::Vop2, op as u16).is_some_and(|n| {
                     matches!(
                         n,
-                        "v_madmk_f32"
-                            | "v_madak_f32"
-                            | "v_fmamk_f32"
-                            | "v_fmaak_f32"
-                            | "v_madmk_f16"
-                            | "v_madak_f16"
-                            | "v_fmamk_f16"
-                            | "v_fmaak_f16"
+                        "v_fmamk_f32" | "v_fmaak_f32" | "v_fmamk_f16" | "v_fmaak_f16"
                     )
                 });
                 (Encoding::Vop2, op, 1 + extra.max(usize::from(mk_ak)))
@@ -304,6 +297,9 @@ fn name(encoding: Encoding, opcode: u16) -> Option<&'static str> {
         Encoding::Vopc => (t::VOPC, opcode),
         // VOP3 also encodes the VOPC, VOP2 and VOP1 opcodes at fixed bases.
         Encoding::Vop3 => match opcode {
+            // Compact dot/packed accumulators, embedded literals and register
+            // swaps have no corresponding VOP3 encoding on GFX10.3.
+            0x102 | 0x10d | 0x12c | 0x12d | 0x137 | 0x138 | 0x13c | 0x1e5 | 0x1e8 => return None,
             0x000..0x100 => (t::VOPC, opcode),
             0x100..0x140 => (t::VOP2, opcode - 0x100),
             0x180..0x200 => (t::VOP1, opcode - 0x180),
@@ -315,7 +311,7 @@ fn name(encoding: Encoding, opcode: u16) -> Option<&'static str> {
         Encoding::Mubuf => (t::MUBUF, opcode),
         Encoding::Mtbuf => (t::MTBUF, opcode),
         Encoding::Mimg => (t::MIMG, opcode),
-        Encoding::Exp => return Some("exp"),
+        Encoding::Exp => return (opcode == 0).then_some("exp"),
         Encoding::Flat => (t::FLAT, opcode),
         Encoding::Global => (t::GLOBAL, opcode),
         Encoding::Scratch => (t::SCRATCH, opcode),

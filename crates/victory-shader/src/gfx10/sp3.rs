@@ -96,6 +96,10 @@ fn join(ops: impl IntoIterator<Item = String>) -> String {
     ops.into_iter().collect::<Vec<_>>().join(", ")
 }
 
+fn interp_param(code: u8) -> &'static str {
+    ["p10", "p20", "p0"].get(usize::from(code)).unwrap_or(&"p?")
+}
+
 fn operands(inst: &Instruction, name: &str, fields: &Fields) -> String {
     let mut out = String::new();
     match fields {
@@ -152,9 +156,7 @@ fn operands(inst: &Instruction, name: &str, fields: &Fields) -> String {
         Fields::Valu(v) => out = valu(name, v, inst.encoding),
         Fields::Vintrp { dst, src, attr } => {
             let src = match (name, src) {
-                ("v_interp_mov_f32", Operand::Const(p)) => ["p10", "p20", "p0"]
-                    .get(usize::from(*p))
-                    .map_or("p?".into(), |p| p.to_string()),
+                ("v_interp_mov_f32", Operand::Const(p)) => interp_param(*p).into(),
                 _ => src.to_string(),
             };
             out = format!("{dst}, {src}, {attr}");
@@ -504,7 +506,10 @@ fn valu(name: &str, v: &Valu, encoding: Encoding) -> String {
     let mix = name.starts_with("v_fma_mix");
     let src = |i: usize| {
         let o = v.src[i];
-        let mut s = o.to_string();
+        let mut s = match (name, i, o) {
+            ("v_interp_mov_f32", 1, Operand::Const(p)) => interp_param(p).into(),
+            _ => o.to_string(),
+        };
         if let Some(sdwa) = v.sdwa
             && bit(sdwa.sext, i)
         {

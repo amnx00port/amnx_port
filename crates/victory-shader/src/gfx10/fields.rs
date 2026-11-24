@@ -142,7 +142,7 @@ pub struct Valu {
     /// Carry-out or the second result of VOP3B (`v_add_co_u32`, `v_div_scale_f32`...).
     pub carry: Option<Operand>,
     /// In operand order, including the implicit VCC of VOP2 `v_cndmask_b32`
-    /// and carry-in, and the literal of `v_madmk`/`v_madak` forms.
+    /// and carry-in, and the literal of `v_fmamk`/`v_fmaak` forms.
     pub src: Vec<Operand>,
     /// Bit i applies to `src[i]`. For VOP3P, `neg` is the low half's.
     pub neg: u8,
@@ -340,7 +340,7 @@ impl Instruction {
                     bit(w1, 31),
                 );
                 let (r128, tfe, lwe) = (bit(w0, 15), bit(w0, 16), bit(w0, 17));
-                let mut data = if name.starts_with("image_gather4") {
+                let mut data = if name.starts_with("image_gather4") && !name.ends_with("_pck") {
                     4
                 } else {
                     dmask.count_ones().max(1) as u8
@@ -361,7 +361,7 @@ impl Instruction {
                         })
                         .collect()
                 };
-                let sampled = ["image_sample", "image_gather4", "image_get_lod"]
+                let sampled = ["image_sample", "image_gather", "image_get_lod"]
                     .iter()
                     .any(|p| name.starts_with(p));
                 Fields::Image {
@@ -564,6 +564,8 @@ impl Instruction {
                                 chan: (code >> 6 & 3) as u8,
                                 high: code >> 8 & 1 == 1,
                             }
+                        } else if i == 1 && name == "v_interp_mov_f32" {
+                            Operand::Const(code as u8)
                         } else if i == 2 && carry_in {
                             source(code, lanes, w(2))
                         } else {
@@ -608,7 +610,6 @@ const VOP3_TWO_SOURCES: &[&str] = &[
     "v_ldexp_f64",
     "v_mul_lo_u32",
     "v_mul_hi_u32",
-    "v_mul_lo_i32",
     "v_mul_hi_i32",
     "v_trig_preop_f64",
     "v_lshlrev_b64",
@@ -632,6 +633,9 @@ const VOP3_TWO_SOURCES: &[&str] = &[
     "v_cvt_pknorm_i16_f16",
     "v_cvt_pknorm_u16_f16",
     "v_lshlrev_b16",
+    "v_interp_p1_f32",
+    "v_interp_p2_f32",
+    "v_interp_mov_f32",
     "v_interp_p1ll_f16",
     "v_readlane_b32",
     "v_writelane_b32",
@@ -805,9 +809,12 @@ fn image_addr_dwords(name: &str, dim: u8, a16: bool) -> u8 {
     } else if name.contains("_mip") {
         packed += 1;
     }
-    if a16 {
-        whole + 2 * derivs.div_ceil(2) + packed.div_ceil(2)
-    } else {
-        whole + 2 * derivs + packed
+    // On RDNA2 the G16 opcode selects packed derivatives independently of A16.
+    if name.ends_with("_g16") {
+        derivs = derivs.div_ceil(2);
     }
+    if a16 {
+        packed = packed.div_ceil(2);
+    }
+    whole + 2 * derivs + packed
 }

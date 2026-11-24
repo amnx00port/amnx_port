@@ -22,8 +22,9 @@
 // FROM, OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS
 // IN THE SOFTWARE.
 //
-// Each table is sorted by opcode. VOP3 holds only VOP3-only opcodes; VOP3
-// encodings of VOPC/VOP2/VOP1 ops (0x000-0x13f, 0x180-0x1ff) use those tables.
+// Updated for GFX10.3 using AMD's amdgpu_isa_rdna2.xml. Each table is
+// sorted by opcode for binary search. The VOP3 table includes its VINTRP
+// forms; the decoder shares VOPC/VOP2/VOP1 entries with legal VOP3 forms.
 
 pub(super) const SOP2: &[(u16, &str)] = &[
     (0x000, "s_add_u32"),
@@ -157,7 +158,6 @@ pub(super) const SOP1: &[(u16, &str)] = &[
     (0x030, "s_movreld_b32"),
     (0x031, "s_movreld_b64"),
     (0x034, "s_abs_i32"),
-    (0x035, "s_mov_fed_b32"),
     (0x037, "s_andn1_saveexec_b64"),
     (0x038, "s_orn1_saveexec_b64"),
     (0x039, "s_andn1_wrexec_b64"),
@@ -245,85 +245,17 @@ pub(super) const SMEM: &[(u16, &str)] = &[
     (0x002, "s_load_dwordx4"),
     (0x003, "s_load_dwordx8"),
     (0x004, "s_load_dwordx16"),
-    (0x005, "s_scratch_load_dword"),
-    (0x006, "s_scratch_load_dwordx2"),
-    (0x007, "s_scratch_load_dwordx4"),
     (0x008, "s_buffer_load_dword"),
     (0x009, "s_buffer_load_dwordx2"),
     (0x00a, "s_buffer_load_dwordx4"),
     (0x00b, "s_buffer_load_dwordx8"),
     (0x00c, "s_buffer_load_dwordx16"),
-    (0x010, "s_store_dword"),
-    (0x011, "s_store_dwordx2"),
-    (0x012, "s_store_dwordx4"),
-    (0x015, "s_scratch_store_dword"),
-    (0x016, "s_scratch_store_dwordx2"),
-    (0x017, "s_scratch_store_dwordx4"),
-    (0x018, "s_buffer_store_dword"),
-    (0x019, "s_buffer_store_dwordx2"),
-    (0x01a, "s_buffer_store_dwordx4"),
     (0x01f, "s_gl1_inv"),
     (0x020, "s_dcache_inv"),
-    (0x021, "s_dcache_wb"),
     (0x024, "s_memtime"),
     (0x025, "s_memrealtime"),
     (0x026, "s_atc_probe"),
     (0x027, "s_atc_probe_buffer"),
-    (0x028, "s_dcache_discard"),
-    (0x029, "s_dcache_discard_x2"),
-    (0x02a, "s_get_waveid_in_workgroup"),
-    (0x040, "s_buffer_atomic_swap"),
-    (0x041, "s_buffer_atomic_cmpswap"),
-    (0x042, "s_buffer_atomic_add"),
-    (0x043, "s_buffer_atomic_sub"),
-    (0x044, "s_buffer_atomic_smin"),
-    (0x045, "s_buffer_atomic_umin"),
-    (0x046, "s_buffer_atomic_smax"),
-    (0x047, "s_buffer_atomic_umax"),
-    (0x048, "s_buffer_atomic_and"),
-    (0x049, "s_buffer_atomic_or"),
-    (0x04a, "s_buffer_atomic_xor"),
-    (0x04b, "s_buffer_atomic_inc"),
-    (0x04c, "s_buffer_atomic_dec"),
-    (0x060, "s_buffer_atomic_swap_x2"),
-    (0x061, "s_buffer_atomic_cmpswap_x2"),
-    (0x062, "s_buffer_atomic_add_x2"),
-    (0x063, "s_buffer_atomic_sub_x2"),
-    (0x064, "s_buffer_atomic_smin_x2"),
-    (0x065, "s_buffer_atomic_umin_x2"),
-    (0x066, "s_buffer_atomic_smax_x2"),
-    (0x067, "s_buffer_atomic_umax_x2"),
-    (0x068, "s_buffer_atomic_and_x2"),
-    (0x069, "s_buffer_atomic_or_x2"),
-    (0x06a, "s_buffer_atomic_xor_x2"),
-    (0x06b, "s_buffer_atomic_inc_x2"),
-    (0x06c, "s_buffer_atomic_dec_x2"),
-    (0x080, "s_atomic_swap"),
-    (0x081, "s_atomic_cmpswap"),
-    (0x082, "s_atomic_add"),
-    (0x083, "s_atomic_sub"),
-    (0x084, "s_atomic_smin"),
-    (0x085, "s_atomic_umin"),
-    (0x086, "s_atomic_smax"),
-    (0x087, "s_atomic_umax"),
-    (0x088, "s_atomic_and"),
-    (0x089, "s_atomic_or"),
-    (0x08a, "s_atomic_xor"),
-    (0x08b, "s_atomic_inc"),
-    (0x08c, "s_atomic_dec"),
-    (0x0a0, "s_atomic_swap_x2"),
-    (0x0a1, "s_atomic_cmpswap_x2"),
-    (0x0a2, "s_atomic_add_x2"),
-    (0x0a3, "s_atomic_sub_x2"),
-    (0x0a4, "s_atomic_smin_x2"),
-    (0x0a5, "s_atomic_umin_x2"),
-    (0x0a6, "s_atomic_smax_x2"),
-    (0x0a7, "s_atomic_umax_x2"),
-    (0x0a8, "s_atomic_and_x2"),
-    (0x0a9, "s_atomic_or_x2"),
-    (0x0aa, "s_atomic_xor_x2"),
-    (0x0ab, "s_atomic_inc_x2"),
-    (0x0ac, "s_atomic_dec_x2"),
 ];
 
 pub(super) const VOP2: &[(u16, &str)] = &[
@@ -332,7 +264,7 @@ pub(super) const VOP2: &[(u16, &str)] = &[
     (0x003, "v_add_f32"),
     (0x004, "v_sub_f32"),
     (0x005, "v_subrev_f32"),
-    (0x006, "v_mac_legacy_f32"),
+    (0x006, "v_fmac_legacy_f32"),
     (0x007, "v_mul_legacy_f32"),
     (0x008, "v_mul_f32"),
     (0x009, "v_mul_i32_i24"),
@@ -353,9 +285,6 @@ pub(super) const VOP2: &[(u16, &str)] = &[
     (0x01c, "v_or_b32"),
     (0x01d, "v_xor_b32"),
     (0x01e, "v_xnor_b32"),
-    (0x01f, "v_mac_f32"),
-    (0x020, "v_madmk_f32"),
-    (0x021, "v_madak_f32"),
     (0x025, "v_add_nc_u32"),
     (0x026, "v_sub_nc_u32"),
     (0x027, "v_subrev_nc_u32"),
@@ -657,8 +586,7 @@ pub(super) const VOPC: &[(u16, &str)] = &[
 ];
 
 pub(super) const VOP3: &[(u16, &str)] = &[
-    (0x140, "v_mad_legacy_f32"),
-    (0x141, "v_mad_f32"),
+    (0x140, "v_fma_legacy_f32"),
     (0x142, "v_mad_i32_i24"),
     (0x143, "v_mad_u32_u24"),
     (0x144, "v_cubeid_f32"),
@@ -697,7 +625,6 @@ pub(super) const VOP3: &[(u16, &str)] = &[
     (0x168, "v_ldexp_f64"),
     (0x169, "v_mul_lo_u32"),
     (0x16a, "v_mul_hi_u32"),
-    (0x16b, "v_mul_lo_i32"),
     (0x16c, "v_mul_hi_i32"),
     (0x16d, "v_div_scale_f32"),
     (0x16e, "v_div_scale_f64"),
@@ -711,6 +638,9 @@ pub(super) const VOP3: &[(u16, &str)] = &[
     (0x176, "v_mad_u64_u32"),
     (0x177, "v_mad_i64_i32"),
     (0x178, "v_xor3_b32"),
+    (0x200, "v_interp_p1_f32"),
+    (0x201, "v_interp_p2_f32"),
+    (0x202, "v_interp_mov_f32"),
     (0x2ff, "v_lshlrev_b64"),
     (0x300, "v_lshrrev_b64"),
     (0x301, "v_ashrrev_i64"),
@@ -800,6 +730,7 @@ pub(super) const VOP3P: &[(u16, &str)] = &[
     (0x015, "v_dot2_u32_u16"),
     (0x016, "v_dot4_i32_i8"),
     (0x017, "v_dot4_u32_u8"),
+    (0x018, "v_dot8_i32_i4"),
     (0x019, "v_dot8_u32_u4"),
     (0x020, "v_fma_mix_f32"),
     (0x021, "v_fma_mixlo_f16"),
@@ -920,22 +851,6 @@ pub(super) const DS: &[(u16, &str)] = &[
     (0x077, "ds_read2_b64"),
     (0x078, "ds_read2st64_b64"),
     (0x07e, "ds_condxchg32_rtn_b64"),
-    (0x080, "ds_add_src2_u32"),
-    (0x081, "ds_sub_src2_u32"),
-    (0x082, "ds_rsub_src2_u32"),
-    (0x083, "ds_inc_src2_u32"),
-    (0x084, "ds_dec_src2_u32"),
-    (0x085, "ds_min_src2_i32"),
-    (0x086, "ds_max_src2_i32"),
-    (0x087, "ds_min_src2_u32"),
-    (0x088, "ds_max_src2_u32"),
-    (0x089, "ds_and_src2_b32"),
-    (0x08a, "ds_or_src2_b32"),
-    (0x08b, "ds_xor_src2_b32"),
-    (0x08d, "ds_write_src2_b32"),
-    (0x092, "ds_min_src2_f32"),
-    (0x093, "ds_max_src2_f32"),
-    (0x095, "ds_add_src2_f32"),
     (0x0a0, "ds_write_b8_d16_hi"),
     (0x0a1, "ds_write_b16_d16_hi"),
     (0x0a2, "ds_read_u8_d16"),
@@ -948,21 +863,6 @@ pub(super) const DS: &[(u16, &str)] = &[
     (0x0b1, "ds_read_addtid_b32"),
     (0x0b2, "ds_permute_b32"),
     (0x0b3, "ds_bpermute_b32"),
-    (0x0c0, "ds_add_src2_u64"),
-    (0x0c1, "ds_sub_src2_u64"),
-    (0x0c2, "ds_rsub_src2_u64"),
-    (0x0c3, "ds_inc_src2_u64"),
-    (0x0c4, "ds_dec_src2_u64"),
-    (0x0c5, "ds_min_src2_i64"),
-    (0x0c6, "ds_max_src2_i64"),
-    (0x0c7, "ds_min_src2_u64"),
-    (0x0c8, "ds_max_src2_u64"),
-    (0x0c9, "ds_and_src2_b64"),
-    (0x0ca, "ds_or_src2_b64"),
-    (0x0cb, "ds_xor_src2_b64"),
-    (0x0cd, "ds_write_src2_b64"),
-    (0x0d2, "ds_min_src2_f64"),
-    (0x0d3, "ds_max_src2_f64"),
     (0x0de, "ds_write_b96"),
     (0x0df, "ds_write_b128"),
     (0x0fe, "ds_read_b96"),
@@ -1128,29 +1028,40 @@ pub(super) const MIMG: &[(u16, &str)] = &[
     (0x03f, "image_sample_c_lz_o"),
     (0x040, "image_gather4"),
     (0x041, "image_gather4_cl"),
+    (0x042, "image_load_by2"),
+    (0x043, "image_load_by4"),
     (0x044, "image_gather4_l"),
     (0x045, "image_gather4_b"),
     (0x046, "image_gather4_b_cl"),
     (0x047, "image_gather4_lz"),
     (0x048, "image_gather4_c"),
     (0x049, "image_gather4_c_cl"),
+    (0x04a, "image_load_mip_by2"),
+    (0x04b, "image_load_mip_by4"),
     (0x04c, "image_gather4_c_l"),
     (0x04d, "image_gather4_c_b"),
     (0x04e, "image_gather4_c_b_cl"),
     (0x04f, "image_gather4_c_lz"),
     (0x050, "image_gather4_o"),
     (0x051, "image_gather4_cl_o"),
+    (0x052, "image_store_by2"),
+    (0x053, "image_store_by4"),
     (0x054, "image_gather4_l_o"),
     (0x055, "image_gather4_b_o"),
     (0x056, "image_gather4_b_cl_o"),
     (0x057, "image_gather4_lz_o"),
     (0x058, "image_gather4_c_o"),
     (0x059, "image_gather4_c_cl_o"),
+    (0x05a, "image_store_mip_by2"),
+    (0x05b, "image_store_mip_by4"),
     (0x05c, "image_gather4_c_l_o"),
     (0x05d, "image_gather4_c_b_o"),
     (0x05e, "image_gather4_c_b_cl_o"),
     (0x05f, "image_gather4_c_lz_o"),
     (0x060, "image_get_lod"),
+    (0x061, "image_gather4h"),
+    (0x062, "image_gather4h_pck"),
+    (0x063, "image_gather8h_pck"),
     (0x068, "image_sample_cd"),
     (0x069, "image_sample_cd_cl"),
     (0x06a, "image_sample_c_cd"),
@@ -1159,6 +1070,14 @@ pub(super) const MIMG: &[(u16, &str)] = &[
     (0x06d, "image_sample_cd_cl_o"),
     (0x06e, "image_sample_c_cd_o"),
     (0x06f, "image_sample_c_cd_cl_o"),
+    (0x070, "image_load_pck2"),
+    (0x071, "image_load_pck4"),
+    (0x073, "image_load_mip_pck2"),
+    (0x074, "image_load_mip_pck4"),
+    (0x076, "image_store_pck2"),
+    (0x077, "image_store_pck4"),
+    (0x079, "image_store_mip_pck2"),
+    (0x07a, "image_store_mip_pck4"),
     (0x080, "image_msaa_load"),
     (0x0a2, "image_sample_d_g16"),
     (0x0a3, "image_sample_d_cl_g16"),
@@ -1170,6 +1089,14 @@ pub(super) const MIMG: &[(u16, &str)] = &[
     (0x0bb, "image_sample_c_d_cl_o_g16"),
     (0x0e6, "image_bvh_intersect_ray"),
     (0x0e7, "image_bvh64_intersect_ray"),
+    (0x0e8, "image_sample_cd_g16"),
+    (0x0e9, "image_sample_cd_cl_g16"),
+    (0x0ea, "image_sample_c_cd_g16"),
+    (0x0eb, "image_sample_c_cd_cl_g16"),
+    (0x0ec, "image_sample_cd_o_g16"),
+    (0x0ed, "image_sample_cd_cl_o_g16"),
+    (0x0ee, "image_sample_c_cd_o_g16"),
+    (0x0ef, "image_sample_c_cd_cl_o_g16"),
 ];
 
 pub(super) const FLAT: &[(u16, &str)] = &[
@@ -1316,6 +1243,330 @@ pub(super) const SCRATCH: &[(u16, &str)] = &[
 
 #[cfg(test)]
 mod tests {
+    use super::*;
+    use crate::gfx10::{Encoding, Fields, Operand, decode, instruction, name};
+
+    #[test]
+    fn every_table_entry_is_reachable_and_has_a_unique_mnemonic() {
+        use Encoding::*;
+        for (encoding, table, limit) in [
+            (Sop1, SOP1, 0x100),
+            (Sop2, SOP2, 0x60),
+            (Sopc, SOPC, 0x80),
+            (Sopk, SOPK, 0x1d),
+            (Sopp, SOPP, 0x80),
+            (Smem, SMEM, 0x100),
+            (Vop1, VOP1, 0x100),
+            (Vop2, VOP2, 0x3e),
+            (Vopc, VOPC, 0x100),
+            (Vop3, VOP3, 0x400),
+            (Vop3p, VOP3P, 0x80),
+            (Vintrp, VINTRP, 4),
+            (Ds, DS, 0x100),
+            (Mubuf, MUBUF, 0x100),
+            (Mtbuf, MTBUF, 0x10),
+            (Mimg, MIMG, 0x100),
+            (Flat, FLAT, 0x80),
+            (Global, GLOBAL, 0x80),
+            (Scratch, SCRATCH, 0x80),
+        ] {
+            let mut names = std::collections::BTreeSet::new();
+            let mut entries = table.iter().copied().peekable();
+            for op in 0..limit {
+                if encoding == Vop3 && matches!(op, 0..=0x13f | 0x180..=0x1ff) {
+                    continue;
+                }
+                let expected = entries.next_if(|&(index, _)| index == op).map(|(_, n)| n);
+                if let Some(n) = expected {
+                    assert!(!n.is_empty() && names.insert(n), "{encoding:?} {op:#x} {n}");
+                }
+                assert_eq!(name(encoding, op), expected, "{encoding:?} {op:#x}");
+            }
+            // Also catches duplicate, unsorted, shadowed or unencodable indices.
+            assert_eq!(entries.next(), None, "{encoding:?}");
+            assert_eq!(name(encoding, limit), None);
+            assert_eq!(name(encoding, u16::MAX), None);
+        }
+        assert_eq!(name(Exp, 0), Some("exp"));
+        assert_eq!(name(Exp, 1), None);
+        assert_eq!(name(Exp, u16::MAX), None);
+    }
+
+    #[test]
+    fn vop3_aliases_only_opcodes_with_a_long_form() {
+        for (base, compact, limit) in [
+            (0, Encoding::Vopc, 0x100),
+            (0x100, Encoding::Vop2, 0x40),
+            (0x180, Encoding::Vop1, 0x80),
+        ] {
+            for op in 0..limit {
+                let expected = name(compact, op).filter(|n| {
+                    !matches!(
+                        *n,
+                        "v_dot2c_f32_f16"
+                            | "v_dot4c_i32_i8"
+                            | "v_pk_fmac_f16"
+                            | "v_fmamk_f32"
+                            | "v_fmaak_f32"
+                            | "v_fmamk_f16"
+                            | "v_fmaak_f16"
+                            | "v_swap_b32"
+                            | "v_swaprel_b32"
+                    )
+                });
+                assert_eq!(
+                    name(Encoding::Vop3, base + op),
+                    expected,
+                    "{compact:?} {op:#x}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn older_generation_opcodes_are_reserved_on_rdna2() {
+        use Encoding::*;
+        for (encoding, op) in [
+            (Sop1, 0x35),
+            (Vop2, 0x1f),
+            (Vop2, 0x20),
+            (Vop2, 0x21),
+            (Vop3, 0x141),
+            (Vop3, 0x16b),
+            (Smem, 5),
+            (Smem, 0x10),
+            (Smem, 0x21),
+            (Smem, 0x2a),
+            (Smem, 0x40),
+            (Smem, 0xac),
+            (Ds, 0x80),
+            (Ds, 0x95),
+            (Ds, 0xc0),
+            (Ds, 0xd3),
+        ] {
+            assert_eq!(name(encoding, op), None, "{encoding:?} {op:#x}");
+        }
+        assert_eq!(name(Smem, 0x20), Some("s_dcache_inv"));
+        assert_eq!(name(Ds, 0xff), Some("ds_read_b128"));
+    }
+
+    #[test]
+    fn rdna2_fused_and_signed_dot_instructions_decode_with_their_operands() {
+        // GFX1030 encodings from llvm-mc. The packed dot accumulates into i32.
+        for (words, mnemonic, sources) in [
+            (&[0x0c00_0300][..], "v_fmac_legacy_f32", 2),
+            (&[0xd540_0000, 0x040a_0300], "v_fma_legacy_f32", 3),
+            (&[0xcc18_4003, 0x1c0a_0300], "v_dot8_i32_i4", 3),
+        ] {
+            let inst = instruction(&bytes(words), 0).unwrap();
+            assert_eq!(inst.name(), Some(mnemonic));
+            let Fields::Valu(v) = inst.fields(false) else {
+                panic!("{mnemonic}")
+            };
+            assert_eq!(v.src.len(), sources);
+            assert!(
+                v.src
+                    .iter()
+                    .all(|s| matches!(s, Operand::Vector { dwords: 1, .. }))
+            );
+        }
+        assert_eq!(name(Encoding::Vop3p, 0x19), Some("v_dot8_u32_u4"));
+    }
+
+    #[test]
+    fn vop3_interpolation_decodes_attribute_and_parameter_fields() {
+        for (w0, w1, text) in [
+            (0xd600_0002, 0x0202_0685, "v_interp_p1_f32 v2, v3, attr5.z"),
+            (0xd601_0002, 0x0202_0685, "v_interp_p2_f32 v2, v3, attr5.z"),
+            (0xd602_0002, 0x0200_0485, "v_interp_mov_f32 v2, p0, attr5.z"),
+        ] {
+            let inst = instruction(&bytes(&[w0, w1]), 0).unwrap();
+            assert_eq!(inst.encoding, Encoding::Vop3);
+            assert_eq!(inst.text(false), text);
+        }
+    }
+
+    #[test]
+    fn sopk_and_vop2_embedded_literals_preserve_instruction_boundaries() {
+        let code = bytes(&[
+            0xba80_1801,
+            0x1234_5678,
+            0x5a06_0300,
+            0x4188_0000,
+            0xbf81_0000,
+        ]);
+        let inst = decode(&code).unwrap();
+        assert_eq!(
+            inst.iter().map(|i| i.offset).collect::<Vec<_>>(),
+            [0, 8, 16]
+        );
+        assert_eq!(inst[0].name(), Some("s_setreg_imm32_b32"));
+        assert_eq!(
+            inst[0].fields(false),
+            Fields::Sop {
+                dst: None,
+                src: vec![Operand::Literal(0x1234_5678)],
+                imm: Some(0x1801),
+            }
+        );
+        assert_eq!(inst[1].name(), Some("v_fmaak_f32"));
+        let Fields::Valu(v) = inst[1].fields(false) else {
+            panic!("expected VOP2")
+        };
+        assert_eq!(
+            v.src,
+            [
+                Operand::Vector { reg: 0, dwords: 1 },
+                Operand::Vector { reg: 1, dwords: 1 },
+                Operand::Literal(0x4188_0000)
+            ]
+        );
+        assert_eq!(inst[2].name(), Some("s_endpgm"));
+        assert!(instruction(&code[..4], 0).is_err());
+        assert!(instruction(&code[8..12], 0).is_err());
+    }
+
+    #[test]
+    fn buffer_widths_survive_split_opcode_fields_and_segment_selection() {
+        for (w0, w1, mnemonic, width) in [
+            (0xe20c_0000, 0, "buffer_load_format_d16_xyzw", 2),
+            (0xe803_0000, 1 << 21, "tbuffer_load_format_d16_xyzw", 2),
+            (0xdc38_0000, 0x007d_0000, "flat_load_dwordx4", 4),
+            (0xdc3c_8000, 0x007d_0000, "global_load_dwordx3", 3),
+            (0xdc2c_4000, 0x007d_0000, "scratch_load_sshort", 1),
+        ] {
+            let inst = instruction(&bytes(&[w0, w1]), 0).unwrap();
+            assert_eq!(inst.name(), Some(mnemonic));
+            let data = match inst.fields(false) {
+                Fields::Buffer { data, .. } => data,
+                Fields::Flat { dst, .. } => dst,
+                _ => panic!("{mnemonic}"),
+            };
+            assert_eq!(
+                data,
+                Some(Operand::Vector {
+                    reg: 0,
+                    dwords: width
+                })
+            );
+        }
+    }
+
+    #[test]
+    fn image_load_store_and_coarse_derivative_opcode_families() {
+        use Encoding::Mimg;
+        // These opcodes occupy the holes between gather variants.
+        for (base, by2, by4) in [
+            (0x42, "image_load_by2", "image_load_by4"),
+            (0x4a, "image_load_mip_by2", "image_load_mip_by4"),
+            (0x52, "image_store_by2", "image_store_by4"),
+            (0x5a, "image_store_mip_by2", "image_store_mip_by4"),
+            (0x70, "image_load_pck2", "image_load_pck4"),
+            (0x73, "image_load_mip_pck2", "image_load_mip_pck4"),
+            (0x76, "image_store_pck2", "image_store_pck4"),
+            (0x79, "image_store_mip_pck2", "image_store_mip_pck4"),
+        ] {
+            assert_eq!(name(Mimg, base), Some(by2));
+            assert_eq!(name(Mimg, base + 1), Some(by4));
+        }
+        for op in 0x68..=0x6f {
+            let ordinary = name(Mimg, op).unwrap();
+            assert_eq!(
+                name(Mimg, op | 0x80).unwrap().strip_suffix("_g16"),
+                Some(ordinary)
+            );
+        }
+    }
+
+    #[test]
+    fn comparison_signedness_and_operand_widths_reach_the_decoder() {
+        for (op, mnemonic, width) in [
+            (0x21, "v_cmp_lt_f64", 2),
+            (0x81, "v_cmp_lt_i32", 1),
+            (0x89, "v_cmp_lt_i16", 1),
+            (0xc1, "v_cmp_lt_u32", 1),
+        ] {
+            let inst = instruction(&bytes(&[0x7c00_0500 | op << 17]), 0).unwrap();
+            assert_eq!(inst.name(), Some(mnemonic));
+            for wave64 in [false, true] {
+                let Fields::Valu(v) = inst.fields(wave64) else {
+                    panic!("expected VOPC")
+                };
+                assert_eq!(
+                    v.dst,
+                    Some(Operand::Scalar {
+                        code: 106,
+                        dwords: 1 + u8::from(wave64)
+                    })
+                );
+                assert_eq!(
+                    v.src,
+                    [
+                        Operand::Vector {
+                            reg: 0,
+                            dwords: width
+                        },
+                        Operand::Vector {
+                            reg: 2,
+                            dwords: width
+                        }
+                    ]
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn image_g16_packs_derivatives_independently_of_a16_coordinates() {
+        for (op_hi, a16, mnemonic, count) in [
+            (0, false, "image_sample_cd", 6),
+            (0, true, "image_sample_cd", 5),
+            (1, false, "image_sample_cd_g16", 4),
+            (1, true, "image_sample_cd_g16", 3),
+        ] {
+            let inst = instruction(
+                &bytes(&[0xf1a0_0108 | op_hi, 0x0040_0000 | u32::from(a16) << 30]),
+                0,
+            )
+            .unwrap();
+            assert_eq!(inst.name(), Some(mnemonic));
+            let Fields::Image { addr, .. } = inst.fields(false) else {
+                panic!("expected MIMG")
+            };
+            assert_eq!(
+                addr,
+                [Operand::Vector {
+                    reg: 0,
+                    dwords: count
+                }]
+            );
+        }
+        for (op, mnemonic, width) in [
+            (0x61, "image_gather4h", 4),
+            (0x62, "image_gather4h_pck", 2),
+            (0x63, "image_gather8h_pck", 2),
+        ] {
+            let mask = if op == 0x61 { 1 } else { 3 };
+            let inst = instruction(
+                &bytes(&[0xf000_0008 | op << 18 | mask << 8, 0x0040_0000]),
+                0,
+            )
+            .unwrap();
+            assert_eq!(inst.name(), Some(mnemonic));
+            let Fields::Image { data, sampler, .. } = inst.fields(false) else {
+                panic!("expected MIMG")
+            };
+            assert_eq!(
+                data,
+                Operand::Vector {
+                    reg: 0,
+                    dwords: width
+                }
+            );
+            assert_eq!(sampler, Some(Operand::Scalar { code: 8, dwords: 4 }));
+        }
+    }
+
     fn bytes(words: &[u32]) -> Vec<u8> {
         words.iter().flat_map(|w| w.to_le_bytes()).collect()
     }
