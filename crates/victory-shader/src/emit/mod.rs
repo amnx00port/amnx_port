@@ -293,22 +293,27 @@ pub fn emit(
         stage: native.stage,
         dxil: l.dxil,
         user_data: l.user_data,
-        static_samplers: l
-            .samplers
-            .iter()
-            .enumerate()
-            .map(|(n, &w)| {
-                let mut s = StaticSampler::from_words(w);
-                if l.cmp_samplers >> n & 1 != 0 {
-                    s.filter |= 0x80;
-                }
-                s
-            })
-            .collect(),
+        static_samplers: build_static_samplers(&l.samplers, &l.cmp_samplers),
         samplers: l.samplers,
         root_cbvs: l.root_cbvs,
         root_srvs: l.root_srvs,
     })
+}
+
+fn build_static_samplers(samplers: &[[u32; 4]], cmp_samplers: &[bool]) -> Vec<StaticSampler> {
+    samplers
+        .iter()
+        .zip(cmp_samplers)
+        .map(|(&w, &cmp)| {
+            let mut s = StaticSampler::from_words(w);
+            if cmp {
+                // Comparison overrides the 2-bit D3D12_FILTER_REDUCTION_TYPE
+                // field (bits 7..8), rather than ORing onto MINIMUM (0x100 -> MAXIMUM).
+                s.filter = (s.filter & !0x180) | 0x80;
+            }
+            s
+        })
+        .collect()
 }
 
 /// The rows of an `ISG1`/`OSG1` part.
@@ -745,5 +750,226 @@ mod tests {
         let io = crate::io::raise(&p, &native).unwrap();
         // Translated or refused with a reason; it must not panic.
         let _ = super::emit(&c, &native, &p, &st, &io, &res);
+    }
+
+    fn lower_immediate_sampler_cs(words: &[u32]) -> super::HostShader {
+        let table = crate::native::RootParam {
+            root: crate::native::RootType::Table,
+            table_offset_dwords: 0,
+            sgprs: 1,
+            base_register: 0,
+            user_data: 0,
+            slot: 0,
+        };
+        let range = |kind, table_offset_dwords, dwords| crate::native::UsedResource {
+            kind,
+            root: crate::native::RootType::Table,
+            table_offset_dwords,
+            lower_bound: 0,
+            stride: 0,
+            dwords,
+            user_data: 0,
+            slot: 0,
+        };
+        let native = super::NativeProgram {
+            stage: super::HwStage::Cs,
+            wave64: false,
+            vgprs: 32,
+            layout: vec![table],
+            used: vec![
+                range(crate::native::ResourceType::Srv, 0, 8),
+                range(crate::native::ResourceType::Uav, 8, 4),
+            ],
+            io: crate::native::StageIo::Cs(crate::native::ComputeIo {
+                rsrc2: 2 << 1,
+                threads: [1, 1, 1],
+            }),
+            code: words.iter().flat_map(|w| w.to_le_bytes()).collect(),
+        };
+        let p = crate::ir::build(&native.code, native.wave64, native.vgprs).expect("ir::build");
+        let st = crate::structure::structure(&p).expect("structure");
+        let res = crate::resource::track(&p, &native.layout, native.stage, Some(&st))
+            .expect("resource::track");
+        let io = crate::io::raise(&p, &native).expect("io::raise");
+        let l = super::lower::lower(&super::lower::Parts {
+            native: &native,
+            p: &p,
+            st: &st,
+            io: &io,
+            res: &res,
+            inputs: Vec::new(),
+            outputs: Vec::new(),
+            prims: Vec::new(),
+            mesh_stride: 0,
+        })
+        .expect("lower");
+        let shader = super::HostShader {
+            stage: native.stage,
+            dxil: l.dxil,
+            user_data: l.user_data,
+            static_samplers: super::build_static_samplers(&l.samplers, &l.cmp_samplers),
+            samplers: l.samplers,
+            root_cbvs: l.root_cbvs,
+            root_srvs: l.root_srvs,
+        };
+        #[cfg(windows)]
+        if let Ok(mut v) = super::validator::Validator::load(
+            super::validator::Validator::default_path().as_deref(),
+        ) {
+            v.validate(&mut shader.dxil.clone())
+                .expect("DXIL validation failed");
+        }
+        shader
+    }
+
+    fn dual_use_sampler_program(sampler: [u32; 4], cmp_first: bool) -> Vec<u32> {
+        let mut words = vec![
+            0xBE84_0300, // s_mov_b32 s4, s0
+            0xBE85_0380, // s_mov_b32 s5, 0
+            0xF40C_0302,
+            0xFA00_0000, // s_load_dwordx8 s[12:19], s[4:5], 0x0
+            0xF408_0A02,
+            0xFA00_0020, // s_load_dwordx4 s[40:43], s[4:5], 0x20
+            0xBF8C_C07F, // s_waitcnt lgkmcnt(0)
+        ];
+        for (i, w) in sampler.into_iter().enumerate() {
+            words.push(0xBE88_03FF | ((i as u32) << 16)); // s_mov_b32 s(8+i), lit32
+            words.push(w);
+        }
+        let v_mov_lit = |dst: u32, lit: f32, out: &mut Vec<u32>| {
+            out.push(0x7E00_02FF | (dst << 17));
+            out.push(lit.to_bits());
+        };
+        v_mov_lit(1, 0.25, &mut words); // ref1 = 0.25 (<= 0.5 -> 1.0)
+        v_mov_lit(2, 0.5, &mut words);
+        v_mov_lit(3, 0.5, &mut words);
+        v_mov_lit(4, 0.75, &mut words); // ref2 = 0.75 (> 0.5 -> 0.0)
+        v_mov_lit(5, 0.5, &mut words);
+        v_mov_lit(6, 0.5, &mut words);
+        words.push(0x7E20_0280); // v_mov_b32 v16, 0
+
+        let std_sample = [0xF09C_0108, 0x0043_0C02]; // image_sample_lz v12, v[2:3], s[12:19], s[8:11]
+        let cmp_sample_1 = [0xF0BC_0108, 0x0043_0D01]; // image_sample_c_lz v13, v[1:3], s[12:19], s[8:11]
+        let cmp_sample_2 = [0xF0BC_0108, 0x0043_0E04]; // image_sample_c_lz v14, v[4:6], s[12:19], s[8:11]
+        if cmp_first {
+            words.extend(cmp_sample_1);
+            words.extend(cmp_sample_2);
+            words.extend(std_sample);
+        } else {
+            words.extend(std_sample);
+            words.extend(cmp_sample_1);
+            words.extend(cmp_sample_2);
+        }
+        words.extend([
+            0xBF8C_3F70, // s_waitcnt vmcnt(0)
+            0xE070_1000,
+            0x800A_0C10, // buffer_store_dword v12, v16, s[40:43], 0 offen
+            0xE070_1004,
+            0x800A_0D10, // buffer_store_dword v13, v16, s[40:43], 0 offen offset:4
+            0xE070_1008,
+            0x800A_0E10, // buffer_store_dword v14, v16, s[40:43], 0 offen offset:8
+            0xBF81_0000, // s_endpgm
+        ]);
+        words
+    }
+
+    #[test]
+    fn constant_sampler_used_with_and_without_comparison_splits_into_two_static_samplers() {
+        // Point clamp, comparison LESS_EQUAL (4).
+        let sampler = [0x3092u32, 0x00FF_F000, 0x0000_0000, 0x0000_0000];
+        for cmp_first in [false, true] {
+            let shader = lower_immediate_sampler_cs(&dual_use_sampler_program(sampler, cmp_first));
+            assert_eq!(shader.samplers, vec![sampler, sampler]);
+            assert_eq!(shader.static_samplers.len(), 2);
+            let filters: Vec<u32> = shader.static_samplers.iter().map(|s| s.filter).collect();
+            let expected = if cmp_first {
+                vec![0x80, 0x00]
+            } else {
+                vec![0x00, 0x80]
+            };
+            assert_eq!(filters, expected, "cmp_first={cmp_first}");
+
+            #[cfg(all(windows, feature = "host"))]
+            {
+                use super::host::{Dispatch, Host, Root, View};
+                let _one = super::valu_tests::ONE_AT_A_TIME
+                    .lock()
+                    .unwrap_or_else(|e| e.into_inner());
+                // D3D12 leaves `SHADER_SAMPLE_COMPARISON` optional for RGBA32F on
+                // hardware; WARP implements it everywhere.
+                if let Ok(host) = Host::new(true) {
+                    let texel = [[0.5f32, 0.0, 0.0, 1.0]];
+                    let views = [View::Texture(1, 1, &texel), View::RawUav(3)];
+                    let (root, pso) = host
+                        .compute_pipeline(&shader)
+                        .unwrap_or_else(|e| panic!("warp: compute_pipeline: {e}"));
+                    let words = host
+                        .dispatch(
+                            &root,
+                            &pso,
+                            &Dispatch {
+                                roots: vec![(0, Root::Constants(vec![0]))],
+                                views: &views,
+                                samplers: &[],
+                                groups: [1, 1, 1],
+                            },
+                        )
+                        .unwrap_or_else(|e| panic!("warp: dispatch: {e}"));
+                    let got: Vec<f32> = words[0].iter().copied().map(f32::from_bits).collect();
+                    assert_eq!(got, vec![0.5, 1.0, 0.0], "warp cmp_first={cmp_first}");
+                }
+            }
+        }
+
+        // A MINIMUM reduction sampler (0x100) also used with comparison must
+        // become COMPARISON (0x80), not MAXIMUM (0x180).
+        let min_sampler = [0x2000_3092u32, 0x00FF_F000, 0x0000_0000, 0x0000_0000];
+        let shader = lower_immediate_sampler_cs(&dual_use_sampler_program(min_sampler, false));
+        let filters: Vec<u32> = shader.static_samplers.iter().map(|s| s.filter).collect();
+        assert_eq!(filters, vec![0x100, 0x80]);
+    }
+
+    #[test]
+    fn more_than_64_immediate_samplers_do_not_overflow() {
+        let mut words = vec![
+            0xBE84_0300, // s_mov_b32 s4, s0
+            0xBE85_0380, // s_mov_b32 s5, 0
+            0xF40C_0302,
+            0xFA00_0000, // s_load_dwordx8 s[12:19], s[4:5], 0x0
+            0xF408_0A02,
+            0xFA00_0020, // s_load_dwordx4 s[40:43], s[4:5], 0x20
+            0xBF8C_C07F, // s_waitcnt lgkmcnt(0)
+            0x7E02_0280, // v_mov_b32 v1, 0
+            0x7E04_0280, // v_mov_b32 v2, 0
+            0x7E06_0280, // v_mov_b32 v3, 0
+            0x7E20_0280, // v_mov_b32 v16, 0
+        ];
+        for i in 0..66u32 {
+            // Vary MaxLOD across bits 12..23 cleanly without colliding with 1-bits.
+            let sampler = [0x3092u32, (i + 1) << 12, 0x0000_0000, 0x0000_0000];
+            for (j, w) in sampler.into_iter().enumerate() {
+                words.push(0xBE88_03FF | ((j as u32) << 16));
+                words.push(w);
+            }
+            if !i.is_multiple_of(2) {
+                words.extend([0xF0BC_0108, 0x0043_0C01]); // image_sample_c_lz v12, v[1:3], s[12:19], s[8:11]
+            } else {
+                words.extend([0xF09C_0108, 0x0043_0C02]); // image_sample_lz v12, v[2:3], s[12:19], s[8:11]
+            }
+            words.extend([
+                0xBF8C_3F70,                      // s_waitcnt vmcnt(0)
+                0xE070_1000 | ((i * 4) & 0x0FFF), // buffer_store_dword v12, v16, s[40:43], 0 offen offset:...
+                0x800A_0C10,
+            ]);
+        }
+        words.push(0xBF81_0000); // s_endpgm
+
+        let shader = lower_immediate_sampler_cs(&words);
+        assert_eq!(shader.samplers.len(), 66);
+        assert_eq!(shader.static_samplers.len(), 66);
+        for (i, s) in shader.static_samplers.iter().enumerate() {
+            let expected = if !i.is_multiple_of(2) { 0x80 } else { 0x00 };
+            assert_eq!(s.filter & 0x180, expected, "sampler {i}");
+        }
     }
 }
