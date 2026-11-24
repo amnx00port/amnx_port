@@ -184,15 +184,35 @@ pub fn run(
     let seen = Mutex::new(HashSet::new());
     let total = Mutex::new(Tally::default());
     for root in &paths {
-        for entry in walkdir::WalkDir::new(root)
-            .into_iter()
-            .filter_map(Result::ok)
-        {
-            if !entry.file_type().is_file() || entry.metadata().map_or(0, |m| m.len()) > MAX_FILE {
+        anyhow::ensure!(root.exists(), "path does not exist: {}", root.display());
+        let mut errors = Vec::new();
+        for entry in walkdir::WalkDir::new(root) {
+            let entry = match entry {
+                Ok(entry) => entry,
+                Err(e) => {
+                    errors.push(format!("cannot walk {}: {e}", root.display()));
+                    continue;
+                }
+            };
+            if !entry.file_type().is_file() {
                 continue;
             }
-            let Ok(data) = std::fs::read(entry.path()) else {
+            let len = match entry.metadata() {
+                Ok(metadata) => metadata.len(),
+                Err(e) => {
+                    errors.push(format!("cannot inspect {}: {e}", entry.path().display()));
+                    continue;
+                }
+            };
+            if len > MAX_FILE {
                 continue;
+            }
+            let data = match std::fs::read(entry.path()) {
+                Ok(data) => data,
+                Err(e) => {
+                    errors.push(format!("cannot read {}: {e}", entry.path().display()));
+                    continue;
+                }
             };
             let jobs = sources(&data);
             let next = AtomicUsize::new(0);
@@ -219,6 +239,12 @@ pub fn run(
                     });
                 }
             });
+        }
+        for error in &errors {
+            eprintln!("{error}");
+        }
+        if !errors.is_empty() {
+            eprintln!("{} input error(s) under {}", errors.len(), root.display());
         }
     }
     let t = total.into_inner().unwrap_or_else(|e| e.into_inner());
@@ -668,4 +694,26 @@ fn tally_structured(program: &ir::Program, s: &structure::Structured, t: &mut Ta
 
 fn lock<T>(m: &Mutex<T>) -> std::sync::MutexGuard<'_, T> {
     m.lock().unwrap_or_else(|e| e.into_inner())
+}
+
+#[cfg(test)]
+mod scan_tests {
+    use super::*;
+
+    #[test]
+    fn a_missing_translation_path_is_an_error() {
+        let dir = tempfile::tempdir().unwrap();
+        let absent = dir.path().join("not-there");
+        let error = run(vec![absent.clone()], false, false, false, None).unwrap_err();
+        assert!(
+            error.to_string().contains(&absent.display().to_string()),
+            "the diagnostic names the path: {error}"
+        );
+    }
+
+    #[test]
+    fn an_empty_translation_directory_succeeds() {
+        let dir = tempfile::tempdir().unwrap();
+        assert!(run(vec![dir.path().to_path_buf()], false, false, false, None).is_ok());
+    }
 }
