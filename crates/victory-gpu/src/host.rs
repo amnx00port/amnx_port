@@ -372,8 +372,14 @@ enum Step {
     /// A copy into title memory (destination, source, bytes): the title's
     /// buffer copies, which later refreshes must see.
     Copy(usize, usize, usize),
-    /// A copy of title memory into the list's own upload memory.
-    Fill(usize, usize, usize),
+    /// A copy of title memory into the list's own upload memory, with any
+    /// trailing padding up to `padded` bytes zeroed.
+    Fill {
+        dst: usize,
+        src: usize,
+        len: usize,
+        padded: usize,
+    },
     /// Brings a range (address, bytes) of a buffer's host copy up to date:
     /// once per submission, whichever lists ask, until a `Copy` or `Run`
     /// intervenes.
@@ -1024,9 +1030,25 @@ impl HostList {
     /// Copies `len` bytes of title memory at `src` into the list's upload
     /// memory at `dst` when the list is submitted.
     pub(crate) fn defer_fill(&self, dst: *mut u8, src: *const u8, len: usize) {
-        self.deferred()
-            .copies
-            .push(Step::Fill(dst as usize, src as usize, len));
+        self.defer_fill_padded(dst, src, len, len);
+    }
+
+    /// Copies `len` bytes of title memory at `src` into the list's upload
+    /// memory at `dst` when the list is submitted, and zeroes any trailing
+    /// padding bytes up to `padded`.
+    pub(crate) fn defer_fill_padded(
+        &self,
+        dst: *mut u8,
+        src: *const u8,
+        len: usize,
+        padded: usize,
+    ) {
+        self.deferred().copies.push(Step::Fill {
+            dst: dst as usize,
+            src: src as usize,
+            len,
+            padded: padded.max(len),
+        });
     }
 
     /// Brings `[address, address + len)` of a buffer's host copy up to date
@@ -1180,13 +1202,23 @@ impl HostList {
                     copy_mapped(dst as *mut u8, src as *const u8, len, true);
                     len
                 }
-                &Step::Fill(dst, src, len) => {
+                &Step::Fill {
+                    dst,
+                    src,
+                    len,
+                    padded,
+                } => {
                     #[cfg(feature = "diagnostics")]
                     {
                         add(C::Copies, 1);
                         add(C::CopyBytes, len as u64);
                     }
                     copy_mapped(dst as *mut u8, src as *const u8, len, false);
+                    if padded > len {
+                        // SAFETY: `dst` is the list's mapped upload memory of
+                        // at least `padded` bytes.
+                        unsafe { (dst as *mut u8).add(len).write_bytes(0, padded - len) };
+                    }
                     len
                 }
                 Step::Refresh(shadow, address, len) => {

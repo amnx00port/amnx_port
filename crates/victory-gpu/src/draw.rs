@@ -146,8 +146,9 @@ fn root_view(list: &HostList, address: u64, srv: bool) -> Option<u64> {
         shadow.refresh(list, address, len);
         return Some(gpu);
     }
-    let (gpu, to) = list.scratch(len)?;
-    list.defer_fill(to, address as *const u8, len as usize);
+    let padded = len.next_multiple_of(256);
+    let (gpu, to) = list.scratch(padded)?;
+    list.defer_fill_padded(to, address as *const u8, len as usize, padded as usize);
     Some(gpu)
 }
 
@@ -742,12 +743,24 @@ impl State {
                 let used = entries.iter().find(|u| u.table_offset_dwords / 8 == k);
                 match crate::descriptor::view(table + u64::from(k) * 32) {
                     Some(View::Constant(address, size)) => {
-                        let Some((gpu, to)) = list.scratch(u64::from(size)) else {
-                            host.make_null(index);
+                        let Some(padded) = (address != 0 && size != 0)
+                            .then(|| size.checked_next_multiple_of(256))
+                            .flatten()
+                        else {
+                            host.make_null_constant(index);
                             continue;
                         };
-                        list.defer_fill(to, address as *const u8, size as usize);
-                        host.constant_at(index, gpu, size);
+                        let Some((gpu, to)) = list.scratch(u64::from(padded)) else {
+                            host.make_null_constant(index);
+                            continue;
+                        };
+                        list.defer_fill_padded(
+                            to,
+                            address as *const u8,
+                            size as usize,
+                            padded as usize,
+                        );
+                        host.constant_at(index, gpu, padded);
                     }
                     Some(view) => {
                         host.make_at(index, &view);
@@ -1214,4 +1227,337 @@ pub(crate) fn blend_factor(list: &HostList, factor: Option<&[f32; 4]>) {
 pub(crate) fn stencil_ref(list: &HostList, reference: u32) {
     // SAFETY: an open list.
     unsafe { list.list.OMSetStencilRef(reference) };
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::object::{Iid, S_OK, guid, slot};
+    use windows::Win32::Graphics::Direct3D::Fxc::D3DCompile;
+    use windows::Win32::Graphics::Direct3D::ID3DBlob;
+    use windows::core::s;
+
+    const VIEW_HEAP_IID: Iid = guid(
+        0x8efb471d,
+        0x616c,
+        0x4f49,
+        [0x90, 0xf7, 0x12, 0x7b, 0xb7, 0x63, 0xfa, 0x51],
+    );
+
+    fn compile_compute(
+        host: &crate::host::Host,
+        source: &str,
+    ) -> (ID3D12RootSignature, ID3D12PipelineState) {
+        let mut code: Option<ID3DBlob> = None;
+        let mut errors: Option<ID3DBlob> = None;
+        // SAFETY: source and entry-point strings live through the call.
+        let compiled = unsafe {
+            D3DCompile(
+                source.as_ptr().cast(),
+                source.len(),
+                s!("cbv_test"),
+                None,
+                None,
+                s!("main"),
+                s!("cs_5_1"),
+                0,
+                0,
+                &mut code,
+                Some(&mut errors),
+            )
+        };
+        if let Err(e) = compiled {
+            let text = errors
+                .as_ref()
+                .map(|b| {
+                    // SAFETY: the compiler's own error blob.
+                    let slice = unsafe {
+                        std::slice::from_raw_parts(
+                            b.GetBufferPointer().cast::<u8>(),
+                            b.GetBufferSize(),
+                        )
+                    };
+                    String::from_utf8_lossy(slice).into_owned()
+                })
+                .unwrap_or_default();
+            panic!("test compute shader failed to compile ({e}): {text}");
+        }
+        let code = code.expect("compiled shader blob");
+        // SAFETY: compiled DXBC blob containing its embedded root signature.
+        unsafe {
+            let bytes = std::slice::from_raw_parts(
+                code.GetBufferPointer().cast::<u8>(),
+                code.GetBufferSize(),
+            );
+            let root: ID3D12RootSignature = host
+                .device
+                .CreateRootSignature(0, bytes)
+                .expect("test root signature");
+            let pso = host
+                .device
+                .CreateComputePipelineState(&D3D12_COMPUTE_PIPELINE_STATE_DESC {
+                    pRootSignature: std::mem::transmute_copy(&root),
+                    CS: D3D12_SHADER_BYTECODE {
+                        pShaderBytecode: bytes.as_ptr().cast(),
+                        BytecodeLength: bytes.len(),
+                    },
+                    ..Default::default()
+                })
+                .expect("test compute pso");
+            (root, pso)
+        }
+    }
+
+    /// A non-256-aligned table CBV zeroes its `[size..padded)` scratch tail
+    /// across list resets (preventing stale scratch reads), while null,
+    /// zero-sized, and overflowing CBVs bind null CBVs without allocating
+    /// scratch.
+    #[test]
+    fn table_cbv_zeroes_scratch_padding_and_binds_null_cbvs_on_gpu() {
+        let Some(host) = crate::host::host() else {
+            return; // no host GPU
+        };
+        const SOURCE: &str = r#"
+#define RS "DescriptorTable(CBV(b0, numDescriptors=5)), UAV(u0)"
+cbuffer Small : register(b0) { uint4 small_c[16]; };
+cbuffer Null0 : register(b1) { uint4 null0_c[4]; };
+cbuffer Null1 : register(b2) { uint4 null1_c[4]; };
+cbuffer Null2 : register(b3) { uint4 null2_c[4]; };
+cbuffer Null3 : register(b4) { uint4 null3_c[4]; };
+RWByteAddressBuffer out_buf : register(u0);
+[RootSignature(RS)]
+[numthreads(1, 1, 1)]
+void main() {
+    for (uint i = 0; i < 16; ++i) {
+        out_buf.Store4(i * 16, small_c[i]);
+    }
+    out_buf.Store4(256, null0_c[0]);
+    out_buf.Store4(272, null1_c[0]);
+    out_buf.Store4(288, null2_c[0]);
+    out_buf.Store4(304, null3_c[0]);
+}
+"#;
+        let (root, pso) = compile_compute(host, SOURCE);
+        let list = host.new_list().expect("host command list");
+
+        // Pass 1: poison the first 512 bytes of the list's scratch chunk, then
+        // reset so the next recording reuses that exact memory.
+        let (poison_gpu, poison_ptr) = list.scratch(512).expect("scratch poison");
+        // SAFETY: mapped scratch chunk of at least 512 bytes.
+        unsafe { poison_ptr.write_bytes(0xDE, 512) };
+        list.close();
+        host.execute(&[&list]);
+        list.reset();
+
+        // Create a shader-visible title view heap with 8 slots.
+        #[repr(C)]
+        struct ExtendedHeapDesc {
+            kind: u32,
+            count: u32,
+            flags: u32,
+            nodes: u32,
+            placement_addr: u64,
+            placement_size: u64,
+        }
+        let desc = ExtendedHeapDesc {
+            kind: 0,
+            count: 8,
+            flags: 1,
+            nodes: 0,
+            placement_addr: 0,
+            placement_size: 0,
+        };
+        let mut heap_this: This = std::ptr::null();
+        assert_eq!(
+            crate::descriptor::create_heap(
+                std::ptr::null(),
+                (&raw const desc).cast(),
+                &VIEW_HEAP_IID,
+                &mut heap_this,
+            ),
+            S_OK
+        );
+        let heap_start = crate::descriptor::heap(heap_this).start;
+
+        // 32-byte (non-256-aligned) title constant payload.
+        let title_data: [u32; 8] = [
+            0x1122_0000,
+            0x1122_0001,
+            0x1122_0002,
+            0x1122_0003,
+            0x1122_0004,
+            0x1122_0005,
+            0x1122_0006,
+            0x1122_0007,
+        ];
+        let addr = title_data.as_ptr() as u64;
+        let (lo, hi) = (addr as u32, (addr >> 32) as u32);
+        let cbvs = [
+            [lo, hi, 32, 0],           // valid 32-byte CBV (padded to 256)
+            [0, 0, 0, 0],              // explicit null CBV
+            [lo, hi, 0, 0],            // zero-sized CBV
+            [0, 0, 256, 0],            // zero-address CBV
+            [lo, hi, u32::MAX - 15, 0], // overflowing 256-byte rounding
+        ];
+        for (k, cbv) in cbvs.iter().enumerate() {
+            crate::descriptor::create_cbv(std::ptr::null(), cbv, heap_start + (k as u64) * 32);
+        }
+
+        let used: Vec<UsedResource> = (0..5u32)
+            .map(|k| UsedResource {
+                kind: ResourceType::Cbv,
+                root: RootType::Table,
+                table_offset_dwords: k * 8,
+                lower_bound: k,
+                stride: 8,
+                dwords: 4,
+                user_data: 0,
+                slot: 0,
+            })
+            .collect();
+
+        let (out_buf, out_ptr) = host.shared_buffer(512).expect("output buffer");
+        // Pre-fill with a non-zero sentinel so zeros must come from the shader.
+        // SAFETY: mapped 512-byte buffer.
+        unsafe { out_ptr.write_bytes(0x77, 512) };
+        // SAFETY: live D3D12 buffer.
+        let out_gpu = unsafe { out_buf.GetGPUVirtualAddress() };
+
+        {
+            let mut state = State::default();
+            state.set_heaps(&[heap_this]);
+            state.set_table(true, 0, heap_start);
+            let made = state.tables(&list, &used, true);
+            assert!(!state.table_failed);
+            assert_eq!(made.len(), 1);
+            let first = made[0].1 / 32;
+
+            // Only slot 0 should have consumed 256 bytes of scratch; the four
+            // null/invalid CBVs must not allocate scratch.
+            let (next_gpu, _) = list.scratch(256).expect("next scratch");
+            assert_eq!(next_gpu, poison_gpu + 256);
+
+            let host_heap = crate::descriptor::heap(heap_this)
+                .host()
+                .expect("host view heap");
+            // SAFETY: open command list, live heap, root signature, PSO and buffer.
+            unsafe {
+                let step = host
+                    .device
+                    .GetDescriptorHandleIncrementSize(D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV);
+                let mut table_gpu = host_heap.heap.GetGPUDescriptorHandleForHeapStart();
+                table_gpu.ptr += u64::from(first) * u64::from(step);
+                list.list.SetDescriptorHeaps(&[Some(host_heap.heap.clone())]);
+                list.list.SetComputeRootSignature(&root);
+                list.list.SetPipelineState(&pso);
+                list.list.SetComputeRootDescriptorTable(0, table_gpu);
+                list.list.SetComputeRootUnorderedAccessView(1, out_gpu);
+                list.list.Dispatch(1, 1, 1);
+            }
+            list.close();
+            host.execute(&[&list]);
+        }
+
+        // SAFETY: GPU execution has completed and `out_ptr` holds 80 dwords.
+        let got = unsafe { std::slice::from_raw_parts(out_ptr.cast::<u32>(), 80) };
+        assert_eq!(&got[..8], &title_data, "in-bounds CBV bytes must match title memory");
+        assert!(
+            got[8..64].iter().all(|&w| w == 0),
+            "CBV padding bytes [32..256) must read as zero, got {:x?}",
+            &got[8..16]
+        );
+        assert!(
+            got[64..80].iter().all(|&w| w == 0),
+            "null/zero-sized/overflowing CBVs must read as zero, got {:x?}",
+            &got[64..80]
+        );
+        // SAFETY: plain device query.
+        assert!(unsafe { host.device.GetDeviceRemovedReason() }.is_ok());
+
+        // Release the title heap after `state` has returned its dynamic slots.
+        let _ = slot::<extern "system" fn(This) -> u32>(heap_this, 0x10)(heap_this);
+    }
+
+    /// An unaligned root CBV copied to scratch near the end of a title buffer
+    /// zeroes its `[len..padded)` tail instead of exposing stale scratch bytes.
+    #[test]
+    fn unaligned_root_cbv_zeroes_scratch_padding_on_gpu() {
+        let Some(host) = crate::host::host() else {
+            return; // no host GPU
+        };
+        const SOURCE: &str = r#"
+#define RS "CBV(b0), UAV(u0)"
+cbuffer RootC : register(b0) { uint4 root_c[16]; };
+RWByteAddressBuffer out_buf : register(u0);
+[RootSignature(RS)]
+[numthreads(1, 1, 1)]
+void main() {
+    for (uint i = 0; i < 16; ++i) {
+        out_buf.Store4(i * 16, root_c[i]);
+    }
+}
+"#;
+        let (root, pso) = compile_compute(host, SOURCE);
+        let list = host.new_list().expect("host command list");
+
+        // Pass 1: poison scratch[0..256) and reset.
+        let (_, poison_ptr) = list.scratch(256).expect("scratch poison");
+        // SAFETY: mapped scratch chunk of at least 256 bytes.
+        unsafe { poison_ptr.write_bytes(0xCC, 256) };
+        list.close();
+        host.execute(&[&list]);
+        list.reset();
+
+        #[repr(align(256))]
+        struct Aligned([u32; 16]);
+        let mut backing = Aligned([0; 16]);
+        for (i, w) in backing.0.iter_mut().enumerate() {
+            *w = 0xAA55_0000 + i as u32;
+        }
+        let base = backing.0.as_ptr() as u64;
+        let resource_id = (&raw const backing) as usize;
+        // Register 64 bytes at `base`; binding `base + 16` gives a 16-byte
+        // unaligned GPU address with `left == 48` bytes before buffer end.
+        crate::shadow::register(resource_id, base, 64);
+        struct Unregister(usize, u64);
+        impl Drop for Unregister {
+            fn drop(&mut self) {
+                crate::shadow::unregister(self.0, self.1);
+            }
+        }
+        let _guard = Unregister(resource_id, base);
+
+        let root_gpu = root_view(&list, base + 16, false).expect("unaligned root cbv");
+        let (out_buf, out_ptr) = host.shared_buffer(256).expect("output buffer");
+        // SAFETY: mapped 256-byte buffer.
+        unsafe { out_ptr.write_bytes(0x77, 256) };
+        // SAFETY: live D3D12 buffer.
+        let out_gpu = unsafe { out_buf.GetGPUVirtualAddress() };
+
+        // SAFETY: open command list, live root signature, PSO and buffers.
+        unsafe {
+            list.list.SetComputeRootSignature(&root);
+            list.list.SetPipelineState(&pso);
+            list.list.SetComputeRootConstantBufferView(0, root_gpu);
+            list.list.SetComputeRootUnorderedAccessView(1, out_gpu);
+            list.list.Dispatch(1, 1, 1);
+        }
+        list.close();
+        host.execute(&[&list]);
+
+        // SAFETY: GPU execution has completed and `out_ptr` holds 64 dwords.
+        let got = unsafe { std::slice::from_raw_parts(out_ptr.cast::<u32>(), 64) };
+        assert_eq!(
+            &got[..12],
+            &backing.0[4..16],
+            "in-bounds root CBV bytes must match title memory"
+        );
+        assert!(
+            got[12..64].iter().all(|&w| w == 0),
+            "root CBV scratch tail [48..256) must read as zero, got {:x?}",
+            &got[12..20]
+        );
+        // SAFETY: plain device query.
+        assert!(unsafe { host.device.GetDeviceRemovedReason() }.is_ok());
+    }
 }
