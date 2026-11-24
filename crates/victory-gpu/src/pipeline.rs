@@ -105,8 +105,23 @@ impl Shader {
     /// The translation, made on first use; a shader that does not
     /// translate is logged once.
     pub(crate) fn translated(&self) -> Option<&Translated> {
-        self.translated
+        // A completed translation (including a cached failure) is not a wait.
+        #[cfg(feature = "diagnostics")]
+        if let Some(done) = self.translated.get() {
+            return done.as_ref();
+        }
+
+        #[cfg(feature = "diagnostics")]
+        let started = std::time::Instant::now();
+        #[cfg(feature = "diagnostics")]
+        let mut initialized = false;
+
+        let result = self.translated
             .get_or_init(|| {
+                #[cfg(feature = "diagnostics")]
+                {
+                    initialized = true;
+                }
                 let done = translate(&self.container);
                 match &done {
                     Ok(t) => tracing::info!(
@@ -124,8 +139,20 @@ impl Shader {
                     ),
                 }
                 done.ok()
-            })
-            .as_ref()
+            });
+
+        #[cfg(feature = "diagnostics")]
+        {
+            let elapsed_us = started.elapsed().as_micros() as u64;
+            if initialized {
+                tracing::debug!(elapsed_us, "shader dependency initialized");
+            } else {
+                // Includes a completion racing with the initial get(), so
+                // this is elapsed lookup time, not exact blocked CPU time.
+                tracing::debug!(elapsed_us, "shader dependency waited");
+            }
+        }
+        result.as_ref()
     }
 }
 
