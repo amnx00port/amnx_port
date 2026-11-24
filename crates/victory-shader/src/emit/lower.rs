@@ -4446,6 +4446,8 @@ impl<'a> Lower<'a> {
             "v_sub_nc_u16",
             "v_subrev_nc_u16",
             "v_mul_lo_u16",
+            "v_mad_u16",
+            "v_mad_i16",
             "v_lshlrev_b16",
             "v_lshrrev_b16",
             "v_ashrrev_i16",
@@ -4603,7 +4605,11 @@ impl<'a> Lower<'a> {
             return self.write_half(inst, r, guard);
         }
         // 16-bit integers: computed on the low halves, the low 16 bits kept.
-        if v.clamp || v.omod != 0 || v.abs != 0 || v.neg != 0 {
+        let saturates = matches!(
+            name,
+            "v_add_nc_u16" | "v_sub_nc_u16" | "v_subrev_nc_u16" | "v_mad_u16" | "v_mad_i16"
+        );
+        if (v.clamp && !saturates) || v.omod != 0 || v.abs != 0 || v.neg != 0 {
             return Err("modifiers on a 16-bit integer operation");
         }
         let r = match name {
@@ -4637,11 +4643,19 @@ impl<'a> Lower<'a> {
                     b = sext(self, b);
                 }
                 let k15 = self.s.m.i32(15);
-                match name {
+                let r = match name {
                     "v_add_nc_u16" => self.s.m.bin(c, Bin::Add, a, b),
                     "v_sub_nc_u16" => self.s.m.bin(c, Bin::Sub, a, b),
                     "v_subrev_nc_u16" => self.s.m.bin(c, Bin::Sub, b, a),
                     "v_mul_lo_u16" => self.s.m.bin(c, Bin::Mul, a, b),
+                    "v_mad_u16" | "v_mad_i16" => {
+                        let mut d = self.half_src(inst, 2)?;
+                        if name == "v_mad_i16" {
+                            d = sext(self, d);
+                        }
+                        let m = self.s.m.bin(c, Bin::Mul, a, b);
+                        self.s.m.bin(c, Bin::Add, m, d)
+                    }
                     "v_lshlrev_b16" | "v_lshrrev_b16" | "v_ashrrev_i16" => {
                         // src0 is the shift (4 bits), src1 the value.
                         let sh = self.s.m.bin(c, Bin::And, a, k15);
@@ -4667,6 +4681,30 @@ impl<'a> Lower<'a> {
                         let t = self.s.m.cmp(c, p, a, b);
                         self.s.m.select(c, t, a, b)
                     }
+                };
+                if v.clamp && saturates {
+                    match name {
+                        "v_add_nc_u16" | "v_mad_u16" => {
+                            let hi = self.s.m.i32(0xFFFF);
+                            let over = self.s.m.cmp(c, pred::IUGT, r, hi);
+                            self.s.m.select(c, over, hi, r)
+                        }
+                        "v_sub_nc_u16" | "v_subrev_nc_u16" => {
+                            let z = self.s.m.i32(0);
+                            let under = self.s.m.cmp(c, pred::SLT, r, z);
+                            self.s.m.select(c, under, z, r)
+                        }
+                        _ => {
+                            let lo = self.s.m.i32(i32::from(i16::MIN) as u32);
+                            let hi = self.s.m.i32(i32::from(i16::MAX) as u32);
+                            let under = self.s.m.cmp(c, pred::SLT, r, lo);
+                            let t = self.s.m.select(c, under, lo, r);
+                            let over = self.s.m.cmp(c, pred::SGT, t, hi);
+                            self.s.m.select(c, over, hi, t)
+                        }
+                    }
+                } else {
+                    r
                 }
             }
         };

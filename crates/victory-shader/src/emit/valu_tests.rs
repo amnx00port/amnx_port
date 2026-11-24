@@ -937,3 +937,95 @@ fn v_cmp_class_f16_matches_rdna2() {
         );
     });
 }
+
+#[test]
+fn v_mad_16_and_int16_clamp_match_rdna2() {
+    let vop3_clamp = |op: u16, s0: u16, s1: u16, s2: u16, clamp: bool| {
+        let [mut w0, w1] = vop3(op, 0, s0, s1, s2);
+        if clamp {
+            w0 |= 1 << 15;
+        }
+        [w0, w1]
+    };
+    let with_sentinel = |words: [u32; 2]| {
+        build_valu_cs(&[
+            vop1(0x001, 0, vgpr(4)), // v_mov_b32 v0, v4 (sentinel upper half)
+            words[0],
+            words[1],
+        ])
+    };
+
+    // VOP3 opcodes: 0x303=v_add_nc_u16, 0x304=v_sub_nc_u16, 0x340=v_mad_u16, 0x35e=v_mad_i16.
+    let mad_u16_wrap = with_sentinel(vop3_clamp(0x340, vgpr(1), vgpr(2), vgpr(3), false));
+    let mad_u16_sat = with_sentinel(vop3_clamp(0x340, vgpr(1), vgpr(2), vgpr(3), true));
+    let mad_i16_wrap = with_sentinel(vop3_clamp(0x35e, vgpr(1), vgpr(2), vgpr(3), false));
+    let mad_i16_sat = with_sentinel(vop3_clamp(0x35e, vgpr(1), vgpr(2), vgpr(3), true));
+    let add_u16_sat = with_sentinel(vop3_clamp(0x303, vgpr(1), vgpr(2), 0, true));
+    let sub_u16_sat = with_sentinel(vop3_clamp(0x304, vgpr(1), vgpr(2), 0, true));
+
+    let sentinel = 0xBEEF_0000u32;
+
+    // v_mad_u16 wrapping & saturating (including u16::MAX * u16::MAX + u16::MAX without u32 wrap)
+    let u_cases: &[(u16, u16, u16, u16, u16)] = &[
+        (20, 30, 40, 640, 640),
+        (300, 300, 100, (90_100u32 & 0xFFFF) as u16, u16::MAX),
+        (u16::MAX, u16::MAX, u16::MAX, 0, u16::MAX),
+    ];
+    let u_in: Vec<[u32; 4]> = u_cases
+        .iter()
+        .map(|&(a, b, c, _, _)| [u32::from(a), u32::from(b), u32::from(c), sentinel])
+        .collect();
+    run_cases(&mad_u16_wrap, &u_in, |backend, i, _, got| {
+        let want = sentinel | u32::from(u_cases[i].3);
+        assert_eq!(got, want, "{backend}: v_mad_u16 wrap case {i}");
+    });
+    run_cases(&mad_u16_sat, &u_in, |backend, i, _, got| {
+        let want = sentinel | u32::from(u_cases[i].4);
+        assert_eq!(got, want, "{backend}: v_mad_u16 clamp case {i}");
+    });
+
+    // v_mad_i16 wrapping & saturating (positive & negative overflow extremes)
+    let i_cases: &[(i16, i16, i16, i16, i16)] = &[
+        (-10, 20, 50, -150, -150),
+        (i16::MIN, i16::MIN, i16::MAX, i16::MAX, i16::MAX),
+        (i16::MIN, i16::MAX, i16::MIN, 0, i16::MIN),
+        (200, 200, 100, (40_100i32 as i16), i16::MAX),
+        (-200, 200, -100, (-40_100i32 as i16), i16::MIN),
+    ];
+    let i_in: Vec<[u32; 4]> = i_cases
+        .iter()
+        .map(|&(a, b, c, _, _)| [u32::from(a as u16), u32::from(b as u16), u32::from(c as u16), sentinel])
+        .collect();
+    run_cases(&mad_i16_wrap, &i_in, |backend, i, _, got| {
+        let want = sentinel | u32::from(i_cases[i].3 as u16);
+        assert_eq!(got, want, "{backend}: v_mad_i16 wrap case {i}");
+    });
+    run_cases(&mad_i16_sat, &i_in, |backend, i, _, got| {
+        let want = sentinel | u32::from(i_cases[i].4 as u16);
+        assert_eq!(got, want, "{backend}: v_mad_i16 clamp case {i}");
+    });
+
+    // v_add_nc_u16 clamp & v_sub_nc_u16 clamp
+    run_cases(
+        &add_u16_sat,
+        &[
+            [60000, 10000, 0, sentinel],
+            [123, 456, 0, sentinel],
+        ],
+        |backend, i, _, got| {
+            let want = sentinel | [u32::from(u16::MAX), 579][i];
+            assert_eq!(got, want, "{backend}: v_add_nc_u16 clamp case {i}");
+        },
+    );
+    run_cases(
+        &sub_u16_sat,
+        &[
+            [5, 10, 0, sentinel],
+            [500, 200, 0, sentinel],
+        ],
+        |backend, i, _, got| {
+            let want = sentinel | [0, 300][i];
+            assert_eq!(got, want, "{backend}: v_sub_nc_u16 clamp case {i}");
+        },
+    );
+}
