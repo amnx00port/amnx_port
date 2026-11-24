@@ -1058,12 +1058,27 @@ impl<'a> Lower<'a> {
     }
 
     fn load_input(&mut self, id: usize, col: u8) -> Val {
-        if self.s.inputs[id].half {
-            // shortcut: 16-bit vertex inputs (the fetch routine's) are not
-            // unpacked; pixel inputs are (`interp`).
-            return Val::Missing("a 16-bit input");
+        let v = self.load_any_input(id, col);
+        if !self.s.inputs[id].half {
+            return v;
         }
-        self.load_any_input(id, col)
+        // 16-bit vertex inputs (the fetch routine's) arrive as 32-bit host
+        // values; the console keeps them in the low half of the VGPR.
+        // shortcut: packed fetch (two values per dword) is not unpacked;
+        // add it when VsInput carries pack flags.
+        let Val::I32(x) = v else {
+            return v;
+        };
+        let c = self.s.entry;
+        let bits = if self.s.inputs[id].comp == 9 {
+            let f = self.s.m.cast(c, Cast::Bitcast, x, self.s.t.f32);
+            self.s
+                .op(c, "legacyF32ToF16", Attr::ReadNone, self.s.t.i32, 130, &[f])
+        } else {
+            let m = self.s.m.i32(0xFFFF);
+            self.s.m.bin(c, Bin::And, x, m)
+        };
+        Val::I32(bits)
     }
 
     /// An input element's channel as declared (16-bit ones as 32-bit floats).
@@ -6949,7 +6964,8 @@ impl<'a> Lower<'a> {
 mod tests {
     use super::{Lowered, Numeric, Parts, buffer_format, half_shift, lower};
     use crate::native::{
-        ComputeIo, HwStage, NativeProgram, ResourceType, RootParam, RootType, StageIo, UsedResource,
+        ComputeIo, HwStage, NativeProgram, ResourceType, RootParam, RootType, StageIo, Usage,
+        UsedResource, VsInput,
     };
     use crate::{io, ir, resource, structure};
 
@@ -7417,5 +7433,65 @@ mod tests {
         assert!(f10(0x3FF).is_nan());
         // A 16-bit float is a half already, sign included.
         assert_eq!(half(0xBC00 << half_shift(16)), -1.0);
+    }
+
+    /// A 16-bit vertex attribute is the host's 32-bit load, packed into the
+    /// low half the way the fetch shader leaves it (one value per dword).
+    #[test]
+    fn a_16_bit_vertex_input_is_unpacked_to_the_low_half() {
+        use super::super::container::SigElement;
+
+        // exp pos0 v4, v4, v4, v4 done vm; the attribute is in v4.
+        let words = [0xF800_18CF, 0x0404_0404, S_ENDPGM];
+        let code: Vec<u8> = words.iter().flat_map(|w| w.to_le_bytes()).collect();
+        let native = NativeProgram {
+            stage: HwStage::Vs,
+            wave64: false,
+            vgprs: 8,
+            layout: vec![],
+            used: vec![],
+            io: StageIo::Vs {
+                inputs: vec![VsInput {
+                    usage: Usage::Generic,
+                    row: 0,
+                    mask: 0b0001,
+                    vgpr: 4,
+                }],
+                outputs: vec![],
+            },
+            code,
+        };
+        let p = ir::build(&native.code, false, 8).unwrap();
+        let st = structure::structure(&p).unwrap();
+        let res = resource::track(&p, &native.layout, native.stage, Some(&st)).unwrap();
+        let io = io::raise(&p, &native).unwrap();
+        let el = |name: &str, kind, comp, cols, half| SigElement {
+            name: name.into(),
+            index: 0,
+            kind,
+            comp,
+            interp: 0,
+            row: Some(0),
+            col: 0,
+            cols,
+            usage: 0,
+            half,
+        };
+        let lower_attr = |comp: u8| {
+            lower(&Parts {
+                native: &native,
+                p: &p,
+                st: &st,
+                io: &io,
+                res: &res,
+                inputs: vec![el("TEXCOORD", 0, comp, 1, true)],
+                outputs: vec![el("SV_Position", 3, 9, 4, false)],
+                prims: vec![],
+                mesh_stride: 0,
+            })
+        };
+        for comp in [9u8, 5, 4] {
+            lower_attr(comp).unwrap_or_else(|e| panic!("{comp}: {e}"));
+        }
     }
 }
