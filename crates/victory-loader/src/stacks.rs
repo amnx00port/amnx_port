@@ -27,19 +27,33 @@ pub fn dump_stacks_on_schedule() {
     let Ok(list) = std::env::var("VICTORY_STACKS") else {
         return;
     };
-    let mut times: Vec<f64> = list
-        .split(',')
-        .filter_map(|t| t.trim().parse().ok())
-        .collect();
-    times.sort_by(f64::total_cmp);
+    let times = delays(&list);
+    if times.is_empty() {
+        return;
+    }
     let start = std::time::Instant::now();
     std::thread::spawn(move || {
-        for t in times {
-            let at = std::time::Duration::from_secs_f64(t.max(0.0));
+        for at in times {
             std::thread::sleep(at.saturating_sub(start.elapsed()));
             dump_stacks();
         }
     });
+}
+
+/// The delays `VICTORY_STACKS` lists, soonest first. Entries that are not a
+/// finite number of seconds are dropped: no `Duration` holds them (a huge
+/// value overflows it, and `inf` and `NaN` parse but have no length), and
+/// taking one would panic the dumping thread instead of timing a dump. A
+/// negative time means "now".
+fn delays(list: &str) -> Vec<std::time::Duration> {
+    let mut times: Vec<std::time::Duration> = list
+        .split(',')
+        .filter_map(|t| t.trim().parse::<f64>().ok())
+        .filter(|t| t.is_finite())
+        .filter_map(|t| std::time::Duration::try_from_secs_f64(t.max(0.0)).ok())
+        .collect();
+    times.sort_unstable();
+    times
 }
 
 /// `THREAD_BASIC_INFORMATION` (ntddk).
@@ -191,6 +205,28 @@ fn name_of(thread: HANDLE) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn the_schedule_keeps_only_delays_a_sleeper_can_wait() {
+        use std::time::Duration;
+        // Times are trimmed, bad entries dropped, the rest sorted soonest first.
+        assert_eq!(
+            delays("2, 0.5 ,1.5,abc,,0.5"),
+            [
+                Duration::from_millis(500),
+                Duration::from_millis(500),
+                Duration::from_millis(1500),
+                Duration::from_secs(2),
+            ]
+        );
+        // A negative time means "now".
+        assert_eq!(delays("-3,1"), [Duration::ZERO, Duration::from_secs(1)]);
+        // `f64` parses `inf` and `NaN`, and a huge value overflows
+        // `Duration`: each would panic `from_secs_f64`.
+        assert_eq!(delays("inf,-inf,NaN,1e300,1"), [Duration::from_secs(1)]);
+        assert!(delays("").is_empty());
+        assert!(delays(" , ,").is_empty());
+    }
 
     #[test]
     fn another_threads_stack_unwinds_to_its_start() {
