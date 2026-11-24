@@ -3923,13 +3923,21 @@ impl<'a> Lower<'a> {
                 float(self, r)
             }
             "v_mad_u32_u16" | "v_mad_i32_i16" => {
-                if v.omod != 0 || v.abs != 0 || v.neg != 0 {
+                if v.omod != 0 {
                     return Err("integer output modifiers");
+                }
+                if v.abs != 0 || v.neg != 0 {
+                    return Err("integer operand modifiers");
                 }
                 let Some(Operand::Vector { reg, .. }) = v.dst else {
                     return Err("a result without a register");
                 };
-                let (mut a, mut bb) = (self.half_src(inst, 0)?, self.half_src(inst, 1)?);
+                // 16-bit integer operands decode inline float constants as f32
+                // bit patterns (not f16), then select low/high half via op_sel.
+                let (mut a, mut bb) = (
+                    self.packed_src(inst, 0, false, false)?,
+                    self.packed_src(inst, 1, false, false)?,
+                );
                 let acc = s(self, 2)?;
                 let signed = name == "v_mad_i32_i16";
                 if signed {
@@ -4671,6 +4679,52 @@ impl<'a> Lower<'a> {
                 let z = self.s.m.i32(0);
                 self.s.m.select(c, nan, z, r)
             }
+            "v_min3_i16" | "v_min3_u16" | "v_max3_i16" | "v_max3_u16" | "v_med3_i16"
+            | "v_med3_u16" => {
+                // 16-bit integer operands decode inline float constants as f32
+                // bit patterns (not f16), then select low/high half via op_sel.
+                let (mut a, mut b, mut d) = (
+                    self.packed_src(inst, 0, false, false)?,
+                    self.packed_src(inst, 1, false, false)?,
+                    self.packed_src(inst, 2, false, false)?,
+                );
+                let k16 = self.s.m.i32(16);
+                let sext = |l: &mut Self, x: V| {
+                    let t = l.s.m.bin(c, Bin::Shl, x, k16);
+                    l.s.m.bin(c, Bin::AShr, t, k16)
+                };
+                let signed = name.ends_with("_i16");
+                if signed {
+                    a = sext(self, a);
+                    b = sext(self, b);
+                    d = sext(self, d);
+                }
+                let (gt, lt) = if signed {
+                    (pred::SGT, pred::SLT)
+                } else {
+                    (pred::IUGT, pred::IULT)
+                };
+                let pick = |l: &mut Self, p: u8, x: V, y: V| {
+                    let t = l.s.m.cmp(c, p, x, y);
+                    l.s.m.select(c, t, x, y)
+                };
+                match name {
+                    "v_min3_i16" | "v_min3_u16" => {
+                        let t = pick(self, lt, a, b);
+                        pick(self, lt, t, d)
+                    }
+                    "v_max3_i16" | "v_max3_u16" => {
+                        let t = pick(self, gt, a, b);
+                        pick(self, gt, t, d)
+                    }
+                    _ => {
+                        let hi = pick(self, gt, a, b);
+                        let lo = pick(self, lt, a, b);
+                        let t = pick(self, lt, hi, d);
+                        pick(self, gt, t, lo)
+                    }
+                }
+            }
             _ => {
                 let (mut a, mut b) = (self.half_src(inst, 0)?, self.half_src(inst, 1)?);
                 let k16 = self.s.m.i32(16);
@@ -4702,38 +4756,6 @@ impl<'a> Lower<'a> {
                             _ => Bin::AShr,
                         };
                         self.s.m.bin(c, op, x, sh)
-                    }
-                    "v_min3_i16" | "v_min3_u16" | "v_max3_i16" | "v_max3_u16" | "v_med3_i16"
-                    | "v_med3_u16" => {
-                        let mut d = self.half_src(inst, 2)?;
-                        if name.ends_with("_i16") {
-                            d = sext(self, d);
-                        }
-                        let (gt, lt) = if name.ends_with("_i16") {
-                            (pred::SGT, pred::SLT)
-                        } else {
-                            (pred::IUGT, pred::IULT)
-                        };
-                        let pick = |l: &mut Self, p: u8, x: V, y: V| {
-                            let t = l.s.m.cmp(c, p, x, y);
-                            l.s.m.select(c, t, x, y)
-                        };
-                        match name {
-                            "v_min3_i16" | "v_min3_u16" => {
-                                let t = pick(self, lt, a, b);
-                                pick(self, lt, t, d)
-                            }
-                            "v_max3_i16" | "v_max3_u16" => {
-                                let t = pick(self, gt, a, b);
-                                pick(self, gt, t, d)
-                            }
-                            _ => {
-                                let hi = pick(self, gt, a, b);
-                                let lo = pick(self, lt, a, b);
-                                let t = pick(self, lt, hi, d);
-                                pick(self, gt, t, lo)
-                            }
-                        }
                     }
                     _ => {
                         let p = match name {

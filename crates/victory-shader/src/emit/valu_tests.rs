@@ -1090,4 +1090,25 @@ fn valu16_min3_max3_med3_and_mad32_16_match_rdna2() {
     run_cases(&mad_i32_clamp, &i32_in, |b, i, _, g| {
         assert_eq!(g, i32_cases[i].2, "{b}: v_mad_i32_i16 clamp case {i}");
     });
+
+    // Inline float constant 242 (1.0f = 0x3F80_0000) on 16-bit integer ops:
+    // op_sel=0 selects low half 0x0000 (not f16 0x3C00); op_sel=1 selects 0x3F80.
+    let mad_u32_fconst_lo = build_valu_cs(&vop3_mod(0x373, 0, false, 0, 242, vgpr(2), vgpr(3)));
+    let mad_u32_fconst_hi =
+        build_valu_cs(&vop3_mod(0x373, 0b0001, false, 0, 242, vgpr(2), vgpr(3)));
+    run_cases(&mad_u32_fconst_lo, &[[0, 7, 11, 0]], |b, _, _, g| {
+        assert_eq!(g, 11, "{b}: v_mad_u32_u16 inline 1.0 op_sel=0");
+    });
+    run_cases(&mad_u32_fconst_hi, &[[0, 2, 11, 0]], |b, _, _, g| {
+        assert_eq!(g, 0x3F80 * 2 + 11, "{b}: v_mad_u32_u16 inline 1.0 op_sel=1");
+    });
+    let max3_u16_fconst_lo = build_valu_cs(&vop3_mod(0x356, 0, false, 0, 242, vgpr(2), vgpr(3)));
+    let max3_u16_fconst_hi =
+        build_valu_cs(&vop3_mod(0x356, 0b0001, false, 0, 242, vgpr(2), vgpr(3)));
+    run_cases(&max3_u16_fconst_lo, &[[0, 10, 20, 0]], |b, _, _, g| {
+        assert_eq!(g & 0xFFFF, 20, "{b}: v_max3_u16 inline 1.0 op_sel=0");
+    });
+    run_cases(&max3_u16_fconst_hi, &[[0, 10, 20, 0]], |b, _, _, g| {
+        assert_eq!(g & 0xFFFF, 0x3F80, "{b}: v_max3_u16 inline 1.0 op_sel=1");
+    });
 }
