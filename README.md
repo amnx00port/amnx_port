@@ -46,7 +46,13 @@ What each part does today and what it still needs:
 
 ## Getting started
 
-Requirements: Windows 10/11 x64, a CPU with AVX2, a Direct3D 12 GPU with
+Community reports show the Windows-target build running on Linux under
+Wine/Proton with vkd3d-proton. This is experimental; see
+[Linux + Wine/Proton](docs/linux-wine.md) for the reported setup and caveats.
+The project does not currently build as a native Linux application; cross-build
+the Windows executable and run it under Wine/Proton instead.
+
+Windows requirements: Windows 10/11 x64, a CPU with AVX2, a Direct3D 12 GPU with
 shader model 6.6 (and mesh shaders for the world), Rust (pinned in
 `rust-toolchain.toml`).
 
@@ -55,10 +61,23 @@ Check **Committed** under **Task Manager → Performance → Memory**. If
 `crashes.log` reports Windows error 1455, close other applications or increase
 the Windows paging file size, then retry.
 
+On Linux, enter the Nix development shell and build the Windows executable:
+
+```sh
+nix-shell
+cargo xwin build --release -p victory --target x86_64-pc-windows-msvc
+./scripts/run-ge-proton.sh
+```
+
+The launch helper defaults to the supplied game path and uses an installed
+GE-Proton release; pass a different executable path to override it.
+
+On Windows, run the workspace tests and install the asset-policy hook:
+
 ```powershell
+cargo test --workspace                   # needs no game data
 cargo xtask install-hooks                # asset-policy check on every commit
 copy victory.example.toml victory.toml   # then set your paths (outside the repo)
-cargo test --workspace                   # needs no game data
 cargo run -p victory -- config           # check your paths
 ```
 
