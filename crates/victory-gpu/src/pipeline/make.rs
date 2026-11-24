@@ -29,6 +29,8 @@ pub(crate) struct Pending {
     pub(crate) graphics: Option<Box<GraphicsState>>,
     queued: AtomicBool,
     made: OnceLock<Option<HostPipeline>>,
+    #[cfg(feature = "diagnostics")]
+    pub(super) skipped_shader: Option<String>,
     /// What identifies it across runs (shader containers and state), and
     /// whether a draw has used it yet.
     key: String,
@@ -42,18 +44,32 @@ unsafe impl Send for Pending {}
 unsafe impl Sync for Pending {}
 
 impl Pending {
-    pub(crate) fn new(shaders: Vec<Arc<Shader>>, graphics: Option<Box<GraphicsState>>) -> Pending {
+    pub(crate) fn new(
+        shaders: Vec<Arc<Shader>>,
+        graphics: Option<Box<GraphicsState>>,
+        #[cfg(feature = "diagnostics")] skip_hashes: &[String],
+    ) -> Pending {
         let mut key = blake3::Hasher::new();
         for s in &shaders {
             key.update(s.stage.as_bytes());
             key.update(s.hash.as_bytes());
         }
         key.update(graphics.as_ref().map(|g| g.describe()).unwrap_or_default().as_bytes());
+        #[cfg(feature = "diagnostics")]
+        let skipped_shader = super::skipped_shader(&shaders, skip_hashes).map(str::to_owned);
+        let made = OnceLock::new();
+        // Publish the completed result before the pipeline can be queued.
+        #[cfg(feature = "diagnostics")]
+        if skipped_shader.is_some() {
+            let _ = made.set(None);
+        }
         Pending {
             shaders,
             graphics,
             queued: AtomicBool::new(false),
-            made: OnceLock::new(),
+            made,
+            #[cfg(feature = "diagnostics")]
+            skipped_shader,
             key: key.finalize().to_hex()[..32].to_owned(),
             used: AtomicBool::new(false),
         }
@@ -130,7 +146,7 @@ fn start(p: &Arc<Pending>) {
 /// At the title's creation of a pipeline: starts it at once if an earlier
 /// run drew with it (during loading, so the world's first frames find it).
 pub(crate) fn early(p: &Arc<Pending>) {
-    if !p.shaders.is_empty() && super::library::wanted_early(&p.key) {
+    if p.made.get().is_none() && !p.shaders.is_empty() && super::library::wanted_early(&p.key) {
         super::library::EARLY.fetch_add(1, Ordering::Relaxed);
         start(p);
     }
@@ -226,7 +242,12 @@ mod tests {
     /// worker's answer (here: no host pipeline for no shaders).
     #[test]
     fn first_use_is_made_by_a_worker() {
-        let p = Arc::new(Pending::new(Vec::new(), None));
+        let p = Arc::new(Pending::new(
+            Vec::new(),
+            None,
+            #[cfg(feature = "diagnostics")]
+            &[],
+        ));
         assert!(ready(&p).is_none());
         assert!(p.queued.load(Ordering::Relaxed));
         let started = Instant::now();
@@ -234,5 +255,32 @@ mod tests {
             std::thread::yield_now();
         }
         assert!(matches!(p.made.get(), Some(None)));
+    }
+
+    #[cfg(feature = "diagnostics")]
+    #[test]
+    fn skipped_pipeline_stays_off_the_queue() {
+        let hashes = crate::pipeline::parse_skip_hashes(" 0123456789ABCDEF ");
+        let shader = Arc::new(Shader {
+            stage: "compute",
+            hash: "0123456789abcdef".into(),
+            container: Vec::new(),
+            translated: OnceLock::new(),
+        });
+        let cold = Arc::new(Pending::new(vec![shader.clone()], None, &hashes));
+        let warm = Arc::new(Pending::new(vec![shader.clone()], None, &hashes));
+        assert!(ready(&cold).is_none());
+        crate::pipeline::library::note_used(&warm.key);
+        early(&warm);
+        assert_eq!(
+            (
+                cold.queued.load(Ordering::Relaxed),
+                warm.queued.load(Ordering::Relaxed)
+            ),
+            (false, false)
+        );
+        assert!(matches!(cold.made.get(), Some(None)));
+        assert!(matches!(warm.made.get(), Some(None)));
+        assert!(shader.translated.get().is_none());
     }
 }
