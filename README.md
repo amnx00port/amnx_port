@@ -28,6 +28,9 @@ Tested on one machine: Windows 11, AMD RX 6700 XT.
 > moment). To look further, use a diagnostics build with
 > `VICTORY_D3D12_WARP=1`, which renders on the software adapter.
 
+For an Arch Linux cross-build and a Proton Experimental run on an RTX 4080,
+see the [Linux rendering report](docs/arch-proton-rendering.md).
+
 What each part does today and what it still needs:
 
 | Subsystem | Today | Needs |
@@ -50,10 +53,23 @@ Requirements: Windows 10/11 x64, a CPU with AVX2, a Direct3D 12 GPU with
 shader model 6.6 (and mesh shaders for the world), Rust (pinned in
 `rust-toolchain.toml`).
 
+To install Rust, use rustup (`winget install --id Rustlang.Rustup -e`, or
+the installer from https://rustup.rs). The first `cargo` command in this
+repository then fetches the pinned toolchain. Building needs the MSVC C++
+build tools: Visual Studio or its Build Tools with the "Desktop development
+with C++" workload.
+
 The title also needs several GiB of available Windows commit at startup.
 Check **Committed** under **Task Manager → Performance → Memory**. If
 `crashes.log` reports Windows error 1455, close other applications or increase
 the Windows paging file size, then retry.
+
+Keep the game folder on an SSD if you can. From a hard drive the first
+screen stays black, at 30 fps and about 3 draws/frame, for a minute and a
+half or more while the title reads its files: the drive stays 100% busy with
+small random reads, and nothing shows until they finish. Wait for it rather
+than closing the window. A later launch is faster while Windows still holds
+the files in its cache.
 
 ```powershell
 cargo xtask install-hooks                # asset-policy check on every commit
@@ -62,13 +78,42 @@ cargo test --workspace                   # needs no game data
 cargo run -p victory -- config           # check your paths
 ```
 
-Run the title:
+Run the title, replacing the example path with the full path to your game's executable:
 
 ```powershell
 cargo build --release -p victory
-target\release\victory.exe run <game dir>\<the title's exe> --execute
+.\target\release\victory.exe run 'D:\Xbox Games\GTA VI\title.exe' --execute
 ```
 
+### Selecting the Series S profile
+
+GTA VI chooses its render configuration from the console model, not from the
+display modes VIctory advertises through DXGI. To use the lower-resolution
+profile, pass `--console series-s` when starting the title:
+
+```powershell
+target\release\victory.exe run <game dir>\<the title's exe> --execute --console series-s
+```
+
+In a reported diagnostic run, the Series X profile used a 3840×2160 scene
+with 2560×1440 internal targets; the Series S profile used a 1920×1080 scene
+with 1280×720 internal targets. The UI can still use a separate 3840×2160
+presentation plane, so selecting Series S does not necessarily make the
+window or every render target 1080p. Changing the DXGI mode list alone does
+not change the scene resolution ([issue #203](https://github.com/Marvisak/VIctory/issues/203));
+Series S multi-plane presentation is covered separately by
+[PR #211](https://github.com/Marvisak/VIctory/pull/211).
+
+The same report measured about 3.9 GB less committed process memory in the
+menus/intro and about 3.6 GB less at the world peak with Series S enabled.
+However, peak committed memory was still about 17.7 GB, and whole-system
+GPU memory use still reached about 7.3 of 8 GB. Both profiles also lost the
+GPU device 30–45 seconds after entering the world. These are measurements
+from one Windows 10 / RTX 2070 SUPER 8 GB / 32 GB RAM diagnostic setup
+(base commit `d2a4bae`, with PRs #175 and #211 applied), not general
+requirements or a guarantee of stability. Series S can reduce memory
+pressure, but it does not make a 16 GB RAM / 8 GB VRAM system reliably fit
+the world or resolve the current GPU hang.
 The window caption shows the framerate. Saves, settings and `crashes.log`
 are kept under the data folder (default `%LOCALAPPDATA%\victory\data`), derived
 data under the cache folder.
@@ -101,7 +146,39 @@ victory config
 Logging: `VICTORY_LOG=victory_loader=trace,info` (a release build logs
 info and above).
 
+### Windows shader-test validator
+
+The shader tests use `dxil.dll` to validate Shader Model 6.6 containers.
+An older Windows SDK validator can load successfully but reject them with
+`Unknown shader model 'ps_6_6'`. If this happens, use a current x64 validator
+from [Microsoft's DirectX Shader Compiler releases](https://github.com/microsoft/DirectXShaderCompiler/releases)
+or a current Windows SDK. Set its path for the test session:
+
+```powershell
+$env:VICTORY_DXIL = 'C:\tools\dxc\bin\x64\dxil.dll'
+cargo test -p victory-shader --lib --locked -- --test-threads=1
+```
+
+Without this override, the validator loader selects the newest installed
+Windows SDK's `bin/<version>/x64/dxil.dll`, then falls back to the DLL search
+path when no SDK copy is found. This is a test/offline-validation dependency;
+the translated shaders do not require it at runtime.
+
 ## Debugging
+
+If the title presents one or two black frames and exits with `0x80000003`,
+check the archive files before investigating rendering. The loader's import
+report only counts bindings, so it can report zero missing imports with a
+damaged archive. Check the SHA-256 of the files your run actually uses against
+a known-good copy of the **same build**. For example, in PowerShell:
+
+```powershell
+Get-FileHash -Algorithm SHA256 -LiteralPath 'C:\path\to\title\anim.rpf'
+```
+
+If a hash differs, restore that file from your verified backup and rerun with
+the same build of VIctory and the same options. A breakpoint can have other
+causes. Include the archive verification outcome in your test report.
 
 A release build has no debugging aids. Build them in with
 
@@ -130,6 +207,10 @@ cargo build --profile diag -p victory --features diagnostics   # target\diag\vic
 
 Every build appends crashes and host GPU failures to `crashes.log` in the
 title's data folder.
+
+[docs/debugging-notes-from-a-gta-v-port.md](docs/debugging-notes-from-a-gta-v-port.md)
+collects what got another RAGE port from "the world loads" to "the game
+runs": what the title waited for, and how each wait was found.
 
 ## License
 
