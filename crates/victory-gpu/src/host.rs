@@ -276,6 +276,79 @@ mod tests {
             desc.Flags & DXGI_ADAPTER_FLAG_SOFTWARE.0 as u32 != 0,
         );
     }
+
+    /// Submitting the same `HostList` twice in one `Host::execute` call must
+    /// record each occurrence's state prelude into a distinct command list /
+    /// allocator so the second run does not clobber the first prelude's barriers.
+    #[test]
+    fn duplicate_list_in_execute_uses_distinct_preludes() {
+        let Some(host) = host() else {
+            return; // no host GPU
+        };
+        let null = std::ptr::null();
+        let res_iid = crate::object::guid(
+            0x696442be,
+            0xa72e,
+            0x4059,
+            [0xbc, 0x79, 0x5b, 0x5c, 0x98, 0x04, 0x0f, 0xad],
+        );
+        // 16x16 RGBA8 render target starting in COMMON (0).
+        let tex_desc: [u32; 14] = [
+            3, 0, // dimension=2D, pad
+            0, 0, // alignment=0
+            16, 0, // width=16
+            16,    // height=16
+            (1 << 16) | 1,
+            28, 1, 0, 0, 1, // RGBA8_UNORM, flags=ALLOW_RENDER_TARGET
+            0,
+        ];
+        let mut tex = null;
+        assert_eq!(
+            crate::resource::create_at_address(
+                null,
+                0x3_0000,
+                tex_desc.as_ptr().cast(),
+                0,
+                null.cast(),
+                &res_iid,
+                &mut tex,
+            ),
+            crate::object::S_OK
+        );
+        let list = host.new_list().unwrap();
+        // Record RENDER_TARGET (0x4) -> COPY_SOURCE (0x800) inside `list`.
+        assert!(list.transition(tex, 0x4).is_none());
+        let (host_tex, before) = list.transition(tex, 0x800).unwrap();
+        assert_eq!(before, 0x4);
+        // SAFETY: open list and live texture.
+        unsafe {
+            list.list.ResourceBarrier(&[transition(
+                host_tex,
+                D3D12_RESOURCE_STATES(0x4),
+                D3D12_RESOURCE_STATE_COPY_SOURCE,
+            )]);
+        }
+        list.close();
+
+        // Execute the SAME `HostList` twice in one batch:
+        //   Run 1 prelude: COMMON (0) -> RENDER_TARGET (0x4), then list ends at COPY_SOURCE (0x800).
+        //   Run 2 prelude: COPY_SOURCE (0x800) -> RENDER_TARGET (0x4), then list ends at COPY_SOURCE (0x800).
+        // Without per-duplicate prelude allocation, Run 2 resets `list.prelude`'s allocator
+        // while Run 1's prelude is still queued for execution.
+        host.execute(&[&list, &list]);
+        assert_eq!(
+            crate::resource::host_copy(tex)
+                .unwrap()
+                .state
+                .load(Ordering::Relaxed),
+            0x800
+        );
+        // SAFETY: plain device query.
+        assert!(unsafe { host.device.GetDeviceRemovedReason() }.is_ok());
+
+        type Release = extern "system" fn(crate::object::This) -> u32;
+        crate::object::slot::<Release>(tex, 0x10)(tex);
+    }
 }
 
 /// A host command list and its allocator, always used together.
@@ -500,12 +573,27 @@ impl Host {
         let mut lists: Vec<Option<ID3D12CommandList>> = Vec::with_capacity(2 * runs.len());
         // Where each run's lists start in `lists`.
         let mut firsts = Vec::with_capacity(runs.len());
+        // Keep per-run prelude allocations alive until the GPU finishes if the
+        // same `HostList` is submitted more than once in `runs` (resetting its
+        // own `prelude` allocator would clobber the earlier entry in `lists`).
+        let mut used_preludes: Vec<usize> = Vec::with_capacity(runs.len());
+        let mut extra_preludes: Vec<(ID3D12CommandAllocator, ID3D12GraphicsCommandList)> = Vec::new();
         let mut batch = Batch::default();
         for list in runs {
             list.run_deferred(&mut batch);
             firsts.push(lists.len());
-            if let Some(prelude) = list.prelude() {
-                lists.push(Some(prelude));
+            let barriers = list.prelude_barriers();
+            if !barriers.is_empty() {
+                let id = std::ptr::from_ref(*list) as usize;
+                let prelude = if !used_preludes.contains(&id) {
+                    used_preludes.push(id);
+                    list.record_prelude(&barriers)
+                } else {
+                    self.record_extra_prelude(&barriers, &mut extra_preludes)
+                };
+                if let Some(prelude) = prelude {
+                    lists.push(Some(prelude));
+                }
             }
             lists.push(list.list.cast().ok());
         }
@@ -603,7 +691,43 @@ impl Host {
                 what.write(at as *mut u8, bytes);
             }
         }
+        drop(extra_preludes);
         self.log_messages();
+    }
+
+    /// Allocates and records a temporary prelude list when the same `HostList`
+    /// appears more than once in one submission so the earlier prelude's
+    /// allocator and recorded barriers are not overwritten.
+    fn record_extra_prelude(
+        &self,
+        barriers: &[D3D12_RESOURCE_BARRIER],
+        keep: &mut Vec<(ID3D12CommandAllocator, ID3D12GraphicsCommandList)>,
+    ) -> Option<ID3D12CommandList> {
+        let made = (|| -> windows::core::Result<(ID3D12CommandAllocator, ID3D12GraphicsCommandList)> {
+            // SAFETY: plain D3D12 allocator/list creation and barrier recording on live textures.
+            unsafe {
+                let allocator: ID3D12CommandAllocator = self
+                    .device
+                    .CreateCommandAllocator(D3D12_COMMAND_LIST_TYPE_DIRECT)?;
+                let list: ID3D12GraphicsCommandList = self.device.CreateCommandList(
+                    0,
+                    D3D12_COMMAND_LIST_TYPE_DIRECT,
+                    &allocator,
+                    None,
+                )?;
+                list.ResourceBarrier(barriers);
+                list.Close()?;
+                Ok((allocator, list))
+            }
+        })();
+        match made {
+            Ok((allocator, list)) => {
+                let out = list.cast().ok();
+                keep.push((allocator, list));
+                out
+            }
+            Err(e) => fail(format_args!("a host state prelude did not record ({e})")),
+        }
     }
 
     /// With `VICTORY_D3D12_DRED`: the faulting address and the allocations
@@ -925,12 +1049,12 @@ impl HostList {
         }
     }
 
-    /// At submission: the list that moves each texture this list uses from
+    /// At submission: the barriers that move each texture this list uses from
     /// its real state to the one the list starts with; the textures' real
     /// states become those the list ends with.
-    fn prelude(&self) -> Option<ID3D12CommandList> {
+    fn prelude_barriers(&self) -> Vec<D3D12_RESOURCE_BARRIER> {
         let states = self.states.lock().unwrap_or_else(|e| e.into_inner());
-        let barriers: Vec<D3D12_RESOURCE_BARRIER> = states
+        states
             .values()
             .filter_map(|(first, last, copy)| {
                 let real = copy.state.swap(*last, Ordering::Relaxed);
@@ -942,17 +1066,18 @@ impl HostList {
                     )
                 })
             })
-            .collect();
-        if barriers.is_empty() {
-            return None;
-        }
+            .collect()
+    }
+
+    /// Records `barriers` into this list's own prelude allocator/list.
+    fn record_prelude(&self, barriers: &[D3D12_RESOURCE_BARRIER]) -> Option<ID3D12CommandList> {
         let (allocator, list) = &self.prelude;
         // SAFETY: the prelude is not executing (every submission is waited
-        // for); the textures are live.
+        // for) and is used at most once per `Host::execute`; the textures are live.
         let recorded = unsafe {
             allocator.Reset().and_then(|()| {
                 list.Reset(allocator, None)?;
-                list.ResourceBarrier(&barriers);
+                list.ResourceBarrier(barriers);
                 list.Close()
             })
         };
