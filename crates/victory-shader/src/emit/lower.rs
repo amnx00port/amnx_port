@@ -3685,7 +3685,10 @@ impl<'a> Lower<'a> {
                 float(self, r)
             }
             "v_div_scale_f32" => {
-                // RDNA2 ISA: src0 = value to scale, src1 = denominator, src2 = numerator.
+                // RDNA2 ISA §12.12 opcode 365:
+                // S0 = Input to scale (either denominator or numerator)
+                // S1 = Denominator
+                // S2 = Numerator
                 let (a, den, num) = (f(self, 0)?, f(self, 1)?, f(self, 2)?);
                 let (ai, ni, di) = (self.as_int(a), self.as_int(num), self.as_int(den));
                 let (k23, k255, kabs) = (
@@ -3693,62 +3696,51 @@ impl<'a> Lower<'a> {
                     self.s.m.i32(0xFF),
                     self.s.m.i32(0x7FFF_FFFF),
                 );
-                let (zero, k23_exp, k232_exp, k96) = (
+                let (zero, k96, kneg126) = (
                     self.s.m.i32(0),
-                    self.s.m.i32(23),
-                    self.s.m.i32(232),
                     self.s.m.i32(96),
+                    self.s.m.i32((-126i32) as u32),
                 );
                 let exp_of = |l: &mut Self, x: V| {
                     let s = l.s.m.bin(c, Bin::LShr, x, k23);
                     l.s.m.bin(c, Bin::And, s, k255)
                 };
-                let (e1, e2) = (exp_of(self, ni), exp_of(self, di));
+                let (e_num, e_den) = (exp_of(self, ni), exp_of(self, di));
                 let n_abs = self.s.m.bin(c, Bin::And, ni, kabs);
                 let d_abs = self.s.m.bin(c, Bin::And, di, kabs);
                 let z1 = self.s.m.cmp(c, pred::EQ, n_abs, zero);
                 let z2 = self.s.m.cmp(c, pred::EQ, d_abs, zero);
                 let any_zero = self.s.m.bin(c, Bin::Or, z1, z2);
                 let special = {
-                    let s1 = self.s.m.cmp(c, pred::EQ, e1, k255);
-                    let s2 = self.s.m.cmp(c, pred::EQ, e2, k255);
-                    let a12 = self.s.m.bin(c, Bin::Or, s1, s2);
-                    self.s.m.bin(c, Bin::Or, a12, any_zero)
+                    let s1 = self.s.m.cmp(c, pred::EQ, e_num, k255);
+                    let s2 = self.s.m.cmp(c, pred::EQ, e_den, k255);
+                    self.s.m.bin(c, Bin::Or, s1, s2)
                 };
                 let is_den = self.s.m.cmp(c, pred::EQ, ai, di);
-                let diff = self.s.m.bin(c, Bin::Sub, e2, e1);
-                let den_tiny = self.s.m.cmp(c, pred::IULE, e2, k23_exp);
-                let den_huge = self.s.m.cmp(c, pred::IUGE, e2, k232_exp);
-                let num_tiny_exp = self.s.m.cmp(c, pred::IULE, e1, k23_exp);
-                let num_huge = self.s.m.cmp(c, pred::IUGE, e1, k232_exp);
-                let num_gap = self.s.m.cmp(c, pred::SGE, diff, k96);
-                let not_den_huge = {
+                let is_num = {
                     let t = self.s.m.bool(true);
-                    self.s.m.bin(c, Bin::Xor, den_huge, t)
+                    self.s.m.bin(c, Bin::Xor, is_den, t)
                 };
-                let num_gap = self.s.m.bin(c, Bin::And, num_gap, not_den_huge);
-                let num_tiny = self.s.m.bin(c, Bin::Or, num_tiny_exp, num_gap);
-                let up_raw = self.s.m.select(c, is_den, den_tiny, num_tiny);
-                let dn_raw = self.s.m.select(c, is_den, den_huge, num_huge);
-                let not_special = {
+                let diff = self.s.m.bin(c, Bin::Sub, e_num, e_den);
+                let case_overflow = self.s.m.cmp(c, pred::SGE, diff, k96);
+                let case_denorm = self.s.m.cmp(c, pred::SLT, diff, kneg126);
+
+                let flag = self.s.m.bin(c, Bin::Or, case_overflow, case_denorm);
+                let not_special_or_zero = {
+                    let sz = self.s.m.bin(c, Bin::Or, special, any_zero);
                     let t = self.s.m.bool(true);
-                    self.s.m.bin(c, Bin::Xor, special, t)
+                    self.s.m.bin(c, Bin::Xor, sz, t)
                 };
-                let up = self.s.m.bin(c, Bin::And, up_raw, not_special);
-                let dn = self.s.m.bin(c, Bin::And, dn_raw, not_special);
-                let uncancelled = {
-                    let x_tiny = self.s.m.bin(c, Bin::Xor, den_tiny, num_tiny);
-                    let x_huge = self.s.m.bin(c, Bin::Xor, den_huge, num_huge);
-                    self.s.m.bin(c, Bin::Or, x_tiny, x_huge)
-                };
-                let flag_raw = self.s.m.select(c, is_den, uncancelled, up_raw);
-                let flag = self.s.m.bin(c, Bin::And, flag_raw, not_special);
-                let k_up = self.s.m.f32(0x5F80_0000);
-                let k_dn = self.s.m.f32(0x1F80_0000);
+                let flag = self.s.m.bin(c, Bin::And, flag, not_special_or_zero);
+
+                let scale_den = self.s.m.bin(c, Bin::And, is_den, case_overflow);
+                let scale_num = self.s.m.bin(c, Bin::And, is_num, case_denorm);
+                let should_scale = self.s.m.bin(c, Bin::Or, scale_den, scale_num);
+                let should_scale = self.s.m.bin(c, Bin::And, should_scale, not_special_or_zero);
+
+                let k_up = self.s.m.f32(0x5F80_0000); // 2^64
                 let a_up = self.s.m.bin(c, Bin::Mul, a, k_up);
-                let a_dn = self.s.m.bin(c, Bin::Mul, a, k_dn);
-                let r = self.s.m.select(c, dn, a_dn, a);
-                let r = self.s.m.select(c, up, a_up, r);
+                let r = self.s.m.select(c, should_scale, a_up, a);
                 let qnan = self.s.m.f32(0x7FC0_0000);
                 let r = self.s.m.select(c, any_zero, qnan, r);
                 float(self, r)?;
@@ -3765,6 +3757,7 @@ impl<'a> Lower<'a> {
                 Ok(())
             }
             "v_div_fmas_f32" => {
+                // RDNA2 ISA §12.12 opcode 367: if (VCC) D.f = 2^32 * (S0.f * S1.f + S2.f) else D.f = S0.f * S1.f + S2.f
                 let (a, bb, cc) = (f(self, 0)?, f(self, 1)?, f(self, 2)?);
                 let m = inst
                     .read(Reg::S(crate::ir::VCC))
@@ -3772,24 +3765,25 @@ impl<'a> Lower<'a> {
                     .ok_or("v_div_fmas_f32 without VCC")?;
                 let vcc = self.boolean(m, c)?;
                 let tmp = self.fmad(a, bb, cc);
-                let ci = self.as_int(cc);
-                let (k23, k255, k128) = (self.s.m.i32(23), self.s.m.i32(0xFF), self.s.m.i32(128));
-                let sh = self.s.m.bin(c, Bin::LShr, ci, k23);
-                let exp = self.s.m.bin(c, Bin::And, sh, k255);
-                let exp_ge = self.s.m.cmp(c, pred::IUGE, exp, k128);
-                let (k_up, k_dn) = (self.s.m.f32(0x5F80_0000), self.s.m.f32(0x1F80_0000));
-                let scale = self.s.m.select(c, exp_ge, k_up, k_dn);
-                let scaled = self.s.m.bin(c, Bin::Mul, tmp, scale);
+                let k_2_32 = self.s.m.f32(0x4F80_0000); // 2^32
+                let scaled = self.s.m.bin(c, Bin::Mul, tmp, k_2_32);
                 let r = self.s.m.select(c, vcc, scaled, tmp);
                 float(self, r)
             }
             "v_div_fixup_f32" => {
+                // RDNA2 ISA §12.12 opcode 366:
+                // S0 = quotient, S1 = denominator, S2 = numerator
                 let (q, den, num) = (f(self, 0)?, f(self, 1)?, f(self, 2)?);
                 let (qi, di, ni) = (self.as_int(q), self.as_int(den), self.as_int(num));
-                let (ksign, kabs, kinf) = (
-                    self.s.m.i32(0x8000_0000),
+                let (k23, k255, kabs) = (
+                    self.s.m.i32(23),
+                    self.s.m.i32(0xFF),
                     self.s.m.i32(0x7FFF_FFFF),
+                );
+                let (ksign, kinf, kneg150) = (
+                    self.s.m.i32(0x8000_0000),
                     self.s.m.i32(0x7F80_0000),
+                    self.s.m.i32((-150i32) as u32),
                 );
                 let (kqnan_bit, kneg_qnan, zero) = (
                     self.s.m.i32(0x0040_0000),
@@ -3813,17 +3807,35 @@ impl<'a> Lower<'a> {
                 let both_inf = self.s.m.bin(c, Bin::And, n_inf, d_inf);
                 let both_zero = self.s.m.bin(c, Bin::And, n_zero, d_zero);
                 let invalid = self.s.m.bin(c, Bin::Or, both_inf, both_zero);
-                let make_inf = {
-                    let t = self.s.m.bin(c, Bin::Or, n_inf, d_zero);
-                    self.s.m.bin(c, Bin::Or, t, q_nan)
-                };
                 let make_zero = self.s.m.bin(c, Bin::Or, d_inf, n_zero);
+                let make_inf = self.s.m.bin(c, Bin::Or, n_inf, d_zero);
+
+                let exp_of = |l: &mut Self, x: V| {
+                    let s = l.s.m.bin(c, Bin::LShr, x, k23);
+                    l.s.m.bin(c, Bin::And, s, k255)
+                };
+                let (e_num, e_den) = (exp_of(self, ni), exp_of(self, di));
+                let exp_diff = self.s.m.bin(c, Bin::Sub, e_num, e_den);
+                let underflow = self.s.m.cmp(c, pred::SLT, exp_diff, kneg150);
+
                 let signed_q = self.s.m.bin(c, Bin::Or, sign, q_abs);
                 let signed_inf = self.s.m.bin(c, Bin::Or, sign, kinf);
                 let n_qnan = self.s.m.bin(c, Bin::Or, ni, kqnan_bit);
                 let d_qnan = self.s.m.bin(c, Bin::Or, di, kqnan_bit);
-                let r = self.s.m.select(c, make_zero, sign, signed_q);
+
+                // Priority:
+                // S2 is NaN -> n_qnan
+                // S1 is NaN -> d_qnan
+                // 0/0 or inf/inf -> -qNaN
+                // 0/x or x/inf -> signed zero (make_zero)
+                // inf/x or x/0 -> signed inf (make_inf)
+                // S0 is NaN -> signed inf (q_nan)
+                // exp(S2) - exp(S1) < -150 -> signed zero (underflow)
+                // default -> signed_q
+                let r = self.s.m.select(c, underflow, sign, signed_q);
+                let r = self.s.m.select(c, q_nan, signed_inf, r);
                 let r = self.s.m.select(c, make_inf, signed_inf, r);
+                let r = self.s.m.select(c, make_zero, sign, r);
                 let r = self.s.m.select(c, invalid, kneg_qnan, r);
                 let r = self.s.m.select(c, d_nan, d_qnan, r);
                 let r = self.s.m.select(c, n_nan, n_qnan, r);
