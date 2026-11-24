@@ -5540,7 +5540,7 @@ impl<'a> Lower<'a> {
                 let c = self.cur;
                 if f16 {
                     let lo = half(self, h + u8::from(attribute.high))?
-                        .ok_or("a packed input half no element holds")?;
+                        .unwrap_or_else(|| self.s.m.i32(0));
                     self.low_half(inst, reg, lo)
                 } else if mode == 1 {
                     // The whole dword of a flat input: both halves.
