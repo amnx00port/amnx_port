@@ -627,6 +627,10 @@ fn make(view: &View, at: D3D12_CPU_DESCRIPTOR_HANDLE) -> Option<Kept> {
     let host = host()?;
     let device = &host.device;
     match view {
+        View::NullConstant => {
+            null_cbv(device, at);
+            Some(None)
+        }
         &View::Constant(address, size) => {
             let shadow = crate::shadow::find(address, u64::from(size))?;
             let gpu = shadow.gpu(address);
@@ -752,8 +756,7 @@ pub(crate) fn placed_texture(view: &View) -> Option<View> {
 }
 
 /// A null view of the kind `view` is, for a slot whose view the host
-/// cannot make: unordered access (to a buffer or a 2D texture) or a shader
-/// view. Writes to it are dropped, reads give zeros.
+/// cannot make. Writes to it are dropped, reads give zeros.
 fn null_for(view: &View, at: D3D12_CPU_DESCRIPTOR_HANDLE) {
     let Some(host) = host() else { return };
     let is_buffer = |r: &usize| crate::resource::buffer_bytes(*r as crate::object::This).is_some();
@@ -778,11 +781,7 @@ fn null_for(view: &View, at: D3D12_CPU_DESCRIPTOR_HANDLE) {
         View::Placed(false, _, desc) => {
             return null_like(desc[..10].try_into().unwrap_or(&[0; 10]), at);
         }
-        View::Constant(..) => {
-            let desc = D3D12_CONSTANT_BUFFER_VIEW_DESC::default();
-            // SAFETY: a slot of our heap; a zero location makes a null view.
-            return unsafe { host.device.CreateConstantBufferView(Some(&desc), at) };
-        }
+        View::Constant(..) | View::NullConstant => return null_cbv(&host.device, at),
         _ => return null_view(at),
     };
     let desc = if buffer {
@@ -803,6 +802,11 @@ fn null_for(view: &View, at: D3D12_CPU_DESCRIPTOR_HANDLE) {
             at,
         )
     };
+}
+
+fn null_cbv(device: &ID3D12Device, at: D3D12_CPU_DESCRIPTOR_HANDLE) {
+    // SAFETY: a slot of our view heap.
+    unsafe { device.CreateConstantBufferView(None, at) };
 }
 
 /// A null texture UAV of the title's view dimension (1D, 1D or 2D arrays,
@@ -954,6 +958,29 @@ mod tests {
         };
         let view = View::Unordered(0, 0, Some([28, 8, 0, 0, 0, 0, 0, 0, 0, 0]));
         null_for(&view, heap.cpu(0));
+        // SAFETY: a plain device query.
+        assert!(unsafe { host.device.GetDeviceRemovedReason() }.is_ok());
+    }
+
+    #[test]
+    fn null_cbv_is_mirrored_without_a_buffer() {
+        let Some(host) = host() else {
+            eprintln!("no host D3D12 device for the null CBV test");
+            return;
+        };
+        let heap = HostHeap::new(false, 1).expect("host view heap");
+        let (buffer, _) = host.upload_buffer(256).expect("test constant buffer");
+        // SAFETY: a live upload buffer.
+        heap.constant_at(0, unsafe { buffer.GetGPUVirtualAddress() }, 256);
+        heap.keep(0, Some(buffer));
+
+        let mut slot = [0u64; 4];
+        let handle = slot.as_mut_ptr() as u64;
+        super::super::create_cbv(std::ptr::null(), std::ptr::null(), handle);
+
+        assert_eq!(heap.mirror(0, handle, false), Some(View::NullConstant));
+        assert_ne!(heap.made.lock().unwrap()[0], 0);
+        assert!(heap.kept.lock().unwrap()[0].is_none());
         // SAFETY: a plain device query.
         assert!(unsafe { host.device.GetDeviceRemovedReason() }.is_ok());
     }

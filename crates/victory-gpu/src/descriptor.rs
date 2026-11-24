@@ -280,6 +280,8 @@ const DSV_TAG: u32 = u32::from_le_bytes(*b"vDSV");
 pub(crate) enum View {
     /// Constant buffer: GPU address and size.
     Constant(u64, u32),
+    /// A constant buffer view with no buffer bound.
+    NullConstant,
     /// Shader resource: resource, description (none: the resource's own).
     Shader(usize, Option<[u32; 10]>),
     /// Unordered access: resource, counter resource, description.
@@ -306,7 +308,7 @@ impl View {
             View::Shader(r, _) | View::Unordered(r, _, _) => {
                 crate::resource::buffer_bytes(*r as This).is_some()
             }
-            View::Sampler(_) | View::ConsoleSampler(_) => false,
+            View::NullConstant | View::Sampler(_) | View::ConsoleSampler(_) => false,
         }
     }
 }
@@ -431,10 +433,11 @@ fn words<const N: usize>(desc: *const [u32; N]) -> Option<[u32; N]> {
 
 /// Device method.
 pub(crate) extern "system" fn create_cbv(_: This, desc: *const [u32; 4], handle: u64) {
-    if let Some([lo, hi, size, _]) = words(desc) {
-        let address = u64::from(lo) | u64::from(hi) << 32;
-        record(handle, View::Constant(address, size));
-    }
+    let view = match words(desc) {
+        Some([lo, hi, size, _]) => View::Constant(u64::from(lo) | u64::from(hi) << 32, size),
+        None => View::NullConstant,
+    };
+    record(handle, view);
 }
 
 /// Device method.
@@ -705,6 +708,19 @@ mod tests {
         assert_eq!(increment_size(null, 9), 0);
         let bad = HeapDesc { kind: 9, ..desc };
         assert_eq!(create(bad, none, &mut h), E_INVALIDARG);
+    }
+
+    #[test]
+    fn null_cbv_overwrites_an_existing_view() {
+        let null = std::ptr::null();
+        let mut slot = [0u64; 4];
+        let handle = slot.as_mut_ptr() as u64;
+        create_srv(null, null, std::ptr::null(), handle);
+        assert_eq!(view(handle), Some(View::Shader(0, None)));
+
+        create_cbv(null, std::ptr::null(), handle);
+
+        assert_eq!(view(handle), Some(View::NullConstant));
     }
 
     #[test]
