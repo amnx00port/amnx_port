@@ -1062,6 +1062,20 @@ impl HostList {
             .push(Step::GpuWrite(shadow.clone(), address, len));
     }
 
+    /// Whether shaders of this list already wrote `buffer` (a title buffer's
+    /// host copy) through unordered access: implicit promotion has then left
+    /// it in `UNORDERED_ACCESS` until the submission ends, and it cannot be
+    /// promoted to a read state.
+    ///
+    /// shortcut: only writes declared through [`Self::defer_gpu_write`] are
+    /// seen; a buffer-state tracker should replace this.
+    pub(crate) fn gpu_written(&self, buffer: &ID3D12Resource) -> bool {
+        use windows::core::Interface;
+        self.deferred().copies.iter().any(|step| {
+            matches!(step, Step::GpuWrite(shadow, ..) if shadow.buffer.as_raw() == buffer.as_raw())
+        })
+    }
+
     /// Stores `what` (`bytes` of it) at `dst` once the list has run.
     pub(crate) fn defer_write(&self, dst: *mut u8, what: crate::queue::Written, bytes: usize) {
         self.deferred().writes.push((dst as usize, what, bytes));

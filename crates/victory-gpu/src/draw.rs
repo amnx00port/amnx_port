@@ -1033,7 +1033,7 @@ impl State {
             list.list.ExecuteIndirect(
                 &signature,
                 max,
-                &bounded,
+                &bounded.scratch,
                 0,
                 counter.as_ref().map(|(s, _)| &s.buffer),
                 counter.as_ref().map_or(0, |(s, at)| s.offset(*at)),

@@ -225,17 +225,60 @@ fn validate_layout(
 /// buffer, leaving that scratch buffer in `INDIRECT_ARGUMENT` at offset `0`.
 /// Replaces the list's compute root signature and pipeline (callers bind
 /// theirs after). `None` if the clamp or alignment is not available.
+///
+/// The argument and count buffers are read in place (root SRVs, and the
+/// count by `ExecuteIndirect`). One the list's shaders already wrote is in
+/// `UNORDERED_ACCESS`, from which a buffer cannot be promoted, so it moves
+/// to [`READ`] here and back in [`done`]; the others are promoted from
+/// `COMMON`.
 pub(crate) fn bound(
     list: &HostList,
     src: (&ID3D12Resource, u64),
     count: Option<(&ID3D12Resource, u64)>,
     spec: (u32, u32, u32),
-) -> Option<ID3D12Resource> {
+) -> Option<Bounded> {
     let bytes = validate_layout(spec, src.1, count.map(|(_, off)| off))?;
     let (c, budget, dst) = (clamp()?, list.budget()?, list.indirect_scratch(bytes)?);
-    record_clamp(c, &list.list, &dst, budget, src, count, spec).then_some(dst)
+    let written = written_among(src.0, count.map(|(b, _)| b), |b| list.gpu_written(b));
+    record_clamp(c, &list.list, &dst, budget, src, count, spec, &written).then_some(Bounded {
+        scratch: dst,
+        written,
+    })
 }
 
+/// A clamp recorded by [`bound`]: the scratch buffer `ExecuteIndirect` reads
+/// the arguments from, and the title buffers moved out of unordered access
+/// until [`done`].
+pub(crate) struct Bounded {
+    pub(crate) scratch: ID3D12Resource,
+    written: Vec<ID3D12Resource>,
+}
+
+/// The state written argument and count buffers are read in: by the clamp
+/// and, for the count, by `ExecuteIndirect`.
+const READ: D3D12_RESOURCE_STATES = D3D12_RESOURCE_STATES(
+    D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE.0 | D3D12_RESOURCE_STATE_INDIRECT_ARGUMENT.0,
+);
+
+/// The distinct buffers among `src` and `count` that `written` (shaders of
+/// the list wrote them through unordered access) names; once each, as the
+/// count may be in the argument buffer.
+fn written_among(
+    src: &ID3D12Resource,
+    count: Option<&ID3D12Resource>,
+    written: impl Fn(&ID3D12Resource) -> bool,
+) -> Vec<ID3D12Resource> {
+    use windows::core::Interface;
+    let mut out: Vec<ID3D12Resource> = Vec::new();
+    for b in std::iter::once(src).chain(count) {
+        if !out.iter().any(|o| o.as_raw() == b.as_raw()) && written(b) {
+            out.push(b.clone());
+        }
+    }
+    out
+}
+
+#[allow(clippy::too_many_arguments)]
 fn record_clamp(
     c: &Clamp,
     l: &ID3D12GraphicsCommandList,
@@ -244,6 +287,7 @@ fn record_clamp(
     (src, src_offset): (&ID3D12Resource, u64),
     count: Option<(&ID3D12Resource, u64)>,
     (kind, stride, records): (u32, u32, u32),
+    written: &[ID3D12Resource],
 ) -> bool {
     let Some(bytes) = validate_layout(
         (kind, stride, records),
@@ -290,19 +334,26 @@ fn record_clamp(
     };
     let constants = [kind, stride, records, args_offset, has_count, count_offset];
     // SAFETY: an open list; our root signature and pipeline; live source,
-    // count, scratch destination, and budget buffers. `src` and `count` stay
-    // in `COMMON` / `GENERIC_READ` via implicit buffer promotion while `dst`
-    // transitions `COMMON -> UNORDERED_ACCESS -> INDIRECT_ARGUMENT`.
+    // count, scratch destination, and budget buffers. `src` and `count` are
+    // promoted from `COMMON` unless `written` names them (in
+    // `UNORDERED_ACCESS`, moved to `READ`), while `dst` transitions
+    // `COMMON -> UNORDERED_ACCESS -> INDIRECT_ARGUMENT`.
     unsafe {
         // Earlier shader writes (the title's argument and count passes) first.
-        l.ResourceBarrier(&[
+        let mut before = vec![
             uav_barrier(),
             transition(
                 dst,
                 D3D12_RESOURCE_STATE_COMMON,
                 D3D12_RESOURCE_STATE_UNORDERED_ACCESS,
             ),
-        ]);
+        ];
+        before.extend(
+            written
+                .iter()
+                .map(|b| transition(b, D3D12_RESOURCE_STATE_UNORDERED_ACCESS, READ)),
+        );
+        l.ResourceBarrier(&before);
         if records > 0 {
             l.SetComputeRootSignature(&c.root);
             l.SetPipelineState(&c.pso);
@@ -326,20 +377,27 @@ fn record_clamp(
 }
 
 /// After indirect execution (or if preparation failed after [`bound`]):
-/// returns the scratch buffer to the common state for the next call.
-pub(crate) fn done(list: &HostList, scratch: &ID3D12Resource) {
-    done_on(&list.list, scratch);
+/// returns the scratch buffer to the common state for the next call, and the
+/// title buffers [`bound`] moved out of unordered access back to it (where
+/// the list's later shaders expect them).
+pub(crate) fn done(list: &HostList, bounded: &Bounded) {
+    done_on(&list.list, &bounded.scratch, &bounded.written);
 }
 
-fn done_on(list: &ID3D12GraphicsCommandList, scratch: &ID3D12Resource) {
-    // SAFETY: an open list and a live scratch buffer in INDIRECT_ARGUMENT.
-    unsafe {
-        list.ResourceBarrier(&[transition(
-            scratch,
-            D3D12_RESOURCE_STATE_INDIRECT_ARGUMENT,
-            D3D12_RESOURCE_STATE_COMMON,
-        )])
-    };
+fn done_on(list: &ID3D12GraphicsCommandList, scratch: &ID3D12Resource, written: &[ID3D12Resource]) {
+    let mut after = vec![transition(
+        scratch,
+        D3D12_RESOURCE_STATE_INDIRECT_ARGUMENT,
+        D3D12_RESOURCE_STATE_COMMON,
+    )];
+    after.extend(
+        written
+            .iter()
+            .map(|b| transition(b, READ, D3D12_RESOURCE_STATE_UNORDERED_ACCESS)),
+    );
+    // SAFETY: an open list, a live scratch buffer in INDIRECT_ARGUMENT, and
+    // live written buffers in READ (moved there by `record_clamp`).
+    unsafe { list.ResourceBarrier(&after) };
 }
 
 fn uav_barrier() -> D3D12_RESOURCE_BARRIER {
@@ -706,6 +764,7 @@ void main() {
             (&src_buf, ARGS_OFFSET as u64),
             Some((&count_buf, COUNT_OFFSET_1 as u64)),
             (KIND_DISPATCH, STRIDE, MAX),
+            &[],
         ));
         // SAFETY: open command list, valid worker PSO/root and buffers.
         unsafe {
@@ -721,7 +780,7 @@ void main() {
                 COUNT_OFFSET_1 as u64,
             );
         }
-        done_on(&warp.list, &dst_buf);
+        done_on(&warp.list, &dst_buf, &[]);
 
         // Snapshot `dst_buf` after Call #1 (from `COMMON`, copy 5 * STRIDE bytes,
         // then return `dst_buf` to `COMMON` before Call #2).
@@ -751,6 +810,7 @@ void main() {
             (&src_buf, ARGS_OFFSET as u64),
             Some((&count_buf, COUNT_OFFSET_2 as u64)),
             (KIND_DISPATCH, STRIDE, MAX),
+            &[],
         ));
         // SAFETY: open command list, valid worker PSO/root and buffers.
         unsafe {
@@ -766,7 +826,7 @@ void main() {
                 COUNT_OFFSET_2 as u64,
             );
         }
-        done_on(&warp.list, &dst_buf);
+        done_on(&warp.list, &dst_buf, &[]);
 
         warp.submit_and_wait();
 
@@ -822,6 +882,77 @@ void main() {
         assert_ne!(clamped_words[21], 0xDEAD_BEEF);
     }
 
+    /// An argument buffer a compute pass of the same list wrote through
+    /// unordered access (holding its own count, so named once) is moved to
+    /// `READ` for the clamp and the count read, sees that pass's write, and
+    /// is back in `UNORDERED_ACCESS` for the list's next writer.
+    #[test]
+    fn warp_reads_arguments_written_earlier_in_the_list() {
+        let Some(mut warp) = WarpHarness::new() else {
+            return;
+        };
+        const COUNT_OFFSET: usize = 64;
+        let (src_buf, src_ptr, src_gpu) = warp.shared_buffer(256);
+        let (_budget_buf, budget_ptr, budget_gpu) = warp.shared_buffer(256);
+        let (_hits_buf, hits_ptr, hits_gpu) = warp.shared_buffer(256);
+        let dst_buf = warp.default_uav(12 * 4);
+        let sig = warp.signature(2, 12);
+        // SAFETY: mapped buffers of the sizes above.
+        unsafe {
+            let words = src_ptr.cast::<u32>();
+            for (i, w) in [2u32, 1, 1].into_iter().enumerate() {
+                words.add(i).write_volatile(w);
+            }
+            words.add(COUNT_OFFSET / 4).write_volatile(1);
+            (budget_ptr as *mut u32).write_volatile(0);
+            (hits_ptr as *mut u32).write_volatile(0);
+        }
+        let written = written_among(&src_buf, Some(&src_buf), |_| true);
+        assert_eq!(written.len(), 1, "arguments and count share one buffer");
+        let produce = |warp: &WarpHarness| {
+            // SAFETY: an open list; the worker adds one to the first word.
+            unsafe {
+                warp.list.SetComputeRootSignature(&warp.worker.root);
+                warp.list.SetPipelineState(&warp.worker.pso);
+                warp.list.SetComputeRootUnorderedAccessView(0, src_gpu);
+                warp.list.Dispatch(1, 1, 1);
+            }
+        };
+        // The producer promotes the buffer to UNORDERED_ACCESS: X becomes 3.
+        produce(&warp);
+        assert!(record_clamp(
+            &warp.clamp,
+            &warp.list,
+            &dst_buf,
+            budget_gpu,
+            (&src_buf, 0),
+            Some((&src_buf, COUNT_OFFSET as u64)),
+            (2, 12, 4),
+            &written,
+        ));
+        // SAFETY: an open list; worker pipeline and live buffers.
+        unsafe {
+            warp.list.SetComputeRootSignature(&warp.worker.root);
+            warp.list.SetPipelineState(&warp.worker.pso);
+            warp.list.SetComputeRootUnorderedAccessView(0, hits_gpu);
+            warp.list
+                .ExecuteIndirect(&sig, 4, &dst_buf, 0, Some(&src_buf), COUNT_OFFSET as u64);
+        }
+        done_on(&warp.list, &dst_buf, &written);
+        // Back in UNORDERED_ACCESS: a later writer of the list: X becomes 4.
+        produce(&warp);
+        warp.submit_and_wait();
+        // SAFETY: the GPU finished; mapped results.
+        let (hits, x) = unsafe {
+            (
+                (hits_ptr as *const u32).read_volatile(),
+                (src_ptr as *const u32).read_volatile(),
+            )
+        };
+        assert_eq!(hits, 3, "the clamp must read the producer's write");
+        assert_eq!(x, 4, "the list's later writer must still run");
+    }
+
     /// WARP D3D12 test proving `BUDGET` saturates without 32-bit unsigned
     /// wraparound across >64 huge indexed-draw records (`count = None`), while
     /// preserving `StartIndexLocation`, `BaseVertexLocation`,
@@ -874,8 +1005,9 @@ void main() {
             (&src_buf, 0),
             None,
             (KIND_INDEXED, STRIDE, RECORDS),
+            &[],
         ));
-        done_on(&warp.list, &dst_buf);
+        done_on(&warp.list, &dst_buf, &[]);
 
         // SAFETY: open command list; copy clamped scratch buffer for verification.
         unsafe {
@@ -959,8 +1091,8 @@ void main() {
         let b2 = bound(&list, (&src_buf, 64), Some((&count_buf, 0)), (1, 20, 128)).unwrap();
         done(&list, &b2);
         assert_eq!(
-            b1.as_raw(),
-            b2.as_raw(),
+            b1.scratch.as_raw(),
+            b2.scratch.as_raw(),
             "scratch buffer within capacity must be reused"
         );
 
@@ -969,8 +1101,8 @@ void main() {
         let b3 = bound(&list, (&src_buf, 0), Some((&count_buf, 0)), (1, 20, 5000)).unwrap();
         done(&list, &b3);
         assert_ne!(
-            b3.as_raw(),
-            b1.as_raw(),
+            b3.scratch.as_raw(),
+            b1.scratch.as_raw(),
             "larger request must grow scratch buffer"
         );
 
@@ -983,8 +1115,8 @@ void main() {
         let b4 = bound(&list, (&src_buf, 0), Some((&count_buf, 0)), (1, 20, 4096)).unwrap();
         done(&list, &b4);
         assert_eq!(
-            b4.as_raw(),
-            b3.as_raw(),
+            b4.scratch.as_raw(),
+            b3.scratch.as_raw(),
             "grown scratch buffer must persist across reset"
         );
         list.close();
