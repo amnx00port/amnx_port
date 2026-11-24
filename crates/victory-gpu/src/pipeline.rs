@@ -105,27 +105,46 @@ impl Shader {
     /// The translation, made on first use; a shader that does not
     /// translate is logged once.
     pub(crate) fn translated(&self) -> Option<&Translated> {
-        self.translated
-            .get_or_init(|| {
-                let done = translate(&self.container);
-                match &done {
-                    Ok(t) => tracing::info!(
-                        stage = self.stage,
-                        hash = %self.hash,
-                        user_data = t.host.user_data.len(),
-                        samplers = t.host.samplers.len(),
-                        "shader translated"
-                    ),
-                    Err(e) => tracing::warn!(
-                        stage = self.stage,
-                        hash = %self.hash,
-                        error = %e,
-                        "shader does not translate; its pipelines' draws are dropped"
-                    ),
-                }
-                done.ok()
-            })
-            .as_ref()
+        // Only pipeline workers are counted. Drop the guard as soon as this
+        // thread wins initialization; otherwise it remains alive for the
+        // duration of a wait on another worker's OnceLock initializer.
+        #[cfg(feature = "diagnostics")]
+        let mut dependency_wait = if self.translated.get().is_none() {
+            scheduler_metrics::dependency_wait()
+        } else {
+            None
+        };
+
+        #[cfg(feature = "diagnostics")]
+        let translated = self.translated.get_or_init(|| {
+            drop(dependency_wait.take());
+            self.translate_once()
+        });
+
+        #[cfg(not(feature = "diagnostics"))]
+        let translated = self.translated.get_or_init(|| self.translate_once());
+
+        translated.as_ref()
+    }
+
+    fn translate_once(&self) -> Option<Translated> {
+        let done = translate(&self.container);
+        match &done {
+            Ok(t) => tracing::info!(
+                stage = self.stage,
+                hash = %self.hash,
+                user_data = t.host.user_data.len(),
+                samplers = t.host.samplers.len(),
+                "shader translated"
+            ),
+            Err(e) => tracing::warn!(
+                stage = self.stage,
+                hash = %self.hash,
+                error = %e,
+                "shader does not translate; its pipelines' draws are dropped"
+            ),
+        }
+        done.ok()
     }
 }
 
@@ -489,6 +508,8 @@ pub(crate) mod host;
 mod library;
 #[cfg(windows)]
 mod make;
+#[cfg(any(test, all(windows, feature = "diagnostics")))]
+mod scheduler_metrics;
 
 /// Keeps compiled host pipelines, and the list of title pipelines to start
 /// early, in `dir` (a folder of the cache) across runs.

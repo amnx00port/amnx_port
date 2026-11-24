@@ -170,6 +170,9 @@ fn queue(p: Arc<Pending>) {
             let spawned = std::thread::Builder::new()
                 .name(format!("victory-pipelines-{i}"))
                 .spawn(move || {
+                    #[cfg(feature = "diagnostics")]
+                    let _worker = super::scheduler_metrics::worker();
+
                     // Below the title's own threads (loading, recording).
                     // SAFETY: a plain call on our own thread.
                     unsafe {
@@ -179,7 +182,11 @@ fn queue(p: Arc<Pending>) {
                     loop {
                         let next = receiver.lock().unwrap_or_else(|e| e.into_inner()).recv();
                         let Ok(p) = next else { return };
+                        #[cfg(feature = "diagnostics")]
+                        let job = super::scheduler_metrics::job_started();
                         p.make();
+                        #[cfg(feature = "diagnostics")]
+                        drop(job);
                         if WAITING.fetch_sub(1, Ordering::Relaxed) == 1 {
                             drained();
                         } else {
@@ -193,9 +200,15 @@ fn queue(p: Arc<Pending>) {
         }
         sender
     });
+    #[cfg(feature = "diagnostics")]
+    super::scheduler_metrics::job_queued();
     if let Err(e) = sender.send(p) {
         // No worker: made here instead.
+        #[cfg(feature = "diagnostics")]
+        let job = super::scheduler_metrics::job_started();
         e.0.make();
+        #[cfg(feature = "diagnostics")]
+        drop(job);
         WAITING.fetch_sub(1, Ordering::Relaxed);
     }
 }
@@ -215,6 +228,8 @@ fn drained() {
             "host pipelines all made"
         );
     }
+    #[cfg(feature = "diagnostics")]
+    super::scheduler_metrics::report();
     super::library::save(false);
 }
 
