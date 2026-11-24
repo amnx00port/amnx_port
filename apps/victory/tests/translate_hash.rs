@@ -57,7 +57,7 @@ fn replays_selected_raw_and_packed_identities_even_with_identical_dxil() {
     archive.extend([0xbb; 19]);
     std::fs::write(&input, archive).unwrap();
 
-    let hashes = format!("{},{}", id(&a).to_uppercase(), id(&b));
+    let hashes = format!("{},{},{}", id(&a).to_uppercase(), id(&b), id(&padded));
     let run = translate(&input, &["--shader-hash", &hashes, "--jobs", "2", "--list"]);
     assert!(
         run.status.success(),
@@ -66,10 +66,10 @@ fn replays_selected_raw_and_packed_identities_even_with_identical_dxil() {
     );
     let out = String::from_utf8(run.stdout).unwrap();
     assert!(
-        out.contains("containers   3 (1 duplicates skipped)"),
+        out.contains("hash matches 4 (1 duplicates skipped)"),
         "{out}"
     );
-    for hash in [id(&a), id(&b)] {
+    for hash in [id(&a), id(&b), id(&padded)] {
         assert!(
             out.lines()
                 .any(|l| l.contains(&hash) && l.contains("truncated")),
@@ -85,6 +85,32 @@ fn replays_selected_raw_and_packed_identities_even_with_identical_dxil() {
         out.contains("containers   4 (3 duplicates skipped)"),
         "{out}"
     );
+}
+
+#[test]
+fn padded_file_length_is_a_candidate_only_at_the_start_of_a_raw_file() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("shader");
+    let declared = container(1);
+    let mut padded = declared.clone();
+    padded.extend([0xaa; 16]);
+    std::fs::write(&path, &padded).unwrap();
+    let hashes = format!("{},{}", id(&declared), id(&padded));
+    let run = translate(&path, &["--shader-hash", &hashes]);
+    assert!(
+        run.status.success(),
+        "{}",
+        String::from_utf8_lossy(&run.stderr)
+    );
+    assert!(String::from_utf8_lossy(&run.stdout).contains("hash matches 2 (0 duplicates skipped)"));
+
+    let mut embedded = vec![0xbb; 8];
+    embedded.extend(&padded);
+    std::fs::write(&path, embedded).unwrap();
+    let run = translate(&path, &["--shader-hash", &hashes]);
+    assert!(!run.status.success());
+    assert!(String::from_utf8_lossy(&run.stdout).contains("hash matches 1 (0 duplicates skipped)"));
+    assert!(String::from_utf8_lossy(&run.stderr).contains(&id(&padded)));
 }
 
 #[test]

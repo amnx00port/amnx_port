@@ -243,8 +243,14 @@ pub fn run(
         println!("matched      {id:016x} {label}");
     }
     println!(
-        "containers   {} ({} duplicates skipped)",
-        t.containers, t.duplicates
+        "{:<12} {} ({} duplicates skipped)",
+        if requested.is_empty() {
+            "containers"
+        } else {
+            "hash matches"
+        },
+        t.containers,
+        t.duplicates
     );
     println!(
         "programs     {} translated of {} ({} IR instructions)",
@@ -347,28 +353,42 @@ fn translate(
         return;
     };
     let container = Container::parse(&bytes).ok();
-    let selected = if requested.is_empty() {
-        None
-    } else {
-        // A raw source can include following archive data and an unpacked
-        // record can have padding. Hash just the declared bytecode span.
-        let Some(c) = &container else { return };
-        let hash = blake3::hash(&bytes[..c.size]);
+    if requested.is_empty() {
+        return translate_container(container.as_ref(), None, location, seen, t, checks);
+    }
+    let Some(c) = &container else { return };
+    let mut replay = |hash: blake3::Hash| {
         let id = u64::from_be_bytes(hash.as_bytes()[..8].try_into().expect("8 bytes"));
-        if !requested.contains(&id) {
-            return;
+        if requested.contains(&id) {
+            translate_container(Some(c), Some((id, hash)), location, seen, t, checks);
         }
-        Some((id, hash))
     };
+    let mut hasher = blake3::Hasher::new();
+    hasher.update(&bytes[..c.size]);
+    replay(hasher.finalize());
+    // The runtime hashes the byte count the caller passed. A record or a
+    // file starting with DXBC also gives us a possible padded length. At
+    // an interior raw offset the rest of the archive is not a known blob.
+    if bytes.len() > c.size && matches!(source, Source::Packed(_) | Source::Raw { offset: 0, .. }) {
+        hasher.update(&bytes[c.size..]);
+        replay(hasher.finalize());
+    }
+}
+
+fn translate_container(
+    container: Option<&Container>,
+    selected: Option<(u64, blake3::Hash)>,
+    location: impl Fn() -> String,
+    seen: &Mutex<HashSet<blake3::Hash>>,
+    t: &mut Tally,
+    checks: &mut Checks,
+) {
     let example = || match selected {
         Some((id, _)) => format!("{} hash={id:016x}", location()),
         None => location(),
     };
     t.containers += 1;
-    let dxil = container
-        .as_ref()
-        .and_then(|c| c.part(FourCC::DXIL))
-        .map(|p| p.data);
+    let dxil = container.and_then(|c| c.part(FourCC::DXIL)).map(|p| p.data);
     // Distinct selected containers can share DXIL but differ in stage I/O.
     let key = selected
         .map(|(_, hash)| hash)
@@ -378,7 +398,7 @@ fn translate(
         return;
     }
     if let Some((id, _)) = selected {
-        t.matched.entry(id).or_insert_with(location);
+        t.matched.entry(id).or_insert_with(&location);
     }
     let (Some(container), Some(dxil)) = (container, dxil) else {
         return t.fail("no DXIL part (SM5 or older)".into(), example);
@@ -450,7 +470,7 @@ fn translate(
                 if let (Some(r), Some(i), Some(s)) = (res, raised, structured) {
                     let label = || format!("{} {:?}", example(), p.stage);
                     *counter(t, p.stage, 0) += 1;
-                    match emit::emit(&container, &p, &program, &s, &i, &r) {
+                    match emit::emit(container, &p, &program, &s, &i, &r) {
                         Ok(shader) => {
                             *counter(t, p.stage, 1) += 1;
                             check(shader, t, checks, label);

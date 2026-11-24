@@ -102,9 +102,11 @@ victory config
 To replay a shader named in a runtime pipeline diagnostic, pass its
 16-digit hash, for example `victory translate path/to/archive --shader-hash
 0123456789abcdef --list`. The scan hashes raw containers and unpacked SGD5
-records over the DXBC header's declared length and runs the translator only
-for matches. Add `--validate` or
-`--pipelines` to check the emitted shaders on the host. Repeat the option or
+records over the DXBC header's declared length. A caller can include trailing
+padding in its bytecode length, so replay also tries the whole unpacked record
+or the whole file when it begins with DXBC. For raw containers embedded at
+other offsets, only the declared length is known. Add `--validate` or
+`--pipelines` to check the selected shaders on the host. Repeat the option or
 separate hashes with commas to check several from the same run. The report
 shows the file and offset for each match. Missing hashes give a nonzero exit
 after the report. Translation refusals are tallied as in a full scan.
