@@ -148,6 +148,7 @@ fn build_valu_cs(body: &[u32]) -> HostShader {
         static_samplers: Vec::new(),
         root_cbvs: lowered.root_cbvs,
         root_srvs: lowered.root_srvs,
+        heap_limits: lowered.heap_limits,
     };
 
     if let Ok(mut v) = validator::Validator::load(validator::Validator::default_path().as_deref()) {
@@ -193,12 +194,16 @@ fn run_cases(
                     other => panic!("unexpected user data {other:?}"),
                 };
             }
+            let mut roots = vec![(0, Root::Constants(ud))];
+            if let Some(p) = Host::heap_limits_param(&[shader]) {
+                roots.push((p, Root::HeapLimits));
+            }
             let out = host
                 .dispatch(
                     &root,
                     &pso,
                     &Dispatch {
-                        roots: vec![(0, Root::Constants(ud))],
+                        roots,
                         views: &[View::RawUav(1)],
                         samplers: &[],
                         groups: [1, 1, 1],

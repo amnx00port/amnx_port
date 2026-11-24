@@ -12,6 +12,9 @@ pub const SAMPLER_SPACE: u32 = 0;
 /// Where root CBVs and SRVs are bound: `b<root parameter index>` and
 /// `t<root parameter index>` in this space.
 pub const ROOT_CBV_SPACE: u32 = 1;
+/// Where the host passes the bound descriptor heaps' guard slot indices:
+/// `b0` in this space, two 32-bit values `[view_guard, sampler_guard]`.
+pub const HEAP_LIMITS_SPACE: u32 = 4;
 
 /// `ShaderFlags` bits (metadata) and their `SFI0` feature bits.
 pub(crate) mod flags {
@@ -65,6 +68,9 @@ pub(crate) struct Shader {
     pub root_cbvs: Vec<(u8, V)>,
     /// Root SRVs (raw buffers) read, likewise.
     pub root_srvs: Vec<(u8, V)>,
+    /// Loaded `(view_guard, sampler_guard)` from `b0` in [`HEAP_LIMITS_SPACE`],
+    /// created lazily on the first descriptor-heap access.
+    pub heap_limits: Option<(V, V)>,
     pub flags: u64,
     /// Heap handles made with a non-uniform index.
     pub nonuniform_handles: u32,
@@ -120,6 +126,7 @@ impl Shader {
             cmp_samplers: 0,
             root_cbvs: Vec::new(),
             root_srvs: Vec::new(),
+            heap_limits: None,
             flags: 0,
             nonuniform_handles: 0,
             threads: None,
@@ -276,8 +283,54 @@ impl Shader {
         )
     }
 
+    /// The bound descriptor heap's guard slot index, loaded once in the entry
+    /// block from `b0` in [`HEAP_LIMITS_SPACE`] (`[view_guard, sampler_guard]`).
+    fn heap_limit(&mut self, sampler: bool) -> V {
+        let (views, samplers) = match self.heap_limits {
+            Some(pair) => pair,
+            None => {
+                let zero = self.m.i32(0);
+                let bind = [
+                    zero,
+                    zero,
+                    self.m.i32(HEAP_LIMITS_SPACE),
+                    self.m.i8(2), // CBV
+                ];
+                let bind = self.m.aggregate(self.t.bind, &bind);
+                let f = self.m.bool(false);
+                let block = self.entry;
+                let h = self.op(
+                    block,
+                    "createHandleFromBinding",
+                    Attr::ReadNone,
+                    self.t.handle,
+                    217,
+                    &[bind, zero, f],
+                );
+                let h = self.annotate(block, h, 13, 16);
+                let r = self.op(
+                    block,
+                    "cbufferLoadLegacy.i32",
+                    Attr::ReadOnly,
+                    self.t.cbuf_ret,
+                    59,
+                    &[h, zero],
+                );
+                let views = self.m.extract(block, r, 0);
+                let samplers = self.m.extract(block, r, 1);
+                self.heap_limits = Some((views, samplers));
+                (views, samplers)
+            }
+        };
+        if sampler { samplers } else { views }
+    }
+
     /// A descriptor heap handle, annotated with `props`; `nonuniform` when
     /// the index may differ between lanes (`NonUniformResourceIndex`).
+    ///
+    /// Out-of-bounds indices are clamped to the bound host heap's guard slot
+    /// (`b0` in [`HEAP_LIMITS_SPACE`]) so garbage indices cannot page-fault
+    /// past the end of `ResourceDescriptorHeap` or `SamplerDescriptorHeap`.
     pub fn heap_handle(
         &mut self,
         block: usize,
@@ -292,6 +345,9 @@ impl Shader {
             flags::RESOURCE_HEAP
         };
         self.nonuniform_handles += u32::from(nonuniform);
+        let limit = self.heap_limit(sampler);
+        let in_bounds = self.m.cmp(block, super::bitcode::pred::IULT, index, limit);
+        let index = self.m.select(block, in_bounds, index, limit);
         let (s, n) = (self.m.bool(sampler), self.m.bool(nonuniform));
         let h = self.op(
             block,
@@ -315,6 +371,7 @@ impl Shader {
             s.m.md_value(c)
         };
         if self.user_data > 0
+            || self.heap_limits.is_some()
             || self.samplers > 0
             || !self.root_cbvs.is_empty()
             || !self.root_srvs.is_empty()
@@ -341,6 +398,29 @@ impl Shader {
                 bindings.push(Binding {
                     kind: 2,
                     space: USER_DATA_SPACE,
+                    register: 0,
+                    dxil_kind: 13,
+                });
+            }
+            if self.heap_limits.is_some() {
+                let arr = self.m.array(4, self.t.i32);
+                let ty = self.m.named_struct("HeapLimits", vec![arr]);
+                let p = self.m.ptr(ty);
+                let u = self.m.undef(p);
+                let ops = vec![
+                    Some(i32c(&mut self, cbv_list.len() as u32)),
+                    Some(self.m.md_value(u)),
+                    Some(empty),
+                    Some(i32c(&mut self, HEAP_LIMITS_SPACE)),
+                    Some(i32c(&mut self, 0)),
+                    Some(i32c(&mut self, 1)),
+                    Some(i32c(&mut self, 16)),
+                    None,
+                ];
+                cbv_list.push(Some(self.m.md_node(ops)));
+                bindings.push(Binding {
+                    kind: 2,
+                    space: HEAP_LIMITS_SPACE,
                     register: 0,
                     dxil_kind: 13,
                 });

@@ -82,6 +82,7 @@ fn build(words: &[u32], buffers: bool) -> HostShader {
         static_samplers: Vec::new(),
         root_cbvs: lowered.root_cbvs,
         root_srvs: lowered.root_srvs,
+        heap_limits: lowered.heap_limits,
     };
     if let Ok(mut v) = validator::Validator::load(validator::Validator::default_path().as_deref()) {
         v.validate(&mut shader.dxil.clone())
@@ -127,12 +128,16 @@ fn run(shader: &HostShader, views: &[View]) -> Vec<(&'static str, Vec<u32>)> {
             assert_eq!(u.root, RootType::Table, "{u:?}");
             ud[u.index as usize] = 0;
         }
+        let mut roots = vec![(0, Root::Constants(ud))];
+        if let Some(p) = Host::heap_limits_param(&[shader]) {
+            roots.push((p, Root::HeapLimits));
+        }
         let words = host
             .dispatch(
                 &root,
                 &pso,
                 &Dispatch {
-                    roots: vec![(0, Root::Constants(ud))],
+                    roots,
                     views,
                     samplers: &samplers,
                     groups: [1, 1, 1],
@@ -245,5 +250,29 @@ fn lanes_sample_their_own_texture_in_a_waterfall_narrowed_by_v_cmpx() {
         for (label, red) in results {
             assert_eq!(red, want, "{label}, folded {folded}");
         }
+    }
+}
+
+/// Out-of-bounds `ResourceDescriptorHeap` indices clamp to the bound host
+/// heap's dedicated null guard slot rather than faulting past the heap or
+/// aliasing live slot 0.
+#[test]
+fn out_of_bounds_heap_index_clamps_to_null_guard_not_slot_zero() {
+    use crate::resource::tests::WATERFALL_JOINED_WAVE32;
+    let mut words = WATERFALL_JOINED_WAVE32.to_vec();
+    // Move the else-arm texture load (`s_load_dwordx8 s[32:39], s[4:5], 0x20`)
+    // far past the 3-slot view heap (byte offset 0x80000 -> heap slot 16384),
+    // leaving slot 0 (red = 1.0) and the output UAV at slot 2 untouched.
+    assert_eq!(words[7], 0xFA00_0020);
+    words[7] = 0xFA08_0000;
+    let shader = build(&words, false);
+    assert!(shader.heap_limits);
+    let results = sampled(&shader);
+    assert!(!results.is_empty());
+    // Lanes 0..16 read slot 0 (1.0); lanes 16..32 hit the null guard slot (0.0),
+    // proving they neither page-fault nor alias slot 0.
+    let want: Vec<f32> = (0..32).map(|l| if l < 16 { 1.0 } else { 0.0 }).collect();
+    for (label, red) in results {
+        assert_eq!(red, want, "{label}");
     }
 }

@@ -8,7 +8,7 @@
 use std::ffi::{CStr, CString};
 use std::sync::Arc;
 
-use victory_shader::emit::{ROOT_CBV_SPACE, SAMPLER_SPACE, USER_DATA_SPACE};
+use victory_shader::emit::{HEAP_LIMITS_SPACE, ROOT_CBV_SPACE, SAMPLER_SPACE, USER_DATA_SPACE};
 use windows::Win32::Graphics::Direct3D::ID3DBlob;
 use windows::Win32::Graphics::Direct3D12::*;
 use windows::Win32::Graphics::Dxgi::Common::*;
@@ -270,6 +270,9 @@ pub(crate) struct HostPipeline {
     pub(crate) root: ID3D12RootSignature,
     /// Vertex, then pixel stage, or the compute stage.
     pub(crate) stages: Vec<Stage>,
+    /// Root parameter of `[view_guard, sampler_guard]` (`b0` in
+    /// [`HEAP_LIMITS_SPACE`]), if any stage indexes a descriptor heap.
+    pub(crate) heap_limits: Option<u32>,
     /// The vertex buffer slots it reads (bit per slot).
     pub(crate) slots: u32,
     pub(crate) inputs: Vec<Input>,
@@ -401,6 +404,26 @@ impl HostPipeline {
             }
             bound.push(stage);
         }
+        let heap_limits = if stages
+            .iter()
+            .any(|(s, _)| s.translated().is_some_and(|t| t.host.heap_limits))
+        {
+            let param = params.len() as u32;
+            params.push(D3D12_ROOT_PARAMETER1 {
+                ParameterType: D3D12_ROOT_PARAMETER_TYPE_32BIT_CONSTANTS,
+                Anonymous: D3D12_ROOT_PARAMETER1_0 {
+                    Constants: D3D12_ROOT_CONSTANTS {
+                        ShaderRegister: 0,
+                        RegisterSpace: HEAP_LIMITS_SPACE,
+                        Num32BitValues: 2,
+                    },
+                },
+                ShaderVisibility: D3D12_SHADER_VISIBILITY_ALL,
+            });
+            Some(param)
+        } else {
+            None
+        };
         let (root, root_blob) = match root_signature(&host.device, &params, &samplers, compute.is_some()) {
             Ok(root) => root,
             Err(e) => {
@@ -448,6 +471,7 @@ impl HostPipeline {
                 pso,
                 root,
                 stages: bound,
+                heap_limits,
                 name: format!("{shaders:?}"),
                 slots: 0,
                 inputs: Vec::new(),
@@ -480,6 +504,7 @@ impl HostPipeline {
                 pso,
                 root,
                 stages: bound,
+                heap_limits,
                 name: format!("{shaders:?}"),
                 slots: 0,
                 inputs: Vec::new(),
@@ -550,6 +575,7 @@ impl HostPipeline {
             pso,
             root,
             stages: bound,
+            heap_limits,
             name: format!("{shaders:?}"),
             slots: g.slots(),
             inputs: g.elements(),

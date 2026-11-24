@@ -19,9 +19,14 @@ pub(crate) struct HostHeap {
     step: u32,
     /// Slots mirroring the title's; view heaps have `dynamic` more.
     count: u32,
-    /// Dynamic slots past `count` (none in sampler heaps): [`DYNAMIC`]
-    /// where the host takes them, else [`MIN_DYNAMIC`].
+    /// Dynamic slots past `count` (none in sampler heaps): [`DYNAMIC`] - 1
+    /// where the host takes them, else [`MIN_DYNAMIC`] - 1 (leaving the last
+    /// slot as the permanently-null guard slot).
     dynamic: u32,
+    /// Guard slot index clamped to by shaders on out-of-bounds heap accesses.
+    /// For view heaps (and sampler heaps below D3D12's 2048-slot cap), this is
+    /// a dedicated slot past `count + dynamic` that stays null forever.
+    guard: u32,
     sampler: bool,
     /// The record (view index and generation) each slot was last made from.
     made: Mutex<Vec<u64>>,
@@ -95,24 +100,42 @@ impl HostHeap {
         };
         // The larger dynamic range only where the host takes it on top of
         // every title slot; else the smaller one, and the cap after that.
-        let (heap, count, extra) = if sampler {
-            match make(count) {
-                Ok(heap) => (heap, count, 0),
-                Err(e) => {
-                    tracing::warn!(error = %e, count, sampler, "no host descriptor heap");
-                    return None;
+        // View heaps reserve the final slot (`total - 1`) as a permanently-null
+        // guard slot so out-of-bounds shader indices never alias slot 0 or
+        // fault past the heap's end; sampler heaps append one guard slot when
+        // the host allows it (i.e. below D3D12's 2048-slot sampler heap cap).
+        let (heap, count, dynamic, total, guard) = if sampler {
+            if let Ok(heap) = make(count + 1) {
+                (heap, count, 0, count + 1, count)
+            } else {
+                match make(count) {
+                    Ok(heap) => (heap, count, 0, count, count.saturating_sub(1)),
+                    Err(e) => {
+                        tracing::warn!(error = %e, count, sampler, "no host descriptor heap");
+                        return None;
+                    }
                 }
             }
         } else if let Ok(heap) = make(count + DYNAMIC) {
-            (heap, count, DYNAMIC)
+            let total = count + DYNAMIC;
+            (heap, count, DYNAMIC - 1, total, total - 1)
         } else {
             match make(count + MIN_DYNAMIC) {
-                Ok(heap) => (heap, count, MIN_DYNAMIC),
+                Ok(heap) => {
+                    let total = count + MIN_DYNAMIC;
+                    (heap, count, MIN_DYNAMIC - 1, total, total - 1)
+                }
                 Err(e) if count + MIN_DYNAMIC > PORTABLE_VIEWS => {
                     // shortcut: descriptors past the host's limit are left
                     // out; a title that reaches them needs remapping.
                     tracing::warn!(error = %e, count, "host view heap capped at {PORTABLE_VIEWS}");
-                    (make(PORTABLE_VIEWS).ok()?, PORTABLE_VIEWS - MIN_DYNAMIC, MIN_DYNAMIC)
+                    (
+                        make(PORTABLE_VIEWS).ok()?,
+                        PORTABLE_VIEWS - MIN_DYNAMIC,
+                        MIN_DYNAMIC - 1,
+                        PORTABLE_VIEWS,
+                        PORTABLE_VIEWS - 1,
+                    )
                 }
                 Err(e) => {
                     tracing::warn!(error = %e, count, sampler, "no host descriptor heap");
@@ -127,12 +150,12 @@ impl HostHeap {
                 host.device.GetDescriptorHandleIncrementSize(kind),
             )
         };
-        tracing::debug!(count, sampler, "host descriptor heap");
+        tracing::debug!(count, dynamic, guard, sampler, "host descriptor heap");
         // SAFETY: a live shader-visible heap.
         let gpu = unsafe { heap.GetGPUDescriptorHandleForHeapStart().ptr };
         GPU_RANGES.lock().unwrap_or_else(|e| e.into_inner()).push((
             gpu,
-            u64::from(count + extra) * u64::from(step),
+            u64::from(total) * u64::from(step),
             u64::from(step),
             sampler,
         ));
@@ -141,18 +164,19 @@ impl HostHeap {
             cpu,
             step,
             count,
-            dynamic: extra,
+            dynamic,
+            guard,
             sampler,
             made: Mutex::new(vec![0; count as usize]),
-            kept: Mutex::new(vec![None; (count + extra) as usize]),
-            next: Mutex::new((0, vec![false; extra as usize])),
+            kept: Mutex::new(vec![None; total as usize]),
+            next: Mutex::new((0, vec![false; dynamic as usize])),
         };
         // A slot never written is undefined: shaders reading one (a slot
         // the title wrote in a way we do not know, or a table entry no
         // used-resource entry names) read a wild address. Every slot starts
         // null instead.
         let started = std::time::Instant::now();
-        if let Err(e) = h.fill_null(kind, count + extra) {
+        if let Err(e) = h.fill_null(kind, total) {
             tracing::warn!(error = %e, "host descriptor heap not made null");
         }
         tracing::debug!(ms = started.elapsed().as_millis(), "host descriptor heap made null");
@@ -261,6 +285,11 @@ impl HostHeap {
     /// when the host caps its size.
     pub(crate) fn count(&self) -> u32 {
         self.count
+    }
+
+    /// Guard slot index for shader descriptor-heap bounds clamping.
+    pub(crate) fn guard(&self) -> u32 {
+        self.guard
     }
 
     /// Gives back `n` dynamic slots from `first` (an index [`dynamic`]
@@ -972,5 +1001,24 @@ mod tests {
         heap.release(a, 50);
         assert_eq!(heap.dynamic(50), Some(4));
         assert_eq!(heap.dynamic(40), Some(4 + heap.dynamic - 40));
+    }
+
+    /// The guard slot sits past both title and dynamic slots on view heaps, and
+    /// past title slots on sampler heaps below D3D12's 2048-slot cap.
+    #[test]
+    fn host_heap_guard_covers_title_and_dynamic_slots() {
+        let Some(views) = HostHeap::new(false, 64) else {
+            return; // no host GPU
+        };
+        assert_eq!(views.guard(), views.count() + views.dynamic);
+        // Taking all dynamic slots never reaches the guard slot.
+        let first = views.dynamic(views.dynamic).unwrap();
+        assert_eq!(first + views.dynamic, views.guard());
+        views.release(first, views.dynamic);
+
+        let Some(samplers) = HostHeap::new(true, 16) else {
+            return;
+        };
+        assert_eq!(samplers.guard(), 16);
     }
 }

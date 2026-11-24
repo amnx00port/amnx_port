@@ -805,16 +805,14 @@ fn translated_shaders_draw_as_pc_ones() {
             }
         }
         let (root_t, pso_t) = host.pipeline(&vs_c, &ps_c).unwrap();
-        let ours = host
-            .draw(
-                &root_t,
-                &pso_t,
-                &draw(vec![
-                    (0, Root::Constants(user_data(&vs_c, &k))),
-                    (1, Root::Constants(user_data(&ps_c, &k))),
-                ]),
-            )
-            .unwrap();
+        let mut roots_t = vec![
+            (0, Root::Constants(user_data(&vs_c, &k))),
+            (1, Root::Constants(user_data(&ps_c, &k))),
+        ];
+        if let Some(p) = Host::heap_limits_param(&[&vs_c, &ps_c]) {
+            roots_t.push((p, Root::HeapLimits));
+        }
+        let ours = host.draw(&root_t, &pso_t, &draw(roots_t)).unwrap();
 
         let (vs_p, ps_p) = (
             compile(&pc, &dir, src, vs, "vs_6_5"),
@@ -917,19 +915,14 @@ fn translated_mesh_shaders_draw_as_pc_ones() {
                 .unwrap_or_else(|e| panic!("{name}: {e}"));
         }
         let (root_t, pso_t) = host.mesh_pipeline(&ms_c, &ps_c).unwrap();
-        let ours = host
-            .draw(
-                &root_t,
-                &pso_t,
-                &draw(
-                    vec![
-                        (0, Root::Constants(user_data(&ms_c, &k))),
-                        (1, Root::Constants(user_data(&ps_c, &k))),
-                    ],
-                    groups,
-                ),
-            )
-            .unwrap();
+        let mut roots_t = vec![
+            (0, Root::Constants(user_data(&ms_c, &k))),
+            (1, Root::Constants(user_data(&ps_c, &k))),
+        ];
+        if let Some(p) = Host::heap_limits_param(&[&ms_c, &ps_c]) {
+            roots_t.push((p, Root::HeapLimits));
+        }
+        let ours = host.draw(&root_t, &pso_t, &draw(roots_t, groups)).unwrap();
         let (ms_p, ps_p) = (
             compile(&pc, &dir, src, "ms", "ms_6_5"),
             compile(&pc, &dir, src, "mps", "ps_6_5"),
@@ -1022,12 +1015,16 @@ fn float_semantics_are_the_consoles() {
         View::RawUav(20),
         View::TextureUav(1, 1),
     ];
+    let mut roots = vec![(0, Root::Constants(user_data(&cs, &k)))];
+    if let Some(p) = Host::heap_limits_param(&[&cs]) {
+        roots.push((p, Root::HeapLimits));
+    }
     let out = host
         .dispatch(
             &root,
             &pso,
             &Dispatch {
-                roots: vec![(0, Root::Constants(user_data(&cs, &k)))],
+                roots,
                 views: &views,
                 samplers: &[],
                 groups: [1, 1, 1],
@@ -1224,6 +1221,9 @@ fn translated_compute_matches_pc() {
                 root_cbv.clone()
             };
             roots.push((1 + n as u32, Root::View { srv, data }));
+        }
+        if let Some(p) = Host::heap_limits_param(&[&cs_c]) {
+            roots.push((p, Root::HeapLimits));
         }
         let ours = host.dispatch(&root_t, &pso_t, &dispatch(roots));
         if name.starts_with("terminates") {

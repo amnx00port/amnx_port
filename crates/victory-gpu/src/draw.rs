@@ -456,6 +456,23 @@ impl State {
             list.keep(&p.pso);
             list.keep(&p.root);
         }
+        if let Some(param) = p.heap_limits {
+            let guard = |h: usize| {
+                (h != 0)
+                    .then(|| crate::descriptor::heap(h as This).host())
+                    .flatten()
+                    .map_or(0, |h| h.guard())
+            };
+            let limits = [guard(self.heaps[0]), guard(self.heaps[1])];
+            // SAFETY: an open list; `limits` covers the 2-dword root parameter.
+            unsafe {
+                if compute {
+                    l.SetComputeRoot32BitConstants(param, 2, limits.as_ptr().cast(), 0);
+                } else {
+                    l.SetGraphicsRoot32BitConstants(param, 2, limits.as_ptr().cast(), 0);
+                }
+            }
+        }
         for stage in &p.stages {
             let t = stage.translated();
             self.table_failed = false;

@@ -62,6 +62,34 @@ fn err(e: windows::core::Error) -> String {
     e.message().to_string()
 }
 
+#[cfg(test)]
+fn null_srv_desc() -> D3D12_SHADER_RESOURCE_VIEW_DESC {
+    D3D12_SHADER_RESOURCE_VIEW_DESC {
+        Format: DXGI_FORMAT_R8G8B8A8_UNORM,
+        ViewDimension: D3D12_SRV_DIMENSION_TEXTURE2D,
+        Shader4ComponentMapping: D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING,
+        Anonymous: D3D12_SHADER_RESOURCE_VIEW_DESC_0 {
+            Texture2D: D3D12_TEX2D_SRV {
+                MipLevels: 1,
+                ..Default::default()
+            },
+        },
+    }
+}
+
+#[cfg(test)]
+fn null_sampler_desc() -> D3D12_SAMPLER_DESC {
+    D3D12_SAMPLER_DESC {
+        Filter: D3D12_FILTER_MIN_MAG_MIP_POINT,
+        AddressU: D3D12_TEXTURE_ADDRESS_MODE_CLAMP,
+        AddressV: D3D12_TEXTURE_ADDRESS_MODE_CLAMP,
+        AddressW: D3D12_TEXTURE_ADDRESS_MODE_CLAMP,
+        MaxAnisotropy: 1,
+        ComparisonFunc: D3D12_COMPARISON_FUNC_NEVER,
+        ..Default::default()
+    }
+}
+
 impl Host {
     /// The default adapter, or WARP with `warp` (or `VICTORY_WARP=1`).
     pub fn new(warp: bool) -> Result<Self, String> {
@@ -112,8 +140,28 @@ impl Host {
         ])
     }
 
+    /// The root parameter index of `b0` in [`super::HEAP_LIMITS_SPACE`] for
+    /// `stages`, or `None` when none of the stages index a descriptor heap.
+    #[cfg(test)]
+    pub fn heap_limits_param(stages: &[&HostShader]) -> Option<u32> {
+        if !stages.iter().any(|s| s.heap_limits) {
+            return None;
+        }
+        let mut views: Vec<(u8, bool)> = stages
+            .iter()
+            .flat_map(|s| {
+                let cbvs = s.root_cbvs.iter().map(|&r| (r, false));
+                cbvs.chain(s.root_srvs.iter().map(|&r| (r, true)))
+            })
+            .collect();
+        views.sort_unstable();
+        views.dedup();
+        Some((stages.len() + views.len()) as u32)
+    }
+
     /// The root signature for these stages: user data of stage k is root
-    /// parameter k, root views follow.
+    /// parameter k, root views follow, then `[view_guard, sampler_guard]` when
+    /// any stage indexes a descriptor heap.
     pub fn root_signature_for(
         &self,
         stages: &[(&HostShader, D3D12_SHADER_VISIBILITY)],
@@ -153,6 +201,19 @@ impl Host {
                         ShaderRegister: u32::from(slot),
                         RegisterSpace: super::ROOT_CBV_SPACE,
                         Flags: D3D12_ROOT_DESCRIPTOR_FLAG_NONE,
+                    },
+                },
+                ShaderVisibility: D3D12_SHADER_VISIBILITY_ALL,
+            });
+        }
+        if stages.iter().any(|(s, _)| s.heap_limits) {
+            params.push(D3D12_ROOT_PARAMETER1 {
+                ParameterType: D3D12_ROOT_PARAMETER_TYPE_32BIT_CONSTANTS,
+                Anonymous: D3D12_ROOT_PARAMETER1_0 {
+                    Constants: D3D12_ROOT_CONSTANTS {
+                        ShaderRegister: 0,
+                        RegisterSpace: super::HEAP_LIMITS_SPACE,
+                        Num32BitValues: 2,
                     },
                 },
                 ShaderVisibility: D3D12_SHADER_VISIBILITY_ALL,
@@ -528,6 +589,7 @@ fn stub(pixel: bool, outputs: Vec<SigElement>) -> HostShader {
         static_samplers: Vec::new(),
         root_cbvs: Vec::new(),
         root_srvs: Vec::new(),
+        heap_limits: false,
     }
 }
 
@@ -546,6 +608,8 @@ pub enum Root {
         srv: bool,
         data: Vec<u32>,
     },
+    /// `[view_guard, sampler_guard]` for `b0` in [`super::HEAP_LIMITS_SPACE`].
+    HeapLimits,
 }
 
 /// Bindings for [`Host::draw`]: root arguments and the heap contents.
@@ -658,7 +722,7 @@ impl Host {
             let views: ID3D12DescriptorHeap = dev
                 .CreateDescriptorHeap(&D3D12_DESCRIPTOR_HEAP_DESC {
                     Type: D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV,
-                    NumDescriptors: d.textures.len().max(1) as u32,
+                    NumDescriptors: (d.textures.len() + 1) as u32,
                     Flags: D3D12_DESCRIPTOR_HEAP_FLAG_SHADER_VISIBLE,
                     ..Default::default()
                 })
@@ -666,7 +730,7 @@ impl Host {
             let sampler_heap: ID3D12DescriptorHeap = dev
                 .CreateDescriptorHeap(&D3D12_DESCRIPTOR_HEAP_DESC {
                     Type: D3D12_DESCRIPTOR_HEAP_TYPE_SAMPLER,
-                    NumDescriptors: d.samplers.len().max(1) as u32,
+                    NumDescriptors: (d.samplers.len() + 1) as u32,
                     Flags: D3D12_DESCRIPTOR_HEAP_FLAG_SHADER_VISIBLE,
                     ..Default::default()
                 })
@@ -743,6 +807,13 @@ impl Host {
                 at.ptr += i * sampler_size;
                 dev.CreateSampler(s, at);
             }
+            // Dedicated null guard slots at the end of both heaps.
+            let mut guard_view = views.GetCPUDescriptorHandleForHeapStart();
+            guard_view.ptr += d.textures.len() * view_size;
+            dev.CreateShaderResourceView(None::<&ID3D12Resource>, Some(&null_srv_desc()), guard_view);
+            let mut guard_sampler = sampler_heap.GetCPUDescriptorHandleForHeapStart();
+            guard_sampler.ptr += d.samplers.len() * sampler_size;
+            dev.CreateSampler(&null_sampler_desc(), guard_sampler);
             let vb = if d.vertices.is_empty() {
                 None
             } else {
@@ -784,6 +855,15 @@ impl Host {
                         list.SetGraphicsRootDescriptorTable(*param, at);
                     }
                     Root::View { .. } => return Err("root views in a draw".into()),
+                    Root::HeapLimits => {
+                        let limits = [d.textures.len() as u32, d.samplers.len() as u32];
+                        list.SetGraphicsRoot32BitConstants(
+                            *param,
+                            2,
+                            limits.as_ptr().cast(),
+                            0,
+                        );
+                    }
                 }
             }
             list.OMSetRenderTargets(1, Some(&rtv), false, None);
@@ -1071,8 +1151,8 @@ impl Host {
                 b.Unmap(0, None);
                 Ok(b)
             };
-            let views = heap(D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV, d.views.len())?;
-            let samplers = heap(D3D12_DESCRIPTOR_HEAP_TYPE_SAMPLER, d.samplers.len())?;
+            let views = heap(D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV, d.views.len() + 1)?;
+            let samplers = heap(D3D12_DESCRIPTOR_HEAP_TYPE_SAMPLER, d.samplers.len() + 1)?;
             let view_size = dev
                 .GetDescriptorHandleIncrementSize(D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV)
                 as usize;
@@ -1288,6 +1368,13 @@ impl Host {
                 at.ptr += i * sampler_size;
                 dev.CreateSampler(s, at);
             }
+            // Dedicated null guard slots at the end of both heaps.
+            let mut guard_view = views.GetCPUDescriptorHandleForHeapStart();
+            guard_view.ptr += d.views.len() * view_size;
+            dev.CreateShaderResourceView(None::<&ID3D12Resource>, Some(&null_srv_desc()), guard_view);
+            let mut guard_sampler = samplers.GetCPUDescriptorHandleForHeapStart();
+            guard_sampler.ptr += d.samplers.len() * sampler_size;
+            dev.CreateSampler(&null_sampler_desc(), guard_sampler);
             list.SetDescriptorHeaps(&[Some(views.clone()), Some(samplers.clone())]);
             list.SetComputeRootSignature(root);
             for (param, arg) in &d.roots {
@@ -1317,6 +1404,15 @@ impl Host {
                             list.SetComputeRootConstantBufferView(*param, va);
                         }
                         keep.push(b);
+                    }
+                    Root::HeapLimits => {
+                        let limits = [d.views.len() as u32, d.samplers.len() as u32];
+                        list.SetComputeRoot32BitConstants(
+                            *param,
+                            2,
+                            limits.as_ptr().cast(),
+                            0,
+                        );
                     }
                 }
             }
