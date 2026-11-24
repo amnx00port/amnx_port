@@ -13,6 +13,50 @@ use windows::Win32::Graphics::Dxgi::Common::*;
 use super::{VIEW_TAG, View, view_at};
 use crate::host::host;
 
+/// What a mirrored host descriptor slot (`0..count`) currently holds.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum SlotState {
+    /// Default null descriptor (`null_view` or `null_sampler`).
+    Null,
+    /// Typed null descriptor made for DXIL `ResourceProperties`.
+    TypedNull(u32, u32),
+    /// Made from a view record `(index, generation)` (`generation >= 1`).
+    View(u64),
+    /// View record `(index, generation)` the host could not make, holding a
+    /// null descriptor: `None` for the view's own-dimension null (`null_for`),
+    /// or `Some(props)` for a typed null made for DXIL `ResourceProperties`.
+    ViewNull(u64, Option<(u32, u32)>),
+}
+
+/// Outcome of [`HostHeap::mirror_for_draw`].
+#[derive(Debug, PartialEq, Eq)]
+pub(crate) enum Mirror {
+    /// Slot mirrored in place (or already up to date), with the title view if any.
+    Done(Option<View>),
+    /// Refused: the slot already holds a typed null of another kind, left
+    /// untouched so earlier draws keep reading it and the caller can go fresh.
+    Refused,
+}
+
+/// A null descriptor description derived from a shader's DXIL
+/// `ResourceProperties` annotation.
+#[derive(Clone, Copy)]
+pub(crate) enum NullDesc {
+    Srv(D3D12_SHADER_RESOURCE_VIEW_DESC),
+    Uav(D3D12_UNORDERED_ACCESS_VIEW_DESC),
+    Cbv,
+}
+
+impl std::fmt::Debug for NullDesc {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            NullDesc::Srv(d) => write!(f, "Srv(dim={}, fmt={})", d.ViewDimension.0, d.Format.0),
+            NullDesc::Uav(d) => write!(f, "Uav(dim={}, fmt={})", d.ViewDimension.0, d.Format.0),
+            NullDesc::Cbv => write!(f, "Cbv"),
+        }
+    }
+}
+
 pub(crate) struct HostHeap {
     pub(crate) heap: ID3D12DescriptorHeap,
     cpu: usize,
@@ -23,8 +67,8 @@ pub(crate) struct HostHeap {
     /// where the host takes them, else [`MIN_DYNAMIC`].
     dynamic: u32,
     sampler: bool,
-    /// The record (view index and generation) each slot was last made from.
-    made: Mutex<Vec<u64>>,
+    /// What each mirrored slot was last made from.
+    made: Mutex<Vec<SlotState>>,
     /// The host resource each slot views, held while the slot does: shaders
     /// index heaps directly, so a slot the title has not rewritten since it
     /// released the resource may still be read, and a freed host resource
@@ -143,7 +187,7 @@ impl HostHeap {
             count,
             dynamic: extra,
             sampler,
-            made: Mutex::new(vec![0; count as usize]),
+            made: Mutex::new(vec![SlotState::Null; count as usize]),
             kept: Mutex::new(vec![None; (count + extra) as usize]),
             next: Mutex::new((0, vec![false; extra as usize])),
         };
@@ -278,12 +322,15 @@ impl HostHeap {
         }
     }
 
-    /// Makes slot `index` (a dynamic one) from `view`; a null view if the
-    /// host cannot.
-    pub(crate) fn make_at(&self, index: u32, view: &View) {
+    /// Makes slot `index` (a dynamic one) from `view`; a typed null (or a null
+    /// matching `view`) if the host cannot.
+    pub(crate) fn make_at(&self, index: u32, view: &View, null_props: Option<(u32, u32)>) {
         let kept = make(view, self.cpu(index));
-        if kept.is_none() {
-            null_for(view, self.cpu(index));
+        if kept.is_none() && !self.sampler {
+            match null_props.and_then(null_desc_for_props) {
+                Some(desc) => write_null(&desc, self.cpu(index)),
+                None => null_for(view, self.cpu(index)),
+            }
         }
         self.keep(index, kept.flatten());
     }
@@ -294,6 +341,17 @@ impl HostHeap {
             self.null_sampler(index);
         } else {
             null_view(self.cpu(index));
+        }
+        self.keep(index, None);
+    }
+
+    /// Makes slot `index` a typed null descriptor matching a shader's
+    /// annotation (view heaps only; sampler heaps get a plain sampler).
+    pub(crate) fn make_typed_null(&self, index: u32, desc: &NullDesc) {
+        if self.sampler {
+            self.null_sampler(index);
+        } else {
+            write_null(desc, self.cpu(index));
         }
         self.keep(index, None);
     }
@@ -333,6 +391,33 @@ impl HostHeap {
     /// views are made only for draws (`for_draw`), which also copy their
     /// data: a host copy of a buffer is made on first use.
     pub(crate) fn mirror(&self, index: u32, handle: u64, for_draw: bool) -> Option<View> {
+        match self.mirror_slot(index, handle, for_draw, None) {
+            Mirror::Done(view) => view,
+            Mirror::Refused => None,
+        }
+    }
+
+    /// As [`HostHeap::mirror`] for a draw or dispatch, placing a typed null
+    /// descriptor matching `null_props` when the title slot has no view (or its
+    /// view cannot be made on the host). Returns [`Mirror::Refused`] under the
+    /// slot lock without touching the slot if it already holds a typed null of
+    /// another kind, so the caller can give the table fresh dynamic slots.
+    pub(crate) fn mirror_for_draw(
+        &self,
+        index: u32,
+        handle: u64,
+        null_props: Option<(u32, u32)>,
+    ) -> Mirror {
+        self.mirror_slot(index, handle, true, null_props)
+    }
+
+    fn mirror_slot(
+        &self,
+        index: u32,
+        handle: u64,
+        for_draw: bool,
+        null_props: Option<(u32, u32)>,
+    ) -> Mirror {
         if index >= self.count {
             // Diagnostic (NVIDIA heap cap): the highest title slot past the
             // host heap seen so far.
@@ -345,37 +430,39 @@ impl HostHeap {
                     "title slot past the host heap"
                 );
             }
-            return None;
+            return Mirror::Done(None);
         }
-        // SAFETY: the handle is a descriptor slot in title memory.
-        let [tag, i, generation] = unsafe { (handle as *const [u32; 3]).read_unaligned() };
-        // Generations start at 1, so a made slot's key is never 0.
-        let key = u64::from(generation) << 32 | u64::from(i);
         let mut made = self.made.lock().unwrap_or_else(|e| e.into_inner());
-        let view = (tag == VIEW_TAG).then(|| view_at(i, generation)).flatten();
-        let Some(view) = view else {
-            // Not a view of ours (never written, or of a resource the
-            // title released): nothing to read.
-            if made[index as usize] != 0 {
-                made[index as usize] = 0;
-                self.make_null(index);
+        let cpu = self.cpu(index);
+        let (view, write, keep) = mirror_slot_state(
+            &mut made[index as usize],
+            self.sampler,
+            handle,
+            for_draw,
+            null_props,
+            |view| make(view, cpu),
+        );
+        match write {
+            SlotWrite::None => {}
+            SlotWrite::Refused => return Mirror::Refused,
+            SlotWrite::DefaultNull => {
+                if self.sampler {
+                    self.null_sampler(index);
+                } else {
+                    null_view(cpu);
+                }
             }
-            return None;
-        };
-        if made[index as usize] != key {
-            let later = !for_draw && view.is_buffer();
-            made[index as usize] = if later { 0 } else { key };
-            let kept = if later {
-                None
-            } else {
-                make(&view, self.cpu(index))
-            };
-            if kept.is_none() && !self.sampler {
-                null_for(&view, self.cpu(index));
+            SlotWrite::TypedNull(desc) => write_null(&desc, cpu),
+            SlotWrite::ViewNull => {
+                if let Some(view) = &view {
+                    null_for(view, cpu);
+                }
             }
-            self.keep(index, kept.flatten());
         }
-        Some(view)
+        if let Some(resource) = keep {
+            self.keep(index, resource);
+        }
+        Mirror::Done(view)
     }
 
     /// The view host slot `index` was made from, in a few words, with the
@@ -383,17 +470,139 @@ impl HostHeap {
     /// a slot never made or left null.
     #[cfg(feature = "diagnostics")]
     pub(crate) fn describe_slot(&self, index: u32) -> Option<String> {
-        let key = *self.made.lock().unwrap_or_else(|e| e.into_inner()).get(index as usize)?;
-        if key == 0 {
-            return Some("null".into());
+        let state = *self
+            .made
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .get(index as usize)?;
+        describe_slot_state(state)
+    }
+}
+
+#[cfg(feature = "diagnostics")]
+fn describe_slot_state(state: SlotState) -> Option<String> {
+    let (key, null) = match state {
+        SlotState::Null => return Some("null".into()),
+        SlotState::TypedNull(p0, p1) => return Some(format!("null ({p0:#x}, {p1:#x})")),
+        SlotState::View(key) => (key, None),
+        SlotState::ViewNull(key, props) => (key, Some(props)),
+    };
+    let view = view_at(key as u32, (key >> 32) as u32)?;
+    let mut text: String = format!("{view:?}").chars().take(120).collect();
+    if let Some((address, len)) = buffer_range(&view) {
+        let host = crate::shadow::find(address, len.max(1)).map(|s| s.gpu(address));
+        text.push_str(&format!(" title {address:#x}+{len:#x} host {host:#x?}"));
+    }
+    match null {
+        Some(Some((p0, p1))) => text.push_str(&format!(" -> null ({p0:#x}, {p1:#x})")),
+        Some(None) => text.push_str(" -> null"),
+        None => {}
+    }
+    Some(text)
+}
+
+/// Descriptor write [`mirror_slot_state`] asks the caller to perform.
+#[derive(Debug)]
+enum SlotWrite {
+    /// Leave the slot untouched (or `try_make` already wrote it).
+    None,
+    /// Write the default null descriptor (`null_view` or `null_sampler`).
+    DefaultNull,
+    /// Write a typed null descriptor (`write_null`).
+    TypedNull(NullDesc),
+    /// Write the view's own-dimension null (`null_for`).
+    ViewNull,
+    /// Refused: the slot already holds a typed null of another kind, so leave
+    /// it untouched and report the refusal to the caller.
+    Refused,
+}
+
+/// Updates `state` for the title descriptor at `handle`, calling `try_make`
+/// only when a new view must be built on the host. Returns `(view, write,
+/// keep)`, where `keep` is `Some(resource)` when the slot's kept host
+/// resource must be updated.
+fn mirror_slot_state(
+    state: &mut SlotState,
+    sampler: bool,
+    handle: u64,
+    for_draw: bool,
+    null_props: Option<(u32, u32)>,
+    try_make: impl FnOnce(&View) -> Option<Kept>,
+) -> (Option<View>, SlotWrite, Option<Kept>) {
+    // SAFETY: the handle is a descriptor slot in title memory.
+    let [tag, i, generation] = unsafe { (handle as *const [u32; 3]).read_unaligned() };
+    // Generations start at 1, so a made slot's key is never 0.
+    let key = u64::from(generation) << 32 | u64::from(i);
+    let view = (tag == VIEW_TAG).then(|| view_at(i, generation)).flatten();
+    let Some(view) = view else {
+        // Not a view of ours (never written, or of a resource the
+        // title released): a typed null when the shader annotates the slot,
+        // otherwise the default null descriptor.
+        if !sampler
+            && let Some(props) = null_props
+            && let Some(desc) = null_desc_for_props(props)
+        {
+            return match *state {
+                SlotState::TypedNull(p0, p1) if (p0, p1) == props => (None, SlotWrite::None, None),
+                SlotState::TypedNull(..) if for_draw => (None, SlotWrite::Refused, None),
+                _ => {
+                    *state = SlotState::TypedNull(props.0, props.1);
+                    (None, SlotWrite::TypedNull(desc), Some(None))
+                }
+            };
         }
-        let view = view_at(key as u32, (key >> 32) as u32)?;
-        let mut text: String = format!("{view:?}").chars().take(120).collect();
-        if let Some((address, len)) = buffer_range(&view) {
-            let host = crate::shadow::find(address, len.max(1)).map(|s| s.gpu(address));
-            text.push_str(&format!(" title {address:#x}+{len:#x} host {host:#x?}"));
+        if matches!(*state, SlotState::Null | SlotState::TypedNull(..)) {
+            return (None, SlotWrite::None, None);
         }
-        Some(text)
+        *state = SlotState::Null;
+        return (None, SlotWrite::DefaultNull, Some(None));
+    };
+    match *state {
+        SlotState::View(k) if k == key => (Some(view), SlotWrite::None, None),
+        SlotState::ViewNull(k, cur_props) if k == key => {
+            if for_draw
+                && !sampler
+                && let Some(props) = null_props
+                && let Some(desc) = null_desc_for_props(props)
+            {
+                return match cur_props {
+                    Some(p) if p == props => (Some(view), SlotWrite::None, None),
+                    Some(_) => (Some(view), SlotWrite::Refused, None),
+                    None => {
+                        *state = SlotState::ViewNull(key, Some(props));
+                        (Some(view), SlotWrite::TypedNull(desc), None)
+                    }
+                };
+            }
+            (Some(view), SlotWrite::None, None)
+        }
+        _ => {
+            let later = !for_draw && view.is_buffer();
+            let kept = if later { None } else { try_make(&view) };
+            let write = if later {
+                *state = SlotState::Null;
+                if sampler {
+                    SlotWrite::None
+                } else {
+                    SlotWrite::ViewNull
+                }
+            } else if kept.is_some() || sampler {
+                *state = SlotState::View(key);
+                SlotWrite::None
+            } else {
+                match null_props.and_then(|p| null_desc_for_props(p).map(|d| (p, d))) {
+                    Some((props, desc)) => {
+                        *state = SlotState::ViewNull(key, Some(props));
+                        SlotWrite::TypedNull(desc)
+                    }
+                    None => {
+                        *state = SlotState::ViewNull(key, None);
+                        SlotWrite::ViewNull
+                    }
+                }
+            };
+            (Some(view), write, Some(kept.flatten()))
+        }
     }
 }
 
@@ -895,10 +1104,293 @@ fn null_like(words: &[u32; 10], at: D3D12_CPU_DESCRIPTOR_HANDLE) {
     };
 }
 
+/// An R32 DXGI format compatible with the DXIL component type in `props1`'s
+/// low byte (signed integer, unsigned integer, or float).
+fn comp_format(props1: u32) -> DXGI_FORMAT {
+    match props1 & 0xFF {
+        2 | 4 | 6 => DXGI_FORMAT_R32_SINT,
+        1 | 3 | 5 | 7 => DXGI_FORMAT_R32_UINT,
+        _ => DXGI_FORMAT_R32_FLOAT,
+    }
+}
+
+/// Maps a DXIL `ResourceProperties` pair (`props`: resource kind in `props.0`
+/// low byte, UAV bit `0x1000`, component type or structure stride in
+/// `props.1`) to a matching null descriptor description. Returns `None` for
+/// kinds with no view descriptor (samplers, unknown kinds, or MSAA UAVs).
+pub(crate) fn null_desc_for_props(props: (u32, u32)) -> Option<NullDesc> {
+    let kind = props.0 & 0xFF;
+    let uav = props.0 & 0x1000 != 0;
+    if uav {
+        let desc = match kind {
+            1 => D3D12_UNORDERED_ACCESS_VIEW_DESC {
+                Format: comp_format(props.1),
+                ViewDimension: D3D12_UAV_DIMENSION_TEXTURE1D,
+                Anonymous: D3D12_UNORDERED_ACCESS_VIEW_DESC_0 {
+                    Texture1D: D3D12_TEX1D_UAV { MipSlice: 0 },
+                },
+            },
+            2 => D3D12_UNORDERED_ACCESS_VIEW_DESC {
+                Format: comp_format(props.1),
+                ViewDimension: D3D12_UAV_DIMENSION_TEXTURE2D,
+                Anonymous: D3D12_UNORDERED_ACCESS_VIEW_DESC_0 {
+                    Texture2D: D3D12_TEX2D_UAV {
+                        MipSlice: 0,
+                        PlaneSlice: 0,
+                    },
+                },
+            },
+            4 => D3D12_UNORDERED_ACCESS_VIEW_DESC {
+                Format: comp_format(props.1),
+                ViewDimension: D3D12_UAV_DIMENSION_TEXTURE3D,
+                Anonymous: D3D12_UNORDERED_ACCESS_VIEW_DESC_0 {
+                    Texture3D: D3D12_TEX3D_UAV {
+                        MipSlice: 0,
+                        FirstWSlice: 0,
+                        WSize: 1,
+                    },
+                },
+            },
+            6 => D3D12_UNORDERED_ACCESS_VIEW_DESC {
+                Format: comp_format(props.1),
+                ViewDimension: D3D12_UAV_DIMENSION_TEXTURE1DARRAY,
+                Anonymous: D3D12_UNORDERED_ACCESS_VIEW_DESC_0 {
+                    Texture1DArray: D3D12_TEX1D_ARRAY_UAV {
+                        MipSlice: 0,
+                        FirstArraySlice: 0,
+                        ArraySize: 1,
+                    },
+                },
+            },
+            5 | 7 | 9 => D3D12_UNORDERED_ACCESS_VIEW_DESC {
+                Format: comp_format(props.1),
+                ViewDimension: D3D12_UAV_DIMENSION_TEXTURE2DARRAY,
+                Anonymous: D3D12_UNORDERED_ACCESS_VIEW_DESC_0 {
+                    Texture2DArray: D3D12_TEX2D_ARRAY_UAV {
+                        MipSlice: 0,
+                        FirstArraySlice: 0,
+                        ArraySize: 1,
+                        PlaneSlice: 0,
+                    },
+                },
+            },
+            10 => D3D12_UNORDERED_ACCESS_VIEW_DESC {
+                Format: comp_format(props.1),
+                ViewDimension: D3D12_UAV_DIMENSION_BUFFER,
+                Anonymous: D3D12_UNORDERED_ACCESS_VIEW_DESC_0 {
+                    Buffer: D3D12_BUFFER_UAV {
+                        FirstElement: 0,
+                        NumElements: 1,
+                        StructureByteStride: 0,
+                        CounterOffsetInBytes: 0,
+                        Flags: D3D12_BUFFER_UAV_FLAG_NONE,
+                    },
+                },
+            },
+            11 => D3D12_UNORDERED_ACCESS_VIEW_DESC {
+                Format: DXGI_FORMAT_R32_TYPELESS,
+                ViewDimension: D3D12_UAV_DIMENSION_BUFFER,
+                Anonymous: D3D12_UNORDERED_ACCESS_VIEW_DESC_0 {
+                    Buffer: D3D12_BUFFER_UAV {
+                        FirstElement: 0,
+                        NumElements: 1,
+                        StructureByteStride: 0,
+                        CounterOffsetInBytes: 0,
+                        Flags: D3D12_BUFFER_UAV_FLAG_RAW,
+                    },
+                },
+            },
+            12 => D3D12_UNORDERED_ACCESS_VIEW_DESC {
+                Format: DXGI_FORMAT_UNKNOWN,
+                ViewDimension: D3D12_UAV_DIMENSION_BUFFER,
+                Anonymous: D3D12_UNORDERED_ACCESS_VIEW_DESC_0 {
+                    Buffer: D3D12_BUFFER_UAV {
+                        FirstElement: 0,
+                        NumElements: 1,
+                        StructureByteStride: if props.1 > 0 { props.1 } else { 4 },
+                        CounterOffsetInBytes: 0,
+                        Flags: D3D12_BUFFER_UAV_FLAG_NONE,
+                    },
+                },
+            },
+            _ => return None,
+        };
+        return Some(NullDesc::Uav(desc));
+    }
+    if kind == 13 {
+        return Some(NullDesc::Cbv);
+    }
+    let srv = |format, dim, anon| D3D12_SHADER_RESOURCE_VIEW_DESC {
+        Format: format,
+        ViewDimension: dim,
+        Shader4ComponentMapping: D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING,
+        Anonymous: anon,
+    };
+    let desc = match kind {
+        1 => srv(
+            comp_format(props.1),
+            D3D12_SRV_DIMENSION_TEXTURE1D,
+            D3D12_SHADER_RESOURCE_VIEW_DESC_0 {
+                Texture1D: D3D12_TEX1D_SRV {
+                    MipLevels: 1,
+                    ..Default::default()
+                },
+            },
+        ),
+        2 => srv(
+            comp_format(props.1),
+            D3D12_SRV_DIMENSION_TEXTURE2D,
+            D3D12_SHADER_RESOURCE_VIEW_DESC_0 {
+                Texture2D: D3D12_TEX2D_SRV {
+                    MipLevels: 1,
+                    ..Default::default()
+                },
+            },
+        ),
+        3 => srv(
+            comp_format(props.1),
+            D3D12_SRV_DIMENSION_TEXTURE2DMS,
+            D3D12_SHADER_RESOURCE_VIEW_DESC_0 {
+                Texture2DMS: D3D12_TEX2DMS_SRV::default(),
+            },
+        ),
+        4 => srv(
+            comp_format(props.1),
+            D3D12_SRV_DIMENSION_TEXTURE3D,
+            D3D12_SHADER_RESOURCE_VIEW_DESC_0 {
+                Texture3D: D3D12_TEX3D_SRV {
+                    MipLevels: 1,
+                    ..Default::default()
+                },
+            },
+        ),
+        5 => srv(
+            comp_format(props.1),
+            D3D12_SRV_DIMENSION_TEXTURECUBE,
+            D3D12_SHADER_RESOURCE_VIEW_DESC_0 {
+                TextureCube: D3D12_TEXCUBE_SRV {
+                    MipLevels: 1,
+                    ..Default::default()
+                },
+            },
+        ),
+        6 => srv(
+            comp_format(props.1),
+            D3D12_SRV_DIMENSION_TEXTURE1DARRAY,
+            D3D12_SHADER_RESOURCE_VIEW_DESC_0 {
+                Texture1DArray: D3D12_TEX1D_ARRAY_SRV {
+                    MipLevels: 1,
+                    ArraySize: 1,
+                    ..Default::default()
+                },
+            },
+        ),
+        7 => srv(
+            comp_format(props.1),
+            D3D12_SRV_DIMENSION_TEXTURE2DARRAY,
+            D3D12_SHADER_RESOURCE_VIEW_DESC_0 {
+                Texture2DArray: D3D12_TEX2D_ARRAY_SRV {
+                    MipLevels: 1,
+                    ArraySize: 1,
+                    ..Default::default()
+                },
+            },
+        ),
+        8 => srv(
+            comp_format(props.1),
+            D3D12_SRV_DIMENSION_TEXTURE2DMSARRAY,
+            D3D12_SHADER_RESOURCE_VIEW_DESC_0 {
+                Texture2DMSArray: D3D12_TEX2DMS_ARRAY_SRV {
+                    FirstArraySlice: 0,
+                    ArraySize: 1,
+                },
+            },
+        ),
+        9 => srv(
+            comp_format(props.1),
+            D3D12_SRV_DIMENSION_TEXTURECUBEARRAY,
+            D3D12_SHADER_RESOURCE_VIEW_DESC_0 {
+                TextureCubeArray: D3D12_TEXCUBE_ARRAY_SRV {
+                    MipLevels: 1,
+                    NumCubes: 1,
+                    ..Default::default()
+                },
+            },
+        ),
+        10 => srv(
+            comp_format(props.1),
+            D3D12_SRV_DIMENSION_BUFFER,
+            D3D12_SHADER_RESOURCE_VIEW_DESC_0 {
+                Buffer: D3D12_BUFFER_SRV {
+                    NumElements: 1,
+                    Flags: D3D12_BUFFER_SRV_FLAG_NONE,
+                    ..Default::default()
+                },
+            },
+        ),
+        11 => srv(
+            DXGI_FORMAT_R32_TYPELESS,
+            D3D12_SRV_DIMENSION_BUFFER,
+            D3D12_SHADER_RESOURCE_VIEW_DESC_0 {
+                Buffer: D3D12_BUFFER_SRV {
+                    NumElements: 1,
+                    Flags: D3D12_BUFFER_SRV_FLAG_RAW,
+                    ..Default::default()
+                },
+            },
+        ),
+        12 => srv(
+            DXGI_FORMAT_UNKNOWN,
+            D3D12_SRV_DIMENSION_BUFFER,
+            D3D12_SHADER_RESOURCE_VIEW_DESC_0 {
+                Buffer: D3D12_BUFFER_SRV {
+                    NumElements: 1,
+                    StructureByteStride: if props.1 > 0 { props.1 } else { 4 },
+                    Flags: D3D12_BUFFER_SRV_FLAG_NONE,
+                    ..Default::default()
+                },
+            },
+        ),
+        _ => return None,
+    };
+    Some(NullDesc::Srv(desc))
+}
+
+/// Writes `desc` as a null descriptor at host heap slot `at`.
+fn write_null(desc: &NullDesc, at: D3D12_CPU_DESCRIPTOR_HANDLE) {
+    let Some(host) = host() else { return };
+    match desc {
+        NullDesc::Srv(d) => {
+            // SAFETY: a slot of our heap; a null resource is allowed with a desc.
+            unsafe {
+                host.device
+                    .CreateShaderResourceView(None::<&ID3D12Resource>, Some(d), at)
+            };
+        }
+        NullDesc::Uav(d) => {
+            // SAFETY: a slot of our heap; a null resource is allowed with a desc.
+            unsafe {
+                host.device.CreateUnorderedAccessView(
+                    None::<&ID3D12Resource>,
+                    None::<&ID3D12Resource>,
+                    Some(d),
+                    at,
+                )
+            };
+        }
+        NullDesc::Cbv => {
+            let d = D3D12_CONSTANT_BUFFER_VIEW_DESC::default();
+            // SAFETY: a slot of our heap; a zero location makes a null CBV.
+            unsafe { host.device.CreateConstantBufferView(Some(&d), at) };
+        }
+    }
+}
+
 /// A view that reads zeros, for slots whose view the host cannot make.
-/// shortcut: slots with no view at all (kind unknown) get this null 2D
-/// view; null buffer views there did not stop the world's low-address
-/// page faults (2026-11-24, run w10), so they are not the cause.
+/// shortcut: slots with no view at all get this null 2D view unless a
+/// shader annotates the slot (`table_views`, then a null of that kind);
+/// untyped null buffer views there did not stop the world's low-address
+/// page faults (2026-11-24, run w10), so they alone are not the cause.
 fn null_view(at: D3D12_CPU_DESCRIPTOR_HANDLE) {
     let Some(host) = host() else { return };
     let desc = D3D12_SHADER_RESOURCE_VIEW_DESC {
@@ -972,5 +1464,581 @@ mod tests {
         heap.release(a, 50);
         assert_eq!(heap.dynamic(50), Some(4));
         assert_eq!(heap.dynamic(40), Some(4 + heap.dynamic - 40));
+    }
+
+    #[test]
+    fn null_desc_maps_buffer_and_texture_annotations() {
+        // Raw buffer SRV and UAV.
+        match null_desc_for_props((11, 0)) {
+            Some(NullDesc::Srv(d)) => {
+                assert_eq!(d.Format, DXGI_FORMAT_R32_TYPELESS);
+                assert_eq!(d.ViewDimension, D3D12_SRV_DIMENSION_BUFFER);
+                assert_eq!(
+                    d.Shader4ComponentMapping,
+                    D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING
+                );
+                // SAFETY: ViewDimension is BUFFER.
+                let b = unsafe { d.Anonymous.Buffer };
+                assert_eq!(b.Flags, D3D12_BUFFER_SRV_FLAG_RAW);
+                assert_eq!(b.StructureByteStride, 0);
+            }
+            other => panic!("expected raw buffer SRV, got {other:?}"),
+        }
+        match null_desc_for_props((11 | 0x1000, 0)) {
+            Some(NullDesc::Uav(d)) => {
+                assert_eq!(d.Format, DXGI_FORMAT_R32_TYPELESS);
+                assert_eq!(d.ViewDimension, D3D12_UAV_DIMENSION_BUFFER);
+                // SAFETY: ViewDimension is BUFFER.
+                let b = unsafe { d.Anonymous.Buffer };
+                assert_eq!(b.Flags, D3D12_BUFFER_UAV_FLAG_RAW);
+                assert_eq!(b.StructureByteStride, 0);
+            }
+            other => panic!("expected raw buffer UAV, got {other:?}"),
+        }
+
+        // Structured buffer SRV and UAV (with stride and 0-stride fallback).
+        match null_desc_for_props((12, 64)) {
+            Some(NullDesc::Srv(d)) => {
+                assert_eq!(d.Format, DXGI_FORMAT_UNKNOWN);
+                assert_eq!(d.ViewDimension, D3D12_SRV_DIMENSION_BUFFER);
+                // SAFETY: ViewDimension is BUFFER.
+                let b = unsafe { d.Anonymous.Buffer };
+                assert_eq!(b.StructureByteStride, 64);
+                assert_eq!(b.Flags, D3D12_BUFFER_SRV_FLAG_NONE);
+            }
+            other => panic!("expected structured buffer SRV, got {other:?}"),
+        }
+        match null_desc_for_props((12 | 0x1000, 0)) {
+            Some(NullDesc::Uav(d)) => {
+                assert_eq!(d.Format, DXGI_FORMAT_UNKNOWN);
+                // SAFETY: ViewDimension is BUFFER.
+                let b = unsafe { d.Anonymous.Buffer };
+                assert_eq!(b.StructureByteStride, 4);
+            }
+            other => panic!("expected structured buffer UAV, got {other:?}"),
+        }
+
+        // Typed buffers respect component type (F32, U32, I32).
+        for (p1, fmt) in [
+            (0x409, DXGI_FORMAT_R32_FLOAT),
+            (0x105, DXGI_FORMAT_R32_UINT),
+            (0x104, DXGI_FORMAT_R32_SINT),
+        ] {
+            match null_desc_for_props((10, p1)) {
+                Some(NullDesc::Srv(d)) => {
+                    assert_eq!(d.Format, fmt);
+                    assert_eq!(d.ViewDimension, D3D12_SRV_DIMENSION_BUFFER);
+                }
+                other => panic!("expected typed buffer SRV for {p1:#x}, got {other:?}"),
+            }
+            match null_desc_for_props((10 | 0x1000, p1)) {
+                Some(NullDesc::Uav(d)) => {
+                    assert_eq!(d.Format, fmt);
+                    assert_eq!(d.ViewDimension, D3D12_UAV_DIMENSION_BUFFER);
+                }
+                other => panic!("expected typed buffer UAV for {p1:#x}, got {other:?}"),
+            }
+        }
+
+        // Texture SRVs cover every dimension.
+        let srv_dims = [
+            (1, D3D12_SRV_DIMENSION_TEXTURE1D),
+            (2, D3D12_SRV_DIMENSION_TEXTURE2D),
+            (3, D3D12_SRV_DIMENSION_TEXTURE2DMS),
+            (4, D3D12_SRV_DIMENSION_TEXTURE3D),
+            (5, D3D12_SRV_DIMENSION_TEXTURECUBE),
+            (6, D3D12_SRV_DIMENSION_TEXTURE1DARRAY),
+            (7, D3D12_SRV_DIMENSION_TEXTURE2DARRAY),
+            (8, D3D12_SRV_DIMENSION_TEXTURE2DMSARRAY),
+            (9, D3D12_SRV_DIMENSION_TEXTURECUBEARRAY),
+        ];
+        for (kind, dim) in srv_dims {
+            match null_desc_for_props((kind, 0x409)) {
+                Some(NullDesc::Srv(d)) => {
+                    assert_eq!(d.ViewDimension, dim);
+                    assert_eq!(d.Format, DXGI_FORMAT_R32_FLOAT);
+                    assert_eq!(
+                        d.Shader4ComponentMapping,
+                        D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING
+                    );
+                }
+                other => panic!("expected texture SRV for kind {kind}, got {other:?}"),
+            }
+        }
+
+        // Texture UAVs (including 3D WSize, 2D atomic uint, cube -> 2D array).
+        let uav_dims = [
+            (
+                1,
+                0x409,
+                D3D12_UAV_DIMENSION_TEXTURE1D,
+                DXGI_FORMAT_R32_FLOAT,
+            ),
+            (
+                2,
+                0x105,
+                D3D12_UAV_DIMENSION_TEXTURE2D,
+                DXGI_FORMAT_R32_UINT,
+            ),
+            (
+                4,
+                0x409,
+                D3D12_UAV_DIMENSION_TEXTURE3D,
+                DXGI_FORMAT_R32_FLOAT,
+            ),
+            (
+                6,
+                0x409,
+                D3D12_UAV_DIMENSION_TEXTURE1DARRAY,
+                DXGI_FORMAT_R32_FLOAT,
+            ),
+            (
+                7,
+                0x409,
+                D3D12_UAV_DIMENSION_TEXTURE2DARRAY,
+                DXGI_FORMAT_R32_FLOAT,
+            ),
+            (
+                5,
+                0x409,
+                D3D12_UAV_DIMENSION_TEXTURE2DARRAY,
+                DXGI_FORMAT_R32_FLOAT,
+            ),
+            (
+                9,
+                0x409,
+                D3D12_UAV_DIMENSION_TEXTURE2DARRAY,
+                DXGI_FORMAT_R32_FLOAT,
+            ),
+        ];
+        for (kind, p1, dim, fmt) in uav_dims {
+            match null_desc_for_props((kind | 0x1000, p1)) {
+                Some(NullDesc::Uav(d)) => {
+                    assert_eq!(d.ViewDimension, dim);
+                    assert_eq!(d.Format, fmt);
+                    if kind == 4 {
+                        // SAFETY: ViewDimension is TEXTURE3D.
+                        assert_eq!(unsafe { d.Anonymous.Texture3D.WSize }, 1);
+                    }
+                }
+                other => panic!("expected texture UAV for kind {kind}, got {other:?}"),
+            }
+        }
+
+        // CBV and unsupported kinds.
+        assert!(matches!(
+            null_desc_for_props((13, 0x1_0000)),
+            Some(NullDesc::Cbv)
+        ));
+        for bad in [
+            (0, 0),
+            (14, 0),
+            (3 | 0x1000, 0x409),
+            (8 | 0x1000, 0x409),
+            (13 | 0x1000, 0),
+        ] {
+            assert!(null_desc_for_props(bad).is_none(), "{bad:?}");
+        }
+    }
+
+    #[test]
+    fn host_accepts_typed_null_descriptors_and_mirror_transitions() {
+        let Some(heap) = HostHeap::new(false, 4) else {
+            return; // no host GPU
+        };
+        let Some(host) = host() else {
+            return;
+        };
+        let slot = heap.dynamic(1).unwrap();
+        let all = [
+            (1, 0x409),
+            (2, 0x409),
+            (3, 0x409),
+            (4, 0x409),
+            (5, 0x409),
+            (6, 0x409),
+            (7, 0x409),
+            (8, 0x409),
+            (9, 0x409),
+            (10, 0x409),
+            (11, 0),
+            (12, 16),
+            (13, 0x1_0000),
+            (1 | 0x1000, 0x409),
+            (2 | 0x1000, 0x105),
+            (4 | 0x1000, 0x409),
+            (6 | 0x1000, 0x409),
+            (7 | 0x1000, 0x409),
+            (10 | 0x1000, 0x104),
+            (11 | 0x1000, 0),
+            (12 | 0x1000, 32),
+        ];
+        for props in all {
+            let desc = null_desc_for_props(props).expect("valid props");
+            heap.make_typed_null(slot, &desc);
+        }
+        heap.release(slot, 1);
+
+        // Mirrored slot: empty -> typed null -> refused other kind -> real view.
+        let mut title = [0u32; 8];
+        let handle = title.as_mut_ptr() as u64;
+        assert_eq!(
+            heap.mirror_for_draw(0, handle, Some((11 | 0x1000, 0))),
+            Mirror::Done(None)
+        );
+        assert_eq!(
+            heap.made.lock().unwrap()[0],
+            SlotState::TypedNull(11 | 0x1000, 0)
+        );
+        assert_eq!(
+            heap.mirror_for_draw(0, handle, Some((12 | 0x1000, 16))),
+            Mirror::Refused
+        );
+        assert_eq!(
+            heap.made.lock().unwrap()[0],
+            SlotState::TypedNull(11 | 0x1000, 0)
+        );
+        // Out-of-bounds mirrored slot is ignored cleanly.
+        assert_eq!(
+            heap.mirror_for_draw(heap.count(), handle, Some((11 | 0x1000, 0))),
+            Mirror::Done(None)
+        );
+
+        // Writing a real view later still triggers `mirror` to make it.
+        super::super::create_cbv(std::ptr::null(), &[0x1000, 0, 256, 0], handle);
+        let view = heap.mirror_for_draw(0, handle, Some((13, 0x1_0000)));
+        assert_eq!(view, Mirror::Done(Some(View::Constant(0x1000, 256))));
+        assert!(matches!(heap.made.lock().unwrap()[0], SlotState::View(_)));
+
+        // SAFETY: live host device.
+        assert!(unsafe { host.device.GetDeviceRemovedReason() }.is_ok());
+    }
+
+    #[test]
+    fn unmakeable_view_takes_typed_null_annotated_by_a_later_draw() {
+        let mut title = [0u32; 8];
+        let handle = title.as_mut_ptr() as u64;
+        // Explicit Texture1D SRV with a null resource: host `make` returns None.
+        let tex1d = [
+            DXGI_FORMAT_R8G8B8A8_UNORM.0 as u32,
+            D3D12_SRV_DIMENSION_TEXTURE1D.0 as u32,
+            D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING,
+            0,
+            1,
+            0,
+            0,
+            0,
+            0,
+            0,
+        ];
+        super::super::create_srv(std::ptr::null(), std::ptr::null(), &tex1d, handle);
+
+        let tex2d_props = (2, 0x409);
+        let raw_uav_props = (11 | 0x1000, 0);
+        let mut state = SlotState::Null;
+
+        // 1. First mirror outside a draw gets the title's own-dimension null.
+        let (view, write, _) = mirror_slot_state(&mut state, false, handle, false, None, |_| None);
+        assert_eq!(view, Some(View::Shader(0, Some(tex1d))));
+        assert!(matches!(write, SlotWrite::ViewNull));
+        assert!(matches!(state, SlotState::ViewNull(_, None)));
+        #[cfg(feature = "diagnostics")]
+        assert!(
+            describe_slot_state(state)
+                .as_deref()
+                .is_some_and(|s| s.ends_with(" -> null"))
+        );
+
+        // 2. A later draw annotating Texture2D SRV replaces that null with a
+        // Texture2D typed null.
+        let (view, write, _) =
+            mirror_slot_state(&mut state, false, handle, true, Some(tex2d_props), |_| None);
+        assert_eq!(view, Some(View::Shader(0, Some(tex1d))));
+        assert!(
+            matches!(
+                write,
+                SlotWrite::TypedNull(NullDesc::Srv(d))
+                    if d.ViewDimension == D3D12_SRV_DIMENSION_TEXTURE2D
+            ),
+            "expected Texture2D typed null write, got {write:?}"
+        );
+        assert!(matches!(state, SlotState::ViewNull(_, Some((2, 0x409)))));
+        #[cfg(feature = "diagnostics")]
+        assert!(
+            describe_slot_state(state)
+                .as_deref()
+                .is_some_and(|s| s.ends_with(" -> null (0x2, 0x409)"))
+        );
+
+        // 3. Repeating the same draw annotation short-circuits with no write.
+        let (_, write, _) =
+            mirror_slot_state(&mut state, false, handle, true, Some(tex2d_props), |_| {
+                panic!("try_make must not run again on the hot path")
+            });
+        assert!(matches!(write, SlotWrite::None));
+
+        // 4. A different draw annotation is refused instead of rewriting in place.
+        let (_, write, _) =
+            mirror_slot_state(&mut state, false, handle, true, Some(raw_uav_props), |_| {
+                panic!("try_make must not run again for the same view key")
+            });
+        assert!(matches!(write, SlotWrite::Refused));
+        assert!(matches!(state, SlotState::ViewNull(_, Some((2, 0x409)))));
+
+        // 5. Same transition when the first draw has no annotation and a later
+        // draw annotates the slot.
+        let mut draw_state = SlotState::Null;
+        let (_, write, _) = mirror_slot_state(&mut draw_state, false, handle, true, None, |_| None);
+        assert!(matches!(write, SlotWrite::ViewNull));
+        assert!(matches!(draw_state, SlotState::ViewNull(_, None)));
+        let (_, write, _) = mirror_slot_state(
+            &mut draw_state,
+            false,
+            handle,
+            true,
+            Some(tex2d_props),
+            |_| None,
+        );
+        assert!(matches!(write, SlotWrite::TypedNull(NullDesc::Srv(_))));
+        assert!(matches!(
+            draw_state,
+            SlotState::ViewNull(_, Some((2, 0x409)))
+        ));
+
+        // 6. A view the host CAN make is never replaced by a null.
+        let mut live_state = SlotState::Null;
+        let (_, write, _) =
+            mirror_slot_state(&mut live_state, false, handle, false, None, |_| Some(None));
+        assert!(matches!(write, SlotWrite::None));
+        assert!(matches!(live_state, SlotState::View(_)));
+        let (_, write, _) = mirror_slot_state(
+            &mut live_state,
+            false,
+            handle,
+            true,
+            Some(tex2d_props),
+            |_| panic!("live view must short-circuit"),
+        );
+        assert!(matches!(write, SlotWrite::None));
+        assert!(matches!(live_state, SlotState::View(_)));
+
+        // 7. End-to-end on a host heap when a D3D12 device is available.
+        let (Some(heap), Some(host)) = (HostHeap::new(false, 4), host()) else {
+            return;
+        };
+        assert_eq!(
+            heap.mirror(0, handle, false),
+            Some(View::Shader(0, Some(tex1d)))
+        );
+        assert!(matches!(
+            heap.made.lock().unwrap()[0],
+            SlotState::ViewNull(_, None)
+        ));
+        assert_eq!(
+            heap.mirror_for_draw(0, handle, Some(tex2d_props)),
+            Mirror::Done(Some(View::Shader(0, Some(tex1d))))
+        );
+        assert!(matches!(
+            heap.made.lock().unwrap()[0],
+            SlotState::ViewNull(_, Some((2, 0x409)))
+        ));
+        #[cfg(feature = "diagnostics")]
+        assert!(
+            heap.describe_slot(0)
+                .as_deref()
+                .is_some_and(|s| s.ends_with(" -> null (0x2, 0x409)"))
+        );
+        // SAFETY: live host device.
+        assert!(unsafe { host.device.GetDeviceRemovedReason() }.is_ok());
+    }
+
+    #[test]
+    fn typed_null_refusal_and_unannotated_mirrors() {
+        let mut title = [0u32; 8];
+        let handle = title.as_mut_ptr() as u64;
+        let tex2d = (2, 0x409);
+        let raw_uav = (11 | 0x1000, 0);
+
+        // 1. Default Null state accepts a typed null with no refusal.
+        let mut state = SlotState::Null;
+        let (view, write, keep) =
+            mirror_slot_state(&mut state, false, handle, true, Some(tex2d), |_| None);
+        assert!(view.is_none());
+        assert!(matches!(write, SlotWrite::TypedNull(NullDesc::Srv(_))));
+        assert!(keep.is_some());
+        assert_eq!(state, SlotState::TypedNull(tex2d.0, tex2d.1));
+
+        // 2. Same kind short-circuits with no write and no refusal.
+        let (view, write, keep) =
+            mirror_slot_state(&mut state, false, handle, true, Some(tex2d), |_| None);
+        assert!(view.is_none());
+        assert!(matches!(write, SlotWrite::None));
+        assert!(keep.is_none());
+        assert_eq!(state, SlotState::TypedNull(tex2d.0, tex2d.1));
+
+        // 3. Different kind on the same empty slot refuses without writing or
+        // changing state.
+        let (view, write, keep) =
+            mirror_slot_state(&mut state, false, handle, true, Some(raw_uav), |_| None);
+        assert!(view.is_none());
+        assert!(matches!(write, SlotWrite::Refused));
+        assert!(keep.is_none());
+        assert_eq!(state, SlotState::TypedNull(tex2d.0, tex2d.1));
+
+        // 4. An unannotated draw and a non-draw mirror both leave TypedNull
+        // untouched with no write.
+        let (_, write, keep) = mirror_slot_state(&mut state, false, handle, true, None, |_| None);
+        assert!(matches!(write, SlotWrite::None));
+        assert!(keep.is_none());
+        assert_eq!(state, SlotState::TypedNull(tex2d.0, tex2d.1));
+
+        let (_, write, keep) = mirror_slot_state(&mut state, false, handle, false, None, |_| None);
+        assert!(matches!(write, SlotWrite::None));
+        assert!(keep.is_none());
+        assert_eq!(state, SlotState::TypedNull(tex2d.0, tex2d.1));
+
+        // 5. Once the title writes a real view over the empty slot, mirroring
+        // is not refused and builds the view.
+        let tex1d = [
+            DXGI_FORMAT_R8G8B8A8_UNORM.0 as u32,
+            D3D12_SRV_DIMENSION_TEXTURE1D.0 as u32,
+            D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING,
+            0,
+            1,
+            0,
+            0,
+            0,
+            0,
+            0,
+        ];
+        super::super::create_srv(std::ptr::null(), std::ptr::null(), &tex1d, handle);
+        let (view, write, _) =
+            mirror_slot_state(&mut state, false, handle, true, Some(raw_uav), |_| {
+                Some(None)
+            });
+        assert_eq!(view, Some(View::Shader(0, Some(tex1d))));
+        assert!(matches!(write, SlotWrite::None));
+        assert!(matches!(state, SlotState::View(_)));
+
+        // A slot holding a real host view is never refused or replaced.
+        let (_, write, _) = mirror_slot_state(&mut state, false, handle, true, Some(tex2d), |_| {
+            panic!("live view must short-circuit")
+        });
+        assert!(matches!(write, SlotWrite::None));
+        assert!(matches!(state, SlotState::View(_)));
+
+        // 6. Unmakeable view: ViewNull(key, None) upgrades on first annotation,
+        // same kind short-circuits, different kind refuses, and None leaves it
+        // alone.
+        let mut unmakeable = SlotState::Null;
+        let (_, write, _) =
+            mirror_slot_state(&mut unmakeable, false, handle, false, None, |_| None);
+        assert!(matches!(write, SlotWrite::ViewNull));
+        assert!(matches!(unmakeable, SlotState::ViewNull(_, None)));
+
+        let (_, write, _) =
+            mirror_slot_state(&mut unmakeable, false, handle, true, Some(tex2d), |_| None);
+        assert!(matches!(write, SlotWrite::TypedNull(NullDesc::Srv(_))));
+        assert!(matches!(unmakeable, SlotState::ViewNull(_, Some(p)) if p == tex2d));
+
+        let (_, write, _) =
+            mirror_slot_state(&mut unmakeable, false, handle, true, Some(tex2d), |_| {
+                panic!("same kind must short-circuit")
+            });
+        assert!(matches!(write, SlotWrite::None));
+
+        let (_, write, keep) =
+            mirror_slot_state(&mut unmakeable, false, handle, true, Some(raw_uav), |_| {
+                panic!("refusal must not call try_make")
+            });
+        assert!(matches!(write, SlotWrite::Refused));
+        assert!(keep.is_none());
+        assert!(matches!(unmakeable, SlotState::ViewNull(_, Some(p)) if p == tex2d));
+
+        for for_draw in [true, false] {
+            let (_, write, keep) =
+                mirror_slot_state(&mut unmakeable, false, handle, for_draw, None, |_| {
+                    panic!("unannotated mirror must leave ViewNull alone")
+                });
+            assert!(matches!(write, SlotWrite::None));
+            assert!(keep.is_none());
+            assert!(matches!(unmakeable, SlotState::ViewNull(_, Some(p)) if p == tex2d));
+        }
+
+        // Once the title writes a different view record there, mirroring is not
+        // refused.
+        super::super::create_cbv(std::ptr::null(), &[0x2000, 0, 256, 0], handle);
+        let (view, write, _) =
+            mirror_slot_state(&mut unmakeable, false, handle, true, Some(raw_uav), |_| {
+                Some(None)
+            });
+        assert_eq!(view, Some(View::Constant(0x2000, 256)));
+        assert!(matches!(write, SlotWrite::None));
+        assert!(matches!(unmakeable, SlotState::View(_)));
+
+        // 7. End-to-end on a host heap when a D3D12 device is available.
+        let Some(heap) = HostHeap::new(false, 4) else {
+            return;
+        };
+        let mut empty = [0u32; 8];
+        let empty_handle = empty.as_mut_ptr() as u64;
+        assert_eq!(
+            heap.mirror_for_draw(0, empty_handle, Some(tex2d)),
+            Mirror::Done(None)
+        );
+        assert_eq!(
+            heap.made.lock().unwrap()[0],
+            SlotState::TypedNull(tex2d.0, tex2d.1)
+        );
+        assert_eq!(
+            heap.mirror_for_draw(0, empty_handle, Some(tex2d)),
+            Mirror::Done(None)
+        );
+        assert_eq!(
+            heap.mirror_for_draw(0, empty_handle, Some(raw_uav)),
+            Mirror::Refused
+        );
+        assert_eq!(
+            heap.made.lock().unwrap()[0],
+            SlotState::TypedNull(tex2d.0, tex2d.1)
+        );
+        assert_eq!(
+            heap.mirror_for_draw(0, empty_handle, None),
+            Mirror::Done(None)
+        );
+        assert_eq!(heap.mirror(0, empty_handle, false), None);
+        assert_eq!(
+            heap.made.lock().unwrap()[0],
+            SlotState::TypedNull(tex2d.0, tex2d.1)
+        );
+        assert_eq!(
+            heap.mirror_for_draw(heap.count(), empty_handle, Some(raw_uav)),
+            Mirror::Done(None)
+        );
+
+        let mut view_slot = [0u32; 8];
+        let view_handle = view_slot.as_mut_ptr() as u64;
+        super::super::create_srv(std::ptr::null(), std::ptr::null(), &tex1d, view_handle);
+        assert_eq!(
+            heap.mirror_for_draw(1, view_handle, Some(tex2d)),
+            Mirror::Done(Some(View::Shader(0, Some(tex1d))))
+        );
+        assert_eq!(
+            heap.mirror_for_draw(1, view_handle, Some(tex2d)),
+            Mirror::Done(Some(View::Shader(0, Some(tex1d))))
+        );
+        assert_eq!(
+            heap.mirror_for_draw(1, view_handle, Some(raw_uav)),
+            Mirror::Refused
+        );
+        assert!(matches!(
+            heap.made.lock().unwrap()[1],
+            SlotState::ViewNull(_, Some(p)) if p == tex2d
+        ));
+        super::super::create_cbv(std::ptr::null(), &[0x3000, 0, 256, 0], view_handle);
+        assert_eq!(
+            heap.mirror_for_draw(1, view_handle, Some(raw_uav)),
+            Mirror::Done(Some(View::Constant(0x3000, 256)))
+        );
     }
 }
