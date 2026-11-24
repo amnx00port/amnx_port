@@ -110,6 +110,28 @@ mod tests {
 
     #[cfg(windows)]
     #[test]
+    fn oleaut32_ordinals_resolve_to_host() {
+        let r = HleResolver::default();
+        assert_eq!(
+            r.classify("oleaut32.dll", &ImportSymbol::Ordinal(4)),
+            Some(Provenance::Host)
+        );
+        assert_eq!(
+            r.classify("oleaut32.dll", &ImportSymbol::Ordinal(6)),
+            Some(Provenance::Host)
+        );
+        assert_eq!(
+            r.host.resolve("oleaut32.dll", &ImportSymbol::Ordinal(4)),
+            crate::host::function("oleaut32.dll", "SysAllocStringLen")
+        );
+        assert_eq!(
+            r.host.resolve("oleaut32.dll", &ImportSymbol::Ordinal(6)),
+            crate::host::function("oleaut32.dll", "SysFreeString")
+        );
+    }
+
+    #[cfg(windows)]
+    #[test]
     fn overrides_win_over_host() {
         let r = HleResolver::default();
         assert_eq!(

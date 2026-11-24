@@ -40,7 +40,8 @@ impl PreparedImage {
 /// * TLS callback pointer cleared: the OS still allocates static TLS for
 ///   the image, but callbacks only run when we call them (after binding);
 ///   its base relocation is made a no-op so the 0 survives a rebase;
-/// * `FORCE_INTEGRITY` cleared, checksum zeroed: the copy is unsigned.
+/// * `FORCE_INTEGRITY` and `GUARD_CF` cleared, checksum zeroed: the copy is
+///   unsigned and its imports and thunks are bound by us rather than the OS loader.
 pub fn prepare(original: &[u8]) -> Result<PreparedImage, PrepareError> {
     let info = ImageInfo::parse(original)?;
     let mut bytes = original.to_vec();
@@ -57,7 +58,8 @@ pub fn prepare(original: &[u8]) -> Result<PreparedImage, PrepareError> {
     )?;
     write_u32(&mut bytes, opt + layout::OPT_ADDRESS_OF_ENTRY_POINT, 0)?;
     write_u32(&mut bytes, opt + layout::OPT_CHECKSUM, 0)?;
-    let dll_characteristics = info.dll_characteristics & !dll_flags::FORCE_INTEGRITY;
+    let dll_characteristics =
+        info.dll_characteristics & !(dll_flags::FORCE_INTEGRITY | dll_flags::GUARD_CF);
     write_u16(
         &mut bytes,
         opt + layout::OPT_DLL_CHARACTERISTICS,
@@ -189,6 +191,7 @@ mod tests {
         assert_eq!(patched.entry_rva, 0);
         assert!(patched.imports.is_empty());
         assert_eq!(patched.dll_characteristics & dll_flags::FORCE_INTEGRITY, 0);
+        assert_eq!(patched.dll_characteristics & dll_flags::GUARD_CF, 0);
         if let Some(tls) = &patched.tls {
             assert_eq!(tls.callbacks_va, 0);
             let field = tls.directory_rva + layout::TLS64_ADDRESS_OF_CALLBACKS as u32;
@@ -270,6 +273,35 @@ mod tests {
         assert_ne!(
             assigned, 0,
             "the process executable already owns TLS slot zero"
+        );
+    }
+
+    #[test]
+    fn strips_guard_cf_and_force_integrity() {
+        let mut original = std::fs::read(std::env::current_exe().unwrap()).unwrap();
+        let opt = layout::optional_header_offset(&original).unwrap();
+        let before = ImageInfo::parse(&original).unwrap().dll_characteristics;
+        let with_flags = before | dll_flags::GUARD_CF | dll_flags::FORCE_INTEGRITY;
+        write_u16(
+            &mut original,
+            opt + layout::OPT_DLL_CHARACTERISTICS,
+            with_flags,
+        )
+        .unwrap();
+
+        let prepared = prepare(&original).unwrap();
+        assert_ne!(prepared.info.dll_characteristics & dll_flags::GUARD_CF, 0);
+        assert_ne!(
+            prepared.info.dll_characteristics & dll_flags::FORCE_INTEGRITY,
+            0
+        );
+
+        let patched = ImageInfo::parse(&prepared.bytes).unwrap();
+        assert_eq!(patched.dll_characteristics & dll_flags::GUARD_CF, 0);
+        assert_eq!(patched.dll_characteristics & dll_flags::FORCE_INTEGRITY, 0);
+        assert_eq!(
+            patched.dll_characteristics,
+            before & !(dll_flags::GUARD_CF | dll_flags::FORCE_INTEGRITY)
         );
     }
 

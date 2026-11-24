@@ -264,6 +264,7 @@ unsafe extern "system" fn on_thread(_: *mut c_void, reason: u32, _: *mut c_void)
         unsafe { image.notify(reason, *dll_main, std::ptr::null_mut()) };
     };
     if reason == DLL_THREAD_ATTACH {
+        crate::crash::ensure_stack_guarantee();
         notify.iter().for_each(notify_one);
     } else {
         notify.iter().rev().for_each(notify_one);

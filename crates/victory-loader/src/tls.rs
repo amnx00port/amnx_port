@@ -50,6 +50,9 @@ pub(crate) unsafe fn redirect(base: usize, info: &ImageInfo) -> Result<usize> {
     {
         let start = base + section.rva as usize;
         let len = section.virtual_size as usize;
+        if len == 0 {
+            continue;
+        }
         let mut old = 0;
         // SAFETY: the section is part of the mapped image.
         if unsafe { VirtualProtect(start as _, len, PAGE_EXECUTE_READWRITE, &mut old) } == 0 {
@@ -67,10 +70,33 @@ pub(crate) unsafe fn redirect(base: usize, info: &ImageInfo) -> Result<usize> {
             FlushInstructionCache(GetCurrentProcess(), start as _, len);
         }
     }
-    // SAFETY: see `index_at`; `.data` is writable.
-    unsafe { index_at.write(0) };
+    // SAFETY: `index_at` is the image's `_tls_index` DWORD; no title code runs yet.
+    unsafe { zero_tls_index(index_at) }?;
     tracing::info!(index, patched, "static TLS redirected");
     Ok(patched)
+}
+
+/// Zeroes `_tls_index`, temporarily granting write access in case the linker
+/// placed it on a read-only page.
+///
+/// # Safety
+/// `index_at` points to a live, mapped `u32` inside the image and no other
+/// thread accesses it concurrently.
+unsafe fn zero_tls_index(index_at: *mut u32) -> Result<()> {
+    let mut old = 0;
+    // SAFETY: caller guarantees `index_at` points to a mapped `u32`.
+    if unsafe { VirtualProtect(index_at.cast(), size_of::<u32>(), PAGE_READWRITE, &mut old) } == 0 {
+        bail!(
+            "VirtualProtect(_tls_index) failed: {}",
+            std::io::Error::last_os_error()
+        );
+    }
+    // SAFETY: writable now, and caller guarantees exclusive access.
+    unsafe { index_at.write(0) };
+    let mut ignored = 0;
+    // SAFETY: restoring the protection we just changed.
+    unsafe { VirtualProtect(index_at.cast(), size_of::<u32>(), old, &mut ignored) };
+    Ok(())
 }
 
 /// Rewrites each `mov r64, gs:[0x58]` in `code` (at address `at`) as
@@ -135,6 +161,8 @@ fn thunks(block: *mut u8, index: u32) -> Result<usize> {
             std::io::Error::last_os_error()
         );
     }
+    // SAFETY: flushing our own freshly written thunks before any thread executes them.
+    unsafe { FlushInstructionCache(GetCurrentProcess(), block as _, 4096) };
     Ok(block as usize)
 }
 
@@ -208,12 +236,53 @@ mod tests {
             assert_eq!(patch(bytes, page as usize, thunks), 1);
             let mut old = 0;
             // SAFETY: our page, made executable to run the patched code.
-            unsafe { VirtualProtect(page as _, 4096, PAGE_EXECUTE_READ, &mut old) };
+            unsafe {
+                VirtualProtect(page as _, 4096, PAGE_EXECUTE_READ, &mut old);
+                FlushInstructionCache(GetCurrentProcess(), page as _, 4096);
+            }
             // SAFETY: the page holds the patched load and a return.
             let f: extern "system" fn() -> usize = unsafe { std::mem::transmute(page) };
             assert_eq!(f(), tls_array() + 3 * 8, "REX {rex:#x} ModRM {modrm:#x}");
             // SAFETY: our page again.
             unsafe { VirtualProtect(page as _, 4096, PAGE_READWRITE, &mut old) };
         }
+    }
+
+    #[test]
+    fn zero_tls_index_writes_read_only_page_and_restores_protection() {
+        use windows_sys::Win32::System::Memory::{
+            MEM_RELEASE, MEMORY_BASIC_INFORMATION, PAGE_READONLY, VirtualFree, VirtualQuery,
+        };
+        // SAFETY: allocating a private single page for this test.
+        let page = unsafe {
+            VirtualAlloc(
+                std::ptr::null(),
+                4096,
+                MEM_COMMIT | MEM_RESERVE,
+                PAGE_READWRITE,
+            )
+        } as *mut u32;
+        assert!(!page.is_null());
+        // SAFETY: freshly allocated writable page.
+        unsafe { page.write(7) };
+        let mut old = 0;
+        // SAFETY: protecting our test page as read-only before calling `zero_tls_index`.
+        let protected = unsafe { VirtualProtect(page.cast(), 4096, PAGE_READONLY, &mut old) };
+        assert_ne!(protected, 0);
+
+        // SAFETY: `page` is our private mapped DWORD with exclusive access.
+        unsafe { zero_tls_index(page) }.unwrap();
+        // SAFETY: still mapped and readable.
+        assert_eq!(unsafe { page.read() }, 0);
+
+        // SAFETY: POD Win32 struct, zero-initialized before `VirtualQuery` writes it.
+        let mut info: MEMORY_BASIC_INFORMATION = unsafe { std::mem::zeroed() };
+        // SAFETY: querying our own page's protection.
+        let queried = unsafe { VirtualQuery(page.cast(), &mut info, size_of_val(&info)) };
+        assert!(queried >= size_of_val(&info));
+        assert_eq!(info.Protect, PAGE_READONLY);
+
+        // SAFETY: releasing the test allocation.
+        unsafe { VirtualFree(page.cast(), 0, MEM_RELEASE) };
     }
 }

@@ -24,7 +24,7 @@ use windows_sys::Win32::System::LibraryLoader::{
     GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS, GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT,
     GetModuleFileNameW, GetModuleHandleExW,
 };
-use windows_sys::Win32::System::Threading::GetCurrentThreadStackLimits;
+use windows_sys::Win32::System::Threading::{GetCurrentThreadStackLimits, SetThreadStackGuarantee};
 
 const EXCEPTION_CONTINUE_SEARCH: i32 = 0;
 /// Frames listed per report.
@@ -64,21 +64,35 @@ pub fn log_crashes_to(file: std::path::PathBuf) {
 /// Appends a failure that is not an exception (the host GPU's) to the crash
 /// log, with the title's last debug output, and prints it.
 pub fn log_crash(text: &str) {
-    let text = format!("{text}
-{}", title_output());
+    let text = format!(
+        "{text}
+{}",
+        title_output()
+    );
     eprint!("{text}");
     append_to_log(&text);
 }
 
+/// Serializes writes to `crashes.log` so concurrent crashes do not interleave.
+static LOG_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
 fn append_to_log(text: &str) {
     use std::io::Write;
     let Some(file) = LOG.get() else { return };
+    let _guard = LOG_LOCK.lock().unwrap_or_else(|e| e.into_inner());
     let now = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .map_or(0, |d| d.as_secs());
-    let opened = std::fs::OpenOptions::new().create(true).append(true).open(file);
+    let opened = std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(file);
     if let Ok(mut f) = opened {
-        let _ = write!(f, "unix time {now}, process {}\n{text}\n", std::process::id());
+        let _ = write!(
+            f,
+            "unix time {now}, process {}\n{text}\n",
+            std::process::id()
+        );
     }
 }
 
@@ -105,23 +119,41 @@ fn title_output() -> String {
     let Ok(said) = SAID.try_lock() else {
         return String::new();
     };
-    said.iter().map(|l| format!("  title said: {l}\n")).collect()
+    said.iter()
+        .map(|l| format!("  title said: {l}\n"))
+        .collect()
 }
 
-/// Installs the handlers; call once before running title code.
+/// Minimum stack reserved for exception handling on a stack overflow so the
+/// crash handler has room to unwind and report.
+const STACK_GUARANTEE_BYTES: u32 = 32 * 1024;
+
+/// Reserves extra stack on the calling thread for handling stack overflows.
+pub(crate) fn ensure_stack_guarantee() {
+    let mut size = STACK_GUARANTEE_BYTES;
+    // SAFETY: writes the previous guarantee size back to `size`.
+    unsafe { SetThreadStackGuarantee(&mut size) };
+}
+
+/// Installs the handlers once and reserves overflow stack on the calling
+/// thread; safe to call more than once.
 pub fn report_crashes() {
-    unsafe extern "system" fn filter(info: *const EXCEPTION_POINTERS) -> i32 {
-        // SAFETY: the system passes the exception being dispatched.
-        unsafe { report_unhandled(info) };
-        EXCEPTION_CONTINUE_SEARCH
-    }
-    // SAFETY: registers handlers that only read the exception they are
-    // given; the title's own filter, once it sets one, takes the place of
-    // ours and calls `report_unhandled` first.
-    unsafe {
-        AddVectoredExceptionHandler(0, Some(handler));
-        SetUnhandledExceptionFilter(Some(filter));
-    }
+    static INSTALLED: std::sync::Once = std::sync::Once::new();
+    INSTALLED.call_once(|| {
+        unsafe extern "system" fn filter(info: *const EXCEPTION_POINTERS) -> i32 {
+            // SAFETY: the system passes the exception being dispatched.
+            unsafe { report_unhandled(info) };
+            EXCEPTION_CONTINUE_SEARCH
+        }
+        // SAFETY: registers handlers that only read the exception they are
+        // given; the title's own filter, once it sets one, takes the place of
+        // ours and calls `report_unhandled` first.
+        unsafe {
+            AddVectoredExceptionHandler(0, Some(handler));
+            SetUnhandledExceptionFilter(Some(filter));
+        }
+    });
+    ensure_stack_guarantee();
 }
 
 /// What the vectored handler reports as it happens.
@@ -140,66 +172,70 @@ const FATAL: [i32; 6] = [
 /// a spin loop around them works with mwaitx as a yield.
 unsafe fn emulate_amd_only(info: *mut EXCEPTION_POINTERS) -> bool {
     // SAFETY: the system passes valid exception pointers; the faulting
-    // instruction's bytes are readable, as the CPU just fetched them.
+    // instruction's bytes inside its page are readable, as the CPU just fetched them.
     unsafe {
         let record = &*(*info).ExceptionRecord;
         let context = &mut *(*info).ContextRecord;
         if record.ExceptionCode != EXCEPTION_ILLEGAL_INSTRUCTION {
             return false;
         }
+        // Only bytes inside the faulting instruction's page are read: the next page may
+        // not be mapped.
         let code = context.Rip as *const u8;
-        match code.cast::<[u8; 3]>().read_unaligned() {
-            [0x0f, 0x01, 0xfc] => ((context.Rax & !63) as *mut u8).write_bytes(0, 64),
-            [0x0f, 0x01, 0xfa] => {}
-            [0x0f, 0x01, 0xfb] => std::thread::yield_now(),
-            _ => {
-                // Only bytes inside the faulting instruction's page are read: the next page may
-                // not be mapped.
-                let room = 0x1000 - (context.Rip as usize & 0xfff);
-                let mut bytes = [0u8; 32];
-                let n = room.min(bytes.len());
-                std::ptr::copy_nonoverlapping(code, bytes.as_mut_ptr(), n);
-                if let Some(pass) = clwb_loop(&bytes[..n]) {
-                    // A whole write-back loop in one exception (see `clwb_loop`).
-                    let limit = *gpr(context, pass.limit);
-                    let base = gpr(context, pass.base);
-                    *base = if *base <= limit {
-                        base.wrapping_add(((limit - *base) / 64 + 1) * 64)
-                    } else {
-                        base.wrapping_add(64)
-                    };
-                    let flags = cmp_flags(*base, limit);
-                    context.EFlags = context.EFlags & !CMP_FLAGS | flags;
-                    context.Rip += pass.len as u64;
-                    return true;
-                }
-                if n >= 15
-                    && let Some(len) = clwb_len(bytes[..15].try_into().unwrap_or([0; 15]))
-                {
-                    // A write-back hint: the PC's memory is coherent, so it has nothing to do.
-                    context.Rip += len as u64;
-                    return true;
-                }
-                let Some(len) = sse4a(code, &mut context.Anonymous.FltSave.XmmRegisters) else {
-                    return false;
-                };
-                context.Rip += len as u64;
-                return true;
+        let room = 0x1000 - (context.Rip as usize & 0xfff);
+        let mut bytes = [0u8; 32];
+        let n = room.min(bytes.len());
+        std::ptr::copy_nonoverlapping(code, bytes.as_mut_ptr(), n);
+        let slice = &bytes[..n];
+
+        if let Some(&[0x0f, 0x01, op @ (0xfa..=0xfc)]) = slice.get(..3) {
+            match op {
+                0xfc => ((context.Rax & !63) as *mut u8).write_bytes(0, 64),
+                0xfa => {}
+                0xfb => std::thread::yield_now(),
+                _ => unreachable!(),
             }
+            context.Rip += 3;
+            return true;
         }
-        context.Rip += 3;
+        if let Some(pass) = clwb_loop(slice) {
+            // A whole write-back loop in one exception (see `clwb_loop`).
+            let limit = *gpr(context, pass.limit);
+            let base = gpr(context, pass.base);
+            *base = if *base <= limit {
+                base.wrapping_add(((limit - *base) / 64 + 1) * 64)
+            } else {
+                base.wrapping_add(64)
+            };
+            let flags = cmp_flags(*base, limit);
+            context.EFlags = context.EFlags & !CMP_FLAGS | flags;
+            context.Rip += pass.len as u64;
+            return true;
+        }
+        if let Some(len) = clwb_len(slice) {
+            // A write-back hint: the PC's memory is coherent, so it has nothing to do.
+            context.Rip += len as u64;
+            return true;
+        }
+        let Some(len) = sse4a(slice, &mut context.Anonymous.FltSave.XmmRegisters) else {
+            return false;
+        };
+        context.Rip += len as u64;
+        true
     }
-    true
 }
 
 /// `clwb m8` (`66 [rex] 0f ae /6`, a memory operand), which Intel CPUs before
 /// Ice Lake lack: its length, or `None` for any other instruction.
-fn clwb_len(code: [u8; 15]) -> Option<usize> {
-    let at = if code[1] & 0xf0 == 0x40 { 2 } else { 1 };
-    if code[0] != 0x66 || code[at] != 0x0f || code[at + 1] != 0xae {
+fn clwb_len(code: &[u8]) -> Option<usize> {
+    if *code.first()? != 0x66 {
         return None;
     }
-    let modrm = code[at + 2];
+    let at = if *code.get(1)? & 0xf0 == 0x40 { 2 } else { 1 };
+    if code.get(at..at + 2)? != [0x0f, 0xae] {
+        return None;
+    }
+    let modrm = *code.get(at + 2)?;
     let (mode, rm) = (modrm >> 6, modrm & 7);
     if mode == 3 || (modrm >> 3) & 7 != 6 {
         return None;
@@ -207,7 +243,7 @@ fn clwb_len(code: [u8; 15]) -> Option<usize> {
     let mut len = at + 3;
     let mut base = rm;
     if rm == 4 {
-        base = code[len] & 7;
+        base = *code.get(len)? & 7;
         len += 1;
     }
     len += match mode {
@@ -216,7 +252,7 @@ fn clwb_len(code: [u8; 15]) -> Option<usize> {
         2 => 4,
         _ => 0,
     };
-    Some(len)
+    (len <= code.len()).then_some(len)
 }
 
 /// A `clwb` write-back loop as the title's compilers build it, one cache line a
@@ -313,35 +349,44 @@ const CMP_FLAGS: u32 = 0x8d5;
 
 /// SSE4a's `extrq`/`insertq` (register forms, the only ones there are) on
 /// the saved XMM registers; returns the instruction's length.
-unsafe fn sse4a(code: *const u8, xmm: &mut [M128A; 16]) -> Option<usize> {
-    // SAFETY: the caller's code bytes are readable up to the instruction's end.
-    let b = |i: usize| unsafe { code.add(i).read() };
-    let prefix = b(0);
-    let (rex, at) = if b(1) & 0xf0 == 0x40 {
-        (b(1), 2)
+fn sse4a(code: &[u8], xmm: &mut [M128A; 16]) -> Option<usize> {
+    let prefix = *code.first()?;
+    let (rex, at) = if *code.get(1)? & 0xf0 == 0x40 {
+        (code[1], 2)
     } else {
         (0, 1)
     };
-    if !matches!(prefix, 0x66 | 0xf2) || b(at) != 0x0f || !matches!(b(at + 1), 0x78 | 0x79) {
+    if !matches!(prefix, 0x66 | 0xf2)
+        || *code.get(at)? != 0x0f
+        || !matches!(*code.get(at + 1)?, 0x78 | 0x79)
+    {
         return None;
     }
-    let modrm = b(at + 2);
+    let modrm = *code.get(at + 2)?;
     if modrm >> 6 != 3 {
         return None;
     }
     let dst = usize::from((modrm >> 3) & 7 | (rex & 4) << 1);
     let src = usize::from(modrm & 7 | (rex & 1) << 3);
-    let immediate = b(at + 1) == 0x78;
+    let immediate = code[at + 1] == 0x78;
     let (fields, len) = if immediate {
-        ((b(at + 3), b(at + 4)), at + 5)
+        ((*code.get(at + 3)?, *code.get(at + 4)?), at + 5)
     } else {
         // extrq reads its fields from src's low half, insertq from its high.
-        let f = if prefix == 0x66 { xmm[src].Low } else { xmm[src].High as u64 };
+        let f = if prefix == 0x66 {
+            xmm[src].Low
+        } else {
+            xmm[src].High as u64
+        };
         ((f as u8, (f >> 8) as u8), at + 3)
     };
     let (n, at_bit) = (u32::from(fields.0 & 63), u32::from(fields.1 & 63));
     let bits = if n == 0 { 64 } else { n };
-    let mask = if bits == 64 { u64::MAX } else { (1u64 << bits) - 1 };
+    let mask = if bits == 64 {
+        u64::MAX
+    } else {
+        (1u64 << bits) - 1
+    };
     if prefix == 0x66 {
         // extrq: register form takes its fields from src, works on dst.
         if immediate && (modrm >> 3) & 7 != 0 {
@@ -383,6 +428,9 @@ pub unsafe fn report_unhandled(info: *const EXCEPTION_POINTERS) {
 const CPP_EXCEPTION: i32 = 0xE06D_7363_u32 as i32;
 const CPP_MAGIC: usize = 0x1993_0520;
 
+/// Upper bound on `CatchableTypeArray::nCatchableTypes` we will walk.
+const MAX_CATCHABLE_TYPES: usize = 64;
+
 /// What a C++ throw threw: the decorated name of its type, then its value
 /// where that names the cause (an integer, e.g. an HRESULT; a standard
 /// exception's message).
@@ -390,25 +438,62 @@ const CPP_MAGIC: usize = 0x1993_0520;
 /// # Safety
 /// `p` are the parameters of a live MSVC throw (`p[0]` the magic).
 unsafe fn thrown(p: &[usize]) -> String {
+    if p.len() < 4 {
+        return "unknown".into();
+    }
+    // A C++ `throw;` rethrow passes null object and ThrowInfo pointers.
+    if p[2] == 0 {
+        return "rethrow".into();
+    }
+    let base = p[3];
+    if base == 0 {
+        return "unknown".into();
+    }
     // SAFETY: the throw's ThrowInfo, its RVAs relative to `p[3]`: catchable
     // type array at +12 (count, then type RVAs), each type's descriptor at
     // +4, whose decorated name starts at +16; the object is at `p[1]`.
     unsafe {
         let rva = |at: usize| (at as *const u32).read_unaligned() as usize;
-        let types = p[3] + rva(p[2] + 12);
-        let name = |i: usize| {
-            let descriptor = p[3] + rva(p[3] + rva(types + 4 + 4 * i) + 4);
-            std::ffi::CStr::from_ptr((descriptor + 16) as *const std::ffi::c_char)
-                .to_string_lossy()
+        let Some(types_at) = p[2].checked_add(12) else {
+            return "unknown".into();
         };
-        let first = name(0);
+        let types_rva = rva(types_at);
+        if types_rva == 0 {
+            return "unknown".into();
+        }
+        let Some(types) = base.checked_add(types_rva) else {
+            return "unknown".into();
+        };
+        let count = rva(types);
+        if count == 0 || count > MAX_CATCHABLE_TYPES {
+            return "unknown".into();
+        }
+        let name = |i: usize| -> Option<std::borrow::Cow<'_, str>> {
+            let entry_rva = rva(types.checked_add(4 + 4 * i)?);
+            if entry_rva == 0 {
+                return None;
+            }
+            let entry = base.checked_add(entry_rva)?;
+            let desc_rva = rva(entry.checked_add(4)?);
+            if desc_rva == 0 {
+                return None;
+            }
+            let descriptor = base.checked_add(desc_rva)?;
+            let name_at = descriptor.checked_add(16)?;
+            Some(std::ffi::CStr::from_ptr(name_at as *const std::ffi::c_char).to_string_lossy())
+        };
+        let Some(first) = name(0) else {
+            return "unknown".into();
+        };
         let value = match &*first {
             // int, unsigned, long (HRESULT), unsigned long
             ".H" | ".I" | ".J" | ".K" if p[1] != 0 => {
                 format!(" = {:#010x}", (p[1] as *const u32).read_unaligned())
             }
             // std::exception keeps its message after the table pointer.
-            _ if (0..rva(types)).any(|i| name(i) == ".?AVexception@std@@") => {
+            _ if p[1] != 0
+                && (0..count).any(|i| name(i).as_deref() == Some(".?AVexception@std@@")) =>
+            {
                 let message = (p[1] as *const *const std::ffi::c_char).add(1).read();
                 if message.is_null() {
                     String::new()
@@ -645,26 +730,21 @@ mod tests {
 
     #[test]
     fn clwb_lengths() {
-        let pad = |b: &[u8]| {
-            let mut c = [0u8; 15];
-            c[..b.len()].copy_from_slice(b);
-            c
-        };
-        assert_eq!(clwb_len(pad(&[0x66, 0x41, 0x0f, 0xae, 0x31])), Some(5)); // clwb [r9]
-        assert_eq!(clwb_len(pad(&[0x66, 0x0f, 0xae, 0x30])), Some(4)); // clwb [rax]
-        assert_eq!(clwb_len(pad(&[0x66, 0x0f, 0xae, 0x70, 0x40])), Some(5)); // clwb [rax+0x40]
-        assert_eq!(
-            clwb_len(pad(&[0x66, 0x0f, 0xae, 0xb0, 0, 1, 0, 0])),
-            Some(8)
-        ); // [rax+disp32]
-        assert_eq!(clwb_len(pad(&[0x66, 0x0f, 0xae, 0x34, 0x24])), Some(5)); // clwb [rsp]
-        assert_eq!(
-            clwb_len(pad(&[0x66, 0x0f, 0xae, 0x35, 0, 0, 0, 0])),
-            Some(8)
-        ); // [rip+disp32]
-        assert_eq!(clwb_len(pad(&[0x66, 0x0f, 0xae, 0x38])), None); // clflushopt, /7
-        assert_eq!(clwb_len(pad(&[0x0f, 0xae, 0x30])), None); // xsaveopt, no 66
-        assert_eq!(clwb_len(pad(&[0x66, 0x0f, 0xae, 0xf0])), None); // register form
+        assert_eq!(clwb_len(&[0x66, 0x41, 0x0f, 0xae, 0x31]), Some(5)); // clwb [r9]
+        assert_eq!(clwb_len(&[0x66, 0x0f, 0xae, 0x30]), Some(4)); // clwb [rax]
+        assert_eq!(clwb_len(&[0x66, 0x0f, 0xae, 0x70, 0x40]), Some(5)); // clwb [rax+0x40]
+        assert_eq!(clwb_len(&[0x66, 0x0f, 0xae, 0xb0, 0, 1, 0, 0]), Some(8)); // [rax+disp32]
+        assert_eq!(clwb_len(&[0x66, 0x0f, 0xae, 0x34, 0x24]), Some(5)); // clwb [rsp]
+        assert_eq!(clwb_len(&[0x66, 0x0f, 0xae, 0x35, 0, 0, 0, 0]), Some(8)); // [rip+disp32]
+        assert_eq!(clwb_len(&[0x66, 0x0f, 0xae, 0x38]), None); // clflushopt, /7
+        assert_eq!(clwb_len(&[0x0f, 0xae, 0x30]), None); // xsaveopt, no 66
+        assert_eq!(clwb_len(&[0x66, 0x0f, 0xae, 0xf0]), None); // register form
+        // Truncated instructions must not match past the available slice.
+        assert_eq!(clwb_len(&[]), None);
+        assert_eq!(clwb_len(&[0x66, 0x0f, 0xae]), None);
+        assert_eq!(clwb_len(&[0x66, 0x0f, 0xae, 0x70]), None);
+        assert_eq!(clwb_len(&[0x66, 0x0f, 0xae, 0xb0, 0, 1]), None);
+        assert_eq!(clwb_len(&[0x66, 0x0f, 0xae, 0x34]), None);
     }
 
     #[test]
@@ -713,10 +793,12 @@ mod tests {
     /// not emulate the instruction. `xmm` gets the saved registers after.
     fn emulate_as(exception: i32, code: &[u8], rax: u64, xmm: &mut [M128A; 16]) -> Option<u64> {
         // `int3` after the instruction, so that a decoder that reads too
-        // far sees no valid bytes.
-        let mut bytes = [0xcc_u8; 16];
-        bytes[..code.len()].copy_from_slice(code);
-        let start = bytes.as_ptr() as u64;
+        // far sees no valid bytes; 32-byte alignment keeps it inside one page.
+        #[repr(align(32))]
+        struct Aligned([u8; 32]);
+        let mut bytes = Aligned([0xcc_u8; 32]);
+        bytes.0[..code.len()].copy_from_slice(code);
+        let start = bytes.0.as_ptr() as u64;
         // SAFETY: a zeroed record and context are valid; the emulation
         // reads only `bytes` and writes only `context` (and memory at
         // `rax` for clzero, which the caller owns).
@@ -846,6 +928,174 @@ mod tests {
         assert_eq!(
             emulate_as(EXCEPTION_ACCESS_VIOLATION, &clzero, 0, &mut xmm),
             None
+        );
+    }
+
+    #[test]
+    fn page_end_emulation_respects_page_bounds() {
+        use windows_sys::Win32::System::Memory::{
+            MEM_COMMIT, MEM_RELEASE, MEM_RESERVE, PAGE_NOACCESS, PAGE_READWRITE, VirtualAlloc,
+            VirtualFree, VirtualProtect,
+        };
+        // Two adjacent pages: page 0 is readable, page 1 is PAGE_NOACCESS so
+        // any read past the page boundary triggers an access violation.
+        // SAFETY: allocates a fresh 2-page private region.
+        let base =
+            unsafe { VirtualAlloc(null_mut(), 0x2000, MEM_COMMIT | MEM_RESERVE, PAGE_READWRITE) }
+                as *mut u8;
+        assert!(!base.is_null());
+        let mut old = 0;
+        // SAFETY: protecting the second page of our allocation as no-access.
+        let protected =
+            unsafe { VirtualProtect(base.add(0x1000).cast(), 0x1000, PAGE_NOACCESS, &mut old) };
+        assert_ne!(protected, 0);
+
+        let run_at_end = |code: &[u8], rax: u64, xmm: &mut [M128A; 16]| -> Option<u64> {
+            let offset = 0x1000 - code.len();
+            // SAFETY: `offset..0x1000` is inside our writable first page.
+            let start = unsafe {
+                let dst = base.add(offset);
+                std::ptr::copy_nonoverlapping(code.as_ptr(), dst, code.len());
+                dst as u64
+            };
+            // SAFETY: zeroed record/context are valid; emulation reads only
+            // within the first page and writes only `context` (and `rax` for clzero).
+            unsafe {
+                let mut record: EXCEPTION_RECORD = std::mem::zeroed();
+                record.ExceptionCode = EXCEPTION_ILLEGAL_INSTRUCTION;
+                let mut context: CONTEXT = std::mem::zeroed();
+                context.Rip = start;
+                context.Rax = rax;
+                context.Anonymous.FltSave.XmmRegisters = *xmm;
+                let mut pointers = EXCEPTION_POINTERS {
+                    ExceptionRecord: &mut record,
+                    ContextRecord: &mut context,
+                };
+                let emulated = emulate_amd_only(&mut pointers);
+                *xmm = context.Anonymous.FltSave.XmmRegisters;
+                emulated.then(|| context.Rip - start)
+            }
+        };
+
+        let mut xmm = [reg(0, 0); 16];
+        // 1-byte and 2-byte illegal opcodes at the very end of the page must
+        // not read into the unmapped page.
+        assert_eq!(run_at_end(&[0x0f], 0, &mut xmm), None);
+        assert_eq!(run_at_end(&[0x0f, 0x0b], 0, &mut xmm), None);
+
+        // 3-byte `clzero` at offset 0xffd.
+        #[repr(align(64))]
+        struct Line([u8; 64]);
+        let mut line = Line([0xaa; 64]);
+        assert_eq!(
+            run_at_end(&[0x0f, 0x01, 0xfc], line.0.as_mut_ptr() as u64, &mut xmm),
+            Some(3)
+        );
+        assert!(line.0.iter().all(|&b| b == 0));
+
+        // `clwb` within the last 14 bytes of a page (previously skipped by `n >= 15`).
+        assert_eq!(run_at_end(&[0x66, 0x0f, 0xae, 0x30], 0, &mut xmm), Some(4));
+        assert_eq!(
+            run_at_end(&[0x66, 0x0f, 0xae, 0xb0, 0, 1, 0, 0], 0, &mut xmm),
+            Some(8)
+        );
+        // Truncated `clwb` at page end must not read past the page or match.
+        assert_eq!(run_at_end(&[0x66, 0x0f, 0xae, 0xb0, 0], 0, &mut xmm), None);
+
+        // `sse4a` fitting right up to the page boundary.
+        xmm[8] = reg(0x1111_2222_3333_4444, 0);
+        xmm[9] = reg(0xabcd, 0);
+        assert_eq!(
+            run_at_end(&[0xf2, 0x45, 0x0f, 0x78, 0xc1, 0x10, 0x10], 0, &mut xmm),
+            Some(7)
+        );
+        assert_eq!(low(&xmm, 8), 0x1111_2222_abcd_4444);
+        // Truncated `insertq` (missing immediate bytes) at page end must not AV.
+        assert_eq!(
+            run_at_end(&[0xf2, 0x45, 0x0f, 0x78, 0xc1], 0, &mut xmm),
+            None
+        );
+
+        // SAFETY: freeing our 2-page test allocation.
+        unsafe { VirtualFree(base.cast(), 0, MEM_RELEASE) };
+    }
+
+    #[test]
+    fn thrown_handles_rethrow_and_invalid_tables() {
+        // SAFETY: `thrown` guards against null/short parameters without dereferencing them.
+        unsafe {
+            assert_eq!(thrown(&[]), "unknown");
+            assert_eq!(thrown(&[CPP_MAGIC, 0, 0, 0]), "rethrow");
+            assert_eq!(thrown(&[CPP_MAGIC, 0, 0, 0x1000]), "rethrow");
+            assert_eq!(thrown(&[CPP_MAGIC, 0, 0x1000, 0]), "unknown");
+        }
+
+        // Synthetic image buffer holding ThrowInfo, CatchableTypeArray,
+        // CatchableType, and TypeDescriptor at known RVAs.
+        let mut buf = vec![0u8; 0x200];
+        let base = buf.as_ptr() as usize;
+        let put32 = |b: &mut [u8], at: usize, v: u32| {
+            b[at..at + 4].copy_from_slice(&v.to_le_bytes());
+        };
+        let throw_info_rva = 0x20u32;
+        let types_rva = 0x40u32;
+        let catchable_rva = 0x60u32;
+        let desc_rva = 0x80u32;
+
+        // types_rva == 0 -> "unknown"
+        // SAFETY: `buf` is a live buffer; ThrowInfo at +0x20 has 0 at +12.
+        let got = unsafe { thrown(&[CPP_MAGIC, 0, base + throw_info_rva as usize, base]) };
+        assert_eq!(got, "unknown");
+
+        // Wire ThrowInfo -> CatchableTypeArray with count == 0 -> "unknown".
+        put32(&mut buf, throw_info_rva as usize + 12, types_rva);
+        put32(&mut buf, types_rva as usize, 0);
+        // SAFETY: valid synthetic ThrowInfo inside `buf`.
+        let got = unsafe { thrown(&[CPP_MAGIC, 0, base + throw_info_rva as usize, base]) };
+        assert_eq!(got, "unknown");
+
+        // Huge count past MAX_CATCHABLE_TYPES -> "unknown".
+        put32(&mut buf, types_rva as usize, 1024);
+        // SAFETY: valid synthetic ThrowInfo inside `buf`.
+        let got = unsafe { thrown(&[CPP_MAGIC, 0, base + throw_info_rva as usize, base]) };
+        assert_eq!(got, "unknown");
+
+        // Valid integer throw (`.H`) with value.
+        put32(&mut buf, types_rva as usize, 1);
+        put32(&mut buf, types_rva as usize + 4, catchable_rva);
+        put32(&mut buf, catchable_rva as usize + 4, desc_rva);
+        buf[desc_rva as usize + 16..desc_rva as usize + 19].copy_from_slice(b".H\0");
+        let hresult: u32 = 0x8007_0005;
+        // SAFETY: valid synthetic ThrowInfo and live `hresult` object.
+        let got = unsafe {
+            thrown(&[
+                CPP_MAGIC,
+                (&raw const hresult) as usize,
+                base + throw_info_rva as usize,
+                base,
+            ])
+        };
+        assert_eq!(got, ".H = 0x80070005");
+
+        // `std::exception` with null object pointer (`p[1] == 0`) must not AV.
+        let exc_name = b".?AVexception@std@@\0";
+        buf[desc_rva as usize + 16..desc_rva as usize + 16 + exc_name.len()]
+            .copy_from_slice(exc_name);
+        // SAFETY: valid synthetic ThrowInfo with null object pointer.
+        let got = unsafe { thrown(&[CPP_MAGIC, 0, base + throw_info_rva as usize, base]) };
+        assert_eq!(got, ".?AVexception@std@@");
+    }
+
+    #[test]
+    fn report_crashes_is_idempotent_and_sets_stack_guarantee() {
+        report_crashes();
+        report_crashes();
+        let mut current = 0u32;
+        // SAFETY: querying this thread's current stack guarantee by passing 0.
+        assert_ne!(unsafe { SetThreadStackGuarantee(&mut current) }, 0);
+        assert!(
+            current >= STACK_GUARANTEE_BYTES,
+            "expected stack guarantee >= {STACK_GUARANTEE_BYTES}, got {current}"
         );
     }
 }
