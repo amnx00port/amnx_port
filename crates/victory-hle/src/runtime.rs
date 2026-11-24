@@ -26,7 +26,10 @@ static IMAGE_PATHS: Mutex<Vec<(usize, PathBuf)>> = Mutex::new(Vec::new());
 /// own path (`GetModuleFileName`) to find its data, and must not get our
 /// cache copy.
 pub fn set_image_path(base: usize, path: &Path) {
+    #[cfg(windows)]
     let path = std::path::absolute(path).unwrap_or_else(|_| path.to_owned());
+    #[cfg(not(windows))]
+    let path = path.to_owned();
     let mut paths = IMAGE_PATHS.lock().unwrap_or_else(|e| e.into_inner());
     paths.retain(|(b, _)| *b != base);
     paths.push((base, path));
@@ -51,7 +54,11 @@ pub fn image_named(file: &str) -> Option<usize> {
     let paths = IMAGE_PATHS.lock().unwrap_or_else(|e| e.into_inner());
     paths
         .iter()
-        .find(|(_, p)| p.file_name().is_some_and(|n| n.eq_ignore_ascii_case(file)))
+        .find(|(_, p)| {
+            let Some(s) = p.to_str() else { return false; };
+            let fname = s.rsplit(['/', '\\']).next().unwrap_or(s);
+            fname.eq_ignore_ascii_case(file)
+        })
         .map(|(b, _)| *b)
 }
 
@@ -204,6 +211,11 @@ pub fn use_console_timers() {
         );
         timeBeginPeriod(1);
     }
+}
+
+#[cfg(not(windows))]
+pub fn use_console_timers() {
+    // Linux uses high-resolution timers by default.
 }
 
 #[cfg(test)]

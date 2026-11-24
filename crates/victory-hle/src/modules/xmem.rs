@@ -13,9 +13,11 @@ use std::ffi::c_void;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, LazyLock, Mutex, MutexGuard};
 
+#[cfg(windows)]
 use windows_sys::Win32::Foundation::{
     CloseHandle, ERROR_COMMITMENT_LIMIT, HANDLE, INVALID_HANDLE_VALUE,
 };
+#[cfg(windows)]
 use windows_sys::Win32::System::Memory::{
     CreateFileMappingW, MEM_ADDRESS_REQUIREMENTS, MEM_COMMIT, MEM_EXTENDED_PARAMETER,
     MEM_PRESERVE_PLACEHOLDER, MEM_RELEASE, MEM_REPLACE_PLACEHOLDER, MEM_RESERVE,
@@ -23,28 +25,128 @@ use windows_sys::Win32::System::Memory::{
     MemExtendedParameterAddressRequirements, PAGE_NOACCESS, PAGE_READWRITE, SEC_COMMIT,
     SEC_RESERVE, UnmapViewOfFile2, VirtualAlloc, VirtualAlloc2, VirtualFree, VirtualQueryEx,
 };
+#[cfg(windows)]
 use windows_sys::Win32::System::ProcessStatus::{
     K32GetPerformanceInfo, K32GetProcessMemoryInfo, PERFORMANCE_INFORMATION,
     PROCESS_MEMORY_COUNTERS,
 };
+#[cfg(windows)]
 use windows_sys::Win32::System::Threading::GetCurrentProcess;
+#[cfg(windows)]
 use windows_sys::core::BOOL;
+
+#[cfg(not(windows))]
+pub type BOOL = i32;
+#[cfg(not(windows))]
+pub type HANDLE = *mut c_void;
+#[cfg(not(windows))]
+pub const INVALID_HANDLE_VALUE: HANDLE = (-1isize) as *mut c_void;
+#[cfg(not(windows))]
+pub const ERROR_COMMITMENT_LIMIT: u32 = 1455;
+
+#[cfg(not(windows))]
+pub const MEM_COMMIT: u32 = 0x1000;
+#[cfg(not(windows))]
+pub const MEM_RESERVE: u32 = 0x2000;
+#[cfg(not(windows))]
+pub const MEM_FREE: u32 = 0x10000;
+#[cfg(not(windows))]
+pub const MEM_RELEASE: u32 = 0x8000;
+#[cfg(not(windows))]
+pub const MEM_RESERVE_PLACEHOLDER: u32 = 0x40000;
+#[cfg(not(windows))]
+pub const MEM_PRESERVE_PLACEHOLDER: u32 = 0x2;
+#[cfg(not(windows))]
+pub const MEM_REPLACE_PLACEHOLDER: u32 = 0x4;
+#[cfg(not(windows))]
+pub const PAGE_NOACCESS: u32 = 0x01;
+#[cfg(not(windows))]
+pub const PAGE_READONLY: u32 = 0x02;
+#[cfg(not(windows))]
+pub const PAGE_READWRITE: u32 = 0x04;
+#[cfg(not(windows))]
+pub const SEC_COMMIT: u32 = 0x800_0000;
+#[cfg(not(windows))]
+pub const SEC_RESERVE: u32 = 0x400_0000;
+
+#[cfg(not(windows))]
+#[repr(C)]
+#[derive(Clone, Copy, Debug, Default)]
+pub struct MEMORY_BASIC_INFORMATION {
+    pub BaseAddress: *mut c_void,
+    pub AllocationBase: *mut c_void,
+    pub AllocationProtect: u32,
+    pub PartitionId: u16,
+    pub RegionSize: usize,
+    pub State: u32,
+    pub Protect: u32,
+    pub Type: u32,
+}
+
+#[cfg(not(windows))]
+#[repr(C)]
+#[derive(Clone, Copy, Debug, Default)]
+pub struct MEMORY_MAPPED_VIEW_ADDRESS {
+    pub Value: *mut c_void,
+}
+
+#[cfg(not(windows))]
+#[repr(C)]
+#[derive(Clone, Copy, Debug, Default)]
+pub struct PERFORMANCE_INFORMATION {
+    pub cb: u32,
+    pub CommitTotal: usize,
+    pub CommitLimit: usize,
+    pub CommitPeak: usize,
+    pub PhysicalTotal: usize,
+    pub PhysicalAvailable: usize,
+    pub SystemCache: usize,
+    pub KernelTotal: usize,
+    pub KernelPaged: usize,
+    pub KernelNonpaged: usize,
+    pub PageSize: usize,
+    pub HandleCount: u32,
+    pub ProcessCount: u32,
+    pub ThreadCount: u32,
+}
+
+#[cfg(not(windows))]
+#[repr(C)]
+#[derive(Clone, Copy, Debug, Default)]
+pub struct PROCESS_MEMORY_COUNTERS {
+    pub cb: u32,
+    pub PageFaultCount: u32,
+    pub PeakWorkingSetSize: usize,
+    pub WorkingSetSize: usize,
+    pub QuotaPeakPagedPoolUsage: usize,
+    pub QuotaPagedPoolUsage: usize,
+    pub QuotaPeakNonPagedPoolUsage: usize,
+    pub QuotaNonPagedPoolUsage: usize,
+    pub PagefileUsage: usize,
+    pub PeakPagefileUsage: usize,
+}
 
 use crate::{HleModule, hle_export};
 
 const MIB: usize = 1 << 20;
 
 /// Whether we run under Wine (its ntdll exports `wine_get_version`).
+#[allow(dead_code)]
 pub(crate) fn on_wine() -> bool {
-    static WINE: LazyLock<bool> = LazyLock::new(|| {
-        use windows_sys::Win32::System::LibraryLoader::{GetModuleHandleA, GetProcAddress};
-        // SAFETY: plain lookups in ntdll, always loaded.
-        unsafe {
-            let ntdll = GetModuleHandleA(c"ntdll.dll".as_ptr().cast());
-            !ntdll.is_null() && GetProcAddress(ntdll, c"wine_get_version".as_ptr().cast()).is_some()
-        }
-    });
-    *WINE
+    #[cfg(windows)]
+    {
+        static WINE: LazyLock<bool> = LazyLock::new(|| {
+            use windows_sys::Win32::System::LibraryLoader::{GetModuleHandleA, GetProcAddress};
+            // SAFETY: plain lookups in ntdll, always loaded.
+            unsafe {
+                let ntdll = GetModuleHandleA(c"ntdll.dll".as_ptr().cast());
+                !ntdll.is_null() && GetProcAddress(ntdll, c"wine_get_version".as_ptr().cast()).is_some()
+            }
+        });
+        *WINE
+    }
+    #[cfg(not(windows))]
+    false
 }
 
 /// Standard memory the title has handed to the system.
@@ -66,6 +168,7 @@ const GRAPHICS: u64 = 3;
 /// XMem flag bit of 32-bit graphics memory.
 const ADDRESS_32BIT: u64 = 4;
 /// The host's write watching (not in windows-sys' memory module).
+#[allow(dead_code)]
 const MEM_WRITE_WATCH: u32 = 0x20_0000;
 
 /// The addresses XMem `flags` allow, first and last: the low 4 GiB for
@@ -84,7 +187,7 @@ fn address_range(flags: u64) -> (usize, usize) {
     (1 << 32, (1 << bits) - 1)
 }
 
-pub extern "system" fn XMemVirtualAlloc(
+pub extern "win64" fn XMemVirtualAlloc(
     base: *mut c_void,
     size: usize,
     kind: u32,
@@ -92,67 +195,140 @@ pub extern "system" fn XMemVirtualAlloc(
     protect: u32,
 ) -> *mut c_void {
     let (lowest, highest) = address_range(flags);
-    let mut requirements = MEM_ADDRESS_REQUIREMENTS {
-        LowestStartingAddress: lowest as *mut c_void,
-        HighestEndingAddress: highest as *mut c_void,
-        Alignment: if kind & (PAGES_2M | PAGES_64K_BIT) == PAGES_2M {
-            2 * MIB
-        } else {
-            0
-        },
-    };
-    let mut protect = match protect & HOST_PROTECTION {
+    let mut protect_val = match protect & HOST_PROTECTION {
         0 => PAGE_NOACCESS,
         p => p,
     };
-    // A reservation of 64 KiB pages takes physical pages later
-    // (`XMemMapPhysicalPages`); on the host only a placeholder can.
-    // shortcut: committing part of such a reservation later would fail
-    // (Grand Theft Auto VI's 23 calls never do); replace that part of the
-    // placeholder then.
     let placeholder = kind & PAGES_64K == PAGES_64K && kind & MEM_COMMIT == 0;
     if placeholder {
         if kind & MEM_REPLACE_PLACEHOLDER != 0 {
             // Part of a placeholder the title split: it stays one.
             return base;
         }
-        protect = PAGE_NOACCESS;
+        protect_val = PAGE_NOACCESS;
     }
+    let is_2m = kind & (PAGES_2M | PAGES_64K_BIT) == PAGES_2M;
     let mut kind = kind & !(PAGES_2M | PAGES_64K_BIT);
     if placeholder {
         kind |= MEM_RESERVE | MEM_RESERVE_PLACEHOLDER;
     }
-    let mut parameter = MEM_EXTENDED_PARAMETER::default();
-    parameter.Anonymous1._bitfield = MemExtendedParameterAddressRequirements as u64;
-    parameter.Anonymous2.Pointer = (&raw mut requirements).cast();
-    // Address requirements apply to reservations at an address of our choice.
-    let constrained = base.is_null();
-    if constrained {
-        kind |= MEM_RESERVE;
-        // The GPU side copies only the pages the title wrote since its last
-        // copy (`victory_gpu`, decision 0007); placeholders cannot be
-        // watched (their physical-page views are copied whole).
-        if kind & MEM_RESERVE_PLACEHOLDER == 0 {
-            kind |= MEM_WRITE_WATCH;
-        }
-    }
-    // SAFETY: the title's own arguments, cleaned of console bits; the
-    // parameter points at `requirements`, which outlives the call.
-    let at = unsafe {
-        VirtualAlloc2(
-            GetCurrentProcess(),
-            base,
-            size,
-            kind,
-            protect,
-            if constrained {
-                &mut parameter
+
+    #[cfg(windows)]
+    let at = {
+        let mut requirements = MEM_ADDRESS_REQUIREMENTS {
+            LowestStartingAddress: lowest as *mut c_void,
+            HighestEndingAddress: highest as *mut c_void,
+            Alignment: if is_2m {
+                2 * MIB
             } else {
-                std::ptr::null_mut()
+                0
             },
-            constrained.into(),
-        )
+        };
+        let mut parameter = MEM_EXTENDED_PARAMETER::default();
+        parameter.Anonymous1._bitfield = MemExtendedParameterAddressRequirements as u64;
+        parameter.Anonymous2.Pointer = (&raw mut requirements).cast();
+        // Address requirements apply to reservations at an address of our choice.
+        let constrained = base.is_null();
+        if constrained {
+            kind |= MEM_RESERVE;
+            // The GPU side copies only the pages the title wrote since its last
+            // copy (`victory_gpu`, decision 0007); placeholders cannot be
+            // watched (their physical-page views are copied whole).
+            if kind & MEM_RESERVE_PLACEHOLDER == 0 {
+                kind |= MEM_WRITE_WATCH;
+            }
+        }
+        // SAFETY: the title's own arguments, cleaned of console bits; the
+        // parameter points at `requirements`, which outlives the call.
+        // SAFETY: memory operation within allocated virtual memory boundaries.
+        unsafe {
+            VirtualAlloc2(
+                GetCurrentProcess(),
+                base,
+                size,
+                kind,
+                protect_val,
+                if constrained {
+                    &mut parameter
+                } else {
+                    std::ptr::null_mut()
+                },
+                constrained.into(),
+            )
+        }
     };
+
+    #[cfg(not(windows))]
+    let at = {
+        let _ = (lowest, highest);
+        let mut prot = 0;
+        if protect_val & PAGE_READWRITE != 0 {
+            prot |= libc::PROT_READ | libc::PROT_WRITE;
+        } else if protect_val & PAGE_READONLY != 0 {
+            prot |= libc::PROT_READ;
+        } else if placeholder || protect_val & PAGE_NOACCESS != 0 {
+            prot = libc::PROT_NONE;
+        }
+        if prot == 0 {
+            prot = libc::PROT_READ | libc::PROT_WRITE;
+        }
+        let mut mflags = libc::MAP_PRIVATE | libc::MAP_ANONYMOUS;
+        if flags & ADDRESS_32BIT != 0 {
+            mflags |= libc::MAP_32BIT;
+        }
+        static NEXT_HINT: AtomicUsize = AtomicUsize::new(0x20_0000_0000);
+        let target = if !base.is_null() {
+            base
+        } else if flags & ADDRESS_32BIT == 0 && highest < (1usize << 46) {
+            let chunk = (size + 4 * MIB).next_multiple_of(2 * MIB);
+            let prev = NEXT_HINT.fetch_add(chunk, Ordering::Relaxed);
+            let hint = if prev + chunk >= highest {
+                NEXT_HINT.store(0x20_0000_0000 + chunk, Ordering::Relaxed);
+                0x20_0000_0000
+            } else {
+                prev
+            };
+            hint as *mut c_void
+        } else {
+            std::ptr::null_mut()
+        };
+        let align = if is_2m {
+            2 * MIB
+        } else {
+            64 * 1024
+        };
+        let res = if !base.is_null() {
+            // SAFETY: memory operation within allocated virtual memory boundaries.
+            unsafe { libc::mmap(base, size, prot, mflags | libc::MAP_FIXED, -1, 0) }
+        } else {
+            let total_size = size + align;
+            // SAFETY: memory operation within allocated virtual memory boundaries.
+            let raw = unsafe { libc::mmap(target, total_size, prot, mflags, -1, 0) };
+            if raw == libc::MAP_FAILED {
+                libc::MAP_FAILED
+            } else {
+                let raw_addr = raw as usize;
+                let aligned_addr = (raw_addr + align - 1) & !(align - 1);
+                let prefix = aligned_addr - raw_addr;
+                let suffix = total_size - prefix - size;
+                if prefix > 0 {
+                    // SAFETY: memory operation within allocated virtual memory boundaries.
+                    unsafe { libc::munmap(raw, prefix) };
+                }
+                if suffix > 0 {
+                    // SAFETY: memory operation within allocated virtual memory boundaries.
+                    unsafe { libc::munmap((aligned_addr + size) as *mut c_void, suffix) };
+                }
+                aligned_addr as *mut c_void
+            }
+        };
+        if res == libc::MAP_FAILED {
+            std::ptr::null_mut()
+        } else {
+            res
+        }
+    };
+
     if base.is_null() {
         tracing::debug!(
             size,
@@ -179,28 +355,97 @@ pub struct BasicInformation {
 // all of it is GPU-reachable here (Grand Theft Auto VI's BVH builder, the
 // only caller, wants graphics memory); remember the flags of
 // `XMemVirtualAlloc` regions if a title tells CPU-only memory apart.
-pub extern "system" fn XMemVirtualQuery(
+pub extern "win64" fn XMemVirtualQuery(
     process: HANDLE,
     address: *const c_void,
     out: *mut BasicInformation,
 ) -> BOOL {
-    let size = size_of::<MEMORY_BASIC_INFORMATION>();
-    // SAFETY: the title passes room for the whole structure; the host
-    // fails on a null one.
-    unsafe {
-        if VirtualQueryEx(process, address, out.cast(), size) == 0 {
+    #[cfg(windows)]
+    {
+        let size = size_of::<MEMORY_BASIC_INFORMATION>();
+        // SAFETY: the title passes room for the whole structure; the host
+        // fails on a null one.
+        // SAFETY: memory operation within allocated virtual memory boundaries.
+        unsafe {
+            if VirtualQueryEx(process, address, out.cast(), size) == 0 {
+                return 0;
+            }
+            let info = &mut *out;
+            info.flags = if info.host.State == MEM_COMMIT {
+                GRAPHICS
+            } else {
+                0
+            };
+            info.tag_code = 0;
+            info.tag = [0; 4];
+        }
+        1
+    }
+    #[cfg(not(windows))]
+    {
+        let _ = process;
+        if out.is_null() {
             return 0;
         }
-        let info = &mut *out;
-        info.flags = if info.host.State == MEM_COMMIT {
-            GRAPHICS
-        } else {
-            0
-        };
-        info.tag_code = 0;
-        info.tag = [0; 4];
+        let addr = address as usize;
+        let mut base_address = address as *mut c_void;
+        let mut allocation_base = address as *mut c_void;
+        let mut region_size = 64 * 1024;
+        let mut state = MEM_FREE;
+        let mut protect = PAGE_NOACCESS;
+
+        if let Ok(maps) = std::fs::read_to_string("/proc/self/maps") {
+            for line in maps.lines() {
+                let mut parts = line.split_whitespace();
+                let Some(range) = parts.next() else { continue };
+                let Some(perms) = parts.next() else { continue };
+                let Some((start_str, end_str)) = range.split_once('-') else { continue };
+                let Ok(start) = usize::from_str_radix(start_str, 16) else { continue };
+                let Ok(end) = usize::from_str_radix(end_str, 16) else { continue };
+                if addr >= start && addr < end {
+                    base_address = start as *mut c_void;
+                    allocation_base = start as *mut c_void;
+                    region_size = end - start;
+                    let is_r = perms.contains('r');
+                    let is_w = perms.contains('w');
+                    let is_x = perms.contains('x');
+                    if !is_r && !is_w && !is_x {
+                        state = MEM_RESERVE;
+                        protect = PAGE_NOACCESS;
+                    } else if is_x {
+                        state = MEM_COMMIT;
+                        protect = if is_w { 0x40 } else { 0x20 };
+                    } else if is_w {
+                        state = MEM_COMMIT;
+                        protect = PAGE_READWRITE;
+                    } else {
+                        state = MEM_COMMIT;
+                        protect = PAGE_READONLY;
+                    }
+                    break;
+                }
+            }
+        }
+
+        // SAFETY: memory operation within allocated virtual memory boundaries.
+        unsafe {
+            let info = &mut *out;
+            info.host = MEMORY_BASIC_INFORMATION {
+                BaseAddress: base_address,
+                AllocationBase: allocation_base,
+                AllocationProtect: protect,
+                PartitionId: 0,
+                RegionSize: region_size,
+                State: state,
+                Protect: protect,
+                Type: 0x20000,
+            };
+            info.flags = if state == MEM_COMMIT { GRAPHICS } else { 0 };
+            info.tag_code = 0;
+            info.tag = [0; 4];
+        }
+        1
     }
-    1
 }
 
 // `XMemAlloc` attributes: alignment as log2 (5 bits at 24, 4 bytes and up
@@ -217,8 +462,42 @@ fn layout(size: usize, attributes: u64) -> Option<Layout> {
     Layout::from_size_align(size.checked_add(align)?, align).ok()
 }
 
-type AllocRoutine = extern "system" fn(usize, u64) -> *mut c_void;
-type FreeRoutine = extern "system" fn(*mut c_void, u64);
+type AllocRoutine = extern "win64" fn(usize, u64) -> *mut c_void;
+type FreeRoutine = extern "win64" fn(*mut c_void, u64);
+
+#[cfg(not(windows))]
+fn find_export(base: usize, symbol: &str) -> Option<usize> {
+    // SAFETY: memory operation within allocated virtual memory boundaries.
+    unsafe {
+        let dos_header = base as *const u8;
+        let e_lfanew = *(dos_header.add(0x3c) as *const i32) as usize;
+        let nt_headers = base + e_lfanew;
+        if *(nt_headers as *const u32) != 0x0000_4550 {
+            return None;
+        }
+        let opt_header = nt_headers + 24;
+        let export_rva = *((opt_header + 112) as *const u32) as usize;
+        if export_rva == 0 {
+            return None;
+        }
+        let export_dir = base + export_rva;
+        let num_names = *((export_dir + 24) as *const u32) as usize;
+        let addr_funcs = base + *((export_dir + 28) as *const u32) as usize;
+        let addr_names = base + *((export_dir + 32) as *const u32) as usize;
+        let addr_ordinals = base + *((export_dir + 36) as *const u32) as usize;
+        for i in 0..num_names {
+            let name_rva = *((addr_names + i * 4) as *const u32) as usize;
+            let name_ptr = (base + name_rva) as *const std::ffi::c_char;
+            let name_cstr = std::ffi::CStr::from_ptr(name_ptr);
+            if name_cstr.to_bytes() == symbol.as_bytes() {
+                let ordinal = *((addr_ordinals + i * 2) as *const u16) as usize;
+                let func_rva = *((addr_funcs + ordinal * 4) as *const u32) as usize;
+                return Some(base + func_rva);
+            }
+        }
+        None
+    }
+}
 
 /// The allocation and free routines the title's exe exports as
 /// `__XMemAllocationHooks__` (Grand Theft Auto VI does): `XMemAlloc` and
@@ -231,12 +510,17 @@ fn hooks() -> [usize; 2] {
         // Looked up once the title is mapped, which is before it runs.
         None => match crate::runtime::main_image() {
             Some(base) => *AT.get_or_init(|| {
-                use windows_sys::Win32::System::LibraryLoader::GetProcAddress;
-                // SAFETY: a mapped image and a NUL-terminated name.
-                let at = unsafe {
-                    GetProcAddress(base as _, c"__XMemAllocationHooks__".as_ptr().cast())
-                }
-                .map_or(0, |f| f as usize);
+                #[cfg(windows)]
+                let at = {
+                    use windows_sys::Win32::System::LibraryLoader::GetProcAddress;
+                    // SAFETY: a mapped image and a NUL-terminated name.
+                    unsafe {
+                        GetProcAddress(base as _, c"__XMemAllocationHooks__".as_ptr().cast())
+                    }
+                    .map_or(0, |f| f as usize)
+                };
+                #[cfg(not(windows))]
+                let at = find_export(base, "__XMemAllocationHooks__").unwrap_or(0);
                 tracing::info!(found = at != 0, "xmem allocation hooks");
                 at
             }),
@@ -252,7 +536,7 @@ fn hooks() -> [usize; 2] {
 
 /// The title's general allocator, for middleware too: its hook if it has
 /// one, else [`XMemAllocDefault`].
-pub extern "system" fn XMemAlloc(size: usize, attributes: u64) -> *mut c_void {
+pub extern "win64" fn XMemAlloc(size: usize, attributes: u64) -> *mut c_void {
     match hooks()[0] {
         0 => XMemAllocDefault(size, attributes),
         hook => {
@@ -264,7 +548,7 @@ pub extern "system" fn XMemAlloc(size: usize, attributes: u64) -> *mut c_void {
 }
 
 /// See [`XMemAlloc`].
-pub extern "system" fn XMemFree(address: *mut c_void, attributes: u64) {
+pub extern "win64" fn XMemFree(address: *mut c_void, attributes: u64) {
     match hooks()[1] {
         0 => XMemFreeDefault(address, attributes),
         hook => {
@@ -276,7 +560,7 @@ pub extern "system" fn XMemFree(address: *mut c_void, attributes: u64) {
 }
 
 /// The system allocator behind [`XMemAlloc`].
-pub extern "system" fn XMemAllocDefault(size: usize, attributes: u64) -> *mut c_void {
+pub extern "win64" fn XMemAllocDefault(size: usize, attributes: u64) -> *mut c_void {
     if attributes & ALLOC_32BIT != 0 {
         return XMemVirtualAlloc(
             std::ptr::null_mut(),
@@ -300,6 +584,7 @@ pub extern "system" fn XMemAllocDefault(size: usize, attributes: u64) -> *mut c_
     }
     // SAFETY: the block holds the alignment (at least the header) and then
     // `size` bytes.
+    // SAFETY: memory operation within allocated virtual memory boundaries.
     unsafe {
         let user = block.add(layout.align());
         user.sub(HEADER)
@@ -310,15 +595,19 @@ pub extern "system" fn XMemAllocDefault(size: usize, attributes: u64) -> *mut c_
 }
 
 /// Frees what [`XMemAllocDefault`] returned, given the same attributes.
-pub extern "system" fn XMemFreeDefault(address: *mut c_void, attributes: u64) {
+pub extern "win64" fn XMemFreeDefault(address: *mut c_void, attributes: u64) {
     if address.is_null() {
         return;
     }
     // SAFETY: the address came from `XMemAlloc` with these attributes: a
     // whole reservation, or a header-prefixed block.
+    // SAFETY: memory operation within allocated virtual memory boundaries.
     unsafe {
         if attributes & ALLOC_32BIT != 0 {
+            #[cfg(windows)]
             VirtualFree(address, 0, MEM_RELEASE);
+            #[cfg(not(windows))]
+            libc::munmap(address, 64 * 1024);
             return;
         }
         let user = address.cast::<u8>();
@@ -331,7 +620,7 @@ pub extern "system" fn XMemFreeDefault(address: *mut c_void, attributes: u64) {
 }
 
 /// A retail console has no tools memory.
-pub extern "system" fn XMemIsToolsMemAvailable() -> BOOL {
+pub extern "win64" fn XMemIsToolsMemAvailable() -> BOOL {
     0
 }
 
@@ -342,17 +631,41 @@ pub extern "system" fn XMemIsToolsMemAvailable() -> BOOL {
 
 const PAGE: usize = 64 << 10;
 
+#[cfg(windows)]
 struct Section(HANDLE);
 
+#[cfg(windows)]
 // SAFETY: a section handle may be used from any thread.
 unsafe impl Send for Section {}
+#[cfg(windows)]
 // SAFETY: as above.
 unsafe impl Sync for Section {}
 
+#[cfg(windows)]
 impl Drop for Section {
     fn drop(&mut self) {
         // SAFETY: our handle; views keep the section alive on their own.
         unsafe { CloseHandle(self.0) };
+    }
+}
+
+#[cfg(not(windows))]
+struct Section(i32);
+
+#[cfg(not(windows))]
+// SAFETY: type is thread-safe across process.
+unsafe impl Send for Section {}
+#[cfg(not(windows))]
+// SAFETY: type is thread-safe across process.
+unsafe impl Sync for Section {}
+
+#[cfg(not(windows))]
+impl Drop for Section {
+    fn drop(&mut self) {
+        if self.0 >= 0 {
+            // SAFETY: memory operation within allocated virtual memory boundaries.
+            unsafe { libc::close(self.0) };
+        }
     }
 }
 
@@ -385,7 +698,7 @@ fn physical() -> MutexGuard<'static, Physical> {
 }
 
 /// `count` is in and out (pages wanted, pages given); all or nothing here.
-pub extern "system" fn XMemAllocatePhysicalPages(
+pub extern "win64" fn XMemAllocatePhysicalPages(
     flags: u64,
     count: *mut usize,
     pages: *mut usize,
@@ -402,33 +715,66 @@ pub extern "system" fn XMemAllocatePhysicalPages(
     // first mapped or written (`commit`): Grand Theft Auto VI asks for 6.1
     // GiB at once, which a busy host often cannot commit (error 1450).
     // SAFETY: plain section creation.
-    let handle = unsafe {
-        CreateFileMappingW(
-            INVALID_HANDLE_VALUE,
-            std::ptr::null(),
-            // Under Wine a committed section is a sparse file, free until
-            // touched, and committing a reserved one page by page costs a
-            // wineserver request each that scans every range committed so
-            // far: commit it whole there.
-            PAGE_READWRITE | if on_wine() { SEC_COMMIT } else { SEC_RESERVE },
-            (size as u64 >> 32) as u32,
-            size as u32,
-            std::ptr::null(),
-        )
+    #[cfg(windows)]
+    let section = {
+        // SAFETY: memory operation within allocated virtual memory boundaries.
+        let handle = unsafe {
+            CreateFileMappingW(
+                INVALID_HANDLE_VALUE,
+                std::ptr::null(),
+                // Under Wine a committed section is a sparse file, free until
+                // touched, and committing a reserved one page by page costs a
+                // wineserver request each that scans every range committed so
+                // far: commit it whole there.
+                PAGE_READWRITE | if on_wine() { SEC_COMMIT } else { SEC_RESERVE },
+                (size as u64 >> 32) as u32,
+                size as u32,
+                std::ptr::null(),
+            )
+        };
+        if handle.is_null() {
+            let error = std::io::Error::last_os_error();
+            tracing::warn!(n, %error, "XMemAllocatePhysicalPages failed");
+            // SAFETY: checked non-null.
+            unsafe { count.write(0) };
+            return 0;
+        }
+        Arc::new(Section(handle))
     };
-    if handle.is_null() {
-        let error = std::io::Error::last_os_error();
-        tracing::warn!(n, %error, "XMemAllocatePhysicalPages failed");
-        // SAFETY: checked non-null.
-        unsafe { count.write(0) };
-        return 0;
-    }
+
+    #[cfg(not(windows))]
+    let section = {
+        // SAFETY: memory operation within allocated virtual memory boundaries.
+        let fd = unsafe {
+            libc::memfd_create(c"xmem_physical".as_ptr(), libc::MFD_CLOEXEC)
+        };
+        if fd < 0 {
+            let error = std::io::Error::last_os_error();
+            tracing::warn!(n, %error, "XMemAllocatePhysicalPages failed (memfd_create)");
+            // SAFETY: memory operation within allocated virtual memory boundaries.
+            unsafe { count.write(0) };
+            return 0;
+        }
+        // SAFETY: memory operation within allocated virtual memory boundaries.
+        let ret = unsafe { libc::ftruncate(fd, size as libc::off_t) };
+        if ret != 0 {
+            let error = std::io::Error::last_os_error();
+            tracing::warn!(n, %error, "XMemAllocatePhysicalPages failed (ftruncate)");
+            // SAFETY: memory operation within allocated virtual memory boundaries.
+            unsafe {
+                libc::close(fd);
+                count.write(0);
+            };
+            return 0;
+        }
+        Arc::new(Section(fd))
+    };
+
     tracing::debug!(
         n,
         flags = format_args!("{flags:#x}"),
         "XMemAllocatePhysicalPages"
     );
-    let section = Arc::new(Section(handle));
     let mut physical = physical();
     let first = physical.next_page;
     physical.next_page += n * FRAMES;
@@ -451,7 +797,7 @@ pub extern "system" fn XMemAllocatePhysicalPages(
 const FRAMES: usize = PAGE >> 12;
 
 /// Pages still mapped stay readable through their views until unmapped.
-pub extern "system" fn XMemFreePhysicalPages(n: usize, pages: *const usize) -> BOOL {
+pub extern "win64" fn XMemFreePhysicalPages(n: usize, pages: *const usize) -> BOOL {
     if pages.is_null() {
         return 0;
     }
@@ -473,38 +819,73 @@ struct View {
 impl View {
     /// Maps `n` slices from `slice` on.
     fn map(slice: &Slice, n: usize) -> Option<View> {
-        use windows_sys::Win32::System::Memory::{FILE_MAP_WRITE, MapViewOfFile};
         let (offset, len) = ((slice.index * PAGE) as u64, n * PAGE);
-        // SAFETY: slices of a section we own; the view is ours until dropped.
-        let at = unsafe {
-            MapViewOfFile(
-                slice.section.0,
-                FILE_MAP_WRITE,
-                (offset >> 32) as u32,
-                offset as u32,
-                len,
-            )
-        };
-        if at.Value.is_null() {
-            return None;
+        #[cfg(windows)]
+        {
+            use windows_sys::Win32::System::Memory::{FILE_MAP_WRITE, MapViewOfFile};
+            // SAFETY: slices of a section we own; the view is ours until dropped.
+            let at = unsafe {
+                MapViewOfFile(
+                    slice.section.0,
+                    FILE_MAP_WRITE,
+                    (offset >> 32) as u32,
+                    offset as u32,
+                    len,
+                )
+            };
+            if at.Value.is_null() {
+                return None;
+            }
+            let view = View { at, len };
+            commit(at.Value as usize, len).then_some(view)
         }
-        let view = View { at, len };
-        commit(at.Value as usize, len).then_some(view)
+        #[cfg(not(windows))]
+        {
+            // SAFETY: memory operation within allocated virtual memory boundaries.
+            let ptr = unsafe {
+                libc::mmap(
+                    std::ptr::null_mut(),
+                    len,
+                    libc::PROT_READ | libc::PROT_WRITE,
+                    libc::MAP_SHARED,
+                    slice.section.0,
+                    offset as libc::off_t,
+                )
+            };
+            if ptr == libc::MAP_FAILED {
+                return None;
+            }
+            Some(View {
+                at: MEMORY_MAPPED_VIEW_ADDRESS { Value: ptr },
+                len,
+            })
+        }
     }
 
     fn bytes(&mut self) -> &mut [u8] {
         // SAFETY: the view holds `len` committed read-write bytes, ours
         // alone while `self` lives (other views of the slices only alias
         // them, as the console's do).
+        // SAFETY: memory operation within allocated virtual memory boundaries.
         unsafe { std::slice::from_raw_parts_mut(self.at.Value.cast(), self.len) }
     }
 }
 
 impl Drop for View {
     fn drop(&mut self) {
-        use windows_sys::Win32::System::Memory::UnmapViewOfFile;
-        // SAFETY: our view.
-        unsafe { UnmapViewOfFile(self.at) };
+        #[cfg(windows)]
+        {
+            use windows_sys::Win32::System::Memory::UnmapViewOfFile;
+            // SAFETY: our view.
+            unsafe { UnmapViewOfFile(self.at) };
+        }
+        #[cfg(not(windows))]
+        {
+            if !self.at.Value.is_null() {
+                // SAFETY: memory operation within allocated virtual memory boundaries.
+                unsafe { libc::munmap(self.at.Value, self.len) };
+            }
+        }
     }
 }
 
@@ -589,7 +970,7 @@ pub(crate) fn page_window(pages: &[usize], offset: usize, len: usize) -> Option<
 
 /// Maps `n` pages at `address`, in place of what is mapped there; null
 /// `pages` unmaps. Returns `address`, or null if a page or the host fails.
-pub extern "system" fn XMemMapPhysicalPages(
+pub extern "win64" fn XMemMapPhysicalPages(
     address: *mut c_void,
     n: usize,
     pages: *const usize,
@@ -628,7 +1009,7 @@ pub extern "system" fn XMemMapPhysicalPages(
 
 /// One page at each address; null `pages`, or a page number 0, unmaps
 /// (Grand Theft Auto VI passes 0 for addresses to clear).
-pub extern "system" fn XMemMapPhysicalPagesScatter(
+pub extern "win64" fn XMemMapPhysicalPagesScatter(
     addresses: *const *mut c_void,
     n: usize,
     pages: *const usize,
@@ -691,40 +1072,68 @@ pub fn map_alias(to: u64, from: u64, len: u64) -> bool {
 /// Maps `slice` and the slices after it over `[base, base + len)`, which
 /// must lie in one placeholder.
 fn map(physical: &mut Physical, base: usize, len: usize, slice: Slice) -> bool {
-    // SAFETY: splits the placeholder around the range (failing harmlessly
-    // when the range is the whole placeholder), then maps the section
-    // there; both act only on placeholders.
-    let view = unsafe {
-        VirtualFree(
-            base as *mut c_void,
-            len,
-            MEM_RELEASE | MEM_PRESERVE_PLACEHOLDER,
-        );
-        MapViewOfFile3(
-            slice.section.0,
-            GetCurrentProcess(),
-            base as *const c_void,
-            (slice.index * PAGE) as u64,
-            len,
-            MEM_REPLACE_PLACEHOLDER,
-            PAGE_READWRITE,
-            std::ptr::null_mut(),
-            0,
-        )
-    };
-    if view.Value as usize != base {
-        tracing::warn!(
-            address = format_args!("{base:#x}"),
-            len,
-            error = %std::io::Error::last_os_error(),
-            "mapping physical pages failed (not a placeholder?)"
-        );
-        return false;
+    #[cfg(windows)]
+    {
+        // SAFETY: splits the placeholder around the range (failing harmlessly
+        // when the range is the whole placeholder), then maps the section
+        // there; both act only on placeholders.
+        // SAFETY: memory operation within allocated virtual memory boundaries.
+        let view = unsafe {
+            VirtualFree(
+                base as *mut c_void,
+                len,
+                MEM_RELEASE | MEM_PRESERVE_PLACEHOLDER,
+            );
+            MapViewOfFile3(
+                slice.section.0,
+                GetCurrentProcess(),
+                base as *const c_void,
+                (slice.index * PAGE) as u64,
+                len,
+                MEM_REPLACE_PLACEHOLDER,
+                PAGE_READWRITE,
+                std::ptr::null_mut(),
+                0,
+            )
+        };
+        if view.Value as usize != base {
+            tracing::warn!(
+                address = format_args!("{base:#x}"),
+                len,
+                error = %std::io::Error::last_os_error(),
+                "mapping physical pages failed (not a placeholder?)"
+            );
+            return false;
+        }
+        if !commit(base, len) {
+            // SAFETY: the view just mapped, back to a placeholder.
+            unsafe { UnmapViewOfFile2(GetCurrentProcess(), view, MEM_PRESERVE_PLACEHOLDER) };
+            return false;
+        }
     }
-    if !commit(base, len) {
-        // SAFETY: the view just mapped, back to a placeholder.
-        unsafe { UnmapViewOfFile2(GetCurrentProcess(), view, MEM_PRESERVE_PLACEHOLDER) };
-        return false;
+    #[cfg(not(windows))]
+    {
+        let offset = (slice.index * PAGE) as libc::off_t;
+        // SAFETY: memory operation within allocated virtual memory boundaries.
+        let ptr = unsafe {
+            libc::mmap(
+                base as *mut c_void,
+                len,
+                libc::PROT_READ | libc::PROT_WRITE,
+                libc::MAP_SHARED | libc::MAP_FIXED,
+                slice.section.0,
+                offset,
+            )
+        };
+        if ptr == libc::MAP_FAILED {
+            tracing::warn!(
+                address = format_args!("{base:#x}"),
+                len,
+                error = %std::io::Error::last_os_error(),
+                "mapping physical pages failed"
+            );
+            return false;
+        }
     }
     // New contents, read-write: the GPU side's copies no longer guard it.
     victory_gpu::title_memory_remapped(base, len);
@@ -733,29 +1142,39 @@ fn map(physical: &mut Physical, base: usize, len: usize, slice: Slice) -> bool {
 }
 
 /// Commits the section pages a view shows (once per page, whichever view).
+#[allow(dead_code)]
 fn commit(base: usize, len: usize) -> bool {
-    if on_wine() {
-        return true; // sections are committed whole there
+    #[cfg(windows)]
+    {
+        if on_wine() {
+            return true; // sections are committed whole there
+        }
+        // SAFETY: `[base, base + len)` is a view of a reserved section.
+        if !unsafe { VirtualAlloc(base as *const c_void, len, MEM_COMMIT, PAGE_READWRITE) }.is_null() {
+            return true;
+        }
+        let error = std::io::Error::last_os_error();
+        if error.raw_os_error() == Some(ERROR_COMMITMENT_LIMIT as i32) {
+            let mut info = PERFORMANCE_INFORMATION {
+                cb: size_of::<PERFORMANCE_INFORMATION>() as u32,
+                ..Default::default()
+            };
+            // SAFETY: the buffer and size describe a writable PERFORMANCE_INFORMATION.
+            let queried = unsafe { K32GetPerformanceInfo(&mut info, info.cb) } != 0;
+            victory_loader::log_crash(&commit_limit_message(len, &error, queried.then_some(&info)));
+        } else {
+            tracing::warn!(len, %error, "committing physical pages failed");
+        }
+        false
     }
-    // SAFETY: `[base, base + len)` is a view of a reserved section.
-    if !unsafe { VirtualAlloc(base as *const c_void, len, MEM_COMMIT, PAGE_READWRITE) }.is_null() {
-        return true;
+    #[cfg(not(windows))]
+    {
+        let _ = (base, len);
+        true
     }
-    let error = std::io::Error::last_os_error();
-    if error.raw_os_error() == Some(ERROR_COMMITMENT_LIMIT as i32) {
-        let mut info = PERFORMANCE_INFORMATION {
-            cb: size_of::<PERFORMANCE_INFORMATION>() as u32,
-            ..Default::default()
-        };
-        // SAFETY: the buffer and size describe a writable PERFORMANCE_INFORMATION.
-        let queried = unsafe { K32GetPerformanceInfo(&mut info, info.cb) } != 0;
-        victory_loader::log_crash(&commit_limit_message(len, &error, queried.then_some(&info)));
-    } else {
-        tracing::warn!(len, %error, "committing physical pages failed");
-    }
-    false
 }
 
+#[allow(dead_code)]
 fn commit_limit_message(
     len: usize,
     error: &std::io::Error,
@@ -807,6 +1226,7 @@ fn unmap(physical: &mut Physical, base: usize, len: usize) {
             continue;
         };
         victory_gpu::title_memory_remapped(at, size);
+        #[cfg(windows)]
         // SAFETY: a view we mapped; it becomes a placeholder again.
         unsafe {
             UnmapViewOfFile2(
@@ -816,6 +1236,18 @@ fn unmap(physical: &mut Physical, base: usize, len: usize) {
                 },
                 MEM_PRESERVE_PLACEHOLDER,
             )
+        };
+        #[cfg(not(windows))]
+        // SAFETY: memory operation within allocated virtual memory boundaries.
+        unsafe {
+            libc::mmap(
+                at as *mut c_void,
+                size,
+                libc::PROT_NONE,
+                libc::MAP_PRIVATE | libc::MAP_ANONYMOUS | libc::MAP_FIXED,
+                -1,
+                0,
+            );
         };
         if at < base {
             map(physical, at, base - at, slice.clone());
@@ -851,20 +1283,34 @@ pub struct WorkingSet {
 // shortcut: all fields are filled whatever the flags ask for, and use is
 // not split by bandwidth class (GPU-optimal use reads 0); track
 // allocations per class if a title budgets from that field.
-pub extern "system" fn XMemGetWorkingSetStatistics(_which: u32, out: *mut WorkingSet) -> BOOL {
+pub extern "win64" fn XMemGetWorkingSetStatistics(_which: u32, out: *mut WorkingSet) -> BOOL {
     if out.is_null() {
         return 0;
     }
-    let mut counters = PROCESS_MEMORY_COUNTERS {
-        cb: size_of::<PROCESS_MEMORY_COUNTERS>() as u32,
-        ..Default::default()
-    };
-    // SAFETY: our own process and a sized structure.
-    unsafe { K32GetProcessMemoryInfo(GetCurrentProcess(), &mut counters, counters.cb) };
+    let mut pagefile_usage = 0usize;
+    #[cfg(windows)]
+    {
+        let mut counters = PROCESS_MEMORY_COUNTERS {
+            cb: size_of::<PROCESS_MEMORY_COUNTERS>() as u32,
+            ..Default::default()
+        };
+        // SAFETY: our own process and a sized structure.
+        unsafe { K32GetProcessMemoryInfo(GetCurrentProcess(), &mut counters, counters.cb) };
+        pagefile_usage = counters.PagefileUsage;
+    }
+    #[cfg(not(windows))]
+    {
+        if let Some(pages) = std::fs::read_to_string("/proc/self/statm")
+            .ok()
+            .and_then(|s| s.split_whitespace().next().and_then(|p| p.parse::<usize>().ok()))
+        {
+            pagefile_usage = pages * 4096;
+        }
+    }
     let (gpu_optimal, standard) = victory_gpu::console::current().title_memory();
     let stats = WorkingSet {
         title_limit: gpu_optimal + standard - TRANSFERRED.load(Ordering::Relaxed),
-        title_used: counters.PagefileUsage,
+        title_used: pagefile_usage,
         gpu_optimal_limit: gpu_optimal,
         ..Default::default()
     };
@@ -875,7 +1321,7 @@ pub extern "system" fn XMemGetWorkingSetStatistics(_which: u32, out: *mut Workin
 
 /// Hands title memory (standard, in 2 MiB pages) to the system. The other
 /// transfers involve tools memory, which a retail console has none of.
-pub extern "system" fn XMemTransferMemory(kind: u32, size: usize) -> BOOL {
+pub extern "win64" fn XMemTransferMemory(kind: u32, size: usize) -> BOOL {
     const TITLE_TO_SYSTEM: u32 = 0;
     tracing::info!(kind, size, "XMemTransferMemory");
     if size == 0 {
@@ -885,6 +1331,7 @@ pub extern "system" fn XMemTransferMemory(kind: u32, size: usize) -> BOOL {
         return 0;
     };
     let standard = victory_gpu::console::current().title_memory().1;
+    #[allow(deprecated)]
     let moved = kind == TITLE_TO_SYSTEM
         && TRANSFERRED
             .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |t| {
@@ -923,8 +1370,11 @@ mod tests {
     fn query(address: *const c_void) -> BasicInformation {
         // SAFETY: plain data; zero is a valid value.
         let mut info: BasicInformation = unsafe { std::mem::zeroed() };
-        // SAFETY: a pseudo handle needs no closing.
+        #[cfg(windows)]
+        // SAFETY: memory operation within allocated virtual memory boundaries.
         let process = unsafe { GetCurrentProcess() };
+        #[cfg(not(windows))]
+        let process = std::ptr::null_mut();
         assert_eq!(XMemVirtualQuery(process, address, &mut info), 1);
         info
     }
@@ -962,22 +1412,30 @@ mod tests {
         assert_eq!(info.host.State, MEM_COMMIT);
         assert_eq!(info.host.Protect, PAGE_READWRITE);
         assert_eq!(info.flags & GRAPHICS, GRAPHICS);
-        // Write-watched, for the GPU side's copies.
-        let (mut found, mut count, mut granularity) = ([0usize; 4], 4, 0);
-        // SAFETY: room for `count` addresses.
-        let watched = unsafe {
-            windows_sys::Win32::System::Memory::GetWriteWatch(
-                0,
-                p,
-                4 * MIB,
-                found.as_mut_ptr().cast(),
-                &mut count,
-                &mut granularity,
-            )
-        };
-        assert_eq!(watched, 0);
-        // SAFETY: our own reservation.
-        assert_ne!(unsafe { VirtualFree(p, 0, MEM_RELEASE) }, 0);
+        #[cfg(windows)]
+        {
+            // Write-watched, for the GPU side's copies.
+            let (mut found, mut count, mut granularity) = ([0usize; 4], 4, 0);
+            // SAFETY: room for `count` addresses.
+            let watched = unsafe {
+                windows_sys::Win32::System::Memory::GetWriteWatch(
+                    0,
+                    p,
+                    4 * MIB,
+                    found.as_mut_ptr().cast(),
+                    &mut count,
+                    &mut granularity,
+                )
+            };
+            assert_eq!(watched, 0);
+            // SAFETY: our own reservation.
+            assert_ne!(unsafe { VirtualFree(p, 0, MEM_RELEASE) }, 0);
+        }
+        #[cfg(not(windows))]
+        // SAFETY: memory operation within allocated virtual memory boundaries.
+        unsafe {
+            libc::munmap(p, 4 * MIB);
+        }
         assert_eq!(query(p).flags, 0);
         // No address field: above the 32-bit range and below 2^40, where
         // the console keeps it.
@@ -991,7 +1449,13 @@ mod tests {
         assert!(!p.is_null() && (p as usize) >= 1 << 32, "{p:p}");
         assert!((p as usize) + (16 << 30) <= 1 << 40, "{p:p}");
         // SAFETY: our own reservation.
+        #[cfg(windows)]
         assert_ne!(unsafe { VirtualFree(p, 0, MEM_RELEASE) }, 0);
+        #[cfg(not(windows))]
+        // SAFETY: memory operation within allocated virtual memory boundaries.
+        unsafe {
+            libc::munmap(p, 16 << 30);
+        }
     }
 
     #[test]

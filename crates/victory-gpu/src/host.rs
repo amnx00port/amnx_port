@@ -1717,7 +1717,7 @@ impl Host {
 /// A visible top-level window of this process: the one the title made, if
 /// it made one.
 fn title_window() -> Option<HWND> {
-    extern "system" fn visit(hwnd: HWND, found: LPARAM) -> windows::core::BOOL {
+    extern "win64" fn visit(hwnd: HWND, found: LPARAM) -> windows::core::BOOL {
         let mut process = 0;
         // SAFETY: a window handle from the enumeration; `found` is ours.
         unsafe {
@@ -1921,7 +1921,7 @@ fn window(width: u32, height: u32) -> windows::core::Result<HWND> {
     Ok(HWND(hwnd as *mut _))
 }
 
-extern "system" fn window_proc(
+extern "win64" fn window_proc(
     hwnd: HWND,
     message: u32,
     wparam: WPARAM,

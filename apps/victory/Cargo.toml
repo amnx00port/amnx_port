@@ -12,13 +12,18 @@ victory-core.workspace = true
 victory-pe.workspace = true
 victory-loader.workspace = true
 victory-hle.workspace = true
-victory-shader = { workspace = true, features = ["host"] }
 victory-game.workspace = true
 anyhow.workspace = true
 blake3.workspace = true
 memchr.workspace = true
 clap.workspace = true
 walkdir.workspace = true
+
+[target.'cfg(windows)'.dependencies]
+victory-shader = { workspace = true, features = ["host"] }
+
+[target.'cfg(not(windows))'.dependencies]
+victory-shader = { workspace = true }
 
 [features]
 # Debug-level logs and the debugging switches (frame capture, stack dumps,

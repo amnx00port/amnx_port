@@ -15,12 +15,15 @@
 use std::sync::atomic::{AtomicU64, Ordering};
 
 use anyhow::{Result, bail};
+#[cfg(windows)]
 use windows_sys::Win32::System::Diagnostics::Debug::{
     DebugBreak, FlushInstructionCache, IsDebuggerPresent,
 };
+#[cfg(windows)]
 use windows_sys::Win32::System::Memory::{
     MEM_COMMIT, MEM_RESERVE, PAGE_EXECUTE_READ, PAGE_READWRITE, VirtualAlloc, VirtualProtect,
 };
+#[cfg(windows)]
 use windows_sys::Win32::System::Threading::GetCurrentProcess;
 
 /// What an unimplemented import does when called.
@@ -50,7 +53,7 @@ pub fn unimplemented_call_count() -> u64 {
     UNIMPLEMENTED_CALLS.load(Ordering::Relaxed)
 }
 
-extern "system" fn unimplemented_import(site: &'static ImportSite) -> u64 {
+extern "win64" fn unimplemented_import(site: &'static ImportSite) -> u64 {
     UNIMPLEMENTED_CALLS.fetch_add(1, Ordering::Relaxed);
     let previous = site.calls.fetch_add(1, Ordering::Relaxed);
     match site.policy {
@@ -68,6 +71,7 @@ extern "system" fn unimplemented_import(site: &'static ImportSite) -> u64 {
             let text = format!("VIctory: unimplemented import {dll}!{symbol} called");
             crate::log_crash(&text);
             // SAFETY: plain Win32 calls without preconditions.
+            #[cfg(windows)]
             unsafe {
                 if IsDebuggerPresent() != 0 {
                     DebugBreak();
@@ -91,6 +95,7 @@ impl ThunkBlock {
     /// Reserves room for `count` stubs (writable until [`Self::seal`]).
     pub(crate) fn new(count: usize) -> Result<Self> {
         let len = (count.max(1) * THUNK_SIZE).next_multiple_of(4096);
+        #[cfg(windows)]
         // SAFETY: fresh anonymous allocation; no existing memory is touched.
         let base = unsafe {
             VirtualAlloc(
@@ -100,9 +105,26 @@ impl ThunkBlock {
                 PAGE_READWRITE,
             )
         } as *mut u8;
+        #[cfg(not(windows))]
+        // SAFETY: fresh anonymous allocation; no existing memory is touched.
+        let base = unsafe {
+            let p = libc::mmap(
+                std::ptr::null_mut(),
+                len,
+                libc::PROT_READ | libc::PROT_WRITE,
+                libc::MAP_PRIVATE | libc::MAP_ANONYMOUS,
+                -1,
+                0,
+            );
+            if p == libc::MAP_FAILED {
+                std::ptr::null_mut()
+            } else {
+                p as *mut u8
+            }
+        };
         if base.is_null() {
             bail!(
-                "VirtualAlloc for import stubs failed: {}",
+                "allocating memory for import stubs failed: {}",
                 std::io::Error::last_os_error()
             );
         }
@@ -118,7 +140,7 @@ impl ThunkBlock {
         code[0..2].copy_from_slice(&[0x48, 0xB9]);
         code[2..10].copy_from_slice(&(site as *const ImportSite as u64).to_le_bytes());
         code[10..12].copy_from_slice(&[0x48, 0xB8]);
-        let handler = unimplemented_import as extern "system" fn(&'static ImportSite) -> u64;
+        let handler = unimplemented_import as extern "win64" fn(&'static ImportSite) -> u64;
         code[12..20].copy_from_slice(&(handler as *const () as u64).to_le_bytes());
         code[20..22].copy_from_slice(&[0xFF, 0xE0]);
         // SAFETY: `used + THUNK_SIZE <= len`, and the block is still writable.
@@ -134,17 +156,37 @@ impl ThunkBlock {
     /// Makes the block read+execute. The block is intentionally leaked:
     /// title code may hold these addresses for the life of the process.
     pub(crate) fn seal(self) -> Result<()> {
-        let mut old = 0;
-        // SAFETY: `base..base+len` is the allocation made in `new`.
-        let ok = unsafe { VirtualProtect(self.base as _, self.len, PAGE_EXECUTE_READ, &mut old) };
-        if ok == 0 {
-            bail!(
-                "VirtualProtect for import stubs failed: {}",
-                std::io::Error::last_os_error()
-            );
+        #[cfg(windows)]
+        {
+            let mut old = 0;
+            // SAFETY: `base..base+len` is the allocation made in `new`.
+            let ok = unsafe { VirtualProtect(self.base as _, self.len, PAGE_EXECUTE_READ, &mut old) };
+            if ok == 0 {
+                bail!(
+                    "VirtualProtect for import stubs failed: {}",
+                    std::io::Error::last_os_error()
+                );
+            }
+            // SAFETY: flushing our own process's instruction cache for our own block.
+            unsafe { FlushInstructionCache(GetCurrentProcess(), self.base as _, self.len) };
         }
-        // SAFETY: flushing our own process's instruction cache for our own block.
-        unsafe { FlushInstructionCache(GetCurrentProcess(), self.base as _, self.len) };
+        #[cfg(not(windows))]
+        {
+            // SAFETY: `base..base+len` is the allocation made in `new`.
+            let ret = unsafe {
+                libc::mprotect(
+                    self.base as *mut libc::c_void,
+                    self.len,
+                    libc::PROT_READ | libc::PROT_EXEC,
+                )
+            };
+            if ret != 0 {
+                bail!(
+                    "mprotect for import stubs failed: {}",
+                    std::io::Error::last_os_error()
+                );
+            }
+        }
         Ok(())
     }
 }

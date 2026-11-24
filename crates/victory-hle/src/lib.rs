@@ -93,7 +93,6 @@ mod tests {
         );
     }
 
-    #[cfg(windows)]
     #[test]
     fn shared_api_sets_pass_through_to_host() {
         let r = HleResolver::default();
@@ -108,7 +107,6 @@ mod tests {
         );
     }
 
-    #[cfg(windows)]
     #[test]
     fn overrides_win_over_host() {
         let r = HleResolver::default();
@@ -119,5 +117,42 @@ mod tests {
             ),
             Some(Provenance::Hle)
         );
+    }
+
+    #[test]
+    fn pe_win64_calling_convention_probe() {
+        let resolver = HleResolver::new(HostPolicy::default());
+        let sym = victory_pe::ImportSymbol::Name {
+            name: "SetLastError".into(),
+            hint: 0,
+        };
+        let Resolution::Found { address, .. } = resolver.resolve("kernel32.dll", &sym) else {
+            panic!("SetLastError not resolved");
+        };
+
+        let fn_ptr = address as *const ();
+        // SAFETY: probe Win64 ABI calling convention with shadow space and arguments in RCX vs RDI
+        unsafe {
+            std::arch::asm!(
+                "sub rsp, 32",
+                "call {fn_ptr}",
+                "add rsp, 32",
+                fn_ptr = in(reg) fn_ptr,
+                in("rcx") 0x12345678_u64,
+                in("rdi") 0x11223344_u64,
+                clobber_abi("win64"),
+            );
+        }
+
+        let sym_get = victory_pe::ImportSymbol::Name {
+            name: "GetLastError".into(),
+            hint: 0,
+        };
+        let Resolution::Found { address: get_addr, .. } = resolver.resolve("kernel32.dll", &sym_get) else {
+            panic!("GetLastError not resolved");
+        };
+        // SAFETY: transmuting resolved export address to function pointer.
+        let get_fn: extern "win64" fn() -> u32 = unsafe { std::mem::transmute(get_addr) };
+        assert_eq!(get_fn(), 0x12345678);
     }
 }

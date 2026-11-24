@@ -56,3 +56,10 @@ mod watch;
 pub use host::on_failure;
 #[cfg(windows)]
 pub use watch::{title_memory_remapped, writing as kernel_will_write};
+
+#[cfg(not(windows))]
+pub fn on_failure<F: FnOnce(&str)>(_callback: F) {}
+#[cfg(not(windows))]
+pub fn title_memory_remapped(_base: usize, _len: usize) {}
+#[cfg(not(windows))]
+pub fn kernel_will_write(_base: usize, _len: usize) {}

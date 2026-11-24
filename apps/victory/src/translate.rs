@@ -7,8 +7,66 @@ use std::sync::Mutex;
 use std::sync::atomic::{AtomicUsize, Ordering};
 
 use anyhow::Result;
+use victory_shader::emit;
+#[cfg(windows)]
 use victory_shader::emit::host::{self, Host};
-use victory_shader::emit::{self, validator::Validator};
+#[cfg(windows)]
+use victory_shader::emit::validator::Validator;
+
+#[cfg(not(windows))]
+pub mod host {
+    use super::*;
+    pub struct Host;
+    impl Host {
+        pub fn new(_warp: bool) -> Result<Self, &'static str> {
+            Err("D3D12 host validation requires Windows")
+        }
+        pub fn pipeline(&self, _vs: &emit::HostShader, _ps: &emit::HostShader) -> Result<(), String> {
+            Err("D3D12 host validation requires Windows".into())
+        }
+        pub fn compute_pipeline(&self, _cs: &emit::HostShader) -> Result<(), String> {
+            Err("D3D12 host validation requires Windows".into())
+        }
+        pub fn mesh_pipeline(&self, _ms: &emit::HostShader, _ps: &emit::HostShader) -> Result<(), String> {
+            Err("D3D12 host validation requires Windows".into())
+        }
+    }
+    pub fn stub_ps() -> emit::HostShader {
+        emit::HostShader {
+            stage: HwStage::Ps,
+            dxil: Vec::new(),
+            user_data: Vec::new(),
+            samplers: Vec::new(),
+            static_samplers: Vec::new(),
+            root_cbvs: Vec::new(),
+            root_srvs: Vec::new(),
+        }
+    }
+    pub fn stub_vs(_ps: &emit::HostShader) -> Result<emit::HostShader, String> {
+        Err("stub_vs requires Windows".into())
+    }
+}
+#[cfg(not(windows))]
+pub use host::Host;
+
+#[cfg(not(windows))]
+pub mod validator {
+    use std::path::{Path, PathBuf};
+    pub struct Validator;
+    impl Validator {
+        pub fn default_path() -> Option<PathBuf> {
+            None
+        }
+        pub fn load(_path: Option<&Path>) -> Result<Self, &'static str> {
+            Err("DXIL validator requires Windows dxil.dll")
+        }
+        pub fn validate(&mut self, _dxbc: &mut [u8]) -> Result<(), String> {
+            Err("DXIL validator requires Windows dxil.dll".into())
+        }
+    }
+}
+#[cfg(not(windows))]
+pub use validator::Validator;
 use victory_shader::structure::{self, Atom, LaneExit};
 use victory_shader::{
     Container, FourCC, HwStage, NativeProgram, RootType, ShaderError, ir, native_programs,

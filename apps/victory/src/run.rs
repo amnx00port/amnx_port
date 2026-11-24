@@ -4,7 +4,6 @@ use anyhow::{Context, Result};
 
 use crate::{Console, Unimplemented};
 
-#[cfg(windows)]
 pub fn run(
     exe: &Path,
     unimplemented: Unimplemented,
@@ -45,8 +44,9 @@ pub fn run(
     let wanted = |dll: &str| title_dll(&resolver.host, dll);
     let title_dir = exe.parent().unwrap_or(Path::new("."));
     // A missing manifest leaves id 0 and no storage quota.
-    let manifest =
-        std::fs::read_to_string(title_dir.join("MicrosoftGame.config")).unwrap_or_default();
+    let manifest = std::fs::read_to_string(title_dir.join("MicrosoftGame.config"))
+        .or_else(|_| std::fs::read_to_string(title_dir.join("MicrosoftGame.Config")))
+        .unwrap_or_default();
     let title = victory_hle::runtime::Title::from_manifest(&manifest);
     let storage = cfg.data_subdir(&format!("{:08X}/storage", title.id))?;
     println!(
@@ -127,10 +127,13 @@ pub fn run(
 
 /// The debugging aids (README): scheduled stack dumps, watched values and
 /// memory saved on a crash.
-#[cfg(all(windows, feature = "diagnostics"))]
+#[cfg(feature = "diagnostics")]
 fn diagnostics(image: &victory_loader::LoadedImage, cfg: &victory_core::Config) {
-    victory_loader::dump_stacks_on_schedule();
-    victory_hle::modules::audio::capture::start();
+    #[cfg(windows)]
+    {
+        victory_loader::dump_stacks_on_schedule();
+        victory_hle::modules::audio::capture::start();
+    }
     watch(image.base(), image.info().size_of_image as usize);
     // Debugging aid: `VICTORY_CRASH_SAVE=<rva>:<len>,...` (hex) writes those
     // title ranges to `crash-<rva>.bin` in the cache dir on a crash.
@@ -153,7 +156,7 @@ fn diagnostics(image: &victory_loader::LoadedImage, cfg: &victory_core::Config) 
 
 /// Debugging aid: `VICTORY_WATCH=<rva>,...` (hex) logs the u32 at each
 /// title+rva whenever it changes, polled every 5 ms (an engine's state, say).
-#[cfg(all(windows, feature = "diagnostics"))]
+#[cfg(feature = "diagnostics")]
 fn watch(base: usize, size: usize) {
     let Ok(list) = std::env::var("VICTORY_WATCH") else {
         return;
@@ -180,14 +183,12 @@ fn watch(base: usize, size: usize) {
 }
 
 /// DLLs the host or our runtime provide are never taken from the title.
-#[cfg(windows)]
 fn title_dll(host: &victory_hle::HostPolicy, dll: &str) -> bool {
     !host.allows(dll) && !victory_hle::registry().iter().any(|m| m.serves(dll))
 }
 
 /// Title DLLs the title loads itself (`LoadLibrary`) that nothing imports,
 /// e.g. Grand Theft Auto VI's upscaler behind its FidelityFX loader.
-#[cfg(windows)]
 struct LateDlls {
     host: victory_hle::HostPolicy,
     title_dir: std::path::PathBuf,
@@ -198,7 +199,6 @@ struct LateDlls {
     lock: LoaderLock,
 }
 
-#[cfg(windows)]
 impl LateDlls {
     /// Every `LoadLibrary` of the title comes here first. Returns a title
     /// image called `file`, mapping it and the title DLLs it needs first,
@@ -279,14 +279,12 @@ impl LateDlls {
 
 /// The Windows loader lock's shape: one thread at a time, re-entered by
 /// the thread that holds it.
-#[cfg(windows)]
 #[derive(Default)]
 struct LoaderLock {
     owner: std::sync::Mutex<(Option<std::thread::ThreadId>, usize)>,
     free: std::sync::Condvar,
 }
 
-#[cfg(windows)]
 impl LoaderLock {
     fn hold<T>(&self, f: impl FnOnce() -> T) -> T {
         let me = std::thread::current().id();
@@ -309,7 +307,7 @@ impl LoaderLock {
     }
 }
 
-#[cfg(all(test, windows))]
+#[cfg(test)]
 mod tests {
     use std::sync::{Arc, Mutex};
 
@@ -330,9 +328,4 @@ mod tests {
         other.join().unwrap();
         assert_eq!(*order.lock().unwrap(), [1, 2]);
     }
-}
-
-#[cfg(not(windows))]
-pub fn run(_: &Path, _: Unimplemented, _: bool, _: bool, _: Console) -> Result<()> {
-    anyhow::bail!("running titles requires Windows")
 }

@@ -704,6 +704,7 @@ dependencies = [
 name = "victory-hle"
 version = "0.1.0"
 dependencies = [
+ "libc",
  "miniz_oxide",
  "opus-pure",
  "tempfile",
@@ -723,6 +724,7 @@ version = "0.1.0"
 dependencies = [
  "anyhow",
  "blake3",
+ "libc",
  "tempfile",
  "thiserror",
  "tracing",

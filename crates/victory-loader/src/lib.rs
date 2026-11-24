@@ -29,12 +29,13 @@ pub mod resolve;
 mod stacks;
 #[cfg(windows)]
 mod threads;
-#[cfg(windows)]
-mod thunks;
+pub mod thunks;
 #[cfg(windows)]
 mod tls;
 #[cfg(windows)]
 mod windows;
+#[cfg(not(windows))]
+pub mod linux;
 
 #[cfg(windows)]
 pub use crash::{
@@ -48,12 +49,20 @@ pub use resolve::{ImportResolver, Provenance, Resolution};
 pub use stacks::{dump_stacks, dump_stacks_on_schedule};
 #[cfg(windows)]
 pub use threads::disable_thread_calls;
-#[cfg(windows)]
 pub use thunks::{UnimplementedPolicy, unimplemented_call_count};
 #[cfg(windows)]
 pub use windows::{
     BindReport, LoadedImage, MissingImport, WithTitleDlls, load, load_title_dll, load_title_dlls,
 };
+
+#[cfg(not(windows))]
+pub use linux::{
+    BindReport, LoadedImage, MissingImport, WithTitleDlls, disable_thread_calls, load,
+    load_title_dll, load_title_dlls, locate, log_crash, log_crashes_to, note_title_output,
+    report_crashes,
+};
+#[cfg(all(not(windows), feature = "diagnostics"))]
+pub use linux::save_on_crash;
 
 /// `DLL_PROCESS_ATTACH`, for TLS callbacks.
 pub const DLL_PROCESS_ATTACH: u32 = 1;
