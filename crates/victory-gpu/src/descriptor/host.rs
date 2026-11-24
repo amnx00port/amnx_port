@@ -263,6 +263,15 @@ impl HostHeap {
         self.count
     }
 
+    #[cfg(all(test, feature = "diagnostics"))]
+    pub(super) fn retains_resource(&self, index: u32) -> bool {
+        self.kept.lock().unwrap_or_else(|e| e.into_inner())[index as usize].is_some()
+    }
+
+    pub(crate) fn dynamic_capacity(&self) -> u32 {
+        self.dynamic
+    }
+
     /// Gives back `n` dynamic slots from `first` (an index [`dynamic`]
     /// returned).
     ///
