@@ -175,9 +175,11 @@ fn write(bytes: &mut [u8], at: usize, v: &[u8]) -> Result<(), PrepareError> {
 
 #[cfg(test)]
 mod tests {
+    #[cfg_attr(not(windows), allow(unused_imports))]
     use super::*;
 
     #[test]
+    #[cfg(windows)] // reads its own PE test binary / Windows path rules
     fn patches_own_test_binary() {
         let original = std::fs::read(std::env::current_exe().unwrap()).unwrap();
         let prepared = prepare(&original).unwrap();
@@ -205,6 +207,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg(windows)] // reads its own PE test binary / Windows path rules
     fn keeps_iat_slots_when_import_size_excludes_the_terminator() {
         let mut original = std::fs::read(std::env::current_exe().unwrap()).unwrap();
         let info = ImageInfo::parse(&original).unwrap();
@@ -274,10 +277,233 @@ mod tests {
     }
 
     #[test]
+    #[cfg(windows)] // reads its own PE test binary / Windows path rules
     fn file_name_is_stable_per_build() {
         let original = std::fs::read(std::env::current_exe().unwrap()).unwrap();
         let a = prepare(&original).unwrap();
         let b = prepare(&original).unwrap();
         assert_eq!(a.file_name(), b.file_name());
+    }
+
+    // Off Windows the test binary is not a PE, so the tests above are gated.
+    // These build a minimal title image by hand: the same patching, on any
+    // host.
+
+    const BASE: u64 = 0x1_4000_0000;
+    /// File offset of the one section, mapped at RVA 0x1000.
+    const fn at(rva: usize) -> usize {
+        rva - 0x1000 + 0x200
+    }
+
+    /// A PE32+ executable with one section holding an import of
+    /// `kernel32.dll!Sleep`, a TLS directory with one callback, a DIR64 base
+    /// relocation on that callback pointer (and one on the field before
+    /// it), a bound-import directory, `FORCE_INTEGRITY` and a checksum.
+    fn synthetic_exe() -> Vec<u8> {
+        let mut d = vec![0u8; 0x600];
+        let p16 = |d: &mut Vec<u8>, at: usize, v: u16| write_u16(d, at, v).unwrap();
+        let p32 = |d: &mut Vec<u8>, at: usize, v: u32| write_u32(d, at, v).unwrap();
+        let p64 = |d: &mut Vec<u8>, at: usize, v: u64| write_u64(d, at, v).unwrap();
+        d[0..2].copy_from_slice(b"MZ");
+        p32(&mut d, layout::DOS_E_LFANEW, 0x40);
+        d[0x40..0x44].copy_from_slice(b"PE\0\0");
+        p16(&mut d, 0x44, 0x8664); // AMD64
+        p16(&mut d, 0x46, 1); // sections
+        p16(&mut d, 0x54, 240); // optional header size
+        p16(&mut d, 0x56, 0x0022); // executable, large address aware
+        let opt = 0x58;
+        p16(&mut d, opt, 0x20B);
+        p32(&mut d, opt + layout::OPT_ADDRESS_OF_ENTRY_POINT, 0x1300);
+        p64(&mut d, opt + 24, BASE);
+        p32(&mut d, opt + 32, 0x1000); // section alignment
+        p32(&mut d, opt + 36, 0x200); // file alignment
+        p32(&mut d, opt + 56, 0x2000); // size of image
+        p32(&mut d, opt + 60, 0x200); // size of headers
+        p32(&mut d, opt + layout::OPT_CHECKSUM, 0xDEAD_BEEF);
+        p16(&mut d, opt + 68, 3); // console
+        p16(
+            &mut d,
+            opt + layout::OPT_DLL_CHARACTERISTICS,
+            dll_flags::FORCE_INTEGRITY | dll_flags::DYNAMIC_BASE | dll_flags::NX_COMPAT,
+        );
+        p32(&mut d, opt + layout::OPT_NUMBER_OF_RVA_AND_SIZES, 16);
+        let directory = |d: &mut Vec<u8>, index: usize, rva: u32, size: u32| {
+            let at = opt + layout::OPT_DATA_DIRECTORY + index * layout::DATA_DIRECTORY_SIZE;
+            p32(d, at, rva);
+            p32(d, at + 4, size);
+        };
+        directory(&mut d, dir::IMPORT, 0x1000, 2 * IMPORT_DESCRIPTOR_SIZE);
+        directory(&mut d, dir::BASERELOC, 0x1380, 12);
+        directory(&mut d, 9, 0x1200, 40); // TLS
+        directory(&mut d, dir::BOUND_IMPORT, 0x1F0, 0x10);
+        directory(&mut d, dir::IAT, 0x1140, 16);
+        let sec = opt + 240;
+        d[sec..sec + 5].copy_from_slice(b".data");
+        p32(&mut d, sec + 8, 0x400); // virtual size
+        p32(&mut d, sec + 12, 0x1000);
+        p32(&mut d, sec + 16, 0x400); // raw size
+        p32(&mut d, sec + 20, 0x200); // raw offset
+        p32(&mut d, sec + 36, 0xE000_0060); // code, data, read/write/execute
+
+        // One import descriptor, then the null one.
+        p32(&mut d, at(0x1000), 0x1100); // name table
+        p32(&mut d, at(0x100C), 0x1180); // DLL name
+        p32(&mut d, at(0x1010), 0x1140); // IAT
+        p64(&mut d, at(0x1100), 0x1190);
+        p64(&mut d, at(0x1140), 0x1190);
+        d[at(0x1180)..at(0x1180) + 13].copy_from_slice(b"kernel32.dll\0");
+        d[at(0x1192)..at(0x1192) + 6].copy_from_slice(b"Sleep\0");
+        // TLS directory: raw data, index slot, callback array.
+        p64(&mut d, at(0x1200), BASE + 0x1280);
+        p64(&mut d, at(0x1208), BASE + 0x1288);
+        p64(&mut d, at(0x1210), BASE + 0x1290);
+        p64(&mut d, at(0x1218), BASE + 0x1240);
+        p64(&mut d, at(0x1240), BASE + 0x1300);
+        d[at(0x1300)] = 0xC3; // ret
+        // One relocation block for page 0x1000.
+        p32(&mut d, at(0x1380), 0x1000);
+        p32(&mut d, at(0x1384), 12);
+        p16(&mut d, at(0x1388), (10 << 12) | 0x210); // index slot pointer
+        p16(&mut d, at(0x138A), (10 << 12) | 0x218); // callback pointer
+        d
+    }
+
+    #[test]
+    fn patches_a_synthetic_title_on_any_host() {
+        let original = synthetic_exe();
+        let prepared = prepare(&original).unwrap();
+        let info = &prepared.info;
+        assert!(!info.is_dll(), "info describes the original");
+        assert_eq!(info.entry_rva, 0x1300);
+        assert_eq!(info.imports.len(), 1);
+        assert_eq!(info.imports[0].dll, "kernel32.dll");
+        assert_eq!(info.imports[0].entries[0].iat_slot_rva, 0x1140);
+        assert_eq!(info.tls.as_ref().unwrap().callback_rvas, [0x1300]);
+
+        let bytes = &prepared.bytes;
+        assert_eq!(bytes.len(), original.len());
+        let patched = ImageInfo::parse(bytes).unwrap();
+        assert!(patched.is_dll());
+        assert_eq!(patched.entry_rva, 0);
+        assert!(patched.imports.is_empty());
+        let opt = layout::optional_header_offset(bytes).unwrap();
+        assert_eq!(layout::read_u32(bytes, opt + layout::OPT_CHECKSUM), Some(0));
+        assert_eq!(
+            patched.dll_characteristics,
+            dll_flags::DYNAMIC_BASE | dll_flags::NX_COMPAT
+        );
+        // The import directory is just the null descriptor after ours.
+        let import = layout::data_directory_offset(bytes, dir::IMPORT).unwrap();
+        assert_eq!(layout::read_u32(bytes, import), Some(0x1014));
+        assert_eq!(
+            layout::read_u32(bytes, import + 4),
+            Some(IMPORT_DESCRIPTOR_SIZE)
+        );
+        let bound = layout::data_directory_offset(bytes, dir::BOUND_IMPORT).unwrap();
+        assert_eq!(bytes[bound..bound + 8], [0; 8]);
+        // The IAT and its slot are left for us to bind.
+        let iat = layout::data_directory_offset(bytes, dir::IAT).unwrap();
+        assert_eq!(bytes[iat..iat + 8], original[iat..iat + 8]);
+        assert_eq!(
+            bytes[at(0x1140)..at(0x1148)],
+            original[at(0x1140)..at(0x1148)]
+        );
+        // The callback pointer is cleared, and so is only its relocation.
+        let tls = patched.tls.as_ref().unwrap();
+        assert_eq!(tls.callbacks_va, 0);
+        assert!(tls.callback_rvas.is_empty());
+        assert_eq!(dir64_relocations(bytes, &patched), [(at(0x1388), 0x1210)]);
+        assert_eq!(bytes[at(0x138A)..at(0x138C)], [0, 0]);
+        // Nothing else changed: the callback array itself is intact.
+        assert_eq!(
+            bytes[at(0x1240)..at(0x1248)],
+            original[at(0x1240)..at(0x1248)]
+        );
+    }
+
+    #[test]
+    fn a_title_without_tls_callbacks_or_imports_keeps_its_relocations() {
+        let mut original = synthetic_exe();
+        write_u64(&mut original, at(0x1218), 0).unwrap();
+        let import = layout::data_directory_offset(&original, dir::IMPORT).unwrap();
+        write(&mut original, import, &[0; 8]).unwrap();
+        let prepared = prepare(&original).unwrap();
+        assert!(prepared.info.imports.is_empty());
+        assert_eq!(prepared.info.tls.as_ref().unwrap().callbacks_va, 0);
+        // An absent import directory stays absent.
+        assert_eq!(prepared.bytes[import..import + 8], [0; 8]);
+        assert_eq!(dir64_relocations(&prepared.bytes, &prepared.info).len(), 2);
+    }
+
+    #[test]
+    fn import_sizes_that_miss_or_overshoot_the_terminator_are_normalised() {
+        // Some linkers count only the real descriptors; others pad. The
+        // parser walks to the null descriptor either way, so the patched
+        // directory is the same: that terminator, one descriptor long.
+        let original = synthetic_exe();
+        let import = layout::data_directory_offset(&original, dir::IMPORT).unwrap();
+        let expected = prepare(&original).unwrap().bytes;
+        for size in [0, IMPORT_DESCRIPTOR_SIZE, 3 * IMPORT_DESCRIPTOR_SIZE, 0x100] {
+            let mut sized = original.clone();
+            write_u32(&mut sized, import + 4, size).unwrap();
+            let prepared = prepare(&sized).unwrap();
+            assert_eq!(prepared.info.import_count(), 1, "size {size:#x}");
+            assert_eq!(
+                prepared.info.imports[0].entries[0].iat_slot_rva, 0x1140,
+                "size {size:#x}"
+            );
+            assert_eq!(prepared.bytes, expected, "size {size:#x}");
+            // Different originals, different prepared files.
+            assert_ne!(
+                prepared.file_name(),
+                prepare(&original).unwrap().file_name()
+            );
+        }
+        // The bound IAT slot survives whatever the recorded size.
+        assert_eq!(
+            expected[at(0x1140)..at(0x1148)],
+            original[at(0x1140)..at(0x1148)]
+        );
+    }
+
+    #[test]
+    fn a_tls_directory_outside_the_file_is_refused() {
+        let mut original = synthetic_exe();
+        // Past the raw data but inside the section's 0x400: not file-backed
+        // once the raw size shrinks to the first 0x200 bytes.
+        let sec = 0x58 + 240;
+        write_u32(&mut original, sec + 16, 0x200).unwrap();
+        write_u32(&mut original, sec + 8, 0x200).unwrap();
+        assert!(matches!(
+            prepare(&original),
+            Err(PrepareError::Pe(PeError::Malformed(_)))
+        ));
+    }
+
+    #[test]
+    fn file_name_follows_the_original_bytes() {
+        let original = synthetic_exe();
+        let a = prepare(&original).unwrap();
+        assert_eq!(a.file_name(), prepare(&original).unwrap().file_name());
+        assert!(a.file_name().starts_with("victory-image-"));
+        assert!(a.file_name().ends_with(".dll"));
+        let mut rebuilt = original.clone();
+        rebuilt[at(0x1301)] = 0xCC;
+        assert_ne!(a.file_name(), prepare(&rebuilt).unwrap().file_name());
+    }
+
+    #[test]
+    fn non_pe_input_is_a_pe_error() {
+        assert!(matches!(prepare(b""), Err(PrepareError::Pe(_))));
+        assert!(matches!(
+            prepare(b"\x7fELF\x02\x01\x01\0"),
+            Err(PrepareError::Pe(_))
+        ));
+        let mut wrong_machine = synthetic_exe();
+        write_u16(&mut wrong_machine, 0x44, 0xAA64).unwrap(); // ARM64
+        assert!(matches!(
+            prepare(&wrong_machine),
+            Err(PrepareError::Pe(PeError::Unsupported(_)))
+        ));
     }
 }

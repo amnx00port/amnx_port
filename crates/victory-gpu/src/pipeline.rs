@@ -18,7 +18,9 @@
 
 use std::collections::HashMap;
 use std::mem::offset_of;
-use std::sync::{Arc, Mutex, OnceLock};
+#[cfg(windows)]
+use std::sync::OnceLock;
+use std::sync::{Arc, Mutex};
 
 use crate::object::{self, E_INVALIDARG, HRESULT, Iid, Object, PIPELINE, Table, This, guid};
 use crate::resource::PAGEABLE_IIDS;
@@ -516,7 +518,33 @@ mod tests {
     }
 
     use super::*;
-    use crate::object::{S_OK, slot};
+    use crate::object::{E_INVALIDARG, S_OK, slot};
+
+    #[test]
+    fn pipeline_creation_refuses_null_descriptions() {
+        let null = std::ptr::null();
+        let mut p = null;
+        assert_eq!(
+            create_graphics(null, std::ptr::null(), &PIPELINE_IIDS[0], &mut p),
+            E_INVALIDARG
+        );
+        assert_eq!(
+            create_compute(null, std::ptr::null(), &PIPELINE_IIDS[0], &mut p),
+            E_INVALIDARG
+        );
+        let stream = StreamDesc {
+            size: 0,
+            stream: std::ptr::null(),
+        };
+        assert_eq!(
+            create_stream(null, &stream, &PIPELINE_IIDS[0], &mut p),
+            E_INVALIDARG
+        );
+        assert_eq!(
+            create_stream(null, std::ptr::null(), &PIPELINE_IIDS[0], &mut p),
+            E_INVALIDARG
+        );
+    }
 
     fn shaders(p: This) -> Vec<(&'static str, Vec<u8>)> {
         pipeline(p)

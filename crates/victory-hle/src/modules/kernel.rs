@@ -594,9 +594,11 @@ mod host {
 
 #[cfg(test)]
 mod tests {
+    #[cfg_attr(not(windows), allow(unused_imports))]
     use super::*;
 
     #[test]
+    #[cfg(windows)] // reads its own PE test binary / Windows path rules
     fn title_images_report_their_original_path() {
         let base = 0x7000_0000_0000;
         runtime::set_image_path(base, std::path::Path::new(r"C:\title\game.exe"));
@@ -615,6 +617,7 @@ mod tests {
         assert_eq!(&small, &[b'C', b':', b'\\', 0]);
     }
 
+    #[cfg(windows)]
     fn w(text: &str) -> Vec<u16> {
         text.encode_utf16().chain(Some(0)).collect()
     }
@@ -655,6 +658,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg(windows)] // reads its own PE test binary / Windows path rules
     fn title_dlls_and_pseudo_modules_are_found_by_name() {
         let base = 0x7100_0000_0000usize;
         runtime::set_image_path(base, std::path::Path::new(r"C:\title\Mapped.dll"));
@@ -683,5 +687,107 @@ mod tests {
         let runtime = LoadLibraryA(c"xgameruntime.dll".as_ptr().cast());
         assert!(!runtime.is_null());
         assert_eq!(GetModuleHandleW(w("XGameRuntime.dll").as_ptr()), runtime);
+    }
+
+    // Off Windows the two tests above are gated (their paths are Windows
+    // paths). The same lookups, with Unix paths, run on any host.
+
+    #[cfg(not(windows))]
+    fn wide_z(text: &str) -> Vec<u16> {
+        text.encode_utf16().chain(Some(0)).collect()
+    }
+
+    #[test]
+    #[cfg(not(windows))]
+    fn title_image_paths_copy_and_truncate_on_any_host() {
+        let base = 0x7300_0000_0000usize;
+        runtime::set_image_path(base, std::path::Path::new("/title/game.exe"));
+        let module = base as *mut c_void;
+        let mut buf = [0xFFFFu16; 32];
+        let n = GetModuleFileNameW(module, buf.as_mut_ptr(), buf.len() as u32);
+        assert_eq!(
+            String::from_utf16_lossy(&buf[..n as usize]),
+            "/title/game.exe"
+        );
+        assert_eq!(buf[n as usize], 0);
+        // Exactly the path plus its NUL fits, untruncated.
+        let mut exact = [0xFFu8; 16];
+        assert_eq!(GetModuleFileNameA(module, exact.as_mut_ptr(), 16), 15);
+        assert_eq!(&exact[..16], b"/title/game.exe\0");
+        // One short: truncated, NUL-terminated, the buffer size returned.
+        let mut short = [0xFFu8; 15];
+        assert_eq!(GetModuleFileNameA(module, short.as_mut_ptr(), 15), 15);
+        assert_eq!(&short, b"/title/game.ex\0");
+        let mut one = [0xFFFFu16; 1];
+        assert_eq!(GetModuleFileNameW(module, one.as_mut_ptr(), 1), 1);
+        assert_eq!(one, [0]);
+        // No room even for the NUL: nothing written, 0 returned.
+        let mut none = [0xFFu8; 1];
+        assert_eq!(GetModuleFileNameA(module, none.as_mut_ptr(), 0), 0);
+        assert_eq!(none, [0xFF]);
+        // Not a title image: the host's answer (none, off Windows).
+        let unknown = 0x7300_1000_0000usize as *mut c_void;
+        assert_eq!(GetModuleFileNameW(unknown, buf.as_mut_ptr(), 32), 0);
+        // Unmapped again, the image is forgotten.
+        runtime::forget_image(base);
+        assert_eq!(GetModuleFileNameA(module, exact.as_mut_ptr(), 16), 0);
+    }
+
+    #[test]
+    #[cfg(not(windows))]
+    fn title_dlls_and_pseudo_modules_are_found_by_name_on_any_host() {
+        let base = 0x7400_0000_0000usize;
+        runtime::set_image_path(base, std::path::Path::new("/title/Mapped.dll"));
+        runtime::set_title_dll_loader(Box::new(|file| match file {
+            "late.dll" => Ok(Some(0x7500_0000_0000)),
+            "broken.dll" => Err("bad image".into()),
+            _ => Ok(None),
+        }));
+        let mapped = base as *mut c_void;
+        // By file name in any case, without extension, under either separator.
+        assert_eq!(GetModuleHandleW(wide_z("MAPPED").as_ptr()), mapped);
+        assert_eq!(GetModuleHandleA(c"sub\\mapped.dll".as_ptr().cast()), mapped);
+        assert_eq!(
+            GetModuleHandleA(c"/elsewhere/Mapped.DLL".as_ptr().cast()),
+            mapped
+        );
+        assert_eq!(LoadLibraryW(wide_z("mapped.dll").as_ptr()), mapped);
+        assert_eq!(FreeLibrary(mapped), 1, "title images stay loaded");
+        // A different extension is a different file.
+        assert!(GetModuleHandleA(c"mapped.exe".as_ptr().cast()).is_null());
+
+        // Not mapped yet: `LoadLibrary` maps it, `GetModuleHandle` does not.
+        assert!(GetModuleHandleW(wide_z("late.dll").as_ptr()).is_null());
+        assert_eq!(
+            LoadLibraryA(c"late".as_ptr().cast()) as usize,
+            0x7500_0000_0000
+        );
+        assert!(LoadLibraryA(c"broken.dll".as_ptr().cast()).is_null());
+        // Loads as data run no code, so they skip the title loader.
+        for flags in [0x1, 0x2, 0x20, 0x40] {
+            let data = LoadLibraryExW(wide_z("late.dll").as_ptr(), std::ptr::null_mut(), flags);
+            assert_ne!(data as usize, 0x7500_0000_0000, "flags {flags:#x}");
+        }
+
+        // Console-only DLLs are pseudo modules, the same handle every way.
+        let runtime = LoadLibraryA(c"xgameruntime.dll".as_ptr().cast());
+        assert!(!runtime.is_null());
+        assert_eq!(GetModuleHandleW(wide_z("XGameRuntime").as_ptr()), runtime);
+        assert_eq!(FreeLibrary(runtime), 1);
+        assert_eq!(
+            GetProcAddress(runtime, c"XGameRuntimeInitialize".as_ptr().cast()) as usize,
+            runtime_initialize_address()
+        );
+        assert!(GetProcAddress(runtime, c"NoSuchExport".as_ptr().cast()).is_null());
+        // We export by name only.
+        assert!(GetProcAddress(runtime, 7 as *const u8).is_null());
+        // Host DLLs outside the host policy do not exist for the title.
+        assert!(LoadLibraryW(wide_z("wininet.dll").as_ptr()).is_null());
+        assert!(GetModuleHandleA(c"/usr/lib/URLMON".as_ptr().cast()).is_null());
+    }
+
+    #[cfg(not(windows))]
+    fn runtime_initialize_address() -> usize {
+        crate::registry::lookup("xgameruntime.dll", "XGameRuntimeInitialize").unwrap()
     }
 }

@@ -4,8 +4,10 @@
 
 use std::ffi::{c_char, c_void};
 
+#[cfg(windows)]
+use super::xgameruntime::put;
 use super::xgameruntime::{
-    Guid, HRESULT, Interface, Methods, NOT_SUPPORTED, Object, add_ref, missing, put, text,
+    Guid, HRESULT, Interface, Methods, NOT_SUPPORTED, Object, add_ref, missing, text,
 };
 
 /// HDR mode; asked for with this interface id since 2020.
@@ -191,5 +193,89 @@ mod tests {
         );
         assert!(!handle.is_null());
         method::<Close>(&SHELL_OBJECT, 0x28)(&SHELL_OBJECT, handle);
+    }
+}
+
+/// The Windows test above takes a host power request; these run anywhere.
+#[cfg(all(test, not(windows)))]
+mod host_free_tests {
+    use super::*;
+    use crate::modules::xasync::E_NOTIMPL;
+    use crate::modules::xgameruntime::{QueryApiImpl, S_OK, method};
+
+    type Hdr = extern "system" fn(This, u32, *mut c_void) -> u32;
+    type Launch = extern "system" fn(This, *const c_void, *const c_char) -> HRESULT;
+    type Shot = extern "system" fn(This, *const c_void, *mut c_void) -> HRESULT;
+    type Plain = extern "system" fn(This) -> HRESULT;
+    type Count = extern "system" fn(This) -> u32;
+
+    fn query(provider: Guid, iid: Guid) -> (HRESULT, *mut c_void) {
+        let mut out = std::ptr::null_mut();
+        (QueryApiImpl(&provider, &iid, &mut out), out)
+    }
+
+    #[test]
+    fn display_areas_resolve_and_refuse_what_the_host_cannot_do() {
+        // Each pair resolves to its object; a provider asked with another
+        // area's interface id does not.
+        for (provider, iid, object) in INTERFACES {
+            let (hr, out) = query(*provider, *iid);
+            assert_eq!(hr, S_OK, "{provider}");
+            assert_eq!(out.cast_const(), (*object as *const Object).cast());
+        }
+        assert_eq!(query(HDR_PROVIDER, SHELL).0, NOT_SUPPORTED);
+        assert_eq!(query(CAPTURE_PROVIDER, HDR_IID).0, NOT_SUPPORTED);
+        assert_eq!(query(SHELL, CAPTURE_IID_2026).0, NOT_SUPPORTED);
+
+        // SDR whatever the title prefers, with or without room for info.
+        let mut info = [0u8; 64];
+        let hdr = method::<Hdr>(&HDR_OBJECT, 0x20);
+        for preference in [0, 1, 2, u32::MAX] {
+            assert_eq!(hdr(&HDR_OBJECT, preference, std::ptr::null_mut()), 2);
+            assert_eq!(hdr(&HDR_OBJECT, preference, info.as_mut_ptr().cast()), 2);
+        }
+        assert_eq!(info, [0; 64], "the info is not written");
+
+        // No URI is launched, named or not.
+        let launch = method::<Launch>(&SHELL_OBJECT, 0x18);
+        let uri = c"ms-windows-store://pdp/?productid=0";
+        assert_eq!(
+            launch(&SHELL_OBJECT, std::ptr::null(), uri.as_ptr()),
+            NOT_SUPPORTED
+        );
+        assert_eq!(
+            launch(&SHELL_OBJECT, std::ptr::null(), std::ptr::null()),
+            NOT_SUPPORTED
+        );
+        // Off Windows there is no power request to defer the screen with:
+        // the shell table ends at the launch slot.
+        assert_eq!(SHELL_VTABLE.0.len(), 4);
+
+        // Screenshots fail as unavailable; the diagnostic captures are
+        // unimplemented slots, not crashes.
+        let mut result = [0u8; 32];
+        assert_eq!(
+            method::<Shot>(&CAPTURE_OBJECT, 0x28)(
+                &CAPTURE_OBJECT,
+                std::ptr::null(),
+                result.as_mut_ptr().cast()
+            ),
+            NOT_SUPPORTED
+        );
+        assert_eq!(result, [0; 32]);
+        for slot in [0x18, 0x20] {
+            assert_eq!(
+                method::<Plain>(&CAPTURE_OBJECT, slot)(&CAPTURE_OBJECT),
+                E_NOTIMPL
+            );
+        }
+        assert_eq!(method::<Plain>(&HDR_OBJECT, 0x18)(&HDR_OBJECT), E_NOTIMPL);
+
+        // AddRef and Release on every object are no-ops that report one.
+        for object in [&HDR_OBJECT, &SHELL_OBJECT, &CAPTURE_OBJECT] {
+            for slot in [0x08, 0x10] {
+                assert_eq!(method::<Count>(object, slot)(object), 1);
+            }
+        }
     }
 }

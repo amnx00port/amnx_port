@@ -417,6 +417,30 @@ mod tests {
     }
 
     #[test]
+    fn creation_refuses_null_arguments_and_unknown_ids() {
+        let version = CHECKED_VERSION;
+        let mut device = std::ptr::null();
+        assert_eq!(
+            create(std::ptr::null(), std::ptr::null(), &IID, &mut device),
+            E_INVALIDARG
+        );
+        assert_eq!(
+            create(std::ptr::null(), &version, std::ptr::null(), &mut device),
+            E_INVALIDARG
+        );
+        let bogus = guid(9, 9, 9, [9; 8]);
+        assert_eq!(
+            create(std::ptr::null(), &version, &bogus, &mut device),
+            E_NOINTERFACE
+        );
+        assert!(device.is_null());
+        assert_eq!(
+            create(std::ptr::null(), &version, &IID, std::ptr::null_mut()),
+            S_FALSE
+        );
+    }
+
+    #[test]
     fn creation_hands_out_the_device() {
         let (hr, device) = create_as(&IID);
         assert_eq!(hr, S_OK);

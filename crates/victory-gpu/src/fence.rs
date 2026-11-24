@@ -133,7 +133,7 @@ static FUNCTIONS: Table<24> = {
     Table(f)
 };
 
-#[cfg(test)]
+#[cfg(all(test, windows))] // every test here calls into host D3D12 / Win32
 mod tests {
     use super::*;
     use crate::object::slot;
@@ -169,5 +169,123 @@ mod tests {
         // SAFETY: ours.
         unsafe { CloseHandle(event) };
         assert_eq!(slot::<extern "system" fn(This) -> u32>(f, 0x10)(f), 0);
+    }
+}
+
+/// The Windows test above waits on host events; off Windows setting one is
+/// a no-op, so these check the fence itself: its value, flags and address,
+/// which waits are queued and which a signal settles, and its ids.
+#[cfg(all(test, not(windows)))]
+mod host_free_tests {
+    use super::*;
+    use crate::object::{E_NOINTERFACE, S_FALSE, slot};
+
+    type Value = extern "system" fn(This) -> u64;
+    type Wait = extern "system" fn(This, u64, *mut c_void) -> HRESULT;
+    type Signal = extern "system" fn(This, u64) -> HRESULT;
+    type Flags = extern "system" fn(This) -> u32;
+    type Query = extern "system" fn(This, *const Iid, *mut This) -> HRESULT;
+    type Release = extern "system" fn(This) -> u32;
+
+    fn new(initial: u64, flags: u32) -> This {
+        let mut f = std::ptr::null();
+        assert_eq!(
+            create(std::ptr::null(), initial, flags, &FENCE_IIDS[0], &mut f),
+            S_OK
+        );
+        f
+    }
+
+    /// The values still waited on, in the order they were asked for.
+    fn waiting(f: This) -> Vec<u64> {
+        let waiters = fence(f).waiters.lock().unwrap();
+        waiters.iter().map(|&(value, _)| value).collect()
+    }
+
+    fn event(n: usize) -> *mut c_void {
+        std::ptr::without_provenance_mut(n)
+    }
+
+    #[test]
+    fn a_fence_keeps_its_value_flags_and_address() {
+        for (initial, flags) in [(0, 0), (1, 0), (u64::MAX, 0x2), (7, 0x1)] {
+            let f = new(initial, flags);
+            assert_eq!(slot::<Value>(f, 0x40)(f), initial);
+            assert_eq!(slot::<Flags>(f, 0x58)(f), flags);
+            // Titles read the value at the fence's GPU address.
+            let at = slot::<Value>(f, 0x60)(f);
+            // SAFETY: the fence's value, alive until released.
+            assert_eq!(unsafe { *(at as *const u64) }, initial);
+            assert_eq!(slot::<Signal>(f, 0x50)(f, initial ^ 1), S_OK);
+            // SAFETY: as above.
+            assert_eq!(unsafe { *(at as *const u64) }, initial ^ 1);
+            assert_eq!(slot::<Value>(f, 0x60)(f), at, "the address stays put");
+            assert_eq!(slot::<Release>(f, 0x10)(f), 0);
+        }
+    }
+
+    #[test]
+    fn waits_are_queued_until_a_signal_reaches_them() {
+        let f = new(3, 0);
+        let (wait, signal) = (slot::<Wait>(f, 0x48), slot::<Signal>(f, 0x50));
+        // At or below the value: done at once, nothing queued, with or
+        // without an event.
+        for value in [0, 3] {
+            assert_eq!(wait(f, value, event(1)), S_OK);
+            assert_eq!(wait(f, value, std::ptr::null_mut()), S_OK);
+        }
+        assert!(waiting(f).is_empty());
+        // Above it with no event would block forever: refused, not queued.
+        assert_eq!(wait(f, 4, std::ptr::null_mut()), E_NOTIMPL);
+        assert!(waiting(f).is_empty());
+
+        for value in [9, 5, 7, 5] {
+            assert_eq!(wait(f, value, event(value as usize)), S_OK);
+        }
+        assert_eq!(waiting(f), [9, 5, 7, 5]);
+        // Short of every wait: none settled.
+        assert_eq!(signal(f, 4), S_OK);
+        assert_eq!(waiting(f), [9, 5, 7, 5]);
+        // A signal settles every wait it reaches, and only those.
+        assert_eq!(signal(f, 6), S_OK);
+        assert_eq!(waiting(f), [9, 7]);
+        // Signals may move the value back; queued waits stay.
+        assert_eq!(signal(f, 1), S_OK);
+        assert_eq!(slot::<Value>(f, 0x40)(f), 1);
+        assert_eq!(waiting(f), [9, 7]);
+        assert_eq!(signal(f, u64::MAX), S_OK);
+        assert!(waiting(f).is_empty());
+        assert_eq!(slot::<Value>(f, 0x40)(f), u64::MAX);
+        assert_eq!(slot::<Release>(f, 0x10)(f), 0);
+    }
+
+    #[test]
+    fn fences_answer_their_ids_and_no_others() {
+        let other = guid(1, 2, 3, [4; 8]);
+        let mut out = std::ptr::dangling();
+        // Made as something it is not: refused, out cleared.
+        assert_eq!(
+            create(std::ptr::null(), 0, 0, &other, &mut out),
+            E_NOINTERFACE
+        );
+        assert!(out.is_null());
+        // No out: only asked whether it would succeed.
+        assert_eq!(
+            create(std::ptr::null(), 0, 0, &FENCE_IIDS[0], std::ptr::null_mut()),
+            S_FALSE
+        );
+
+        let f = new(0, 0);
+        let query = slot::<Query>(f, 0);
+        for known in FENCE_IIDS {
+            let mut again = std::ptr::null();
+            assert_eq!(query(f, &known, &mut again), S_OK);
+            assert_eq!(again, f);
+            assert_eq!(slot::<Release>(f, 0x10)(f), 1);
+        }
+        let mut none = std::ptr::dangling();
+        assert_eq!(query(f, &other, &mut none), E_NOINTERFACE);
+        assert!(none.is_null());
+        assert_eq!(slot::<Release>(f, 0x10)(f), 0);
     }
 }

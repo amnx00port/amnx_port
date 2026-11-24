@@ -1612,4 +1612,33 @@ mod tests {
         rumble(device, std::ptr::null());
         assert_eq!(host.lock().unwrap().rumble, [(2, 32767, 65535), (2, 0, 0)]);
     }
+
+    /// Off Windows the host has no input yet: every pad slot stays empty and
+    /// no key is ever down, so only the keyboard and its idle stand-in pad
+    /// are connected, and rumble goes nowhere.
+    #[cfg(not(windows))]
+    #[test]
+    fn off_windows_the_host_reports_no_pads_and_no_keys() {
+        let mut source = host();
+        assert!((0..PADS).all(|slot| source.pad(slot).is_none()));
+        assert!(source.keys().is_empty());
+        source.rumble(0, u16::MAX, u16::MAX);
+
+        let hub = Hub::new(source);
+        hub.poll();
+        let connected: Vec<_> = (0..DEVICES)
+            .filter(|&i| hub.state().slots[i].connected)
+            .collect();
+        assert_eq!(connected, [FALLBACK, KEYBOARD]);
+        for slot in 0..PADS {
+            assert_eq!(current(hub, GAMEPAD_KIND, slot), Err(DEVICE_DISCONNECTED));
+        }
+        let r = current(hub, GAMEPAD_KIND, FALLBACK).unwrap();
+        assert_eq!(pad(r), PadState::default());
+        release(r);
+        let r = current(hub, KEYBOARD_KIND, KEYBOARD).unwrap();
+        let count = slot::<extern "system" fn(*const Reading) -> u32, _>(r, 0x70);
+        assert_eq!(count(r), 0);
+        release(r);
+    }
 }

@@ -212,7 +212,7 @@ static FUNCTIONS: Table<24> = {
     Table(f)
 };
 
-#[cfg(test)]
+#[cfg(all(test, windows))] // every test here calls into host D3D12 / Win32
 mod tests {
     use super::*;
     use crate::object::{S_OK, slot};
@@ -320,5 +320,130 @@ mod tests {
             serialize_versioned(std::ptr::null(), &mut blob.cast_mut().cast(), &mut error),
             E_INVALIDARG
         );
+    }
+}
+
+/// The Windows tests above serialize on the host's `d3d12.dll`; these
+/// check what needs no host: argument refusals, the console flags, and the
+/// root signature object itself.
+#[cfg(all(test, not(windows)))]
+mod host_free_tests {
+    use super::*;
+    use crate::object::{E_NOINTERFACE, S_FALSE, S_OK, slot};
+
+    fn desc(flags: u32) -> Desc {
+        Desc {
+            parameter_count: 3,
+            parameters: std::ptr::dangling(),
+            sampler_count: 2,
+            samplers: std::ptr::dangling(),
+            flags,
+        }
+    }
+
+    #[test]
+    fn serializing_refuses_null_and_reports_no_host() {
+        let null = std::ptr::null_mut();
+        let (mut blob, mut error) = (null, null);
+        assert_eq!(
+            serialize(std::ptr::null(), 1, &mut blob, &mut error),
+            E_INVALIDARG
+        );
+        assert_eq!(serialize(&desc(1), 1, &mut blob, &mut error), E_NOTIMPL);
+        let versioned = VersionedDesc {
+            version: 1,
+            desc: desc(1),
+        };
+        assert_eq!(
+            serialize_versioned(std::ptr::null(), &mut blob, &mut error),
+            E_INVALIDARG
+        );
+        assert_eq!(
+            serialize_versioned(&versioned, &mut blob, &mut error),
+            E_NOTIMPL
+        );
+        // Nothing handed out on failure.
+        assert!(blob.is_null() && error.is_null());
+
+        let bytes = [0u8; 4];
+        let iid = ROOT_SIGNATURE_IIDS[0];
+        let mut out = null;
+        assert_eq!(
+            create_deserializer(std::ptr::null(), 4, &iid, &mut out),
+            E_INVALIDARG
+        );
+        assert_eq!(
+            create_deserializer(bytes.as_ptr(), 4, &iid, std::ptr::null_mut()),
+            E_INVALIDARG
+        );
+        assert_eq!(
+            create_deserializer(bytes.as_ptr(), 4, &iid, &mut out),
+            E_NOTIMPL
+        );
+        assert!(out.is_null());
+    }
+
+    #[test]
+    fn only_the_console_flag_byte_is_dropped() {
+        for (flags, kept) in [
+            (0x0100_0001, 0x1),
+            (0xff00_0000, 0),
+            (0x8000_0040, 0x40),
+            (0x00ff_ffff, 0x00ff_ffff),
+            (0, 0),
+        ] {
+            let d = without_console_flags(desc(flags));
+            assert_eq!(d.flags, kept, "{flags:#x}");
+            assert_eq!((d.parameter_count, d.sampler_count), (3, 2));
+            assert_eq!(d.parameters, std::ptr::dangling());
+        }
+    }
+
+    #[test]
+    fn root_signatures_keep_their_blob_and_answer_their_ids() {
+        let null = std::ptr::null();
+        let bytes = [0x44, 0x58, 0x42, 0x43, 1, 2, 3];
+        let iid = ROOT_SIGNATURE_IIDS[0];
+        let mut root = null;
+        // No bytes: refused, nothing written.
+        assert_eq!(
+            create(null, 0, std::ptr::null(), 7, &iid, &mut root),
+            E_INVALIDARG
+        );
+        assert_eq!(
+            create(null, 0, bytes.as_ptr(), 0, &iid, &mut root),
+            E_INVALIDARG
+        );
+        assert!(root.is_null());
+        // An id it is not: refused, out cleared.
+        let other = guid(1, 2, 3, [4; 8]);
+        root = std::ptr::dangling();
+        assert_eq!(
+            create(null, 0, bytes.as_ptr(), 7, &other, &mut root),
+            E_NOINTERFACE
+        );
+        assert!(root.is_null());
+        // No out: only asked whether it would succeed.
+        assert_eq!(
+            create(null, 0, bytes.as_ptr(), 7, &iid, std::ptr::null_mut()),
+            S_FALSE
+        );
+
+        assert_eq!(create(null, 0, bytes.as_ptr(), 7, &iid, &mut root), S_OK);
+        // SAFETY: a root signature we just made.
+        assert_eq!(unsafe { &*root.cast::<RootSignature>() }.blob, bytes);
+        type Query = extern "system" fn(This, *const Iid, *mut This) -> HRESULT;
+        type Release = extern "system" fn(This) -> u32;
+        let query = slot::<Query>(root, 0);
+        for known in ROOT_SIGNATURE_IIDS {
+            let mut again = null;
+            assert_eq!(query(root, &known, &mut again), S_OK);
+            assert_eq!(again, root);
+            assert_eq!(slot::<Release>(root, 0x10)(root), 1);
+        }
+        let mut none = std::ptr::dangling();
+        assert_eq!(query(root, &other, &mut none), E_NOINTERFACE);
+        assert!(none.is_null());
+        assert_eq!(slot::<Release>(root, 0x10)(root), 0);
     }
 }

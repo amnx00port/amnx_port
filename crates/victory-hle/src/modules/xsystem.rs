@@ -132,8 +132,10 @@ static ANALYTICS_VTABLE: Methods<4> = Methods([
 
 /// The device type is not a runtime call: code linked into the title reads
 /// `ConsoleMode` from this key (`RegOpenKeyW`, `RegQueryValueExW`) and
-/// takes a missing value for a PC.
-#[cfg(windows)]
+/// takes a missing value for a PC. Off Windows there is no host registry
+/// behind our key, so every other key is missing; nothing binds these
+/// there yet, so off Windows the module is built for its tests.
+#[cfg(any(windows, test))]
 mod device_type {
     #![allow(non_snake_case)]
 
@@ -141,7 +143,9 @@ mod device_type {
 
     use victory_gpu::console::{self, Console};
 
+    #[cfg(windows)]
     use crate::modules::files::host;
+    #[cfg(windows)]
     use crate::{HleModule, hle_export};
 
     type Key = *mut c_void;
@@ -150,6 +154,8 @@ mod device_type {
     const VALUE: &str = "ConsoleMode";
     const SUCCESS: u32 = 0;
     const FILE_NOT_FOUND: u32 = 2;
+    #[cfg(not(windows))]
+    const INVALID_HANDLE: u32 = 6;
     const INVALID_PARAMETER: u32 = 87;
     const MORE_DATA: u32 = 234;
     const DWORD: u32 = 4;
@@ -197,11 +203,17 @@ mod device_type {
     // Our titles import only these registry functions (and `RegOpenKeyExW`
     // below), so no other call can reach the host with our key.
     pub extern "system" fn RegOpenKeyW(root: Key, sub: *const u16, out: *mut Key) -> u32 {
-        open(root, sub, out).unwrap_or_else(|| {
+        if let Some(result) = open(root, sub, out) {
+            return result;
+        }
+        #[cfg(windows)]
+        {
             host!("advapi32.dll", "RegOpenKeyW": extern "system" fn(Key, *const u16, *mut Key) -> u32)(
                 root, sub, out,
             )
-        })
+        }
+        #[cfg(not(windows))]
+        FILE_NOT_FOUND
     }
 
     pub extern "system" fn RegOpenKeyExW(
@@ -211,11 +223,19 @@ mod device_type {
         access: u32,
         out: *mut Key,
     ) -> u32 {
-        open(root, sub, out).unwrap_or_else(|| {
+        #[cfg(not(windows))]
+        let _ = (options, access);
+        if let Some(result) = open(root, sub, out) {
+            return result;
+        }
+        #[cfg(windows)]
+        {
             host!("advapi32.dll", "RegOpenKeyExW": extern "system" fn(
                 Key, *const u16, u32, u32, *mut Key,
             ) -> u32)(root, sub, options, access, out)
-        })
+        }
+        #[cfg(not(windows))]
+        FILE_NOT_FOUND
     }
 
     pub extern "system" fn RegQueryValueExW(
@@ -227,10 +247,15 @@ mod device_type {
         size: *mut u32,
     ) -> u32 {
         if key != oem() {
+            #[cfg(windows)]
             return host!("advapi32.dll", "RegQueryValueExW": extern "system" fn(
                 Key, *const u16, *mut u32, *mut u32, *mut u8, *mut u32,
             ) -> u32)(key, name, reserved, kind, data, size);
+            #[cfg(not(windows))]
+            return INVALID_HANDLE;
         }
+        #[cfg(not(windows))]
+        let _ = reserved;
         if !is(name, VALUE) {
             return FILE_NOT_FOUND;
         }
@@ -264,9 +289,15 @@ mod device_type {
         if key == oem() {
             return SUCCESS;
         }
-        host!("advapi32.dll", "RegCloseKey": extern "system" fn(Key) -> u32)(key)
+        #[cfg(windows)]
+        {
+            host!("advapi32.dll", "RegCloseKey": extern "system" fn(Key) -> u32)(key)
+        }
+        #[cfg(not(windows))]
+        INVALID_HANDLE
     }
 
+    #[cfg(windows)]
     pub(crate) fn module() -> HleModule {
         HleModule {
             name: "device type",
@@ -339,6 +370,66 @@ mod device_type {
             assert_eq!(again, oem());
         }
 
+        /// Size and type probes on our value: data without a size is
+        /// refused, a size alone reports four bytes, and a type alone is a
+        /// DWORD; a key under ours does not exist.
+        #[test]
+        fn the_console_mode_answers_size_and_type_probes() {
+            let mut key = std::ptr::null_mut();
+            let path = w(KEY);
+            assert_eq!(RegOpenKeyW(LOCAL_MACHINE, path.as_ptr(), &mut key), SUCCESS);
+            assert_eq!(key, oem());
+            let name = w(&VALUE.to_ascii_uppercase());
+            let null = std::ptr::null_mut();
+            let mut value = 0u32;
+            assert_eq!(
+                RegQueryValueExW(
+                    key,
+                    name.as_ptr(),
+                    null,
+                    null,
+                    (&raw mut value).cast(),
+                    null
+                ),
+                INVALID_PARAMETER
+            );
+            assert_eq!(value, 0);
+            let mut size = 0;
+            assert_eq!(
+                RegQueryValueExW(key, name.as_ptr(), null, null, null.cast(), &mut size),
+                SUCCESS
+            );
+            assert_eq!(size, 4);
+            let mut kind = 0;
+            assert_eq!(
+                RegQueryValueExW(key, name.as_ptr(), null, &mut kind, null.cast(), null),
+                SUCCESS
+            );
+            assert_eq!(kind, DWORD);
+            assert_eq!(
+                RegQueryValueExW(
+                    key,
+                    std::ptr::null(),
+                    null,
+                    &mut kind,
+                    null.cast(),
+                    &mut size
+                ),
+                FILE_NOT_FOUND
+            );
+            let mut sub = std::ptr::null_mut();
+            assert_eq!(RegOpenKeyW(key, std::ptr::null(), &mut sub), FILE_NOT_FOUND);
+            assert!(sub.is_null());
+            // Our path with nowhere to put the key is not ours to open.
+            #[cfg(not(windows))]
+            assert_eq!(
+                RegOpenKeyW(LOCAL_MACHINE, path.as_ptr(), std::ptr::null_mut()),
+                FILE_NOT_FOUND
+            );
+            assert_eq!(RegCloseKey(key), SUCCESS);
+        }
+
+        #[cfg(windows)]
         #[test]
         fn other_keys_reach_the_host() {
             let mut key = std::ptr::null_mut();
@@ -359,6 +450,46 @@ mod device_type {
             );
             assert!(size > 0);
             assert_eq!(RegCloseKey(key), SUCCESS);
+        }
+
+        /// Off Windows no host registry stands behind our key: other keys
+        /// are missing, and handles we never gave out are refused, so
+        /// nothing reaches a host function that is not there.
+        #[cfg(not(windows))]
+        #[test]
+        fn off_windows_other_keys_are_missing() {
+            let mut key = std::ptr::null_mut();
+            let path = w(r"Software\Microsoft\Windows NT\CurrentVersion");
+            assert_eq!(
+                RegOpenKeyW(LOCAL_MACHINE, path.as_ptr(), &mut key),
+                FILE_NOT_FOUND
+            );
+            assert_eq!(
+                RegOpenKeyExW(LOCAL_MACHINE, path.as_ptr(), 0, 1, &mut key),
+                FILE_NOT_FOUND
+            );
+            assert!(key.is_null());
+            // A null path is not our key either.
+            assert_eq!(
+                RegOpenKeyW(LOCAL_MACHINE, std::ptr::null(), &mut key),
+                FILE_NOT_FOUND
+            );
+            let stranger = 0x1234 as Key;
+            let mut size = 0;
+            let name = w(VALUE);
+            assert_eq!(
+                RegQueryValueExW(
+                    stranger,
+                    name.as_ptr(),
+                    std::ptr::null_mut(),
+                    std::ptr::null_mut(),
+                    std::ptr::null_mut(),
+                    &mut size
+                ),
+                INVALID_HANDLE
+            );
+            assert_eq!(size, 0);
+            assert_eq!(RegCloseKey(stranger), INVALID_HANDLE);
         }
     }
 }

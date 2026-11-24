@@ -545,3 +545,157 @@ mod tests {
         assert!(at[1] > first);
     }
 }
+
+/// Off Windows nothing runs on the host, so queues only signal fences,
+/// present without copying, map pages through the runtime's mapper if any,
+/// and write timestamps from our clocks.
+#[cfg(all(test, not(windows)))]
+mod host_free_tests {
+    use super::*;
+    use crate::object::{E_INVALIDARG, slot};
+    use crate::resource::use_page_mapper;
+    use std::sync::Mutex;
+
+    fn queue_direct() -> This {
+        let null = std::ptr::null();
+        let desc = QueueDesc {
+            kind: 0,
+            priority: 0,
+            flags: 0,
+            nodes: 0,
+        };
+        let mut q = null;
+        assert_eq!(create(null, &desc, &QUEUE_IIDS[0], &mut q), S_OK);
+        q
+    }
+
+    #[test]
+    fn timestamp_frequency_refuses_null_and_reports_the_rate() {
+        let q = queue_direct();
+        type Freq = extern "system" fn(This, *mut u64) -> HRESULT;
+        let freq = slot::<Freq>(q, 0x80);
+        assert_eq!(freq(q, std::ptr::null_mut()), E_INVALIDARG);
+        let mut out = 0;
+        assert_eq!(freq(q, &mut out), S_OK);
+        assert_eq!(out, TIMESTAMP_FREQUENCY);
+        assert_eq!(slot::<extern "system" fn(This) -> u32>(q, 0x10)(q), 0);
+    }
+
+    #[test]
+    fn fence_waits_complete_without_blocking_the_queue() {
+        let q = queue_direct();
+        let mut fence = std::ptr::null();
+        assert_eq!(
+            crate::fence::create(std::ptr::null(), 0, 0, &crate::fence::FENCE_IIDS[0], &mut fence),
+            S_OK
+        );
+        type Wait = extern "system" fn(This, This, u64) -> HRESULT;
+        let wait = slot::<Wait>(q, 0x78);
+        assert_eq!(wait(q, std::ptr::null(), 1), E_INVALIDARG);
+        assert_eq!(wait(q, fence, 9), S_OK);
+        type Signal2 = extern "system" fn(This, This, u64, *const u8, *const u8) -> HRESULT;
+        let signal2 = slot::<Signal2>(q, 0x100);
+        assert_eq!(signal2(q, fence, 4, std::ptr::null(), std::ptr::null()), S_OK);
+        assert_eq!(
+            slot::<extern "system" fn(This) -> u64>(fence, 0x40)(fence),
+            4
+        );
+        assert_eq!(slot::<extern "system" fn(This) -> u32>(fence, 0x10)(fence), 0);
+    }
+
+    #[test]
+    fn present_succeeds_without_copying_to_a_window() {
+        let q = queue_direct();
+        type Present = extern "system" fn(This, u32, *const Plane, *const u8) -> HRESULT;
+        let present = slot::<Present>(q, 0xf0);
+        assert_eq!(present(q, 0, std::ptr::null(), std::ptr::null()), S_OK);
+        // planes set but no resources is still fine off Windows.
+        let plane = Plane {
+            token: 0,
+            count: 0,
+            resources: std::ptr::null(),
+        };
+        assert_eq!(present(q, 1, &plane, std::ptr::null()), S_OK);
+        assert_eq!(slot::<extern "system" fn(This) -> u32>(q, 0x10)(q), 0);
+    }
+
+    #[test]
+    fn the_system_clock_writes_zero_off_windows() {
+        let mut at = [0u64; 1];
+        Written::SystemTimestamp.write(at.as_mut_ptr().cast(), 8);
+        assert_eq!(at[0], 0);
+    }
+
+    #[test]
+    fn page_mapping_batches_run_through_the_runtime_mapper() {
+        static LOG: Mutex<Vec<(u64, u64, u64)>> = Mutex::new(Vec::new());
+        fn record(to: u64, from: u64, len: u64) -> bool {
+            LOG.lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .push((to, from, len));
+            true
+        }
+        let q = queue_direct();
+        type Map = extern "system" fn(This, u32, *const PageBatch, u64, u32, u32) -> HRESULT;
+        let map = slot::<Map>(q, 0xe8);
+        assert_eq!(map(q, 1, std::ptr::null(), 0, 0, 0), E_INVALIDARG);
+        if crate::resource::page_mapper().is_none() {
+            let batch = PageBatch {
+                destination: 0,
+                count: 0,
+                ranges: std::ptr::null(),
+            };
+            assert_eq!(map(q, 0, &batch, 0, 1, 0), E_INVALIDARG);
+        }
+        use_page_mapper(record);
+        let pool = 0x10_0000;
+        let ranges = [
+            PageRange {
+                kind: 0,
+                start: 0,
+                count: 1,
+            },
+            PageRange {
+                kind: 1,
+                start: 1,
+                count: 2,
+            },
+            PageRange {
+                kind: 2,
+                start: 0,
+                count: 1,
+            },
+            PageRange {
+                kind: 3,
+                start: 0,
+                count: 1,
+            },
+        ];
+        let batch = PageBatch {
+            destination: 0x1000,
+            count: ranges.len() as u32,
+            ranges: ranges.as_ptr(),
+        };
+        assert_eq!(map(q, 1, &batch, pool, 4, 0), S_OK);
+        let want = [
+            (0x1000, pool, PAGE),
+            (0x1000 + PAGE, pool + PAGE, PAGE),
+            (0x1000 + 2 * PAGE, pool + PAGE, PAGE),
+            (0x1000 + 3 * PAGE, 0, PAGE),
+        ];
+        assert_eq!(*LOG.lock().unwrap_or_else(|e| e.into_inner()), want);
+        // Out-of-range pool pages fail the batch.
+        let bad = PageRange {
+            kind: 0,
+            start: 3,
+            count: 2,
+        };
+        let batch = PageBatch {
+            destination: 0x2000,
+            count: 1,
+            ranges: &bad,
+        };
+        assert_eq!(map(q, 1, &batch, pool, 4, 0), S_OK);
+        assert_eq!(slot::<extern "system" fn(This) -> u32>(q, 0x10)(q), 0);
+    }
+}

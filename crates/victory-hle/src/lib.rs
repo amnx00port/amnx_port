@@ -120,4 +120,76 @@ mod tests {
             Some(Provenance::Hle)
         );
     }
+
+    // Off Windows the two tests above are gated (pass-through needs the
+    // host's DLLs). Precedence and the policy itself are code-only.
+
+    #[cfg(not(windows))]
+    #[test]
+    fn overrides_win_and_allowed_host_dlls_go_missing_on_any_host() {
+        let r = HleResolver::default();
+        // Our override answers before the policy is consulted, at any
+        // API-set version and in any case.
+        for dll in [
+            "api-ms-win-core-libraryloader-l1-2-0.dll",
+            "API-MS-WIN-CORE-LIBRARYLOADER-L1-1-1.DLL",
+        ] {
+            assert_eq!(
+                r.classify(dll, &name("GetModuleHandleW")),
+                Some(Provenance::Hle),
+                "{dll}"
+            );
+            assert_eq!(
+                HleResolver::new(HostPolicy::none()).classify(dll, &name("GetModuleHandleW")),
+                Some(Provenance::Hle),
+                "{dll}"
+            );
+        }
+        // Allowed for pass-through, but there is no host to pass to.
+        assert!(r.host.allows("api-ms-win-core-synch-l1-2-0.dll"));
+        assert_eq!(
+            r.classify("api-ms-win-core-synch-l1-2-0.dll", &name("Sleep")),
+            None
+        );
+        assert_eq!(r.classify("ws2_32.dll", &ImportSymbol::Ordinal(115)), None);
+        // Console-only DLLs are never allowed through.
+        assert!(!r.host.allows("xmem.dll"));
+        assert_eq!(
+            r.classify("xmem.dll", &name("XMemSetAllocationHooks")),
+            None
+        );
+    }
+
+    #[test]
+    fn host_policy_patterns_are_exact_or_prefix_and_ignore_case() {
+        let policy = HostPolicy::default();
+        for allowed in [
+            "KERNEL32.DLL",
+            "api-ms-win-crt-runtime-l1-1-0.dll",
+            "vcruntime140_1.dll",
+            "msvcp140_atomic_wait.dll",
+            "Ext-MS-Win-RTCore-NTUser-Window-L1-1-0.dll",
+        ] {
+            assert!(policy.allows(allowed), "{allowed}");
+        }
+        for refused in [
+            // Exact entries are not prefixes, and carry their extension.
+            "kernel32.dll.bak",
+            "kernel32",
+            "xkernel32.dll",
+            // A prefix entry matches from the start only.
+            "my-api-ms-win-core-synch.dll",
+            "xgameruntime.dll",
+            "d3d12_xs.dll",
+            "wininet.dll",
+            "",
+        ] {
+            assert!(!policy.allows(refused), "{refused}");
+        }
+        assert!(!HostPolicy::none().allows("kernel32.dll"));
+        let star = HostPolicy {
+            allow: vec!["*".into()],
+        };
+        assert!(star.allows("anything.dll") && star.allows(""));
+    }
 }

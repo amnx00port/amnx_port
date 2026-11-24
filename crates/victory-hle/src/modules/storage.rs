@@ -172,7 +172,7 @@ static VTABLE: Methods<8> = Methods([
     prompt_result as *const (),    // 0x38
 ]);
 
-#[cfg(test)]
+#[cfg(all(test, windows))]
 mod tests {
     use super::*;
     use crate::modules::xgameruntime::method;
@@ -236,5 +236,145 @@ mod tests {
             assert_eq!(xasync::XAsyncGetStatus(&mut block, true), expect);
             assert_eq!(result(this, &mut block), expect, "{bytes} bytes");
         }
+    }
+}
+
+/// The Windows test above mounts a drive; these run anywhere, and own the
+/// title alone (the only other writer is that Windows-only test).
+#[cfg(all(test, not(windows)))]
+mod host_free_tests {
+    use super::*;
+    use crate::modules::xgameruntime::method;
+    use std::os::unix::fs::symlink;
+
+    type Size = extern "system" fn(This, *mut usize) -> HRESULT;
+    type Get = extern "system" fn(This, usize, *mut u8, *mut usize) -> HRESULT;
+    type Space = extern "system" fn(This, *mut SpaceInfo) -> HRESULT;
+    type Prompt = extern "system" fn(This, u64, *mut AsyncBlock) -> HRESULT;
+    type Answer = extern "system" fn(This, *mut AsyncBlock) -> HRESULT;
+
+    fn set(storage: &Path, quota: u64) {
+        runtime::set_title(runtime::Title {
+            id: 1,
+            storage: storage.to_owned(),
+            storage_bytes: quota,
+            ..Default::default()
+        });
+    }
+
+    fn info() -> SpaceInfo {
+        let mut out = SpaceInfo {
+            available_free: 1,
+            total_free: 1,
+            used: 1,
+            total: 1,
+        };
+        assert_eq!(method::<Space>(&OBJECT, 0x28)(&OBJECT, &mut out), S_OK);
+        out
+    }
+
+    fn prompt(bytes: u64) -> HRESULT {
+        let mut block = AsyncBlock {
+            queue: std::ptr::null(),
+            context: std::ptr::null_mut(),
+            callback: None,
+            internal: [0; 4],
+        };
+        assert_eq!(
+            method::<Prompt>(&OBJECT, 0x30)(&OBJECT, bytes, &mut block),
+            S_OK
+        );
+        let status = xasync::XAsyncGetStatus(&mut block, true);
+        assert_eq!(method::<Answer>(&OBJECT, 0x38)(&OBJECT, &mut block), status);
+        status
+    }
+
+    #[test]
+    fn quota_counts_the_folder_tree_and_paths_fail_without_a_drive() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().join("storage");
+
+        // No drive to serve off Windows, title or not: both path calls
+        // fail and leave their outputs alone.
+        for storage in [Path::new(""), &root] {
+            set(storage, 1000);
+            let (mut size, mut used, mut buffer) = (7usize, 7usize, [9u8; 8]);
+            assert_eq!(
+                method::<Size>(&OBJECT, 0x18)(&OBJECT, &mut size),
+                NOT_SUPPORTED
+            );
+            let get = method::<Get>(&OBJECT, 0x20);
+            assert_eq!(
+                get(&OBJECT, 8, buffer.as_mut_ptr(), &mut used),
+                NOT_SUPPORTED
+            );
+            assert_eq!(
+                get(&OBJECT, 0, buffer.as_mut_ptr(), &mut used),
+                NOT_SUPPORTED
+            );
+            assert_eq!((size, used, buffer), (7, 7, [9; 8]), "{storage:?}");
+        }
+
+        // A folder not made yet is empty, not an error; with no host disk
+        // limit off Windows, writable now is the quota's rest.
+        let empty = SpaceInfo {
+            available_free: 1000,
+            total_free: 1000,
+            used: 0,
+            total: 1000,
+        };
+        assert_eq!(info(), empty);
+        assert_eq!(disk_free(&root), u64::MAX);
+
+        // Files at any depth count; empty folders cost nothing.
+        std::fs::create_dir_all(root.join("a/b/c")).unwrap();
+        std::fs::create_dir_all(root.join("empty/deeper")).unwrap();
+        std::fs::write(root.join("top.dat"), [0u8; 100]).unwrap();
+        std::fs::write(root.join("a/b/c/deep.dat"), [0u8; 250]).unwrap();
+        std::fs::write(root.join("a/zero"), []).unwrap();
+        assert_eq!((info().used, info().total_free), (350, 650));
+
+        // Links are not followed: one to a file outside counts as the link
+        // (its target's path length), and a loop back to the root ends.
+        let outside = dir.path().join("outside.bin");
+        std::fs::write(&outside, [0u8; 4096]).unwrap();
+        symlink(&outside, root.join("a/link")).unwrap();
+        symlink(&root, root.join("a/b/loop")).unwrap();
+        let links = [&outside, &root]
+            .map(|t| t.as_os_str().len() as u64)
+            .iter()
+            .sum::<u64>();
+        assert_eq!(info().used, 350 + links);
+        std::fs::remove_file(root.join("a/link")).unwrap();
+        std::fs::remove_file(root.join("a/b/loop")).unwrap();
+
+        // The prompt grants exactly the quota's rest.
+        assert_eq!(prompt(0), S_OK);
+        assert_eq!(prompt(650), S_OK);
+        assert_eq!(prompt(651), E_ABORT);
+        assert_eq!(prompt(u64::MAX), E_ABORT);
+
+        // Over the quota (it shrank under saved data): nothing is free, the
+        // use is still told in full, and only a zero-byte ask is granted.
+        set(&root, 300);
+        let over = SpaceInfo {
+            available_free: 0,
+            total_free: 0,
+            used: 350,
+            total: 300,
+        };
+        assert_eq!(info(), over);
+        assert_eq!(prompt(0), S_OK);
+        assert_eq!(prompt(1), E_ABORT);
+
+        // A manifest with no quota: nothing to grant beyond zero.
+        set(&root, 0);
+        assert_eq!((info().total, info().total_free), (0, 0));
+        assert_eq!(prompt(1), E_ABORT);
+
+        // The storage path names a file, not a folder: nothing is used.
+        set(&root.join("top.dat"), 1000);
+        assert_eq!((info().used, info().total_free), (0, 1000));
+        set(Path::new(""), 0);
     }
 }

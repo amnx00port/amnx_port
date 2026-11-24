@@ -1447,3 +1447,344 @@ mod tests {
         assert_eq!(release(allocator), 0);
     }
 }
+
+/// Off Windows no list has a host list behind it, so what a list does on
+/// its own is all there is: value writes land at once, query results are
+/// written into the buffer, draws and dispatches are only counted, and
+/// creation, upload memory and the two table layouts behave as titles
+/// expect.
+#[cfg(all(test, not(windows)))]
+mod host_free_tests {
+    use super::*;
+    use crate::object::{E_NOINTERFACE, S_FALSE};
+
+    type Release = extern "system" fn(This) -> u32;
+
+    fn release(o: This) -> u32 {
+        crate::object::slot::<Release>(o, 0x10)(o)
+    }
+
+    fn allocator() -> This {
+        let mut a = std::ptr::null();
+        assert_eq!(
+            create_allocator(std::ptr::null(), 0, &ALLOCATOR_IIDS[0], &mut a),
+            S_OK
+        );
+        a
+    }
+
+    fn list(allocator: This) -> This {
+        let null = std::ptr::null();
+        let mut l = null;
+        assert_eq!(
+            create_list(null, 0, 0, allocator, null, &LIST_IIDS[0], &mut l),
+            S_OK
+        );
+        l
+    }
+
+    fn uploads(list: This) -> usize {
+        // SAFETY: one of our lists.
+        let uploads = unsafe { &(*list.cast::<List>()).uploads };
+        uploads.lock().unwrap().len()
+    }
+
+    /// A buffer resource over `memory`, as a title places one at an address.
+    fn buffer_at(memory: &mut [u64]) -> This {
+        /// The title's resource description (`ResourceDesc`).
+        #[repr(C)]
+        struct Desc {
+            dimension: u32,
+            alignment: u64,
+            width: u64,
+            height: u32,
+            depth_or_array_size: u16,
+            mip_levels: u16,
+            format: u32,
+            sample_count: u32,
+            sample_quality: u32,
+            layout: u32,
+            flags: u32,
+        }
+        const _: () = assert!(size_of::<Desc>() == size_of::<crate::resource::ResourceDesc>());
+        let desc = Desc {
+            dimension: 1,
+            alignment: 0,
+            width: size_of_val(memory) as u64,
+            height: 1,
+            depth_or_array_size: 1,
+            mip_levels: 1,
+            format: 0,
+            sample_count: 1,
+            sample_quality: 0,
+            layout: 1,
+            flags: 0,
+        };
+        // Any id the resource answers; the first is ID3D12Resource.
+        let iid = guid(
+            0x696442be,
+            0xa72e,
+            0x4059,
+            [0xbc, 0x79, 0x5b, 0x5c, 0x98, 0x04, 0x0f, 0xad],
+        );
+        let null = std::ptr::null();
+        let mut r = null;
+        let hr = crate::resource::create_at_address(
+            null,
+            memory.as_mut_ptr() as u64,
+            (&raw const desc).cast(),
+            0,
+            null.cast(),
+            &iid,
+            &mut r,
+        );
+        assert_eq!(hr, S_OK);
+        r
+    }
+
+    #[test]
+    fn value_writes_land_at_once_and_only_their_width() {
+        let l = list(allocator());
+        let mut at = [u64::MAX; 3];
+        let p = |i: usize, at: &mut [u64; 3]| at[i..].as_mut_ptr() as u64;
+        // 32 bits: the low half only, the high half left as it was.
+        write32(l, p(0, &mut at), 0x1234_5678, 0, 0);
+        assert_eq!(at[0], 0xffff_ffff_1234_5678);
+        write64(l, p(1, &mut at), 0xaaaa_bbbb_cccc_dddd, 0, 0);
+        assert_eq!(at[1], 0xaaaa_bbbb_cccc_dddd);
+        // Unknown flags write the value.
+        write64(l, p(2, &mut at), 5, 0, 0x80);
+        assert_eq!(at[2], 5);
+        // Flag 2, the system timestamp: no performance counter off Windows.
+        write64(l, p(2, &mut at), 9, 0, 2);
+        assert_eq!(at[2], 0);
+        // Flag 1, the GPU clock: never runs backwards, and not the value.
+        write64(l, p(0, &mut at), u64::MAX, 0, 1);
+        let first = at[0];
+        assert_ne!(first, u64::MAX);
+        write64(l, p(0, &mut at), u64::MAX, 0, 1);
+        assert!(at[0] >= first);
+        // A null address is skipped, not written through.
+        write32(l, 0, 1, 0, 0);
+        write64(l, 0, 1, 0, 0);
+        assert_eq!(at[1], 0xaaaa_bbbb_cccc_dddd);
+        assert_eq!(release(l), 0);
+    }
+
+    #[test]
+    fn query_results_are_written_into_the_buffer_if_they_fit() {
+        let l = list(allocator());
+        const UNTOUCHED: u64 = 0x5a5a_5a5a_5a5a_5a5a;
+        let mut memory = [UNTOUCHED; 16];
+        let buffer = buffer_at(&mut memory);
+        let resolve = |kind, count, offset| {
+            resolve_queries(l, std::ptr::null(), kind, 0, count, buffer, offset)
+        };
+
+        // Occlusion: a million samples passed, one 8-byte result each.
+        resolve(0, 2, 8);
+        assert_eq!(memory[..4], [UNTOUCHED, 1 << 20, 1 << 20, UNTOUCHED]);
+        // Binary occlusion: visible.
+        resolve(1, 1, 0);
+        assert_eq!(memory[0], 1);
+        // Pipeline statistics: 88 bytes of zeros each.
+        memory.fill(UNTOUCHED);
+        resolve(3, 1, 0);
+        assert_eq!(memory[..11], [0; 11]);
+        assert_eq!(memory[11], UNTOUCHED);
+        // Other kinds (stream output): 16 bytes of zeros each.
+        memory.fill(UNTOUCHED);
+        resolve(9, 2, 16);
+        assert_eq!(memory[..7], [UNTOUCHED, UNTOUCHED, 0, 0, 0, 0, UNTOUCHED]);
+
+        // Past the end, even by one result: nothing written at all.
+        memory.fill(UNTOUCHED);
+        resolve(0, 2, 15 * 8);
+        resolve(3, 2, 0);
+        resolve(9, 1, 15 * 8);
+        // Exactly to the end fits.
+        resolve(0, 1, 15 * 8);
+        assert_eq!(memory[..15], [UNTOUCHED; 15]);
+        assert_eq!(memory[15], 1 << 20);
+        // No buffer: nothing to write into.
+        resolve_queries(l, std::ptr::null(), 0, 0, 4, std::ptr::null(), 0);
+
+        assert_eq!(release(buffer), 0);
+        assert_eq!(release(l), 0);
+    }
+
+    #[test]
+    fn creation_refuses_what_it_cannot_use() {
+        let null = std::ptr::null();
+        let a = allocator();
+        let other = guid(1, 2, 3, [4; 8]);
+
+        // No allocator: refused, nothing made.
+        let mut l = null;
+        assert_eq!(
+            create_list(null, 0, 0, null, null, &LIST_IIDS[0], &mut l),
+            E_INVALIDARG
+        );
+        assert!(l.is_null());
+        // The console's form: no description is refused; the type comes
+        // from the description.
+        assert_eq!(
+            create_list_x(null, std::ptr::null(), a, null, &LIST_IIDS[0], &mut l),
+            E_INVALIDARG
+        );
+        let desc = ListDesc {
+            kind: 3,
+            flags: 0x10,
+            nodes: 1,
+            barrier_batch: 64,
+        };
+        assert_eq!(
+            create_list_x(null, &desc, a, null, &LIST_IIDS[7], &mut l),
+            S_OK
+        );
+        assert_eq!(list_type(l), 3);
+        assert_eq!(release(l), 0);
+        // Asked as something a list is not; asked with no out.
+        let mut none = std::ptr::dangling();
+        assert_eq!(
+            create_list(null, 0, 0, a, null, &other, &mut none),
+            E_NOINTERFACE
+        );
+        assert!(none.is_null());
+        assert_eq!(
+            create_list(null, 0, 0, a, null, &LIST_IIDS[0], std::ptr::null_mut()),
+            S_FALSE
+        );
+
+        // Every list id, and no allocator id, answers on a list.
+        let l = list(a);
+        for known in LIST_IIDS {
+            let mut same = null;
+            assert_eq!(list_query(l, &known, &mut same), S_OK);
+            assert_eq!(same, l);
+            assert_eq!(release(l), 1);
+        }
+        let mut none = std::ptr::dangling();
+        assert_eq!(list_query(l, &ALLOCATOR_IIDS[0], &mut none), E_NOINTERFACE);
+        assert!(none.is_null());
+        // And the other way round on the allocator, which resets at once.
+        for known in ALLOCATOR_IIDS {
+            let mut same = null;
+            assert_eq!(allocator_query(a, &known, &mut same), S_OK);
+            assert_eq!(release(a), 1);
+        }
+        assert_eq!(allocator_query(a, &LIST_IIDS[0], &mut none), E_NOINTERFACE);
+        assert_eq!(allocator_reset(a), S_OK);
+
+        // A reset with no allocator is refused and keeps the list's memory.
+        assert!(!allocate_upload(l, 8, 0).is_null());
+        assert_eq!(reset(l, null, null), E_INVALIDARG);
+        assert_eq!(reset_x(l, null, null, 0), E_INVALIDARG);
+        assert_eq!(uploads(l), 1);
+        assert_eq!(reset_x(l, a, null, 0xff), S_OK);
+        assert_eq!(uploads(l), 0);
+        assert_eq!(close(l), S_OK);
+        assert_eq!(release(l), 0);
+        assert_eq!(release(a), 0);
+    }
+
+    #[test]
+    fn upload_memory_is_aligned_kept_and_refused_when_it_cannot_be() {
+        let a = allocator();
+        let l = list(a);
+        // Below 16 (none included) aligns to 16.
+        for alignment in [0, 1, 2, 8] {
+            let p = allocate_upload(l, 3, alignment);
+            assert!((p as usize).is_multiple_of(16), "{alignment}");
+        }
+        for shift in 4..=16 {
+            let p = allocate_upload(l, 1 << shift, 1 << shift);
+            assert!((p as usize).is_multiple_of(1 << shift));
+            // SAFETY: as many bytes as were asked for.
+            unsafe { p.write_bytes(0xcd, 1 << shift) };
+        }
+        // An empty block is still a block.
+        assert!(!allocate_upload(l, 0, 64).is_null());
+        let kept = 4 + 13 + 1;
+        assert_eq!(uploads(l), kept);
+        // Too large to add the alignment to, not a power of two, or no
+        // list: null, and nothing kept.
+        assert!(allocate_upload(l, u64::MAX, 16).is_null());
+        assert!(allocate_upload(l, u64::MAX - 8, 16).is_null());
+        assert!(allocate_upload(l, 16, 48).is_null());
+        assert!(allocate_upload(l, 16, u64::MAX).is_null());
+        assert!(allocate_upload(std::ptr::null(), 16, 16).is_null());
+        assert_eq!(uploads(l), kept);
+        assert_eq!(reset(l, a, std::ptr::null()), S_OK);
+        assert_eq!(uploads(l), 0);
+        assert_eq!(release(l), 0);
+        assert_eq!(release(a), 0);
+    }
+
+    #[test]
+    fn newer_lists_have_their_methods_two_slots_later_from_0x1d8() {
+        let (old, new) = (&LIST_FUNCTIONS.0, &NEWER_LIST_FUNCTIONS.0);
+        // Below 0x1d8 both layouts agree: the clears stay at 0x198/0x1a0.
+        for slot in 0..59 {
+            assert_eq!(old[slot], new[slot], "slot {:#x}", slot * 8);
+        }
+        assert_eq!(new[51], clear_dsv as *const ());
+        assert_eq!(new[52], clear_rtv as *const ());
+        // ExecuteIndirect 0x1d8 → 0x1e8, the writes 0x228/0x230 →
+        // 0x238/0x240, ResetX 0x448 → 0x458.
+        for (slot, f) in [
+            (59, execute_indirect as *const ()),
+            (69, write32 as *const ()),
+            (70, write64 as *const ()),
+            (137, reset_x as *const ()),
+        ] {
+            assert_eq!(old[slot], f);
+            assert_eq!(new[slot + 2], f);
+        }
+        // The two slots newer lists gained before ExecuteIndirect are not
+        // written.
+        assert_ne!(new[59], execute_indirect as *const ());
+        assert_ne!(new[60], execute_indirect as *const ());
+        // Only newer lists have the enhanced barrier and upload memory.
+        assert_eq!(new[146], barrier_groups as *const ());
+        assert_eq!(new[148], allocate_upload as *const ());
+        assert_ne!(old[146], barrier_groups as *const ());
+        assert_ne!(old[148], allocate_upload as *const ());
+        // Every slot exists in both, for the methods not written yet.
+        assert!(old.iter().chain(new).all(|f| !f.is_null()));
+    }
+
+    #[test]
+    fn draws_and_dispatches_are_only_counted() {
+        // The only test that draws, so the counts are its own.
+        let _ = take_counts();
+        let _ = take_indirect();
+        let l = list(allocator());
+        let call = |offset: usize| crate::object::slot::<extern "system" fn(This)>(l, offset)(l);
+        call(0x60); // instanced
+        call(0x68); // indexed
+        // Mesh dispatch moves in newer lists; whichever this list is.
+        state::dispatch_mesh(l);
+        call(0x70); // dispatch
+        dispatch_x(l, 1, 2, 3, 0);
+        // No signature: counted as a draw, and as nothing run.
+        execute_indirect(
+            l,
+            std::ptr::null(),
+            1,
+            std::ptr::null(),
+            0,
+            std::ptr::null(),
+            0,
+        );
+        assert_eq!(take_counts(), (4, 2));
+        assert_eq!(take_counts(), (0, 0), "taking them resets them");
+        assert_eq!(take_indirect(), 0, "dropped only with a signature");
+        // Other recorded state is accepted and ignored.
+        barrier_groups(l, 3, std::ptr::null());
+        assert_eq!(driver_hint(l, 1, 2), 0);
+        copy_memory(l, 0, 0, 16, 0);
+        assert_eq!(take_counts(), (0, 0));
+        assert_eq!(release(l), 0);
+    }
+}
