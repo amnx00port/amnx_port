@@ -746,4 +746,352 @@ mod tests {
         // Translated or refused with a reason; it must not panic.
         let _ = super::emit(&c, &native, &p, &st, &io, &res);
     }
+
+    /// End-to-end pixel shader `exp ... vm` (Valid Mask) and multi-MRT color
+    /// export tests, validated with `dxil.dll` and rendered on hardware GPU
+    /// and WARP into cleared 4x4 RGBA32F render targets.
+    #[test]
+    #[cfg(windows)]
+    fn pixel_export_valid_mask_and_multi_mrt_match_rdna2() {
+        use super::bitcode::{Attr, Term};
+        use super::host::{Draw, Host};
+
+        // Pass-through fullscreen vertex shader: POSITION -> SV_Position.
+        let fullscreen_vs = || -> super::HostShader {
+            let mut s = Shader::new(false);
+            s.inputs.push(SigElement {
+                name: "POSITION".into(),
+                index: 0,
+                kind: 0,
+                comp: 9,
+                interp: 0,
+                row: Some(0),
+                col: 0,
+                cols: 4,
+                usage: 15,
+                half: false,
+            });
+            s.outputs.push(SigElement {
+                name: "SV_Position".into(),
+                index: 0,
+                kind: 3,
+                comp: 9,
+                interp: 4,
+                row: Some(0),
+                col: 0,
+                cols: 4,
+                usage: 15,
+                half: false,
+            });
+            let b = s.entry;
+            let undef = s.m.undef(s.t.i32);
+            for col in 0..4u8 {
+                let id = s.m.i32(0);
+                let row = s.m.i32(0);
+                let c = s.m.i8(col);
+                let v = s.op(b, "loadInput.f32", Attr::ReadNone, s.t.f32, 4, &[id, row, c, undef]);
+                s.op(b, "storeOutput.f32", Attr::NoUnwind, s.t.void, 5, &[id, row, c, v]);
+            }
+            s.m.terminate(b, Term::Ret);
+            let mut dxil = s.finish();
+            if let Ok(mut v) = super::validator::Validator::load(
+                super::validator::Validator::default_path().as_deref(),
+            ) {
+                v.validate(&mut dxil).expect("VS DXIL validation failed");
+            }
+            super::HostShader {
+                stage: super::HwStage::Vs,
+                dxil,
+                user_data: Vec::new(),
+                samplers: Vec::new(),
+                static_samplers: Vec::new(),
+                root_cbvs: Vec::new(),
+                root_srvs: Vec::new(),
+            }
+        };
+
+        let exp = |target: u8, en: u8, done: bool, vm: bool, vsrc: [u8; 4]| -> [u32; 2] {
+            let w0 = 0xF800_0000
+                | (u32::from(vm) << 12)
+                | (u32::from(done) << 11)
+                | (u32::from(target) << 4)
+                | u32::from(en & 0xF);
+            let w1 = u32::from(vsrc[0])
+                | (u32::from(vsrc[1]) << 8)
+                | (u32::from(vsrc[2]) << 16)
+                | (u32::from(vsrc[3]) << 24);
+            [w0, w1]
+        };
+
+        let build_ps = |words: &[u32], mrt_count: u32| -> super::HostShader {
+            let native = super::NativeProgram {
+                stage: super::HwStage::Ps,
+                wave64: false,
+                vgprs: 4,
+                layout: vec![],
+                used: vec![],
+                io: crate::native::StageIo::Ps {
+                    inputs: vec![],
+                    input_addr: 1 << 8, // v0 = SV_Position.x
+                    db_shader_control: 0,
+                    patches: vec![],
+                },
+                code: words.iter().flat_map(|w| w.to_le_bytes()).collect(),
+            };
+            let pos = SigElement {
+                name: "SV_Position".into(),
+                index: 0,
+                kind: 3,
+                comp: 9,
+                interp: 4,
+                row: Some(0),
+                col: 0,
+                cols: 4,
+                usage: 1,
+                half: false,
+            };
+            let targets: Vec<SigElement> = (0..mrt_count)
+                .map(|n| SigElement {
+                    name: "SV_Target".into(),
+                    index: n,
+                    kind: 16,
+                    comp: 9,
+                    interp: 0,
+                    row: Some(n),
+                    col: 0,
+                    cols: 4,
+                    usage: 15,
+                    half: false,
+                })
+                .collect();
+            let isg1 = super::container::signature(&[pos], true);
+            let osg1 = super::container::signature(&targets, false);
+            let bytes = crate::dxbc::build(&[
+                (super::FourCC::ISG1, &isg1),
+                (super::FourCC::OSG1, &osg1),
+            ]);
+            let c = super::Container::parse(&bytes).unwrap();
+            let p = crate::ir::build(&native.patched_code(), native.wave64, native.vgprs).unwrap();
+            let st = crate::structure::structure(&p).unwrap();
+            let res =
+                crate::resource::track(&p, &native.layout, native.stage, Some(&st)).unwrap();
+            let io = crate::io::raise(&p, &native).unwrap();
+            let mut out = super::emit(&c, &native, &p, &st, &io, &res).unwrap();
+            if let Ok(mut v) = super::validator::Validator::load(
+                super::validator::Validator::default_path().as_deref(),
+            ) {
+                let ours = out.dxil[4..20].to_vec();
+                v.validate(&mut out.dxil).expect("PS DXIL validation failed");
+                assert_eq!(out.dxil[4..20], ours[..], "container hash mismatch");
+            }
+            out
+        };
+
+        const V_MOV_V1_1: u32 = 0x7E02_02F2; // v_mov_b32 v1, 1.0
+        const V_MOV_V2_0: u32 = 0x7E04_0280; // v_mov_b32 v2, 0.0
+        // v_cmp_lt_f32 vcc_lo, v0, 2.0 (VOP3 op 0x001, sdst = 0x6a, src0 = v0 (256), src1 = 2.0 (244))
+        const CMP_X_LT_2: [u32; 2] = [0xD400_0000 | (0x001 << 16) | 0x6A, 256 | (244 << 9)];
+        const SAVEEXEC: u32 = 0xBE80_3C6A; // s_and_saveexec_b32 s0, vcc_lo
+        const RESTORE_EXEC: u32 = 0xBEFE_0300; // s_mov_b32 exec_lo, s0
+        const S_ENDPGM: u32 = 0xBF81_0000;
+
+        const RED_V: [u8; 4] = [1, 2, 2, 1];
+        const GREEN_V: [u8; 4] = [2, 1, 2, 1];
+        const BLUE_V: [u8; 4] = [2, 2, 1, 1];
+        const RED: [f32; 4] = [1.0, 0.0, 0.0, 1.0];
+        const GREEN: [f32; 4] = [0.0, 1.0, 0.0, 1.0];
+        const BLUE: [f32; 4] = [0.0, 0.0, 1.0, 1.0];
+        const CLEAR: [f32; 4] = [0.0, 0.0, 0.0, 0.0];
+
+        // Case 1: exp mrt0 (vm=1, done=0) under x<2, restore EXEC, exp mrt1 (vm=0, done=1) full EXEC.
+        // Right half (x>=2) MUST be discarded even though done=1 ran under full EXEC.
+        let mut w1 = vec![V_MOV_V1_1, V_MOV_V2_0, CMP_X_LT_2[0], CMP_X_LT_2[1], SAVEEXEC];
+        w1.extend_from_slice(&exp(0, 0xF, false, true, RED_V));
+        w1.push(RESTORE_EXEC);
+        w1.extend_from_slice(&exp(1, 0xF, true, false, BLUE_V));
+        w1.push(S_ENDPGM);
+        let ps_vm_then_done = build_ps(&w1, 2);
+
+        // Case 2: exp mrt0 (vm=1, done=0) full EXEC, narrow to x<2, exp mrt1 (vm=0, done=1).
+        // Right half (x>=2) MUST NOT be discarded (MRT0 stays RED) because done=1 has vm=0.
+        let mut w2 = vec![V_MOV_V1_1, V_MOV_V2_0];
+        w2.extend_from_slice(&exp(0, 0xF, false, true, RED_V));
+        w2.extend_from_slice(&[CMP_X_LT_2[0], CMP_X_LT_2[1], SAVEEXEC]);
+        w2.extend_from_slice(&exp(1, 0xF, true, false, BLUE_V));
+        w2.push(S_ENDPGM);
+        let ps_vm_full_done_partial = build_ps(&w2, 2);
+
+        // Case 3: exp mrt0 (vm=0, done=0) full EXEC, narrow to x<2, exp null (vm=1, done=1).
+        // Left half survives with MRT0=RED; right half is discarded.
+        let mut w3 = vec![V_MOV_V1_1, V_MOV_V2_0];
+        w3.extend_from_slice(&exp(0, 0xF, false, false, RED_V));
+        w3.extend_from_slice(&[CMP_X_LT_2[0], CMP_X_LT_2[1], SAVEEXEC]);
+        w3.extend_from_slice(&exp(9, 0x0, true, true, [0, 0, 0, 0]));
+        w3.push(S_ENDPGM);
+        let ps_mrt0_then_null_vm = build_ps(&w3, 1);
+
+        // Case 4: Two VM=1 exports — last VM=1 export governs survival.
+        // exp mrt0 (vm=1) under x<2, restore EXEC, exp mrt1 (vm=1, done=1) full EXEC.
+        // All 16 pixels survive (MRT1=BLUE everywhere; right half is not killed by the first vm).
+        let mut w4 = vec![V_MOV_V1_1, V_MOV_V2_0, CMP_X_LT_2[0], CMP_X_LT_2[1], SAVEEXEC];
+        w4.extend_from_slice(&exp(0, 0xF, false, true, RED_V));
+        w4.push(RESTORE_EXEC);
+        w4.extend_from_slice(&exp(1, 0xF, true, true, BLUE_V));
+        w4.push(S_ENDPGM);
+        let ps_last_vm_wins = build_ps(&w4, 2);
+
+        // Case 5: Conditional per-MRT color overwrite (non-done MRT0 write under partial EXEC).
+        // exp mrt0 RED (full), narrow to x<2, exp mrt0 GREEN, restore EXEC, exp mrt1 BLUE done vm.
+        let mut w5 = vec![V_MOV_V1_1, V_MOV_V2_0];
+        w5.extend_from_slice(&exp(0, 0xF, false, false, RED_V));
+        w5.extend_from_slice(&[CMP_X_LT_2[0], CMP_X_LT_2[1], SAVEEXEC]);
+        w5.extend_from_slice(&exp(0, 0xF, false, false, GREEN_V));
+        w5.push(RESTORE_EXEC);
+        w5.extend_from_slice(&exp(1, 0xF, true, true, BLUE_V));
+        w5.push(S_ENDPGM);
+        let ps_conditional_mrt_overwrite = build_ps(&w5, 2);
+
+        // Case 6: Mixed-join CFG — left half exports mrt0 done vm, right half skips to shared s_endpgm.
+        let mut w6 = vec![
+            V_MOV_V1_1,
+            V_MOV_V2_0,
+            CMP_X_LT_2[0],
+            CMP_X_LT_2[1],
+            SAVEEXEC,
+            0xBF88_0002, // s_cbranch_execz +2 -> S_ENDPGM
+        ];
+        w6.extend_from_slice(&exp(0, 0xF, true, true, RED_V));
+        w6.push(S_ENDPGM);
+        let ps_mixed_join = build_ps(&w6, 1);
+
+        // Case 7: Early-kill fallthrough (`v_cmpx_lt_f32` + `s_cbranch_execnz`):
+        // dead lanes fall through to `exp null done vm` with EXEC=0 (guard=Bool::FALSE),
+        // alive lanes jump to `exp mrt0 RED done vm`.
+        // v_cmpx_lt_f32 exec, v0, 2.0 (VOP3 op 0x011, sdst = 0x7e)
+        let mut w7 = vec![
+            V_MOV_V1_1,
+            V_MOV_V2_0,
+            0xD400_0000 | (0x011 << 16) | 0x7E,
+            256 | (244 << 9),
+            0xBF89_0003, // s_cbranch_execnz +3 -> alive block (after 2-dword exp null + s_endpgm)
+        ];
+        w7.extend_from_slice(&exp(9, 0x0, true, true, [0, 0, 0, 0]));
+        w7.push(S_ENDPGM);
+        w7.extend_from_slice(&exp(0, 0xF, true, true, RED_V));
+        w7.push(S_ENDPGM);
+        let ps_early_kill_null_vm = build_ps(&w7, 1);
+
+        let vs = fullscreen_vs();
+        let verts: [f32; 12] = [
+            -1.0, -1.0, 0.0, 1.0,
+            3.0, -1.0, 0.0, 1.0,
+            -1.0, 3.0, 0.0, 1.0,
+        ];
+        let draw_desc = Draw {
+            roots: vec![],
+            textures: &[],
+            samplers: &[],
+            vertices: &verts,
+            stride: 16,
+            size: (4, 4),
+            mesh_groups: 0,
+        };
+
+        let _one = super::valu_tests::ONE_AT_A_TIME
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let mut ran = 0;
+        for (label, warp) in [("hardware", false), ("warp", true)] {
+            let Ok(host) = Host::new(warp) else {
+                eprintln!("no SM 6.6 {label} device; skipped");
+                continue;
+            };
+            ran += 1;
+
+            let render = |ps: &super::HostShader, rtvs: usize| -> Vec<Vec<[f32; 4]>> {
+                let (root, pso) = host
+                    .pipeline(&vs, ps)
+                    .unwrap_or_else(|e| panic!("{label}: pipeline failed: {e}"));
+                host.draw_mrt(&root, &pso, &draw_desc, rtvs)
+                    .unwrap_or_else(|e| panic!("{label}: draw_mrt failed: {e}"))
+            };
+
+            // Case 1: left survives (RED, BLUE), right discarded (CLEAR, CLEAR).
+            let r1 = render(&ps_vm_then_done, 2);
+            for y in 0..4 {
+                for x in 0..4 {
+                    let i = y * 4 + x;
+                    let (want0, want1) = if x < 2 { (RED, BLUE) } else { (CLEAR, CLEAR) };
+                    assert_eq!(r1[0][i], want0, "{label}: case1 MRT0 ({x},{y})");
+                    assert_eq!(r1[1][i], want1, "{label}: case1 MRT1 ({x},{y})");
+                }
+            }
+
+            // Case 2: ALL pixels survive (MRT0 = RED everywhere); left MRT1 = BLUE.
+            let r2 = render(&ps_vm_full_done_partial, 2);
+            for y in 0..4 {
+                for x in 0..4 {
+                    let i = y * 4 + x;
+                    assert_eq!(r2[0][i], RED, "{label}: case2 MRT0 ({x},{y})");
+                    if x < 2 {
+                        assert_eq!(r2[1][i], BLUE, "{label}: case2 MRT1 ({x},{y})");
+                    }
+                }
+            }
+
+            // Case 3: exp mrt0 full -> exp null done vm partial.
+            let r3 = render(&ps_mrt0_then_null_vm, 1);
+            for y in 0..4 {
+                for x in 0..4 {
+                    let i = y * 4 + x;
+                    let want = if x < 2 { RED } else { CLEAR };
+                    assert_eq!(r3[0][i], want, "{label}: case3 MRT0 ({x},{y})");
+                }
+            }
+
+            // Case 4: two VM=1 exports; last VM=1 (full EXEC) keeps all pixels alive.
+            let r4 = render(&ps_last_vm_wins, 2);
+            for y in 0..4 {
+                for x in 0..4 {
+                    let i = y * 4 + x;
+                    assert_eq!(r4[1][i], BLUE, "{label}: case4 MRT1 ({x},{y})");
+                    if x < 2 {
+                        assert_eq!(r4[0][i], RED, "{label}: case4 MRT0 ({x},{y})");
+                    }
+                }
+            }
+
+            // Case 5: conditional per-MRT color overwrite.
+            let r5 = render(&ps_conditional_mrt_overwrite, 2);
+            for y in 0..4 {
+                for x in 0..4 {
+                    let i = y * 4 + x;
+                    let want0 = if x < 2 { GREEN } else { RED };
+                    assert_eq!(r5[0][i], want0, "{label}: case5 MRT0 ({x},{y})");
+                    assert_eq!(r5[1][i], BLUE, "{label}: case5 MRT1 ({x},{y})");
+                }
+            }
+
+            // Case 6: mixed-join CFG — left survives (RED), right discarded (CLEAR).
+            let r6 = render(&ps_mixed_join, 1);
+            for y in 0..4 {
+                for x in 0..4 {
+                    let i = y * 4 + x;
+                    let want = if x < 2 { RED } else { CLEAR };
+                    assert_eq!(r6[0][i], want, "{label}: case6 MRT0 ({x},{y})");
+                }
+            }
+
+            // Case 7: early-kill fallthrough (`exp null done vm` under EXEC=0).
+            let r7 = render(&ps_early_kill_null_vm, 1);
+            for y in 0..4 {
+                for x in 0..4 {
+                    let i = y * 4 + x;
+                    let want = if x < 2 { RED } else { CLEAR };
+                    assert_eq!(r7[0][i], want, "{label}: case7 MRT0 ({x},{y})");
+                }
+            }
+        }
+        assert!(ran > 0, "neither hardware nor WARP SM 6.6 device available");
+    }
 }

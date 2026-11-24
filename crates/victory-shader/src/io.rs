@@ -171,8 +171,11 @@ pub struct Export {
     pub values: [Option<Value>; 4],
     /// Two f16 values per dword.
     pub compressed: bool,
-    /// The program's last export (for pixels: kills the lanes not in EXEC).
+    /// The program's last export (`DONE`).
     pub done: bool,
+    /// Valid mask (`VM`): in pixel shaders, updates the wave's surviving
+    /// pixel mask from `EXEC`.
+    pub vm: bool,
 }
 
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
@@ -377,7 +380,7 @@ pub fn raise(p: &Program, native: &NativeProgram) -> Result<Io, ShaderError> {
                     src,
                     compr,
                     done,
-                    ..
+                    vm,
                 } => {
                     let target = match *target {
                         t @ 0..=7 => Target::Color(t),
@@ -410,6 +413,7 @@ pub fn raise(p: &Program, native: &NativeProgram) -> Result<Io, ShaderError> {
                         values,
                         compressed: *compr,
                         done: *done,
+                        vm: *vm,
                     });
                 }
                 _ => {}
