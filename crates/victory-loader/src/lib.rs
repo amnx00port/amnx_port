@@ -23,6 +23,8 @@
 
 #[cfg(windows)]
 mod crash;
+#[cfg(windows)]
+mod patch;
 pub mod prepare;
 pub mod resolve;
 #[cfg(all(windows, feature = "diagnostics"))]

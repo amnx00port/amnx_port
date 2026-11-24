@@ -79,6 +79,14 @@ pub fn load(prepared: &PreparedImage, dir: &Path) -> Result<LoadedImage> {
         path,
         info: prepared.info.clone(),
     };
+    // Debugging aid (README): VICTORY_PATCH entries naming this module write
+    // their bytes now — mapped and relocated, before TLS redirection and
+    // import binding — and are logged with the bytes they replaced.
+    crate::patch::apply(
+        loaded.base(),
+        loaded.info.size_of_image as usize,
+        &prepared.file_name(),
+    );
     // A DLL indexes its TLS properly; only an exe assumes index 0.
     if !loaded.info.is_dll() {
         // SAFETY: just mapped, and no title code has run.
