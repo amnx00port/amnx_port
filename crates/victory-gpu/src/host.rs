@@ -1240,6 +1240,11 @@ impl HostList {
 #[derive(Default)]
 struct Batch {
     refreshes: Vec<(std::sync::Arc<crate::shadow::Shadow>, usize, usize)>,
+    /// Where each shadow sits in `refreshes`, by `Arc::as_ptr`. A world
+    /// submission records tens of thousands of refreshes over a few hundred
+    /// buffers; looking a buffer up by scanning the vector made that
+    /// quadratic, and this is the hot path of a frame's preparation.
+    refresh_index: std::collections::HashMap<usize, usize>,
     /// Staging buffers (by address) refreshed since the last title write.
     textures: std::collections::HashSet<usize>,
 }
@@ -1247,14 +1252,17 @@ struct Batch {
 impl Batch {
     fn add(&mut self, shadow: &std::sync::Arc<crate::shadow::Shadow>, address: usize, len: usize) {
         let end = address + len;
-        match self
-            .refreshes
-            .iter_mut()
-            .find(|(s, ..)| std::sync::Arc::ptr_eq(s, shadow))
-        {
-            Some((_, from, to)) => (*from, *to) = ((*from).min(address), (*to).max(end)),
-            None => self.refreshes.push((shadow.clone(), address, end)),
+        let key = std::sync::Arc::as_ptr(shadow) as usize;
+        if let Some(&at) = self.refresh_index.get(&key) {
+            let (_, from, to) = &mut self.refreshes[at];
+            (*from, *to) = ((*from).min(address), (*to).max(end));
+            return;
         }
+        // The vector holds a clone of the shadow, so the allocation this key
+        // names stays alive until the entry is drained; addresses are not
+        // reused under it.
+        self.refresh_index.insert(key, self.refreshes.len());
+        self.refreshes.push((shadow.clone(), address, end));
     }
 
     /// Whether `staging` is still to be refreshed in this submission (and
@@ -1271,6 +1279,7 @@ impl Batch {
     }
 
     fn flush(&mut self) {
+        self.refresh_index.clear();
         for (shadow, from, to) in self.refreshes.drain(..) {
             let started = std::time::Instant::now();
             let copied = shadow.update(from, to - from);
@@ -1984,6 +1993,62 @@ fn pump() {
 mod batch {   // Batch::texture_due lives here; `mod tests` is already taken at the top of this file
     use super::Batch;
     use std::sync::Arc;
+
+    /// Merging a submission's refreshes per buffer: the vector scan this
+    /// replaced against the index that does it now. Stand-in buffers of one
+    /// word each - the comparison is a pointer either way, so the shape is
+    /// the real one. Run with
+    /// `cargo test --release -p victory-gpu -- --ignored --nocapture refresh_merge`.
+    #[test]
+    #[ignore = "timing; run with --ignored --nocapture"]
+    fn refresh_merge_scan_vs_index() {
+        const REFRESHES: usize = 33_000;
+        println!();
+        for buffers_count in [50usize, 250, 1000] {
+        let buffers: Vec<Arc<u32>> = (0..buffers_count as u32).map(Arc::new).collect();
+        let plan: Vec<(usize, usize, usize)> = (0..REFRESHES)
+            .map(|i| (i % buffers_count, (i * 64) % (1 << 20), 4096))
+            .collect();
+        let mut best_scan = u128::MAX;
+        let mut best_index = u128::MAX;
+        for _ in 0..7 {
+            let t = std::time::Instant::now();
+            let mut v: Vec<(Arc<u32>, usize, usize)> = Vec::new();
+            for &(b, a, l) in &plan {
+                match v.iter_mut().find(|(s, ..)| Arc::ptr_eq(s, &buffers[b])) {
+                    Some((_, from, to)) => (*from, *to) = ((*from).min(a), (*to).max(a + l)),
+                    None => v.push((buffers[b].clone(), a, a + l)),
+                }
+            }
+            best_scan = best_scan.min(t.elapsed().as_nanos());
+            std::hint::black_box(&v);
+
+            let t = std::time::Instant::now();
+            let mut w: Vec<(Arc<u32>, usize, usize)> = Vec::new();
+            let mut ix: std::collections::HashMap<usize, usize> = std::collections::HashMap::new();
+            for &(b, a, l) in &plan {
+                let key = Arc::as_ptr(&buffers[b]) as usize;
+                if let Some(&at) = ix.get(&key) {
+                    let (_, from, to) = &mut w[at];
+                    (*from, *to) = ((*from).min(a), (*to).max(a + l));
+                    continue;
+                }
+                ix.insert(key, w.len());
+                w.push((buffers[b].clone(), a, a + l));
+            }
+            best_index = best_index.min(t.elapsed().as_nanos());
+            std::hint::black_box(&w);
+        }
+        println!(
+            "{REFRESHES} refreshes over {buffers_count} buffers (best of 7): scan {:.2} ms, index {:.2} ms, {:.1}x",
+            best_scan as f64 / 1e6,
+            best_index as f64 / 1e6,
+            best_scan as f64 / best_index as f64
+        );
+        }
+        println!();
+    }
+
 
     #[test]
     fn a_texture_is_checked_once_per_submission() {
