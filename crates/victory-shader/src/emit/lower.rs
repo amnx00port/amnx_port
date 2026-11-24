@@ -82,6 +82,19 @@ pub(crate) fn lower(parts: &Parts) -> Result<Lowered, ShaderError> {
     }
 }
 
+/// Exercise the legacy MAD lowering with the equivalent VOP3 operand layout.
+#[cfg(test)]
+pub(super) fn lower_legacy_mad_f16(parts: &Parts) -> Lowered {
+    let bad = HashMap::new();
+    let mut lower = Lower::new(parts, &bad);
+    lower.test_legacy_mad_f16 = true;
+    match lower.run() {
+        Ok(shader) => shader,
+        Err(Stop::Fail(e)) => panic!("lower: {e}"),
+        Err(Stop::Retry(_, why)) => panic!("unexpected phi in MAD test: {why}"),
+    }
+}
+
 const TWO_PI: f32 = std::f32::consts::TAU;
 /// `s_sendmsg` id of a mesh or NGG stage's output allocation request.
 const GS_ALLOC_REQ: u16 = 9;
@@ -186,6 +199,8 @@ struct Lower<'a> {
     writes_uavs: bool,
     /// src0 of the current instruction as DPP fetched it.
     src0: Option<V>,
+    #[cfg(test)]
+    test_legacy_mad_f16: bool,
     /// Compute code that reads other lanes: thread ids follow the host
     /// lanes, so lane n is console lane n.
     console_lanes: bool,
@@ -485,6 +500,8 @@ impl<'a> Lower<'a> {
             tail: vec![None; p.blocks.len()],
             writes_uavs,
             src0: None,
+            #[cfg(test)]
+            test_legacy_mad_f16: false,
             console_lanes,
             flat: None,
             no_barrier,
@@ -1409,6 +1426,60 @@ impl<'a> Lower<'a> {
             46,
             &[a, b, c],
         )
+    }
+
+    /// Round f32 to binary16 nearest-even. The legacy narrowing conversion
+    /// can truncate and clamp finite overflow to the largest finite half.
+    fn f16_nearest_even(&mut self, f: V) -> V {
+        let c = self.cur;
+        let bits = self.as_int(f);
+        let k = |l: &mut Self, n| l.s.m.i32(n);
+        let (k1, k13, k16, k23) = (k(self, 1), k(self, 13), k(self, 16), k(self, 23));
+        let sign_mask = k(self, 0x8000);
+        let mag_mask = k(self, 0x7fff_ffff);
+        let sign = self.s.m.bin(c, Bin::LShr, bits, k16);
+        let sign = self.s.m.bin(c, Bin::And, sign, sign_mask);
+        let mag = self.s.m.bin(c, Bin::And, bits, mag_mask);
+
+        // Normals drop 13 bits after rebiasing. For subnormals the shift
+        // depends on the f32 exponent, capped at 25 since lower values round to zero.
+        let min_normal = k(self, 0x3880_0000);
+        let normal = self.s.m.cmp(c, pred::IUGE, mag, min_normal);
+        let rebias = k(self, 112 << 23);
+        let normal_bits = self.s.m.bin(c, Bin::Sub, mag, rebias);
+        let mant_mask = k(self, 0x007f_ffff);
+        let hidden_bit = k(self, 1 << 23);
+        let mant = self.s.m.bin(c, Bin::And, mag, mant_mask);
+        let sub_bits = self.s.m.bin(c, Bin::Or, mant, hidden_bit);
+        let significand = self.s.m.select(c, normal, normal_bits, sub_bits);
+
+        let exp = self.s.m.bin(c, Bin::LShr, mag, k23);
+        let min_exp = k(self, 101); // 126 - 101 = 25
+        let tiny = self.s.m.cmp(c, pred::IULT, exp, min_exp);
+        let exp = self.s.m.select(c, tiny, min_exp, exp);
+        let k126 = k(self, 126);
+        let sub_shift = self.s.m.bin(c, Bin::Sub, k126, exp);
+        let shift = self.s.m.select(c, normal, k13, sub_shift);
+
+        // Add half an ulp minus one, plus the low bit of the retained field.
+        let unit = self.s.m.bin(c, Bin::Shl, k1, shift);
+        let midpoint = self.s.m.bin(c, Bin::LShr, unit, k1);
+        let bias = self.s.m.bin(c, Bin::Sub, midpoint, k1);
+        let truncated = self.s.m.bin(c, Bin::LShr, significand, shift);
+        let odd = self.s.m.bin(c, Bin::And, truncated, k1);
+        let bias = self.s.m.bin(c, Bin::Add, bias, odd);
+        let rounded = self.s.m.bin(c, Bin::Add, significand, bias);
+        let half = self.s.m.bin(c, Bin::LShr, rounded, shift);
+
+        let overflow_at = k(self, 65520.0f32.to_bits());
+        let overflow = self.s.m.cmp(c, pred::IUGE, mag, overflow_at);
+        let inf16 = k(self, 0x7c00);
+        let half = self.s.m.select(c, overflow, inf16, half);
+        let inf32 = k(self, f32::INFINITY.to_bits());
+        let nan = self.s.m.cmp(c, pred::IUGT, mag, inf32);
+        let nan16 = k(self, 0x7e00);
+        let half = self.s.m.select(c, nan, nan16, half);
+        self.s.m.bin(c, Bin::Or, half, sign)
     }
 
     /// `f` as an f16 in the low bits, rounded toward zero: the nearest-even
@@ -3732,6 +3803,14 @@ impl<'a> Lower<'a> {
             unreachable!()
         };
         let name = inst.name();
+        // GFX10 has no V_MAD_F16 encoding. Give the test's V_FMA_F16
+        // instruction the legacy mnemonic after decoding and SSA construction.
+        #[cfg(test)]
+        let name = if self.test_legacy_mad_f16 && name == "v_fma_f16" {
+            "v_mad_f16"
+        } else {
+            name
+        };
         let c = self.cur;
         let f = |l: &mut Self, k| l.fsrc(inst, k);
         let s = |l: &mut Self, k| l.src(inst, k);
@@ -4404,9 +4483,10 @@ impl<'a> Lower<'a> {
         Ok(())
     }
 
-    /// 16-bit operations, computed in f32 or i32: f16 sums, differences and
-    /// products are exact there and round once to f16 (f32 has the 2 x 11 +
-    /// 2 bits that make double rounding harmless); `None` if `name` is none.
+    /// 16-bit operations, computed in f32 or i32. Finite f16 products fit
+    /// exactly in f32. The sum or difference also fits in 24 bits when the
+    /// input exponents differ by at most 13. With a larger gap the smaller
+    /// operand is too small for the f32 result to reach an f16 rounding midpoint.
     fn valu16(&mut self, inst: &Inst, name: &str, guard: Option<V>) -> Option<Result<(), Why>> {
         const FLOAT2: &[&str] = &[
             "v_add_f16",
@@ -4487,6 +4567,7 @@ impl<'a> Lower<'a> {
             let f = self.half_fsrc(inst, 0)?;
             return self.write_f(inst, f, guard);
         }
+        let unfused = matches!(name, "v_mad_f16" | "v_mac_f16");
         let float_result = |l: &mut Self, mut f: V| -> Result<(), Why> {
             if v.omod != 0 {
                 return Err("an output modifier on a 16-bit operation");
@@ -4494,8 +4575,11 @@ impl<'a> Lower<'a> {
             if v.clamp {
                 f = l.unary(7, f);
             }
-            let h =
-                l.s.op(l.cur, "legacyF32ToF16", Attr::ReadNone, i32t, 130, &[f]);
+            let h = if unfused {
+                l.f16_nearest_even(f)
+            } else {
+                l.s.op(l.cur, "legacyF32ToF16", Attr::ReadNone, i32t, 130, &[f])
+            };
             l.write_half(inst, h, guard)
         };
         if name == "v_cvt_f16_f32" {
@@ -4538,7 +4622,16 @@ impl<'a> Lower<'a> {
             let r = match name {
                 // shortcut: fused f16 multiply-adds as FMad in f32 (the
                 // product is exact; the sum rounds twice).
-                "v_fma_f16" | "v_fmac_f16" | "v_mad_f16" | "v_mac_f16" => self.fmad(a, b, acc),
+                "v_fma_f16" | "v_fmac_f16" => self.fmad(a, b, acc),
+                // Legacy MAD/MAC round the product to f16 before adding.
+                "v_mad_f16" | "v_mac_f16" => {
+                    let product = self.s.m.bin(c, Bin::Mul, a, b);
+                    let half = self.f16_nearest_even(product);
+                    let product =
+                        self.s
+                            .op(c, "legacyF16ToF32", Attr::ReadNone, f32t, 131, &[half]);
+                    self.s.m.bin(c, Bin::Add, product, acc)
+                }
                 "v_max3_f16" => {
                     let t = self.max_min(true, a, b);
                     self.max_min(true, t, acc)
