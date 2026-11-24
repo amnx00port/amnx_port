@@ -1783,6 +1783,206 @@ mod tests {
         }
     }
 
+    /// A texture the title writes reaches its host copy once per change of
+    /// its memory, however many lists of however many submissions read it
+    /// (here as the source of copies into another texture, read back from
+    /// the host GPU).
+    #[cfg(windows)]
+    #[test]
+    fn title_textures_reach_the_host_once_per_change() {
+        use windows::Win32::Graphics::Direct3D12::*;
+        let Some(host) = crate::host::host() else {
+            return; // no host GPU here
+        };
+        let null = std::ptr::null();
+        let iid = &RESOURCE_IIDS[0];
+        // 64x64 RGBA8 in the console's linear layout: uniform fills read the
+        // same in any layout.
+        let desc = ResourceDesc {
+            layout: 1,
+            ..texture(64, 64, 28, 1)
+        };
+        let (mut source, mut target) = (null, null);
+        for out in [&mut source, &mut target] {
+            let made = create_committed(null, &PROPERTIES, 0, &desc, 0, null.cast(), iid, out);
+            assert_eq!(made, S_OK);
+        }
+        let (memory, _) = texture_memory(source).unwrap();
+        let size = texture_layout(&desc).unwrap().planes[0].layout.size as usize;
+        // SAFETY: the texture's memory is `size` bytes.
+        let fill = |value: u8| unsafe { memory.cast_mut().write_bytes(value, size) };
+
+        let queue_iid = guid(
+            0x0ec870a6,
+            0x5d7e,
+            0x4c22,
+            [0x8c, 0xfc, 0x5b, 0xaa, 0xe0, 0x76, 0x16, 0xed],
+        );
+        let allocator_iid = guid(
+            0x6102dee4,
+            0xaf59,
+            0x4b09,
+            [0xb9, 0x99, 0xb4, 0x4d, 0x73, 0xf0, 0x9b, 0x24],
+        );
+        let list_iid = guid(
+            0x5b160d0f,
+            0xac1b,
+            0x4185,
+            [0x8b, 0xa8, 0xb3, 0xae, 0x42, 0xa5, 0xa4, 0x55],
+        );
+        let (mut queue, mut allocator) = (null, null);
+        let queue_desc = [0u32; 4];
+        assert_eq!(
+            crate::queue::create(null, queue_desc.as_ptr().cast(), &queue_iid, &mut queue),
+            S_OK
+        );
+        assert_eq!(
+            crate::list::create_allocator(null, 0, &allocator_iid, &mut allocator),
+            S_OK
+        );
+        type Close = extern "system" fn(This) -> HRESULT;
+        type Reset = extern "system" fn(This, This, This) -> HRESULT;
+        type CopyResource = extern "system" fn(This, This, This);
+        type Execute = extern "system" fn(This, u32, *const This);
+        let lists: Vec<This> = (0..2)
+            .map(|_| {
+                let mut list = null;
+                let made =
+                    crate::list::create_list(null, 0, 0, allocator, null, &list_iid, &mut list);
+                assert_eq!(made, S_OK);
+                assert_eq!(slot::<Close>(list, 0x48)(list), S_OK);
+                list
+            })
+            .collect();
+        // Each list copies the title texture into the other one.
+        let submit = |lists: &[This]| {
+            for &list in lists {
+                assert_eq!(slot::<Reset>(list, 0x50)(list, allocator, null), S_OK);
+                slot::<CopyResource>(list, 0x88)(list, target, source);
+                assert_eq!(slot::<Close>(list, 0x48)(list), S_OK);
+            }
+            slot::<Execute>(queue, 0x50)(queue, lists.len() as u32, lists.as_ptr());
+        };
+
+        let readback_heap = D3D12_HEAP_PROPERTIES {
+            Type: D3D12_HEAP_TYPE_READBACK,
+            ..Default::default()
+        };
+        let (pitch, rows) = (256u32, 64u32);
+        let bytes = (pitch * rows) as usize;
+        let readback_desc = D3D12_RESOURCE_DESC {
+            Dimension: D3D12_RESOURCE_DIMENSION_BUFFER,
+            Width: bytes as u64,
+            Height: 1,
+            DepthOrArraySize: 1,
+            MipLevels: 1,
+            SampleDesc: windows::Win32::Graphics::Dxgi::Common::DXGI_SAMPLE_DESC {
+                Count: 1,
+                Quality: 0,
+            },
+            Layout: D3D12_TEXTURE_LAYOUT_ROW_MAJOR,
+            ..Default::default()
+        };
+        let mut readback: Option<ID3D12Resource> = None;
+        // SAFETY: plain creation of a readback buffer.
+        unsafe {
+            host.device
+                .CreateCommittedResource(
+                    &readback_heap,
+                    D3D12_HEAP_FLAG_NONE,
+                    &readback_desc,
+                    D3D12_RESOURCE_STATE_COPY_DEST,
+                    None,
+                    &mut readback,
+                )
+                .unwrap();
+        }
+        let readback = readback.unwrap();
+        // The target's texels, read back from the host GPU.
+        let read_target = || -> Vec<u8> {
+            const COPY_SOURCE: u32 = 0x800;
+            let texture = host_resource(target).unwrap();
+            let back = host.new_list().unwrap();
+            let before = host_transition(target, COPY_SOURCE).map_or(COPY_SOURCE, |(_, b)| b);
+            let to = D3D12_TEXTURE_COPY_LOCATION {
+                // SAFETY: a borrowed pointer the location never releases.
+                pResource: unsafe { std::mem::transmute_copy(&readback) },
+                Type: D3D12_TEXTURE_COPY_TYPE_PLACED_FOOTPRINT,
+                Anonymous: D3D12_TEXTURE_COPY_LOCATION_0 {
+                    PlacedFootprint: D3D12_PLACED_SUBRESOURCE_FOOTPRINT {
+                        Offset: 0,
+                        Footprint: D3D12_SUBRESOURCE_FOOTPRINT {
+                            Format: windows::Win32::Graphics::Dxgi::Common::DXGI_FORMAT(28),
+                            Width: 64,
+                            Height: rows,
+                            Depth: 1,
+                            RowPitch: pitch,
+                        },
+                    },
+                },
+            };
+            let from = D3D12_TEXTURE_COPY_LOCATION {
+                // SAFETY: as above.
+                pResource: unsafe { std::mem::transmute_copy(texture) },
+                Type: D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX,
+                Anonymous: D3D12_TEXTURE_COPY_LOCATION_0 {
+                    SubresourceIndex: 0,
+                },
+            };
+            // SAFETY: an open list of ours, live resources.
+            unsafe {
+                if before != COPY_SOURCE {
+                    back.list.ResourceBarrier(&[crate::host::transition(
+                        texture,
+                        D3D12_RESOURCE_STATES(before as i32),
+                        D3D12_RESOURCE_STATE_COPY_SOURCE,
+                    )]);
+                }
+                back.list.CopyTextureRegion(&to, 0, 0, 0, &from, None);
+            }
+            back.close();
+            host.execute(&[&back]);
+            let mut mapped = std::ptr::null_mut();
+            let range = D3D12_RANGE {
+                Begin: 0,
+                End: bytes,
+            };
+            // SAFETY: the copy finished (execute waits); the buffer holds
+            // `bytes`.
+            unsafe {
+                readback.Map(0, Some(&range), Some(&mut mapped)).unwrap();
+                let read = std::slice::from_raw_parts(mapped.cast::<u8>(), bytes).to_vec();
+                readback.Unmap(0, None);
+                read
+            }
+        };
+        let all = |texels: &[u8], value: u8| texels.iter().all(|&b| b == value);
+
+        fill(0x11);
+        submit(&lists[..1]);
+        assert_eq!(
+            crate::texture::uploads(source),
+            1,
+            "the first submission uploads"
+        );
+        assert!(all(&read_target(), 0x11));
+        // Unchanged memory: nothing to upload; the host copy keeps what it
+        // was given.
+        submit(&lists[..1]);
+        submit(&lists[..1]);
+        assert_eq!(crate::texture::uploads(source), 1, "nothing changed");
+        assert!(all(&read_target(), 0x11));
+        // Changed memory, read by two lists of one submission: one upload,
+        // before both.
+        fill(0x22);
+        submit(&lists);
+        assert_eq!(crate::texture::uploads(source), 2, "one upload per change");
+        assert!(all(&read_target(), 0x22));
+        submit(&lists);
+        assert_eq!(crate::texture::uploads(source), 2, "nothing changed");
+        assert!(all(&read_target(), 0x22));
+    }
+
     #[test]
     fn committed_and_placed_resources_map_at_their_gpu_address() {
         let null = std::ptr::null();

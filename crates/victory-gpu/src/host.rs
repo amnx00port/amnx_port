@@ -53,10 +53,14 @@ pub(crate) struct Host {
     messages: Option<ID3D12InfoQueue>,
     next_rtv: AtomicU32,
     presenter: Mutex<Option<Presenter>>,
+    /// The list that copies changed title textures into their host copies
+    /// before a submission's lists run, made on first use.
+    uploads: OnceLock<HostList>,
 }
 
 // SAFETY: D3D12 devices, queues, fences and descriptor heaps are
-// free-threaded; the event handle is only waited on under `submitted`.
+// free-threaded; the event handle is only waited on, and the upload list
+// only recorded, under `submitted`.
 unsafe impl Send for Host {}
 // SAFETY: as above.
 unsafe impl Sync for Host {}
@@ -72,6 +76,16 @@ static SUBMISSION_US: [std::sync::atomic::AtomicU64; 2] =
 /// frame-rate line.
 static COPY_BACK: [std::sync::atomic::AtomicU64; 2] =
     [std::sync::atomic::AtomicU64::new(0), std::sync::atomic::AtomicU64::new(0)];
+
+/// Bytes of title textures copied into their host copies since the last
+/// frame-rate line.
+static UPLOADED: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+/// A title texture's staging buffer and its host copy.
+type Upload = (
+    std::sync::Arc<crate::texture::Staging>,
+    std::sync::Arc<crate::resource::HostTexture>,
+);
 
 /// Of the preparing: title memory copies (microseconds, bytes) and texture
 /// refreshes (microseconds, bytes hashed), since the last frame-rate line.
@@ -222,6 +236,7 @@ fn create() -> windows::core::Result<Host> {
             messages,
             next_rtv: AtomicU32::new(0),
             presenter: Mutex::new(None),
+            uploads: OnceLock::new(),
         })
     }
 }
@@ -385,8 +400,12 @@ enum Step {
     /// Shaders write a range (address, bytes) of a buffer's host copy.
     GpuWrite(std::sync::Arc<crate::shadow::Shadow>, usize, usize),
     /// Brings a texture's staging buffer up to date: once per submission,
-    /// whichever lists sample it, until a `Copy` or `Run` intervenes.
-    Texture(std::sync::Arc<crate::texture::Staging>),
+    /// whichever lists sample it, until a `Copy` or `Run` intervenes; and
+    /// its host copy, if that lacks what the staging buffer then holds.
+    Texture(
+        std::sync::Arc<crate::texture::Staging>,
+        std::sync::Arc<crate::resource::HostTexture>,
+    ),
 }
 
 /// What a list does on the CPU when it is submitted: copies between host
@@ -497,19 +516,29 @@ impl Host {
         let started = std::time::Instant::now();
         #[cfg(feature = "diagnostics")]
         crate::copystat::add(crate::copystat::C::Submissions, 1);
-        let mut lists: Vec<Option<ID3D12CommandList>> = Vec::with_capacity(2 * runs.len());
-        // Where each run's lists start in `lists`.
-        let mut firsts = Vec::with_capacity(runs.len());
         let mut batch = Batch::default();
         for list in runs {
             list.run_deferred(&mut batch);
+        }
+        batch.flush();
+        // Title textures whose host copies lack what their memory holds now
+        // get it once, before any list runs. Each list that sampled one used
+        // to copy it, every submission: all those copies read the same
+        // staging buffer, which the steps above fill before any list runs.
+        let uploads = self.record_uploads(&batch.uploads);
+        // What runs, timed and reported: the uploads, then the lists.
+        let runs: Vec<&HostList> = uploads.into_iter().chain(runs.iter().copied()).collect();
+        let mut lists: Vec<Option<ID3D12CommandList>> = Vec::with_capacity(2 * runs.len());
+        // Where each run's lists start in `lists`. Preludes come after the
+        // uploads, which leave their textures in the copy destination state.
+        let mut firsts = Vec::with_capacity(runs.len());
+        for list in &runs {
             firsts.push(lists.len());
             if let Some(prelude) = list.prelude() {
                 lists.push(Some(prelude));
             }
             lists.push(list.list.cast().ok());
         }
-        batch.flush();
         let prepared = std::time::Instant::now();
         // Diagnostics: each list on its own, timed (`VICTORY_GPU_TIMING`).
         #[cfg(feature = "diagnostics")]
@@ -570,8 +599,8 @@ impl Host {
             fail(format_args!(
                 "host GPU device removed after a submission of {} lists{}{}",
                 runs.len(),
-                self.removal_data(runs),
-                last_notes(runs)
+                self.removal_data(&runs),
+                last_notes(&runs)
             ));
         }
         // What shaders wrote goes back before the bottom-of-pipe writes,
@@ -581,7 +610,7 @@ impl Host {
         let copying = std::time::Instant::now();
         // One list's lock at a time: a submission may name a list twice.
         let mut back: Vec<(std::sync::Arc<crate::shadow::Shadow>, usize, usize)> = Vec::new();
-        for list in runs {
+        for list in &runs {
             for step in &list.deferred().copies {
                 if let Step::GpuWrite(shadow, address, len) = step
                     && !back
@@ -598,12 +627,60 @@ impl Host {
             COPY_BACK[1].fetch_add(written as u64, Ordering::Relaxed);
         }
         COPY_BACK[0].fetch_add(copying.elapsed().as_micros() as u64, Ordering::Relaxed);
-        for list in runs {
+        for list in &runs {
             for &(at, what, bytes) in &list.deferred().writes {
                 what.write(at as *mut u8, bytes);
             }
         }
         self.log_messages();
+    }
+
+    /// Records the copies of title textures' staging buffers into host
+    /// copies that lack them, in the list that runs before a submission's
+    /// lists (`None` if no host copy lacks its contents). Under the
+    /// submission lock; the textures are left in the copy destination
+    /// state, which the lists' preludes move them on from.
+    fn record_uploads(&self, uploads: &[Upload]) -> Option<&HostList> {
+        if uploads.is_empty() {
+            return None;
+        }
+        let list = self.uploads.get_or_init(|| match self.new_list() {
+            Ok(list) => {
+                list.close();
+                list
+            }
+            Err(e) => fail(format_args!(
+                "no host command list for texture uploads ({e})"
+            )),
+        });
+        // Its last submission has run (every one is waited for).
+        list.reset();
+        const COPY_DEST: u32 = D3D12_RESOURCE_STATE_COPY_DEST.0 as u32;
+        let barriers: Vec<D3D12_RESOURCE_BARRIER> = uploads
+            .iter()
+            .filter_map(|(_, copy)| {
+                let real = copy.state.swap(COPY_DEST, Ordering::Relaxed);
+                (real != COPY_DEST).then(|| {
+                    transition(
+                        &copy.texture,
+                        D3D12_RESOURCE_STATES(real as i32),
+                        D3D12_RESOURCE_STATE_COPY_DEST,
+                    )
+                })
+            })
+            .collect();
+        if !barriers.is_empty() {
+            // SAFETY: an open list; the textures are live.
+            unsafe { list.list.ResourceBarrier(&barriers) };
+        }
+        let mut bytes = 0;
+        for (staging, copy) in uploads {
+            staging.record_upload(list, &copy.texture);
+            bytes += staging.size();
+        }
+        UPLOADED.fetch_add(bytes, Ordering::Relaxed);
+        list.close();
+        Some(list)
     }
 
     /// With `VICTORY_D3D12_DRED`: the faulting address and the allocations
@@ -1155,10 +1232,14 @@ impl HostList {
         self.deferred().copies.push(Step::Host(Box::new(work)));
     }
 
-    /// Brings a texture's staging buffer up to date when the list is
-    /// submitted, keeping it alive until the list is reset.
-    pub(crate) fn defer_texture(&self, staging: std::sync::Arc<crate::texture::Staging>) {
-        self.deferred().copies.push(Step::Texture(staging));
+    /// Brings a texture's staging buffer and host copy up to date when the
+    /// list is submitted, keeping both alive until the list is reset.
+    pub(crate) fn defer_texture(
+        &self,
+        staging: std::sync::Arc<crate::texture::Staging>,
+        copy: std::sync::Arc<crate::resource::HostTexture>,
+    ) {
+        self.deferred().copies.push(Step::Texture(staging, copy));
     }
 
     /// Runs the list's submission-time steps; refreshes go into `batch`
@@ -1216,10 +1297,8 @@ impl HostList {
                     shadow.writing(*address, *len);
                     continue;
                 }
-                Step::Texture(staging) => {
-                    if batch.texture_due(staging) {
-                        staging.refresh();
-                    }
+                Step::Texture(staging, copy) => {
+                    batch.texture(staging, copy);
                     continue;
                 }
             };
@@ -1237,11 +1316,18 @@ impl HostList {
 /// lists of a world submission sample the same textures, and a texture in
 /// physical-page memory is hashed whole each time it is checked. Checked
 /// once, it is checked again only after a step that writes title memory.
+/// The textures due are checked together when the buffers are, on several
+/// threads if there is enough to hash.
 #[derive(Default)]
 struct Batch {
     refreshes: Vec<(std::sync::Arc<crate::shadow::Shadow>, usize, usize)>,
     /// Staging buffers (by address) refreshed since the last title write.
     textures: std::collections::HashSet<usize>,
+    /// Of those, the ones not refreshed yet, with their host copies.
+    due: Vec<Upload>,
+    /// Textures whose host copies lack what their staging buffers hold,
+    /// each once: copied before the submission's lists run.
+    uploads: Vec<Upload>,
 }
 
 impl Batch {
@@ -1263,6 +1349,37 @@ impl Batch {
         self.textures.insert(std::sync::Arc::as_ptr(staging) as *const () as usize)
     }
 
+    /// A list samples a texture: refreshed at the next flush, unless it was
+    /// since the last title write.
+    fn texture(
+        &mut self,
+        staging: &std::sync::Arc<crate::texture::Staging>,
+        copy: &std::sync::Arc<crate::resource::HostTexture>,
+    ) {
+        if self.texture_due(staging) {
+            self.due.push((staging.clone(), copy.clone()));
+        }
+    }
+
+    /// After `staging`'s refresh: its host copy gets what the staging buffer
+    /// holds before the submission's lists run, if it lacks it. Once however
+    /// many refreshes of the submission change it: the copy reads what the
+    /// last one left.
+    fn upload(
+        &mut self,
+        staging: &std::sync::Arc<crate::texture::Staging>,
+        copy: &std::sync::Arc<crate::resource::HostTexture>,
+    ) {
+        if staging.take_upload()
+            && !self
+                .uploads
+                .iter()
+                .any(|(s, _)| std::sync::Arc::ptr_eq(s, staging))
+        {
+            self.uploads.push((staging.clone(), copy.clone()));
+        }
+    }
+
     /// Before a step that writes title memory: pending refreshes are done
     /// first, and textures are checked again after it.
     fn title_written(&mut self) {
@@ -1279,6 +1396,14 @@ impl Batch {
             crate::copystat::range(from, to - from, us, 0);
             PREPARING[0].fetch_add(us, Ordering::Relaxed);
             PREPARING[1].fetch_add(copied as u64, Ordering::Relaxed);
+        }
+        if !self.due.is_empty() {
+            let due = std::mem::take(&mut self.due);
+            let stagings: Vec<&crate::texture::Staging> = due.iter().map(|(s, _)| &**s).collect();
+            crate::texture::refresh(&stagings);
+            for (staging, copy) in &due {
+                self.upload(staging, copy);
+            }
         }
     }
 }
@@ -1520,6 +1645,7 @@ impl Meter {
         let [back_ms, back_mb] = [0, 1].map(|i| {
             COPY_BACK[i].swap(0, Ordering::Relaxed) as f64 / [1e3, 1e6][i] / frames
         });
+        let uploaded_mb = UPLOADED.swap(0, Ordering::Relaxed) as f64 / 1e6 / frames;
         let dropped = crate::draw::take_dropped() as f64 / frames;
         let indirect = crate::list::take_indirect() as f64 / frames;
         // Over the same frames as the counts above.
@@ -1529,8 +1655,9 @@ impl Meter {
             self.logged = std::time::Instant::now();
             tracing::info!(
                 "{fps:.1} fps, {ms:.1} ms/frame ({cpu:.1} preparing: copies {copy_ms:.1} ms \
-                 {copy_mb:.1} MB, textures {texture_ms:.1} ms {texture_mb:.1} MB; {gpu:.1} on the \
-                 GPU; {back_ms:.1} copying back {back_mb:.1} MB), {draws:.0} draws/frame, \
+                 {copy_mb:.1} MB, textures {texture_ms:.1} ms {texture_mb:.1} MB, {uploaded_mb:.1} \
+                 MB uploaded; {gpu:.1} on the GPU; {back_ms:.1} copying back {back_mb:.1} MB), \
+                 {draws:.0} draws/frame, \
                  dropped {dropped:.0} without a host pipeline ({making} being made) and \
                  {indirect:.0} indirect",
                 making = crate::pipeline::making()
