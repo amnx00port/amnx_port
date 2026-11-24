@@ -519,3 +519,24 @@ fn negative_multiple_gs_alloc_req_sites_take_max_and_require_all_proven() {
     let ms_unproven = build_mesh_shader(&one_unproven, 64, 256, 256, 0, 0, 1);
     assert_eq!(psv_mesh_bounds(&ms_unproven), (256, 256));
 }
+
+#[test]
+#[cfg(windows)]
+fn mixed_unbounded_vertex_and_small_const_prim_guards_primitive_exports() {
+    // Unbounded vertex count (s8) | small constant primitive count (16) with threads=64:
+    // overall bounds stay (256, 256), while setMeshOutputCounts emits (v, 16), so
+    // body storePrimitiveOutput and emitIndices must still be guarded by `flat < 16`.
+    let mut prologue = Vec::new();
+    prologue.extend_from_slice(&s_and_b32_lit(TMP0, UD0, 0x3FF));
+    prologue.push(s_mov_b32(TMP1, inline_u32(16)));
+    prologue.push(s_lshl_b32(TMP1, TMP1, inline_u32(12)));
+    prologue.push(s_or_b32(M0, TMP0, TMP1));
+    prologue.push(S_SENDMSG_GS_ALLOC_REQ);
+
+    // Include 1 prim COLOR output (prim_rows = 1) so storePrimitiveOutput + emitIndices both run.
+    let ms = build_mesh_shader(&prologue, 64, 256, 256, 0, 1, 1);
+    assert_eq!(psv_mesh_bounds(&ms), (256, 256));
+    assert_eq!(ms.user_data.len(), 1);
+    validate_dxil(&ms).expect("mixed unbounded-vertex + const-16 prim must validate");
+    assert_pso_on_gpu_and_warp(&ms, &[vec![3], vec![64], vec![512]]);
+}

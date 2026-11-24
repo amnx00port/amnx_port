@@ -608,6 +608,12 @@ enum MeshCountsMode {
     },
 }
 
+#[derive(Debug, Clone, Copy)]
+enum MeshExportLimit {
+    Const(u32),
+    Dynamic(V),
+}
+
 struct MeshAllocPlan {
     max_vertices: u32,
     max_primitives: u32,
@@ -841,7 +847,9 @@ fn analyze_mesh_alloc(
             .any(|inst| matches!(inst.fields, Fields::Exp { .. }))
     };
 
-    let counts = if let [(m0_val, vr, pr)] = &site_ranges[..] {
+    let counts = if sites.len() == 1
+        && let [(m0_val, vr, pr)] = &site_ranges[..]
+    {
         let v_const = (vr.0 == vr.1)
             .then_some(vr.0.min(max_vertices))
             .or((vr.0 >= max_vertices).then_some(max_vertices));
@@ -882,6 +890,7 @@ fn analyze_mesh_alloc(
             }
         }
     } else if proven
+        && sites.len() == site_ranges.len()
         && !site_ranges.is_empty()
         && site_ranges
             .iter()
@@ -1010,8 +1019,8 @@ struct Lower<'a> {
     flat: Option<V>,
     /// Mesh: how `setMeshOutputCounts` and prologue `emitIndices` are placed.
     mesh_counts: MeshCountsMode,
-    /// Mesh: runtime vertex and primitive output counts when dynamic.
-    mesh_rt_counts: (Option<V>, Option<V>),
+    /// Mesh: actual vertex and primitive output limits passed to `setMeshOutputCounts`.
+    mesh_export_limits: (MeshExportLimit, MeshExportLimit),
     /// Mesh: IR blocks whose `s_barrier` is left out.
     no_barrier: HashSet<usize>,
     /// Vertex and mesh outputs holding 16-bit values: row, whether two per
@@ -1319,7 +1328,10 @@ impl<'a> Lower<'a> {
             console_lanes,
             flat: None,
             mesh_counts,
-            mesh_rt_counts: (None, None),
+            mesh_export_limits: (
+                MeshExportLimit::Const(u32::MAX),
+                MeshExportLimit::Const(u32::MAX),
+            ),
             no_barrier,
             half_outputs: half_outputs(&x.native.io, &x.outputs),
             mask_data: match x.native.stage {
@@ -2802,7 +2814,10 @@ impl<'a> Lower<'a> {
 
     fn emit_mesh_counts_const(&mut self, v_count: u32, p_count: u32) {
         let (v, p) = (self.s.m.i32(v_count), self.s.m.i32(p_count));
-        self.mesh_rt_counts = (None, None);
+        self.mesh_export_limits = (
+            MeshExportLimit::Const(v_count),
+            MeshExportLimit::Const(p_count),
+        );
         self.emit_mesh_counts(v, p, Some(p_count));
     }
 
@@ -2820,26 +2835,25 @@ impl<'a> Lower<'a> {
             l.s.m.select(c, over, max_v, raw)
         };
         let k3ff = self.s.m.i32(GS_ALLOC_COUNT_MASK);
-        let v = match v_const {
-            Some(cv) => self.s.m.i32(cv),
+        let (v, v_limit) = match v_const {
+            Some(cv) => (self.s.m.i32(cv), MeshExportLimit::Const(cv)),
             None => {
                 let raw = self.s.m.bin(c, Bin::And, m0, k3ff);
-                clamp_field(self, raw, mesh.max_vertices)
+                let clamped = clamp_field(self, raw, mesh.max_vertices);
+                (clamped, MeshExportLimit::Dynamic(clamped))
             }
         };
-        let p = match p_const {
-            Some(cp) => self.s.m.i32(cp),
+        let (p, p_limit) = match p_const {
+            Some(cp) => (self.s.m.i32(cp), MeshExportLimit::Const(cp)),
             None => {
                 let k12 = self.s.m.i32(GS_ALLOC_PRIM_SHIFT);
                 let sh = self.s.m.bin(c, Bin::LShr, m0, k12);
                 let raw = self.s.m.bin(c, Bin::And, sh, k3ff);
-                clamp_field(self, raw, mesh.max_primitives)
+                let clamped = clamp_field(self, raw, mesh.max_primitives);
+                (clamped, MeshExportLimit::Dynamic(clamped))
             }
         };
-        self.mesh_rt_counts = (
-            v_const.is_none().then_some(v),
-            p_const.is_none().then_some(p),
-        );
+        self.mesh_export_limits = (v_limit, p_limit);
         self.emit_mesh_counts(v, p, p_const);
     }
 
@@ -2900,20 +2914,20 @@ impl<'a> Lower<'a> {
         }
     }
 
-    /// Combines `guard` with `flat < count` for mesh exports when counts are
-    /// dynamic or smaller than the thread-group size.
+    /// Combines `guard` with `flat < count` for mesh exports when emitted
+    /// counts are dynamic or smaller than the thread-group size.
     fn mesh_export_guard(&mut self, primitive: bool, guard: Option<V>) -> Option<V> {
-        let mesh = self.s.mesh?;
+        let _mesh = self.s.mesh?;
         let threads = self.s.threads.expect("mesh")[0];
-        let (rt, limit) = if primitive {
-            (self.mesh_rt_counts.1, mesh.max_primitives)
+        let limit = if primitive {
+            self.mesh_export_limits.1
         } else {
-            (self.mesh_rt_counts.0, mesh.max_vertices)
+            self.mesh_export_limits.0
         };
-        let count = match rt {
-            Some(v) => v,
-            None if threads > limit => self.s.m.i32(limit),
-            None => return guard,
+        let count = match limit {
+            MeshExportLimit::Dynamic(v) => v,
+            MeshExportLimit::Const(c) if threads > c => self.s.m.i32(c),
+            MeshExportLimit::Const(_) => return guard,
         };
         let flat = self.mesh_thread();
         let in_bounds = self.s.m.cmp(self.cur, pred::IULT, flat, count);
