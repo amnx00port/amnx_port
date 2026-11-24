@@ -5,6 +5,7 @@
 
 mod census;
 mod inspect;
+mod listdiff;
 mod run;
 mod shader;
 mod translate;
@@ -85,6 +86,19 @@ enum Command {
         #[arg(long)]
         jobs: Option<usize>,
     },
+    /// Compare two `translate --validate --list` outputs program by
+    /// program: programs gained and lost, by failure reason. The report
+    /// names no program, so it can be shared as it is.
+    ListDiff {
+        /// The listing before the change.
+        before: PathBuf,
+        /// The listing after the change.
+        after: PathBuf,
+        /// How many (before -> after) reason pairs of programs failing in
+        /// both to print.
+        #[arg(long, default_value_t = 20)]
+        top: usize,
+    },
     /// Prepare, map and bind a title executable; with --execute, run it.
     Run {
         exe: PathBuf,
@@ -153,6 +167,7 @@ fn main() -> Result<()> {
             list,
             jobs,
         } => translate::run(paths, validate, pipelines, list, jobs),
+        Command::ListDiff { before, after, top } => listdiff::run(&before, &after, top),
         Command::Run {
             exe,
             unimplemented,
