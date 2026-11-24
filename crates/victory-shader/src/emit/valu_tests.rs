@@ -28,6 +28,11 @@ const fn sop2(op: u8, sdst: u8, src0: u8, src1: u8) -> u32 {
         | src0 as u32
 }
 
+/// SOP1 `op sdst, src0`.
+const fn sop1(op: u8, sdst: u8, src0: u8) -> u32 {
+    0xBE80_0000 | (sdst as u32) << 16 | (op as u32) << 8 | src0 as u32
+}
+
 /// SMEM `s_load_dwordx4 s[dst:dst+3], s[base:base+1], 0` (soffset = null).
 const fn s_load_dwordx4(dst: u8, base: u8) -> [u32; 2] {
     [
@@ -709,6 +714,53 @@ fn v_cvt_u16_and_i16_f16_saturate() {
                 u32::from(want),
                 "{backend}: {what}({:#06x}) = {got:#010x}, want {want:#06x}",
                 cases[i].0,
+            );
+        });
+    }
+}
+
+#[test]
+fn s_bit_scan_and_reverse_ops_match_rdna2() {
+    // s_<op> s6, s0 (SOP1); v_mov_b32 v0, s6. The searches give -1 for no bit.
+    type Op = fn(u32) -> u32;
+    let signed_first_bit = |x: u32| {
+        // The first bit from the top that differs from the sign bit.
+        let x = if x >> 31 == 1 { !x } else { x };
+        if x == 0 { u32::MAX } else { x.leading_zeros() }
+    };
+    let ops: [(&str, u8, Op); 6] = [
+        ("s_brev_b32", 0x0b, u32::reverse_bits),
+        ("s_bcnt1_i32_b32", 0x0f, u32::count_ones),
+        ("s_ff1_i32_b32", 0x13, |x| {
+            if x == 0 { u32::MAX } else { x.trailing_zeros() }
+        }),
+        ("s_flbit_i32_b32", 0x15, |x| {
+            if x == 0 { u32::MAX } else { x.leading_zeros() }
+        }),
+        ("s_flbit_i32", 0x17, signed_first_bit),
+        ("s_abs_i32", 0x34, |x| (x as i32).wrapping_abs() as u32),
+    ];
+    let values = [
+        0u32,
+        1,
+        2,
+        0x80,
+        0x0001_0000,
+        0x00F0_0000,
+        0x7FFF_FFFF,
+        0x8000_0000,
+        0xFFFF_FFFE,
+        0xFFFF_FFFF,
+    ];
+    let cases: Vec<[u32; 4]> = values.iter().map(|&v| [v, 0, 0, 0]).collect();
+    for (name, op, pick) in ops {
+        let shader = build_valu_cs(&[sop1(op, 6, 0), vop1(0x001, 0, sgpr(6))]);
+        run_cases(&shader, &cases, |backend, _, inp, got| {
+            let want = pick(inp[0]);
+            assert_eq!(
+                got, want,
+                "{backend}: {name}({:#010x}) = {got:#010x}, want {want:#010x}",
+                inp[0],
             );
         });
     }
