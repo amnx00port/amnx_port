@@ -273,6 +273,28 @@ pub(crate) fn family(format: u32) -> u32 {
     }
 }
 
+/// Whether a format is the root typeless format of a multi-format family.
+pub(crate) fn is_typeless(format: u32) -> bool {
+    format != 0 && family(format) == format && family(format + 1) == format
+}
+
+/// A concrete shader-readable format for a typeless format, resolving depth
+/// families to their legal depth SRV format (not their DSV attachment format)
+/// and color families to their primary typed view format.
+pub(crate) fn concrete_srv_format(format: u32) -> u32 {
+    match format {
+        19 => 21, // R32G8X24_TYPELESS -> R32_FLOAT_X8X24_TYPELESS (depth SRV, not DSV 20)
+        44 => 46, // R24G8_TYPELESS -> R24_UNORM_X8_TYPELESS (depth SRV, not DSV 45)
+        39 => 41, // R32_TYPELESS -> R32_FLOAT (SRV, not DSV 40)
+        53 => 56, // R16_TYPELESS -> R16_UNORM (depth SRV, not DSV 55)
+        90 => 87, // B8G8R8A8_TYPELESS -> B8G8R8A8_UNORM
+        92 => 88, // B8G8R8X8_TYPELESS -> B8G8R8X8_UNORM
+        94 => 95, // BC6H_TYPELESS -> BC6H_UF16
+        f if is_typeless(f) => f + 1,
+        f => f,
+    }
+}
+
 /// sRGB formats and their linear twins.
 pub(crate) const SRGB: [(u32, u32); 3] = [(29, 28), (91, 87), (93, 88)];
 
@@ -1840,5 +1862,26 @@ mod tests {
         // The resource keeps the heap alive.
         assert_eq!(slot::<Release>(heap, 0x10)(heap), 1);
         assert_eq!(slot::<Release>(placed, 0x10)(placed), 0);
+    }
+
+    #[test]
+    fn concrete_srv_format_resolves_color_and_depth_families() {
+        // Color typeless formats resolve to primary typed view format
+        assert_eq!(concrete_srv_format(27), 28); // R8G8B8A8_TYPELESS -> R8G8B8A8_UNORM
+        assert_eq!(concrete_srv_format(90), 87); // B8G8R8A8_TYPELESS -> B8G8R8A8_UNORM
+        assert_eq!(concrete_srv_format(92), 88); // B8G8R8X8_TYPELESS -> B8G8R8X8_UNORM
+        assert_eq!(concrete_srv_format(9), 10); // R16G16B16A16_TYPELESS -> R16G16B16A16_FLOAT
+        assert_eq!(concrete_srv_format(94), 95); // BC6H_TYPELESS -> BC6H_UF16
+        assert_eq!(concrete_srv_format(97), 98); // BC7_TYPELESS -> BC7_UNORM
+
+        // Depth typeless formats resolve to valid SRVs (never DSV attachment formats 20, 45, 40, 55)
+        assert_eq!(concrete_srv_format(19), 21); // R32G8X24_TYPELESS -> R32_FLOAT_X8X24_TYPELESS
+        assert_eq!(concrete_srv_format(44), 46); // R24G8_TYPELESS -> R24_UNORM_X8_TYPELESS
+        assert_eq!(concrete_srv_format(39), 41); // R32_TYPELESS -> R32_FLOAT
+        assert_eq!(concrete_srv_format(53), 56); // R16_TYPELESS -> R16_UNORM
+
+        // Typed formats are preserved untouched
+        assert_eq!(concrete_srv_format(28), 28);
+        assert_eq!(concrete_srv_format(46), 46);
     }
 }
