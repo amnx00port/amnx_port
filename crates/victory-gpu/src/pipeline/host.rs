@@ -408,6 +408,11 @@ impl HostPipeline {
                 return None;
             }
         };
+        for (s, _) in &stages {
+            if crate::breadcrumb::enabled() {
+                crate::breadcrumb::note_stage(&s.container, &format!("{shaders:?}"));
+            }
+        }
         let code = |i: usize| {
             stages.get(i).and_then(|(s, _)| s.translated()).map_or(
                 D3D12_SHADER_BYTECODE::default(),
