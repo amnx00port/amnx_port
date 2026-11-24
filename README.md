@@ -8,7 +8,6 @@ Runs Grand Theft Auto VI (Xbox Series X|S) natively on Windows, from files the u
 
 The title's x86-64 code runs unchanged inside our process; amnx supplies the platform underneath it and converts the title's data, ahead of time where it can and on first use where it must (shaders). See `docs/architecture.md`.
 
-> Command and file names in this build still use the original `amnx` crate, binary and config identifiers in the source tree; the documentation below uses the amnx branding.
 
 ## Status (2026-11-24)
 
@@ -106,7 +105,6 @@ cargo build --profile diag -p amnx --features diagnostics   # target\diag\amnx.e
 | `AMNX_AUDIO_CAPTURE=<file.wav>` | records what the title plays (our process only) |
 | `AMNX_XMA_DUMP=<dir>` | saves the first 32 XMA voices' context and input |
 
-> These are the documentation-facing names; the current source still reads the original `AMNX_*` variables.
 
 Every build appends crashes and host GPU failures to `crashes.log` in the title's data folder.
 
