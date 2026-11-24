@@ -268,14 +268,16 @@ impl Shadow {
         if from >= to {
             return 0;
         }
-        let mut busy: Vec<(usize, usize)> = self
-            .pending
-            .lock()
-            .unwrap_or_else(|e| e.into_inner())
+        let page_from = (from / PAGE * PAGE).max(start);
+        let page_to = to.div_ceil(PAGE).saturating_mul(PAGE).min(end);
+        let pending = self.pending.lock().unwrap_or_else(|e| e.into_inner());
+        let mut busy: Vec<(usize, usize)> = pending
             .iter()
             .copied()
             .filter(|&(a, e)| a < to && e > from)
             .collect();
+        let pages_busy = pending.iter().any(|&(a, e)| a < page_to && e > page_from);
+        drop(pending);
         if !busy.is_empty() {
             // Around ranges shaders are writing: the gaps, each as below
             // (in the world most submissions have such ranges; copying the
@@ -284,30 +286,45 @@ impl Shadow {
             let (mut at, mut bytes) = (from, 0);
             for (a, e) in busy {
                 if a > at {
-                    bytes += self.update_free(at, a);
+                    bytes += self.update_free(at, a, false);
                 }
                 at = at.max(e);
             }
             if at < to {
-                bytes += self.update_free(at, to);
+                bytes += self.update_free(at, to, false);
             }
             return bytes;
         }
-        self.update_free(from, to)
+        self.update_free(from, to, !pages_busy)
     }
 
     /// [`Shadow::update`] of `[from, to)` (inside the buffer) where no
-    /// shader writes.
-    fn update_free(&self, from: usize, to: usize) -> usize {
+    /// shader writes. When `whole_pages` is true (no pending GPU write overlaps
+    /// the enclosing 64 KiB pages) and the memory is write-watched, stale pages
+    /// are copied whole so they are marked clean and not re-copied on every
+    /// later submission.
+    fn update_free(&self, from: usize, to: usize, whole_pages: bool) -> usize {
         if self.watched.load(Ordering::Relaxed) != NOT_WATCHED {
             if let Some((now, written)) = crate::watch::writes(from, to, true) {
                 self.watched.store(1, Ordering::Relaxed);
-                let copied = self.copy_stale(from, to, now, &written);
+                let (copy_from, copy_to) = if whole_pages {
+                    let (start, end) = (self.start as usize, (self.start + self.len) as usize);
+                    (
+                        (from / PAGE * PAGE).max(start),
+                        to.div_ceil(PAGE).saturating_mul(PAGE).min(end),
+                    )
+                } else {
+                    (from, to)
+                };
+                let copied = self.copy_stale(copy_from, copy_to, now, &written);
                 #[cfg(feature = "diagnostics")]
                 {
                     use crate::copystat::{C, add};
-                    add(C::Checked, (to - from) as u64);
-                    add(C::Unchanged, (to - from).saturating_sub(copied) as u64);
+                    add(C::Checked, (copy_to - copy_from) as u64);
+                    add(
+                        C::Unchanged,
+                        (copy_to - copy_from).saturating_sub(copied) as u64,
+                    );
                 }
                 return copied;
             }
@@ -391,6 +408,19 @@ pub(crate) fn register(resource: usize, start: u64, len: u64) {
 /// The title released it; lists that still hold its copy keep it alive.
 pub(crate) fn unregister(resource: usize, start: u64) {
     buffers().remove(&(start, resource));
+}
+
+/// Whether a title buffer holds `[address, address + len)` (its memory is
+/// the title's, without asking the kernel).
+pub(crate) fn in_buffer(address: u64, len: u64) -> bool {
+    let Some(end) = address.checked_add(len.max(1)) else {
+        return false;
+    };
+    buffers()
+        .range(..=(address, usize::MAX))
+        .rev()
+        .take(64)
+        .any(|(_, e)| e.end >= end)
 }
 
 /// The copy of the innermost title buffer holding `[address, address +

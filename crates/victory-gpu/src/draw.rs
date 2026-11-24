@@ -444,6 +444,14 @@ impl State {
             list.keep(&p.pso);
             list.keep(&p.root);
         }
+        if p.stages.iter().any(|s| s.translated().resource_heap)
+            && self.heaps[0] != 0
+            && let Some(host_heap) = crate::descriptor::heap(self.heaps[0] as This).host_arc()
+        {
+            host_heap.prepare_bindless_record(list);
+            let writes = p.stages.iter().any(|s| s.translated().writes_memory);
+            list.defer_bindless(&host_heap, writes);
+        }
         for stage in &p.stages {
             let t = stage.translated();
             let made = self.tables(list, &t.used, compute);
@@ -1075,7 +1083,7 @@ fn readable(list: &HostList, u: &UsedResource, view: &View) {
     const SHADER_RESOURCE: u32 = 0x40 | 0x80;
     const UNORDERED_ACCESS: u32 = 0x8;
     let placed = crate::descriptor::host::placed_texture(view);
-    let view = placed.as_ref().unwrap_or(view);
+    let view = placed.as_ref().map_or(view, |(v, _)| v);
     // Buffer views read title memory: their range is copied at submission;
     // what shaders write through unordered access goes back to it after.
     if let Some((address, len)) = crate::descriptor::host::buffer_range(view)

@@ -1137,44 +1137,229 @@ pub(crate) extern "system" fn create_at_address(
 }
 
 /// Textures the title placed in its own memory and views without a
-/// resource object (device 0x230, Grand Theft Auto VI's streamed and
-/// interface textures), by address and description: a resource at that
-/// address, made the first time a draw reads one.
-/// shortcut: never released (one host texture per distinct address and
-/// description viewed); release them when the title unmaps or reuses the
-/// memory once streaming grows VRAM use.
+/// resource object (device 0x230, streamed and interface textures), by
+/// address and description: a resource at that address, where its footprint
+/// ends, its estimated byte size, and its LRU sequence number. Evicted when
+/// [`crate::watch::title_memory_remapped`] unmaps or remaps the range, or
+/// when the cache exceeds its VRAM/count budget so long runs do not hit
+/// `E_OUTOFMEMORY`.
 #[cfg(windows)]
-static PLACED_TEXTURES: std::sync::Mutex<std::collections::BTreeMap<(u64, [u32; 14]), usize>> =
-    std::sync::Mutex::new(std::collections::BTreeMap::new());
+struct PlacedEntry {
+    resource: usize,
+    end: u64,
+    bytes: u64,
+    used: u64,
+}
+
+#[cfg(windows)]
+struct PlacedCache {
+    map: std::collections::BTreeMap<(u64, [u32; 14]), PlacedEntry>,
+    total_bytes: u64,
+    seq: u64,
+}
+
+#[cfg(windows)]
+const MAX_PLACED_TEXTURES: usize = 4096;
+#[cfg(windows)]
+const MAX_PLACED_BYTES: u64 = 1 << 30; // 1 GiB host VRAM cap
+
+#[cfg(windows)]
+static PLACED_TEXTURES: std::sync::Mutex<PlacedCache> = std::sync::Mutex::new(PlacedCache {
+    map: std::collections::BTreeMap::new(),
+    total_bytes: 0,
+    seq: 0,
+});
+
+/// Incremented whenever [`evict_placed_textures`] removes an entry on
+/// title-memory remap so bindless heaps re-check affected slots.
+#[cfg(windows)]
+static PLACED_EPOCH: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+/// Incremented whenever LRU trimming evicts placed textures so bindless heaps
+/// release retained references and clear their slots instead of re-allocating.
+#[cfg(windows)]
+static PLACED_LRU_EPOCH: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+#[cfg(windows)]
+pub(crate) fn placed_epoch() -> u64 {
+    PLACED_EPOCH.load(std::sync::atomic::Ordering::Acquire)
+}
+
+#[cfg(windows)]
+pub(crate) fn placed_lru_epoch() -> u64 {
+    PLACED_LRU_EPOCH.load(std::sync::atomic::Ordering::Acquire)
+}
+
+/// A reference to a placed texture: eviction does not free it while held.
+#[cfg(windows)]
+pub(crate) struct HeldTexture(This);
+
+#[cfg(windows)]
+impl HeldTexture {
+    pub(crate) fn as_this(&self) -> This {
+        self.0
+    }
+}
+
+#[cfg(windows)]
+impl Drop for HeldTexture {
+    fn drop(&mut self) {
+        resource_release(self.0);
+    }
+}
+
+/// A reference to `texture` if it is a placed texture alive now.
+#[cfg(windows)]
+pub(crate) fn hold_placed(texture: This) -> Option<HeldTexture> {
+    let mut cache = PLACED_TEXTURES.lock().unwrap_or_else(|e| e.into_inner());
+    let next_seq = cache.seq.wrapping_add(1);
+    if let Some(entry) = cache
+        .map
+        .values_mut()
+        .find(|e| e.resource == texture as usize)
+    {
+        entry.used = next_seq;
+        cache.seq = next_seq;
+        object::add_ref(texture);
+        return Some(HeldTexture(texture));
+    }
+    None
+}
+
+/// The placed textures alive now (resource objects).
+#[cfg(windows)]
+pub(crate) fn placed_live() -> std::collections::HashSet<usize> {
+    PLACED_TEXTURES
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .map
+        .values()
+        .map(|e| e.resource)
+        .collect()
+}
 
 /// The resource for a texture placed at `address` with the resource
-/// description `desc` (as words), made on first use.
+/// description `desc` (as words), made on first use. Returns a reference
+/// taken under `PLACED_TEXTURES` so eviction cannot free it out from under
+/// the caller.
 #[cfg(windows)]
-pub(crate) fn texture_at(address: u64, desc: &[u32; 14]) -> Option<This> {
-    let mut map = PLACED_TEXTURES.lock().unwrap_or_else(|e| e.into_inner());
-    if let Some(&r) = map.get(&(address, *desc)) {
-        return Some(r as This);
-    }
-    // SAFETY: 56 bytes in the description's layout.
-    let d = unsafe { desc.as_ptr().cast::<ResourceDesc>().read_unaligned() };
-    if d.dimension == BUFFER {
+pub(crate) fn texture_at(address: u64, desc: &[u32; 14]) -> Option<HeldTexture> {
+    if address == 0 {
         return None;
     }
-    let mut out = std::ptr::null();
-    let made = create_at_address(
-        std::ptr::null(),
-        address,
-        &d,
-        0,
-        std::ptr::null(),
-        &RESOURCE_IIDS[0],
-        &mut out,
-    );
-    if made != S_OK {
-        return None;
+    let mut evicted = Vec::new();
+    let held = {
+        let mut cache = PLACED_TEXTURES.lock().unwrap_or_else(|e| e.into_inner());
+        let next_seq = cache.seq.wrapping_add(1);
+        if let Some(entry) = cache.map.get_mut(&(address, *desc)) {
+            entry.used = next_seq;
+            let texture = entry.resource as This;
+            cache.seq = next_seq;
+            object::add_ref(texture);
+            return Some(HeldTexture(texture));
+        }
+        // SAFETY: 56 bytes in the description's layout.
+        let d = unsafe { desc.as_ptr().cast::<ResourceDesc>().read_unaligned() };
+        if d.dimension == BUFFER {
+            return None;
+        }
+        let size = footprint(&d).map_or(1, |info| info.size.max(1));
+        let end = address.saturating_add(size);
+        let mut out = std::ptr::null();
+        let made = create_at_address(
+            std::ptr::null(),
+            address,
+            &d,
+            0,
+            std::ptr::null(),
+            &RESOURCE_IIDS[0],
+            &mut out,
+        );
+        if made != S_OK {
+            return None;
+        }
+        if resource(out).host.is_none() {
+            drop(cache);
+            resource_release(out);
+            return None;
+        }
+        // One reference stays in `PLACED_TEXTURES`; the caller gets a second.
+        object::add_ref(out);
+        cache.seq = next_seq;
+        cache.total_bytes = cache.total_bytes.saturating_add(size);
+        cache.map.insert(
+            (address, *desc),
+            PlacedEntry {
+                resource: out as usize,
+                end,
+                bytes: size,
+                used: next_seq,
+            },
+        );
+        // Trim oldest entries if over count or VRAM budget (never evict `out`).
+        while cache.map.len() > MAX_PLACED_TEXTURES
+            || (cache.total_bytes > MAX_PLACED_BYTES && cache.map.len() > 1)
+        {
+            let Some(victim_key) = cache
+                .map
+                .iter()
+                .filter(|&(_, e)| e.resource != out as usize)
+                .min_by_key(|&(_, e)| e.used)
+                .map(|(k, _)| *k)
+            else {
+                break;
+            };
+            if let Some(entry) = cache.map.remove(&victim_key) {
+                cache.total_bytes = cache.total_bytes.saturating_sub(entry.bytes);
+                evicted.push(entry.resource);
+            }
+        }
+        HeldTexture(out)
+    };
+    if !evicted.is_empty() {
+        PLACED_LRU_EPOCH.fetch_add(1, std::sync::atomic::Ordering::Release);
+        for res in evicted {
+            resource_release(res as This);
+        }
     }
-    map.insert((address, *desc), out as usize);
-    resource(out).host.is_some().then_some(out)
+    Some(held)
+}
+
+/// Releases placed textures whose backing range overlaps `[start, end)`.
+#[cfg(windows)]
+pub(crate) fn evict_placed_textures(start: u64, end: u64) {
+    if start >= end {
+        return;
+    }
+    let mut evicted = Vec::new();
+    {
+        let mut cache = PLACED_TEXTURES.lock().unwrap_or_else(|e| e.into_inner());
+        let mut removed_bytes = 0u64;
+        cache.map.retain(|&(addr, _), entry| {
+            let overlaps = addr < end && entry.end > start;
+            if overlaps {
+                evicted.push(entry.resource);
+                removed_bytes = removed_bytes.saturating_add(entry.bytes);
+            }
+            !overlaps
+        });
+        cache.total_bytes = cache.total_bytes.saturating_sub(removed_bytes);
+    }
+    if !evicted.is_empty() {
+        PLACED_EPOCH.fetch_add(1, std::sync::atomic::Ordering::Release);
+        for res in evicted {
+            resource_release(res as This);
+        }
+    }
+}
+
+#[cfg(all(test, windows))]
+pub(crate) fn has_placed_texture(address: u64, desc: &[u32; 14]) -> bool {
+    PLACED_TEXTURES
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .map
+        .contains_key(&(address, *desc))
 }
 
 pub(crate) extern "system" fn create_placed(

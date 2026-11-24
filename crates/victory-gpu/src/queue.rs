@@ -227,9 +227,14 @@ fn system_timestamp() -> u64 {
 /// Frames presented so far.
 static FRAMES: AtomicU64 = AtomicU64::new(0);
 
-#[cfg(feature = "diagnostics")]
 pub(crate) fn presented() -> u64 {
     FRAMES.load(Ordering::Relaxed)
+}
+
+/// A frame passes (tests that check per-frame work).
+#[cfg(test)]
+pub(crate) fn pass_frame() {
+    FRAMES.fetch_add(1, Ordering::Relaxed);
 }
 
 /// Shows the first plane's first resource in our window.
