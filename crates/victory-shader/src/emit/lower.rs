@@ -2159,6 +2159,63 @@ impl<'a> Lower<'a> {
             ]
         };
         if let Some(rest) = name.strip_prefix("ds_read") {
+            if let Some((bits, signed, d16, hi)) = match rest {
+                "_u8" => Some((8u32, false, false, false)),
+                "_i8" => Some((8, true, false, false)),
+                "_u16" => Some((16, false, false, false)),
+                "_i16" => Some((16, true, false, false)),
+                "_u8_d16" => Some((8, false, true, false)),
+                "_i8_d16" => Some((8, true, true, false)),
+                "_u16_d16" => Some((16, false, true, false)),
+                "_u8_d16_hi" => Some((8, false, true, true)),
+                "_i8_d16_hi" => Some((8, true, true, true)),
+                "_u16_d16_hi" => Some((16, false, true, true)),
+                _ => None,
+            } {
+                let reg = dst_reg.ok_or("an LDS read result")?;
+                let p = dword(self, offset);
+                let x = self.s.m.load(self.cur, p);
+                let c = self.cur;
+                let off_val = self.s.m.i32(offset);
+                let at = self.s.m.bin(c, Bin::Add, a, off_val);
+                let three = self.s.m.i32(3);
+                let byte_in_dword = self.s.m.bin(c, Bin::And, at, three);
+                let k3 = self.s.m.i32(3);
+                let shift = self.s.m.bin(c, Bin::Shl, byte_in_dword, k3);
+                let mut r = if signed {
+                    let top = self.s.m.i32(32 - bits);
+                    let up = self.s.m.bin(c, Bin::Sub, top, shift);
+                    let x = self.s.m.bin(c, Bin::Shl, x, up);
+                    let sx = self.s.m.bin(c, Bin::AShr, x, top);
+                    if d16 {
+                        let m16 = self.s.m.i32(0xFFFF);
+                        self.s.m.bin(c, Bin::And, sx, m16)
+                    } else {
+                        sx
+                    }
+                } else {
+                    let mask = self.s.m.i32((1u32 << bits) - 1);
+                    let x = self.s.m.bin(c, Bin::LShr, x, shift);
+                    self.s.m.bin(c, Bin::And, x, mask)
+                };
+                if d16 {
+                    if hi {
+                        let old = match inst.read(Reg::V(reg)) {
+                            Some(v) => self.i32_of(v)?,
+                            None => self.s.m.i32(0),
+                        };
+                        let m16 = self.s.m.i32(0xFFFF);
+                        let lo = self.s.m.bin(c, Bin::And, old, m16);
+                        let k16 = self.s.m.i32(16);
+                        let shifted = self.s.m.bin(c, Bin::Shl, r, k16);
+                        r = self.s.m.bin(c, Bin::Or, lo, shifted);
+                    } else {
+                        r = self.low_half(inst, reg, r);
+                    }
+                }
+                self.write(inst, Reg::V(reg), r, guard);
+                return Ok(());
+            }
             let elements = if rest.starts_with('2') {
                 pair(name)
             } else if matches!(rest, "_b32" | "_b64" | "_b96" | "_b128") {
@@ -2179,6 +2236,40 @@ impl<'a> Lower<'a> {
             return Ok(());
         }
         if let Some(rest) = name.strip_prefix("ds_write") {
+            if let Some((bits, hi)) = match rest {
+                "_b8" => Some((8u32, false)),
+                "_b16" => Some((16, false)),
+                "_b8_d16_hi" => Some((8, true)),
+                "_b16_d16_hi" => Some((16, true)),
+                _ => None,
+            } {
+                let mut val = self.vgprs(inst, data.first().ok_or("an LDS write")?, 1)?[0];
+                let p = dword(self, offset);
+                let c = self.cur;
+                if hi {
+                    let k16 = self.s.m.i32(16);
+                    val = self.s.m.bin(c, Bin::LShr, val, k16);
+                }
+                let off_val = self.s.m.i32(offset);
+                let at = self.s.m.bin(c, Bin::Add, a, off_val);
+                let three = self.s.m.i32(3);
+                let byte_in_dword = self.s.m.bin(c, Bin::And, at, three);
+                let k3 = self.s.m.i32(3);
+                let shift = self.s.m.bin(c, Bin::Shl, byte_in_dword, k3);
+                let mask = self.s.m.i32((1u32 << bits) - 1);
+                let v = self.s.m.bin(c, Bin::And, val, mask);
+                let v = self.s.m.bin(c, Bin::Shl, v, shift);
+                let placed_mask = self.s.m.bin(c, Bin::Shl, mask, shift);
+                let all_ones = self.s.m.i32(u32::MAX);
+                let clear = self.s.m.bin(c, Bin::Xor, placed_mask, all_ones);
+                let at = self.begin_guarded(guard);
+                self.s
+                    .m
+                    .atomic(self.cur, super::bitcode::Rmw::And, p, clear);
+                self.s.m.atomic(self.cur, super::bitcode::Rmw::Or, p, v);
+                self.end_guarded(at, &[]);
+                return Ok(());
+            }
             let elements = if rest.starts_with('2') {
                 pair(name)
             } else if matches!(rest, "_b32" | "_b64" | "_b96" | "_b128") {
@@ -5594,9 +5685,6 @@ impl<'a> Lower<'a> {
             return Err("an image access with tfe or lwe");
         }
         let name = inst.name();
-        if *a16 && name.starts_with("image_sample_b") {
-            return Err("a biased image sample with 16-bit coordinates");
-        }
         // A load or sample with no channel enabled returns the first.
         let dmask = if *dmask == 0 { &1 } else { dmask };
         let site = (b, i);
@@ -5625,18 +5713,26 @@ impl<'a> Lower<'a> {
                 regs.extend((0..dwords).map(|k| reg + k));
             }
         }
-        // With a16, two 16-bit components per VGPR, low half first.
+        // Offset, bias, and comparison reference are always 32-bit dwords;
+        // with a16, components from `whole` onward are packed in pairs, low half first.
+        let whole = usize::from(name.ends_with("_o"))
+            + usize::from(name.starts_with("image_sample_b") || name.starts_with("image_gather4_b"))
+            + usize::from(name.starts_with("image_sample_c") || name.starts_with("image_gather4_c"));
         let addr_val = |l: &mut Self, k: usize| -> Result<V, Why> {
-            let r = *regs
-                .get(if *a16 { k / 2 } else { k })
-                .ok_or("an image address")?;
+            let (reg_idx, half) = if *a16 && k >= whole {
+                let p = k - whole;
+                (whole + p / 2, Some(p as u32 % 2))
+            } else {
+                (k, None)
+            };
+            let r = *regs.get(reg_idx).ok_or("an image address")?;
             let v = inst.read(Reg::V(r)).ok_or("an image address")?;
             let x = l.i32_of(v)?;
-            if !*a16 {
+            let Some(half) = half else {
                 return Ok(x);
-            }
+            };
             let c = l.cur;
-            let (sh, mask) = (l.s.m.i32(16 * (k as u32 % 2)), l.s.m.i32(0xFFFF));
+            let (sh, mask) = (l.s.m.i32(16 * half), l.s.m.i32(0xFFFF));
             let x = l.s.m.bin(c, Bin::LShr, x, sh);
             Ok(l.s.m.bin(c, Bin::And, x, mask))
         };
@@ -5849,8 +5945,9 @@ impl<'a> Lower<'a> {
             // Texel offsets (`_o`) come first: x in bits 0-5, y in 8-13,
             // signed (programmable offsets: gathers only).
             let offset_word = name.ends_with("_o");
-            let first =
-                usize::from(offset_word) + usize::from(name == "image_sample_b") + usize::from(cmp);
+            let first = usize::from(offset_word)
+                + usize::from(name.starts_with("image_sample_b"))
+                + usize::from(cmp);
             // Coordinates the size divides (not the array slice); explicit
             // gradients (x then y) come before the coordinates.
             let spatial = coords - usize::from(kind == 6 || kind == 7);
@@ -5950,8 +6047,15 @@ impl<'a> Lower<'a> {
                         .op(c, "sample.f32", Attr::ReadOnly, self.s.t.res_ret, 60, &args)
                 }
                 61 => {
-                    let bias = addr_val(self, 0)?;
-                    let bias = self.as_float(bias);
+                    let bias = addr_val(self, usize::from(offset_word))?;
+                    let bias = if *a16 {
+                        // Under A16, bias occupies a full 32-bit VGPR with an f16 in the low half.
+                        let m16 = self.s.m.i32(0xFFFF);
+                        let lo = self.s.m.bin(c, Bin::And, bias, m16);
+                        to_float(self, lo)
+                    } else {
+                        self.as_float(bias)
+                    };
                     args.extend(&os);
                     args.extend([bias, fu]);
                     self.s.op(
@@ -7417,5 +7521,41 @@ mod tests {
         assert!(f10(0x3FF).is_nan());
         // A 16-bit float is a half already, sign included.
         assert_eq!(half(0xBC00 << half_shift(16)), -1.0);
+    }
+
+    #[test]
+    fn v_cvt_f32_f64_lowers_with_double_flag() {
+        let words = [
+            0x7E00_1F00, // v_cvt_f32_f64 v0, v[0:1]
+            S_ENDPGM,
+        ];
+        lowers(&words, 0).expect("v_cvt_f32_f64 should lower");
+    }
+
+    #[test]
+    fn lds_byte_and_half_read_write_lower() {
+        // ds_write_b8 v0, v1; ds_write_b16 v0, v1; ds_read_u8 v2, v0;
+        // ds_read_i8 v3, v0; ds_read_u16 v4, v0; ds_read_i16 v5, v0
+        // DS encoding: 0xD800_0000 | (op << 18) | ...
+        let ds = |op: u32, addr: u32, data0: u32, vdst: u32| -> [u32; 2] {
+            [0xD800_0000 | (op << 18), (vdst << 24) | (data0 << 8) | addr]
+        };
+        let mut words = Vec::new();
+        words.extend(ds(0x01e, 0, 1, 0)); // ds_write_b8 v0, v1
+        words.extend(ds(0x01f, 0, 1, 0)); // ds_write_b16 v0, v1
+        words.extend(ds(0x0a0, 0, 1, 0)); // ds_write_b8_d16_hi v0, v1
+        words.extend(ds(0x0a1, 0, 1, 0)); // ds_write_b16_d16_hi v0, v1
+        words.extend(ds(0x039, 0, 0, 2)); // ds_read_i8 v2, v0
+        words.extend(ds(0x03a, 0, 0, 3)); // ds_read_u8 v3, v0
+        words.extend(ds(0x03b, 0, 0, 4)); // ds_read_i16 v4, v0
+        words.extend(ds(0x03c, 0, 0, 5)); // ds_read_u16 v5, v0
+        words.extend(ds(0x0a2, 0, 0, 6)); // ds_read_u8_d16 v6, v0
+        words.extend(ds(0x0a3, 0, 0, 6)); // ds_read_u8_d16_hi v6, v0
+        words.extend(ds(0x0a4, 0, 0, 7)); // ds_read_i8_d16 v7, v0
+        words.extend(ds(0x0a5, 0, 0, 7)); // ds_read_i8_d16_hi v7, v0
+        words.extend(ds(0x0a6, 0, 0, 8)); // ds_read_u16_d16 v8, v0
+        words.extend(ds(0x0a7, 0, 0, 8)); // ds_read_u16_d16_hi v8, v0
+        words.push(S_ENDPGM);
+        lowers(&words, 1 << 15).expect("LDS byte and half read/write should lower");
     }
 }
