@@ -64,15 +64,12 @@ unsafe impl Sync for Staging {}
 
 static STAGING: Mutex<Option<HashMap<usize, Arc<Staging>>>> = Mutex::new(None);
 
-/// Textures the host GPU wrote by a copy or resolve: their contents are on
-/// the host, not in title memory, which stays as it was.
-static HOST_WRITTEN: Mutex<Option<std::collections::HashSet<usize>>> = Mutex::new(None);
-
-/// A host copy or resolve writes `resource`.
-pub(crate) fn host_written(resource: This) {
-    let mut set = HOST_WRITTEN.lock().unwrap_or_else(|e| e.into_inner());
-    set.get_or_insert_with(Default::default)
-        .insert(resource as usize);
+/// Records a host copy or resolve write on `list` so `resource` becomes
+/// host-written only if and when `list` is actually submitted.
+pub(crate) fn defer_host_write(list: &HostList, resource: This) {
+    if let Some(copy) = crate::resource::host_copy(resource) {
+        list.defer_texture_write(copy);
+    }
 }
 
 /// The title released a resource.
@@ -80,10 +77,6 @@ pub(crate) fn forget(resource: usize) {
     let mut map = STAGING.lock().unwrap_or_else(|e| e.into_inner());
     if let Some(map) = map.as_mut() {
         map.remove(&resource);
-    }
-    let mut set = HOST_WRITTEN.lock().unwrap_or_else(|e| e.into_inner());
-    if let Some(set) = set.as_mut() {
-        set.remove(&resource);
     }
 }
 
@@ -100,19 +93,16 @@ pub(crate) fn title_written(texture: &ID3D12Resource) -> bool {
 /// only when its contents changed (including first upload), copied into its
 /// host texture on the list's prelude command list.
 pub(crate) fn upload(list: &HostList, resource: This, texture: &ID3D12Resource) {
-    let host_written = HOST_WRITTEN
-        .lock()
-        .unwrap_or_else(|e| e.into_inner())
-        .as_ref()
-        .is_some_and(|set| set.contains(&(resource as usize)));
-    // shortcut: a texture the host copied into keeps the host's contents
-    // even if the title later writes its memory too.
-    if host_written || !list.first_use(resource as usize) {
-        return;
-    }
     let Some(copy) = crate::resource::host_copy(resource) else {
         return;
     };
+    // shortcut: a texture the host copied into keeps the host's contents
+    // even if the title later writes its memory too.
+    if copy.host_written.load(std::sync::atomic::Ordering::Relaxed)
+        || !list.first_use(resource as usize)
+    {
+        return;
+    }
     let Some(staging) = staging(resource, texture) else {
         return;
     };
@@ -402,6 +392,7 @@ mod tests {
         let copy = Arc::new(HostTexture {
             texture: resource.unwrap(),
             state: AtomicU32::new(D3D12_RESOURCE_STATE_COMMON.0 as u32),
+            host_written: false.into(),
         });
         (copy, layout_tex)
     }
@@ -696,19 +687,106 @@ mod tests {
     }
 
     #[test]
-    fn host_written_texture_never_queues_cpu_upload() {
+    fn discarded_copy_list_still_uploads_cpu_texture() {
         let Some(host) = Host::new_warp() else {
             return;
         };
-        let (copy, _) = make_rgba_texture(&host, 4, 4);
-        let fake_resource = 0x1234_5678usize as This;
-        host_written(fake_resource);
-        let list = host.new_list().expect("new list");
-        upload(&list, fake_resource, &copy.texture);
+        let (copy, tex) = make_rgba_texture(&host, 4, 4);
+        let layout = tex.planes[0].layout.clone();
+        let mut title_mem = vec![0u8; layout.size as usize];
+        let cpu_pixel = [0x11, 0x22, 0x33, 0xff];
+        fill_linear_rgba(&layout, &mut title_mem, cpu_pixel);
+        let staging = create_staging(
+            &host,
+            std::ptr::null(),
+            &copy.texture,
+            layout,
+            title_mem.as_ptr(),
+        )
+        .expect("create staging");
+        let (source, _) = make_rgba_texture(&host, 4, 4);
+
+        // Record and close a CopyResource list, then discard it without submitting.
+        {
+            let discarded = host.new_list().expect("discarded copy list");
+            discarded.expect_texture_state(&source, D3D12_RESOURCE_STATE_COPY_SOURCE.0 as u32);
+            discarded.expect_texture_state(&copy, D3D12_RESOURCE_STATE_COPY_DEST.0 as u32);
+            discarded.defer_texture_write(copy.clone());
+            // SAFETY: compatible textures on an open list.
+            unsafe { discarded.list.CopyResource(&copy.texture, &source.texture) };
+            discarded.close();
+        }
         assert!(
-            !list.has_deferred_work(),
-            "host-written textures must not queue CPU-to-GPU uploads"
+            !copy.host_written.load(Ordering::Relaxed),
+            "unsubmitted CopyResource must not mark texture host-written"
         );
-        forget(fake_resource as usize);
+
+        // An independent list must still upload the CPU texture.
+        let reader = host.new_list().expect("reader");
+        reader.defer_texture(staging.clone(), copy.clone());
+        reader.expect_texture_state(&copy, SHADER_RESOURCE);
+        reader.close();
+        host.execute(&[&reader]);
+
+        assert_eq!(staging.gpu_uploads(), 1);
+        assert!(all_pixels_eq(
+            &read_back_rgba(&host, &copy, 4, 4),
+            cpu_pixel
+        ));
+    }
+
+    #[test]
+    fn submitted_texture_write_prevents_a_later_staging_copy() {
+        let Some(host) = Host::new_warp() else {
+            return;
+        };
+        let (copy, tex) = make_rgba_texture(&host, 4, 4);
+        let layout = tex.planes[0].layout.clone();
+        let mut title_mem = vec![0u8; layout.size as usize];
+        fill_linear_rgba(&layout, &mut title_mem, [0x11, 0x22, 0x33, 0xff]);
+        let staging = create_staging(
+            &host,
+            std::ptr::null(),
+            &copy.texture,
+            layout,
+            title_mem.as_ptr(),
+        )
+        .expect("create staging");
+        let (source, source_tex) = make_rgba_texture(&host, 4, 4);
+        let source_layout = source_tex.planes[0].layout.clone();
+        let mut source_mem = vec![0u8; source_layout.size as usize];
+        let gpu_pixel = [0x44, 0x55, 0x66, 0xff];
+        fill_linear_rgba(&source_layout, &mut source_mem, gpu_pixel);
+        let source_staging = create_staging(
+            &host,
+            std::ptr::null(),
+            &source.texture,
+            source_layout,
+            source_mem.as_ptr(),
+        )
+        .expect("create source staging");
+
+        let writer = host.new_list().expect("writer");
+        writer.defer_texture(source_staging, source.clone());
+        writer.expect_texture_state(&source, D3D12_RESOURCE_STATE_COPY_SOURCE.0 as u32);
+        writer.expect_texture_state(&copy, D3D12_RESOURCE_STATE_COPY_DEST.0 as u32);
+        writer.defer_texture_write(copy.clone());
+        // SAFETY: compatible textures, with the source and destination
+        // states established by the prelude.
+        unsafe { writer.list.CopyResource(&copy.texture, &source.texture) };
+        writer.close();
+        let reader = host.new_list().expect("reader");
+        reader.defer_texture(staging.clone(), copy.clone());
+        reader.expect_texture_state(&copy, SHADER_RESOURCE);
+        reader.close();
+
+        host.execute(&[&writer, &reader]);
+
+        assert_eq!(staging.gpu_uploads(), 0, "the host write takes precedence");
+        assert!(copy.host_written.load(Ordering::Relaxed));
+        assert!(all_pixels_eq(
+            &read_back_rgba(&host, &copy, 4, 4),
+            gpu_pixel
+        ));
     }
 }

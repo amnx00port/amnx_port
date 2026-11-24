@@ -288,6 +288,7 @@ mod tests {
             factory.EnumWarpAdapter::<IDXGIAdapter>()
         };
         let Ok(raw) = raw else { return };
+        // SAFETY: `raw` is a live DXGI adapter returned by `EnumWarpAdapter`.
         let desc = unsafe { raw.cast::<IDXGIAdapter1>().unwrap().GetDesc1().unwrap() };
         eprintln!(
             "EnumWarpAdapter: vendor={:#x}, flags={:#x}",
@@ -406,6 +407,8 @@ enum Step {
     Host(Box<dyn Fn() + Send>),
     /// Shaders write a range (address, bytes) of a buffer's host copy.
     GpuWrite(std::sync::Arc<crate::shadow::Shadow>, usize, usize),
+    /// A submitted copy or resolve makes this host texture authoritative.
+    TextureHostWrite(std::sync::Arc<crate::resource::HostTexture>),
     /// Brings a texture's staging buffer up to date and, when dirty, copies
     /// it into the host texture on the list's prelude: once per submission,
     /// whichever lists sample it, until a `Copy` or `Run` intervenes.
@@ -965,11 +968,6 @@ impl HostList {
             .or_insert_with(|| (wanted, wanted, copy.clone()));
     }
 
-    #[cfg(test)]
-    pub(crate) fn has_deferred_work(&self) -> bool {
-        !self.deferred().copies.is_empty()
-    }
-
     /// At submission: the list that copies any newly dirtied textures from
     /// their staging buffers into their host textures and moves each texture
     /// this list uses from its real state to the one the list starts with;
@@ -1227,6 +1225,11 @@ impl HostList {
         self.deferred().copies.push(Step::Host(Box::new(work)));
     }
 
+    /// Marks `texture` as written by the host GPU when this list is submitted.
+    pub(crate) fn defer_texture_write(&self, texture: std::sync::Arc<crate::resource::HostTexture>) {
+        self.deferred().copies.push(Step::TextureHostWrite(texture));
+    }
+
     /// Brings a texture's staging buffer up to date when the list is
     /// submitted (and copies it to `texture` on the prelude only if dirty),
     /// keeping both alive until the list is reset.
@@ -1303,8 +1306,15 @@ impl HostList {
                     shadow.writing(*address, *len);
                     continue;
                 }
+                Step::TextureHostWrite(copy) => {
+                    copy.host_written.store(true, Ordering::Relaxed);
+                    continue;
+                }
                 Step::Texture(staging, copy) => {
-                    if batch.texture_due(staging) && staging.refresh() {
+                    if !copy.host_written.load(Ordering::Relaxed)
+                        && batch.texture_due(staging)
+                        && staging.refresh()
+                    {
                         uploads.push((staging.clone(), copy.clone()));
                     }
                     continue;
