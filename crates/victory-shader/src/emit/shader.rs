@@ -2,7 +2,7 @@
 //! the `dx.op` declarations it calls, its signatures and bound resources,
 //! and the metadata and container that wrap it up (SM 6.6, validator 1.6).
 
-use super::bitcode::{Attr, Md, Module, Ty, V};
+use super::bitcode::{Attr, Bin, Md, Module, Rmw, Ty, V, pred};
 use super::container::{self, Binding, Psv, SigElement};
 
 /// Where the shader reads its user data: `b0` in this space.
@@ -75,6 +75,13 @@ pub(crate) struct Shader {
     /// Thread-group shared memory, in dwords.
     pub lds_dwords: u32,
     lds: Option<V>,
+    /// A split compute program's group-shared claim counter (one dword,
+    /// zero when the group starts), in address space 3.
+    taken: Option<V>,
+    /// A split compute program's group-shared exchange slot (two words per
+    /// hardware half: `swap[0]`, `swap[1]` one word per side; `swap[2]`,
+    /// `swap[3]` a pair), in address space 3.
+    swap: Option<V>,
     main: V,
     pub entry: usize,
 }
@@ -126,6 +133,8 @@ impl Shader {
             wave_size: None,
             lds_dwords: 0,
             lds: None,
+            taken: None,
+            swap: None,
             main,
             entry,
         }
@@ -141,6 +150,70 @@ impl Shader {
         let g = self.m.global("lds", arr, 3);
         self.lds = Some(g);
         g
+    }
+
+    /// The split's group-shared claim counter (zero when the group starts).
+    pub fn taken(&mut self) -> V {
+        if let Some(g) = self.taken {
+            return g;
+        }
+        let arr = self.m.array(1, self.t.i32);
+        let g = self.m.global("taken", arr, 3);
+        self.taken = Some(g);
+        g
+    }
+
+    /// The split's group-shared exchange slot (zero when the group starts):
+    /// word `n` is hardware half `n`'s (`swap[0]`, `swap[1]` one word per
+    /// side; `swap[2]`, `swap[3]` a pair).
+    pub fn ex(&mut self) -> V {
+        if let Some(g) = self.swap {
+            return g;
+        }
+        let arr = self.m.array(4, self.t.i32);
+        let g = self.m.global("swap", arr, 3);
+        self.swap = Some(g);
+        g
+    }
+
+    /// The split's thread claim (the lowering calls it once, in the entry
+    /// block): the console's waves hold consecutive threads while the host
+    /// composes them in an arbitrary order, so a half claims its 32 console
+    /// threads lazily — lane 0 adds 32 to `taken`, its old value is the
+    /// half's base. Returns (base, thread = base + the hardware lane); only
+    /// the lanes that exist claim (a 48-thread group's second half has 16).
+    pub fn split_claim(&mut self) -> (V, V) {
+        let e = self.entry;
+        let i32t = self.t.i32;
+        let lane = self.op(e, "waveGetLaneIndex", Attr::ReadOnly, i32t, 111, &[]);
+        let zero = self.m.i32(0);
+        let is0 = self.m.cmp(e, pred::EQ, lane, zero);
+        let k32 = self.m.i32(32);
+        let charge = self.m.select(e, is0, k32, zero);
+        let taken = self.taken();
+        let zero = self.m.i32(0);
+        let at = self.m.element(e, taken, zero);
+        let old = self.m.atomic(e, Rmw::Add, at, charge);
+        let contributed = self.m.select(e, is0, old, zero);
+        let base = self.op(
+            e,
+            "waveReadLaneFirst.i32",
+            Attr::NoUnwind,
+            i32t,
+            118,
+            &[contributed],
+        );
+        let thread = self.m.bin(e, Bin::Add, base, lane);
+        (base, thread)
+    }
+
+    /// The global variables in group-shared memory (space 3).
+    #[cfg(test)]
+    pub fn shared_globals(&self) -> Vec<&str> {
+        self.m
+            .shared_globals()
+            .into_iter()
+            .collect()
     }
 
     /// Calls `dx.op.<name>` (class and overload) with `opcode` and `args`.

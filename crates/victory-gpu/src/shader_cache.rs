@@ -37,8 +37,8 @@ pub(crate) fn counts() -> (u64, u64) {
 }
 
 /// What identifies this build: the BLAKE3 of our executable file and of
-/// the translation settings it runs with (the loop limit, which a
-/// diagnostics build can change at run time).
+/// the translation settings it runs with (the loop limit and the wave64
+/// split, which a diagnostics build can change at run time).
 fn build() -> &'static [u8; 32] {
     static BUILD: OnceLock<[u8; 32]> = OnceLock::new();
     BUILD.get_or_init(|| {
@@ -50,9 +50,16 @@ fn build() -> &'static [u8; 32] {
                 "VICTORY_SHADER_LOOP_LIMIT: translated loops stop sooner"
             );
         }
+        let split = victory_shader::emit::split_wave64() as u8;
+        if split != 0 {
+            tracing::warn!(
+                "VICTORY_SHADER_SPLIT_WAVE64: wave64 compute is split into wave32 halves"
+            );
+        }
         match exe {
             Ok(mut bytes) => {
                 bytes.extend_from_slice(&limit.to_le_bytes());
+                bytes.push(split);
                 *blake3::hash(&bytes).as_bytes()
             }
             Err(e) => {

@@ -328,6 +328,16 @@ impl Module {
         V::Func(i)
     }
 
+    /// The names of the globals in group-shared memory (space 3).
+    #[cfg(test)]
+    pub(crate) fn shared_globals(&self) -> Vec<&str> {
+        self.globals
+            .iter()
+            .filter(|g| g.space == 3)
+            .map(|g| g.name.as_str())
+            .collect()
+    }
+
     /// An external global of type `ty` in address space `space` (DXIL
     /// declares thread-group shared memory this way).
     pub fn global(&mut self, name: &str, ty: Ty, space: u32) -> V {

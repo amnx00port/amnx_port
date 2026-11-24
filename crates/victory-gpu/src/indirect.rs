@@ -21,7 +21,7 @@ use windows::Win32::Graphics::Direct3D::ID3DBlob;
 use windows::Win32::Graphics::Direct3D12::*;
 use windows::core::s;
 
-use crate::host::{HostList, host, transition};
+use crate::host::{HostList, host};
 
 const SOURCE: &str = r#"
 #define RS "RootConstants(num32BitConstants=4, b0), UAV(u0), UAV(u1)"
@@ -31,6 +31,7 @@ RWByteAddressBuffer args : register(u0);
 // records run empty.
 RWByteAddressBuffer budget : register(u1);
 static const uint BUDGET = 1u << 27;
+static const uint SPENT = 1u << 31;
 // Groups of one dispatch; more run empty.
 static const uint GROUPS = 1u << 20;
 [RootSignature(RS)]
@@ -60,9 +61,25 @@ void main(uint3 id : SV_DispatchThreadID) {
         cost = g.x * g.y * g.z * 128;
         args.Store3(at, g);
     }
-    uint before;
-    budget.InterlockedAdd(0, cost, before);
-    if (before >= BUDGET || before + cost > BUDGET) {
+    uint state;
+    budget.InterlockedOr(0, 0u, state);
+    bool accepted = false;
+    // CAS retry: FXC wants this attribute for a loop that exits on a
+    // UAV's value; the loop holds no synchronization intrinsics.
+    [allow_uav_condition]
+    while ((state & SPENT) == 0u) {
+        bool over = state >= BUDGET;
+        if (!over) over = cost > BUDGET - state;
+        uint next = over ? state | SPENT : state + cost;
+        uint actual;
+        budget.InterlockedCompareExchange(0, state, next, actual);
+        if (actual == state) {
+            accepted = !over;
+            break;
+        }
+        state = actual;
+    }
+    if (!accepted) {
         // Draws keep their layout with no vertices; groups become zero.
         args.Store(at, 0);
     }
@@ -146,7 +163,7 @@ fn make() -> windows::core::Result<Clamp> {
 /// after). False if the clamp is not available.
 pub(crate) fn bound(
     list: &HostList,
-    buffer: &ID3D12Resource,
+    buffer: &std::sync::Arc<crate::shadow::Shadow>,
     gpu: u64,
     (kind, stride, records): (u32, u32, u32),
 ) -> bool {
@@ -163,35 +180,35 @@ pub(crate) fn bound(
     unsafe {
         // Earlier shader writes (the title's argument passes) first.
         l.ResourceBarrier(&[uav_barrier()]);
+        crate::shadow::ensure_state(
+            buffer,
+            list,
+            crate::shadow::UNORDERED_ACCESS,
+        );
         l.SetComputeRootSignature(&c.root);
         l.SetPipelineState(&c.pso);
         l.SetComputeRoot32BitConstants(0, 4, constants.as_ptr().cast(), 0);
         l.SetComputeRootUnorderedAccessView(1, gpu);
         l.SetComputeRootUnorderedAccessView(2, budget);
         l.Dispatch(records.div_ceil(64), 1, 1);
-        l.ResourceBarrier(&[
-            uav_barrier(),
-            transition(
-                buffer,
-                D3D12_RESOURCE_STATE_UNORDERED_ACCESS,
-                D3D12_RESOURCE_STATE_INDIRECT_ARGUMENT,
-            ),
-        ]);
+        l.ResourceBarrier(&[uav_barrier()]);
     }
+    crate::shadow::ensure_state(
+        buffer,
+        list,
+        crate::shadow::INDIRECT_ARGUMENT,
+    );
     true
 }
 
 /// After the execution: the buffer back to unordered access, where the
 /// title's passes keep using it.
-pub(crate) fn done(list: &HostList, buffer: &ID3D12Resource) {
-    // SAFETY: an open list and a live buffer.
-    unsafe {
-        list.list.ResourceBarrier(&[transition(
-            buffer,
-            D3D12_RESOURCE_STATE_INDIRECT_ARGUMENT,
-            D3D12_RESOURCE_STATE_UNORDERED_ACCESS,
-        )])
-    };
+pub(crate) fn done(list: &HostList, buffer: &std::sync::Arc<crate::shadow::Shadow>) {
+    crate::shadow::ensure_state(
+        buffer,
+        list,
+        crate::shadow::UNORDERED_ACCESS,
+    );
 }
 
 fn uav_barrier() -> D3D12_RESOURCE_BARRIER {
@@ -213,5 +230,14 @@ mod tests {
             return; // no host GPU here
         }
         assert!(super::clamp().is_some());
+    }
+
+    /// Budget reservations and the spent transition share one atomic word.
+    #[test]
+    fn budget_reservations_cannot_wrap_after_spending() {
+        assert!(super::SOURCE.contains("static const uint SPENT = 1u << 31;"));
+        assert!(super::SOURCE.contains("[allow_uav_condition]"));
+        assert!(super::SOURCE.contains("budget.InterlockedCompareExchange(0, state, next, actual)"));
+        assert!(!super::SOURCE.contains("budget.InterlockedAdd(0, cost, before)"));
     }
 }

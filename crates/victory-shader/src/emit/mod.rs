@@ -137,6 +137,46 @@ fn parse_loop_limit(value: Option<&str>) -> u32 {
     }
 }
 
+/// Whether a console wave64 compute program is translated as two hardware
+/// wave32 halves: `WaveSize(32)` instead of the console's 64, which
+/// 32-lane host devices refuse (RTX 30: `WaveLaneCountMax` 32; the title's
+/// 117 wave64 compute pipelines come back 0x80070057). The two halves of
+/// a group exchange cross-lane values through group-shared memory, a
+/// reimplementation of XCL's wave64-on-wave32: the console runs one wave
+/// per group of at most 64 threads, and its waves hold consecutive
+/// threads, while the host composes them in an arbitrary order — so the
+/// lowering claims each half's 32 console threads lazily from a
+/// group-shared counter, and an exchange is a store to the half's slot, a
+/// group barrier and a load of the other half's.
+///
+/// Tier 1, conservative on purpose: only compute programs of one console
+/// wave per group (at most 64 threads) that read other lanes and declare
+/// no group-shared memory of their own (writes to it are wave-scoped on
+/// the console; with two hardware waves they would race) are split.
+/// Everything else keeps the console's wave size: today's behaviour. Both
+/// halves of a group traverse the same blocks (the console's compute
+/// control flow is scalar), which pairs the store/barrier/load sequences.
+///
+/// With the `diagnostics` feature, `VICTORY_SHADER_SPLIT_WAVE64=1` turns
+/// it on. The value is part of the translation, so the shader cache must
+/// key on it (`victory-gpu`'s does).
+pub fn split_wave64() -> bool {
+    static SPLIT: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *SPLIT.get_or_init(|| {
+        if cfg!(feature = "diagnostics") {
+            parse_split_wave64(std::env::var("VICTORY_SHADER_SPLIT_WAVE64").ok().as_deref())
+        } else {
+            false
+        }
+    })
+}
+
+/// `VICTORY_SHADER_SPLIT_WAVE64`'s value. `1` (trimmed) turns it on.
+/// Pure, for testing.
+fn parse_split_wave64(value: Option<&str>) -> bool {
+    value.map(str::trim) == Some("1")
+}
+
 /// A translated shader and what the host binds for it.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct HostShader {
@@ -288,6 +328,7 @@ pub fn emit(
         outputs,
         prims,
         mesh_stride,
+        split: split_wave64(),
     })?;
     Ok(HostShader {
         stage: native.stage,
@@ -407,6 +448,17 @@ mod tests {
     use super::bitcode::Attr;
     use super::lower::LOOP_LIMIT;
     use super::parse_loop_limit;
+    use super::parse_split_wave64;
+
+    #[test]
+    fn the_wave64_split_switch_parses_or_stays_off() {
+        assert!(!parse_split_wave64(None));
+        assert!(parse_split_wave64(Some("1")));
+        assert!(parse_split_wave64(Some(" 1 ")));
+        for off in ["", "0", "2", "true", "on"] {
+            assert!(!parse_split_wave64(Some(off)), "{off:?}");
+        }
+    }
 
     #[test]
     fn the_loop_limit_switch_parses_or_falls_back() {
@@ -518,6 +570,79 @@ mod tests {
         if let Err(e) = emit(&c, &native, &p, &st, &io, &res) {
             assert!(e.to_string().contains("its own value"), "{e}");
         }
+    }
+
+    /// A wave64 compute program that reads another lane (`v_readlane_b32
+    /// s2, v0, s0`). Split: the wave size is the halves' 32, the claim
+    /// counter and the exchange slot (group-shared) are there, and the
+    /// exchanges come as `dx.op.barrier`. Without the switch, the console's
+    /// wave size stands and no split machinery appears (what 32-lane
+    /// devices refuse today).
+    #[test]
+    fn a_wave64_program_splits_into_wave32_halves_only_when_asked() {
+        let words = [
+            0x7E00_0200u32, // v_mov_b32 v0, s0
+            0xD760_0002,
+            0x0000_0100, // v_readlane_b32 s2, v0, s0
+            0xBF81_0000,
+        ];
+        let native = NativeProgram {
+            stage: HwStage::Cs,
+            wave64: true,
+            vgprs: 4,
+            layout: vec![],
+            used: vec![],
+            io: StageIo::Cs(ComputeIo {
+                rsrc2: 0,
+                threads: [64, 1, 1],
+            }),
+            code: words.iter().flat_map(|w| w.to_le_bytes()).collect(),
+        };
+        let p = ir::build(&native.patched_code(), native.wave64, native.vgprs).unwrap();
+        let st = structure::structure(&p).unwrap();
+        let res = resource::track(&p, &native.layout, native.stage, Some(&st)).unwrap();
+        let io = io::raise(&p, &native).unwrap();
+        let lowered = |split| {
+            super::lower::lower(&super::lower::Parts {
+                native: &native,
+                p: &p,
+                st: &st,
+                io: &io,
+                res: &res,
+                inputs: vec![],
+                outputs: vec![],
+                prims: vec![],
+                mesh_stride: 0,
+                split,
+            })
+            .unwrap()
+        };
+        // The minimum wave size of the container's PSV0.
+        let wave_size = |dxil: &[u8]| {
+            let host = crate::dxbc::Container::parse(dxil).unwrap();
+            let psv = host.part(FourCC::PSV0).expect("a PSV0 part").data;
+            let at = 4 + 16; // Runtime info starts after the size field.
+            u32::from_le_bytes(psv[at..at + 4].try_into().unwrap())
+        };
+        let off = lowered(false);
+        let text = String::from_utf8_lossy(&off.dxil).into_owned();
+        assert_eq!(
+            wave_size(&off.dxil),
+            64,
+            "without the switch: the console's waves"
+        );
+        assert!(!text.contains("taken"), "no claim counter");
+        assert!(!text.contains("swap"), "no exchange slot");
+        let on = lowered(true);
+        assert_eq!(wave_size(&on.dxil), 32, "the halves' wave size");
+        assert_eq!(
+            on.shared_globals
+                .iter()
+                .map(String::as_str)
+                .collect::<Vec<_>>(),
+            vec!["taken", "swap"],
+            "the claim counter and the exchange slot (group-shared)"
+        );
     }
 
     /// A pixel shader writing a constant colour.

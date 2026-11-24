@@ -43,6 +43,9 @@ pub(crate) struct Lowered {
     /// Whether the program uses wave operations.
     #[cfg(test)]
     pub wave_ops: bool,
+    /// The group-shared globals (counters and slots; the whole `lds`).
+    #[cfg(test)]
+    pub shared_globals: Vec<String>,
 }
 
 pub(crate) struct Parts<'a> {
@@ -56,6 +59,10 @@ pub(crate) struct Parts<'a> {
     pub prims: Vec<SigElement>,
     /// Mesh: what the group id arrives multiplied by.
     pub mesh_stride: u32,
+    /// Whether a wave64 compute program is split into two hardware wave32
+    /// halves (see [`super::split_wave64`]); the lowering's own conditions
+    /// decide whether this program takes it.
+    pub split: bool,
 }
 
 enum Stop {
@@ -222,6 +229,15 @@ struct Lower<'a> {
     counters: HashMap<usize, (V, Vec<(V, usize)>)>,
     /// The block a loop stopped by [`LOOP_LIMIT`] leaves the program from.
     abort: Option<usize>,
+    /// This program is split (see [`super::split_wave64`]): host lanes are
+    /// hardware lanes of two wave32 halves, exchanged through group-shared
+    /// memory; the console lanes are claimed ([`Self::console_lane`]).
+    split: bool,
+    /// The split's claim, emitted in the entry block: (base, thread), the
+    /// half's first console lane and this lane's console lane.
+    claimed: Option<(V, V)>,
+    /// The split's half (0 or 1), from the claim's base.
+    half: Option<V>,
 }
 
 /// Iterations after which a loop is left (per entry into it), unless
@@ -360,6 +376,8 @@ impl<'a> Lower<'a> {
                 && (i.name().contains("store") || i.name().contains("atomic"))
         });
         let mut console_lanes = false;
+        let mut split = false;
+        let mut claimed = None;
         if let StageIo::Cs(cs) = x.native.io {
             s.threads = Some(cs.threads);
             s.lds_dwords = cs.lds_bytes() / 4;
@@ -399,8 +417,18 @@ impl<'a> Lower<'a> {
                 })
             };
             let wave = if x.native.wave64 { 64 } else { 32 };
-            let one_wave = cs.threads.iter().product::<u32>() <= wave;
-            if console_lanes || one_wave && s.lds_dwords > 0 {
+            let threads = cs.threads.iter().product::<u32>();
+            let one_wave = threads <= wave;
+            // Tier 1 of the split (see `super::split_wave64`): one console
+            // wave per group, code that reads other lanes, and no
+            // group-shared memory of the program's own (the console orders
+            // its accesses within one wave; two hardware waves would race).
+            split = x.split && console_lanes && threads <= 64 && s.lds_dwords == 0;
+            if split {
+                s.wave_size = Some(32);
+                s.flags |= flags::WAVE_OPS;
+                claimed = Some(s.split_claim());
+            } else if console_lanes || one_wave && s.lds_dwords > 0 {
                 s.wave_size = Some(wave);
             }
         }
@@ -515,6 +543,9 @@ impl<'a> Lower<'a> {
             code_table: None,
             counters: HashMap::new(),
             abort: None,
+            split,
+            claimed,
+            half: None,
         }
     }
 
@@ -910,6 +941,13 @@ impl<'a> Lower<'a> {
             nonuniform_handles: self.s.nonuniform_handles,
             #[cfg(test)]
             wave_ops: self.s.flags & flags::WAVE_OPS != 0,
+            #[cfg(test)]
+            shared_globals: self
+                .s
+                .shared_globals()
+                .into_iter()
+                .map(String::from)
+                .collect(),
             dxil: self.s.finish(),
             user_data,
             samplers: self.samplers,
@@ -1213,6 +1251,13 @@ impl<'a> Lower<'a> {
                     .op(at, "waveActiveBallot", Attr::NoUnwind, four, 116, &[bit]);
                 self.s.flags |= flags::WAVE_OPS;
                 let xy = (self.s.m.extract(at, r, 0), self.s.m.extract(at, r, 1));
+                // Split: 32 hardware lanes give the half's word (the high
+                // one reads zero); exchange and order the pair.
+                let xy = if self.split {
+                    self.ballot_pair(at, xy.0)?
+                } else {
+                    xy
+                };
                 self.ballots.insert(lo, xy);
                 xy
             }
@@ -1877,11 +1922,65 @@ impl<'a> Lower<'a> {
         Ok(())
     }
 
+    /// The split's hardware half (0 or 1): the claim's base is 0 or 32.
+    fn split_half(&mut self) -> V {
+        if let Some(&h) = self.half.as_ref() {
+            return h;
+        }
+        let (base, _) = self.claimed.expect("split");
+        let (e, k32) = (self.s.entry, self.s.m.i32(32));
+        let h = self.s.m.bin(e, Bin::UDiv, base, k32);
+        self.half = Some(h);
+        h
+    }
+
+    /// The split: this lane's console lane, the thread the claim gave it.
+    fn console_lane(&mut self) -> V {
+        let (_, thread) = self.claimed.expect("split");
+        thread
+    }
+
+    /// The split: exchanges one dword between the two hardware halves —
+    /// stores it in this half's word of the slot, synchronises the group
+    /// (one console wave per group: both halves traverse the same blocks,
+    /// which pairs the exchanges) and reads the other half's word.
+    fn exchange(&mut self, at: usize, word: V) -> Result<V, Why> {
+        let half = self.split_half();
+        let ex = self.s.ex();
+        let mine = self.s.m.element(at, ex, half);
+        self.s.m.store(at, mine, word);
+        let mode = self.s.m.i32(1 | 8);
+        let void = self.s.t.void;
+        self.s
+            .op(at, "barrier", Attr::NoDuplicate, void, 80, &[mode]);
+        let one = self.s.m.i32(1);
+        let oid = self.s.m.bin(at, Bin::Xor, half, one);
+        let ex = self.s.ex();
+        let other = self.s.m.element(at, ex, oid);
+        Ok(self.s.m.load(at, other))
+    }
+
+    /// The split: the ballot of one hardware half and the other half's,
+    /// ordered as the console wave's two mask dwords (half 0 is the low
+    /// half: console lanes 0..31).
+    fn ballot_pair(&mut self, at: usize, mine_low: V) -> Result<(V, V), Why> {
+        let other = self.exchange(at, mine_low)?;
+        let half = self.split_half();
+        let zero = self.s.m.i32(0);
+        let low = self.s.m.cmp(at, pred::EQ, half, zero);
+        Ok((
+            self.s.m.select(at, low, mine_low, other),
+            self.s.m.select(at, low, other, mine_low),
+        ))
+    }
+
     /// Component `c` of the thread id in the group. With console lanes, the
     /// thread is relabelled so that its host lane is its console lane: the
     /// flat id is the wave's first lane's, rounded down to the wave size,
     /// plus the lane index. (A bijection while each host wave holds a
-    /// wave-aligned run of flat ids, as the console's waves do.)
+    /// wave-aligned run of flat ids, as the console's waves do.) Split: the
+    /// claim's console lane already is the console's (it claims
+    /// consecutively, whatever waves the host composes).
     fn thread_id(&mut self, c: u8) -> Val {
         if !self.console_lanes {
             return self.compute_id("threadIdInGroup.i32", 95, c);
@@ -1889,6 +1988,18 @@ impl<'a> Lower<'a> {
         let [x, y, _] = self.s.threads.expect("compute");
         let e = self.s.entry;
         let i32t = self.s.t.i32;
+        if self.split {
+            let f = self.console_lane();
+            let (xk, yk, xy) = (self.s.m.i32(x), self.s.m.i32(y), self.s.m.i32(x * y));
+            return Val::I32(match c {
+                0 => self.s.m.bin(e, Bin::URem, f, xk),
+                1 => {
+                    let t = self.s.m.bin(e, Bin::UDiv, f, xk);
+                    self.s.m.bin(e, Bin::URem, t, yk)
+                }
+                _ => self.s.m.bin(e, Bin::UDiv, f, xy),
+            });
+        }
         let flat = self.s.op(
             e,
             "flattenedThreadIdInGroup.i32",
@@ -1993,6 +2104,11 @@ impl<'a> Lower<'a> {
             let f = self.mesh_thread();
             let m = self.s.m.i32(self.wave() - 1);
             return self.s.m.bin(self.s.entry, Bin::And, f, m);
+        }
+        if self.split {
+            // The console's lane (`v_writelane`'s destination, `v_mbcnt`'s
+            // position in the 64-lane mask); no hardware lane here.
+            return self.console_lane();
         }
         self.s.op(
             self.cur,
@@ -4211,7 +4327,21 @@ impl<'a> Lower<'a> {
                 } else {
                     self.cross_lane(false)?;
                 }
-                let r = self.read_lane(a, lane);
+                let r = if self.split {
+                    // The console lane may sit in the other half: read it
+                    // within this half either way (the wrong half's value
+                    // is not selected), exchange, and pick by owner.
+                    let (k31, k5) = (self.s.m.i32(31), self.s.m.i32(5));
+                    let within = self.s.m.bin(c, Bin::And, lane, k31);
+                    let mine = self.read_lane(a, within);
+                    let other = self.exchange(c, mine)?;
+                    let half = self.split_half();
+                    let owner = self.s.m.bin(c, Bin::LShr, lane, k5);
+                    let mine_wins = self.s.m.cmp(c, pred::EQ, owner, half);
+                    self.s.m.select(c, mine_wins, mine, other)
+                } else {
+                    self.read_lane(a, lane)
+                };
                 int(self, r)
             }
             "v_writelane_b32" => {
@@ -4243,14 +4373,46 @@ impl<'a> Lower<'a> {
             "v_readfirstlane_b32" => {
                 let a = s(self, 0)?;
                 self.s.flags |= flags::WAVE_OPS;
-                let r = self.s.op(
-                    c,
-                    "waveReadLaneFirst.i32",
-                    Attr::NoUnwind,
-                    self.s.t.i32,
-                    118,
-                    &[a],
-                );
+                let r = if self.split {
+                    // The console's first active lane: this half's first
+                    // active lane while half 0 has any active lane; the
+                    // halves exchange activity and value, half 0 wins (a
+                    // fully masked half still runs to the exchanges).
+                    let c = self.cur;
+                    let i32t = self.s.t.i32;
+                    let four = self.s.m.named_struct("dx.types.fouri32", vec![i32t; 4]);
+                    let one = self.s.m.bool(true);
+                    let b = self
+                        .s
+                        .op(c, "waveActiveBallot", Attr::NoUnwind, four, 116, &[one]);
+                    let mine_active = self.s.m.extract(c, b, 0);
+                    let mine = self.s.op(
+                        c,
+                        "waveReadLaneFirst.i32",
+                        Attr::NoUnwind,
+                        i32t,
+                        118,
+                        &[a],
+                    );
+                    let other_active = self.exchange(c, mine_active)?;
+                    let other = self.exchange(c, mine)?;
+                    let half = self.split_half();
+                    let zero = self.s.m.i32(0);
+                    let is0 = self.s.m.cmp(c, pred::EQ, half, zero);
+                    let active0 = self.s.m.select(c, is0, mine_active, other_active);
+                    let value0 = self.s.m.select(c, is0, mine, other);
+                    let value1 = self.s.m.select(c, is0, other, mine);
+                    self.s.m.select(c, active0, value0, value1)
+                } else {
+                    self.s.op(
+                        c,
+                        "waveReadLaneFirst.i32",
+                        Attr::NoUnwind,
+                        self.s.t.i32,
+                        118,
+                        &[a],
+                    )
+                };
                 int(self, r)
             }
             _ => {
@@ -6984,6 +7146,7 @@ mod tests {
             outputs: vec![],
             prims: vec![],
             mesh_stride: 0,
+            split: false,
         })
         .map(|_| ())
     }
@@ -7034,6 +7197,7 @@ mod tests {
             outputs: vec![],
             prims: vec![],
             mesh_stride: 0,
+            split: false,
         })
     }
 
@@ -7137,6 +7301,7 @@ mod tests {
             outputs: vec![],
             prims: vec![],
             mesh_stride: 0,
+            split: false,
         }).unwrap();
 
         let container =

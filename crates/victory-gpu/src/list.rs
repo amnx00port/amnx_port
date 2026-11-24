@@ -516,20 +516,52 @@ extern "system" fn copy_texture_region(
         #[cfg(feature = "diagnostics")]
         let mut read = None;
         if src.kind == FOOTPRINT {
-            let (Some(host), Some(bytes)) = (crate::host::host(), src.footprint.bytes()) else {
+            let (Some(host), Some(source_bytes)) = (crate::host::host(), src.footprint.bytes())
+            else {
                 return;
             };
-            let Some(data) = buffer_range(src.resource, src.footprint.offset, bytes) else {
+            let Some(data) = buffer_range(src.resource, src.footprint.offset, source_bytes) else {
                 return;
             };
+            let expanded = src.footprint.expanded_host();
+            let (footprint, bytes) = expanded
+                .as_ref()
+                .map_or((src.footprint, source_bytes), |(footprint, bytes)| {
+                    (*footprint, *bytes)
+                });
             let Some((buffer, staging)) = list.upload(host, bytes) else {
                 return;
             };
-            // The list owns this mapped D3D12 upload buffer. Wine can report
-            // its address as MEM_FREE, so use the host-upload path.
-            list.defer_fill(staging, data, bytes as usize);
+            if expanded.is_some() {
+                let source = data as usize;
+                let destination = staging as usize;
+                let source_len = source_bytes as usize;
+                let destination_len = bytes as usize;
+                let original = src.footprint;
+                list.defer(move || {
+                    if !crate::texture::committed(source as *const u8, source_len) {
+                        tracing::warn!("packed texture copy source is not committed");
+                        return;
+                    }
+                    // SAFETY: the title source and mapped list upload remain
+                    // live through this deferred submission step.
+                    let (source, destination) = unsafe {
+                        (
+                            std::slice::from_raw_parts(source as *const u8, source_len),
+                            std::slice::from_raw_parts_mut(destination as *mut u8, destination_len),
+                        )
+                    };
+                    if original.expand_into(source, destination).is_none() {
+                        tracing::warn!("packed texture copy could not be expanded");
+                    }
+                });
+            } else {
+                // The list owns this mapped D3D12 upload buffer. Wine can report
+                // its address as MEM_FREE, so use the host-upload path.
+                list.defer_fill(staging, data.cast_const(), bytes as usize);
+            }
             from.resource = buffer.as_raw().cast_const().cast();
-            from.footprint.offset = 0;
+            from.footprint = footprint;
             #[cfg(feature = "diagnostics")]
             {
                 // SAFETY: a live buffer.
@@ -637,7 +669,9 @@ extern "system" fn resolve(
         // SAFETY: an open list and live textures; the region is inside both.
         unsafe {
             let (a, b) = (to.GetDesc(), from.GetDesc());
-            let format = DXGI_FORMAT(format as i32);
+            let format = DXGI_FORMAT(crate::resource::host_texture_format(
+                crate::resource::pc_format(format),
+            ) as i32);
             if (a.Width, a.Height) == (b.Width, b.Height) {
                 list.list
                     .ResolveSubresource(to, dst_sub, from, src_sub, format);
@@ -698,6 +732,11 @@ extern "system" fn clear_rtv(
         let Some(color) = (unsafe { color.as_ref() }) else {
             return;
         };
+        let Some(format) = crate::resource::texture_format(record.resource) else {
+            tracing::warn!(resource = ?record.resource, "render target clear has no texture format");
+            return;
+        };
+        let color = crate::resource::quantize_clear_color(format, *color);
         let rects = (count > 0 && !rects.is_null()).then(|| {
             // SAFETY: the title passes `count` rectangles, laid out as the host's.
             unsafe { std::slice::from_raw_parts(rects.cast(), count as usize) }
@@ -714,7 +753,7 @@ extern "system" fn clear_rtv(
                     State(RENDER_TARGET as i32),
                 )]);
             }
-            list.list.ClearRenderTargetView(rtv, color, rects);
+            list.list.ClearRenderTargetView(rtv, &color, rects);
         }
     }
     #[cfg(not(windows))]

@@ -237,7 +237,132 @@ pub(crate) fn pc_format(format: u32) -> u32 {
     }
 }
 
-/// The typeless format of a format's family (itself if it has none).
+/// The host backing format for a console texture format.
+///
+/// The host cannot create these packed formats with the title's required
+/// render-target/UAV flags, so they use RGBA8 backing with converted data.
+pub(crate) fn host_texture_format(format: u32) -> u32 {
+    match format {
+        86 | 115 => 28,
+        other => other,
+    }
+}
+
+pub(crate) fn quantize_clear_color(format: u32, mut color: [f32; 4]) -> [f32; 4] {
+    let bits = match format {
+        86 => [5, 5, 5, 1],
+        115 => [4, 4, 4, 4],
+        _ => return color,
+    };
+    for (channel, bits) in color.iter_mut().zip(bits) {
+        let levels = (1u32 << bits) - 1;
+        let value = if channel.is_nan() {
+            0.0
+        } else {
+            channel.clamp(0.0, 1.0)
+        };
+        *channel = (value * levels as f32).round() / levels as f32;
+    }
+    color
+}
+
+/// Maps an explicit title view format to the host backing's format.
+pub(crate) fn host_view_format(this: This, format: u32) -> u32 {
+    if format == 0 {
+        return 0;
+    }
+    let title_resource = resource(this);
+    if format == title_resource.desc.format {
+        return host_texture_format(pc_format(format));
+    }
+    pc_format(format)
+}
+
+fn unpack_packed_color(format: u32, pixel: u16) -> Option<[u8; 4]> {
+    let expand5 = |value: u16| ((u32::from(value) * 255 + 15) / 31) as u8;
+    Some(match format {
+        86 => [
+            expand5(pixel & 0x1f),
+            expand5((pixel >> 5) & 0x1f),
+            expand5((pixel >> 10) & 0x1f),
+            if pixel & 0x8000 == 0 { 0 } else { 255 },
+        ],
+        115 => [
+            ((pixel >> 4) & 0xf) as u8 * 17,
+            ((pixel >> 8) & 0xf) as u8 * 17,
+            ((pixel >> 12) & 0xf) as u8 * 17,
+            (pixel & 0xf) as u8 * 17,
+        ],
+        _ => return None,
+    })
+}
+
+/// Expands one of the console's packed 16-bit RGBA formats into host RGBA8.
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn expand_packed_color(
+    format: u32,
+    source: &[u8],
+    source_pitch: usize,
+    destination: &mut [u8],
+    destination_pitch: usize,
+    width: u32,
+    height: u32,
+    depth: u32,
+) -> Option<()> {
+    let width = usize::try_from(width).ok()?;
+    let rows = usize::try_from(height.checked_mul(depth)?).ok()?;
+    let source_row = width.checked_mul(2)?;
+    let destination_row = width.checked_mul(4)?;
+    if source_pitch < source_row || destination_pitch < destination_row {
+        return None;
+    }
+    let source_len = rows
+        .checked_sub(1)?
+        .checked_mul(source_pitch)?
+        .checked_add(source_row)?;
+    let destination_len = rows
+        .checked_sub(1)?
+        .checked_mul(destination_pitch)?
+        .checked_add(destination_row)?;
+    if source.len() < source_len || destination.len() < destination_len {
+        return None;
+    }
+    for row in 0..rows {
+        let from = row * source_pitch;
+        let to = row * destination_pitch;
+        for x in 0..width {
+            let pixel = u16::from_le_bytes([source[from + x * 2], source[from + x * 2 + 1]]);
+            destination[to + x * 4..to + x * 4 + 4]
+                .copy_from_slice(&unpack_packed_color(format, pixel)?);
+        }
+    }
+    Some(())
+}
+
+pub(crate) fn expand_packed_color_in_place(
+    format: u32,
+    bytes: &mut [u8],
+    pitch: usize,
+    width: u32,
+    height: u32,
+    depth: u32,
+) -> Option<()> {
+    let width = usize::try_from(width).ok()?;
+    let rows = usize::try_from(height.checked_mul(depth)?).ok()?;
+    let destination_row = width.checked_mul(4)?;
+    if pitch < destination_row || bytes.len() < rows.checked_mul(pitch)? {
+        return None;
+    }
+    for row in 0..rows {
+        let row = &mut bytes[row * pitch..(row + 1) * pitch];
+        for x in (0..width).rev() {
+            let pixel = u16::from_le_bytes([row[x * 2], row[x * 2 + 1]]);
+            row[x * 4..x * 4 + 4].copy_from_slice(&unpack_packed_color(format, pixel)?);
+        }
+    }
+    Some(())
+}
+
 pub(crate) fn family(format: u32) -> u32 {
     const FAMILIES: [(u32, u32); 22] = [
         (1, 4),
@@ -330,6 +455,45 @@ impl PlacedFootprint {
         let lines = u64::from(self.height).div_ceil(block) * u64::from(self.depth);
         let last = u64::from(self.width).div_ceil(block) * element;
         Some(u64::from(self.row_pitch) * lines.saturating_sub(1) + last)
+    }
+
+    pub(crate) fn expanded_host(&self) -> Option<(Self, u64)> {
+        if !matches!(self.format, 86 | 115) {
+            return None;
+        }
+        let row_pitch = u64::from(self.width)
+            .checked_mul(4)?
+            .checked_next_multiple_of(256)?;
+        let footprint = Self {
+            offset: 0,
+            format: host_texture_format(pc_format(self.format)),
+            width: self.width,
+            height: self.height,
+            depth: self.depth,
+            row_pitch: u32::try_from(row_pitch).ok()?,
+        };
+        let size = row_pitch
+            .checked_mul(u64::from(self.height))?
+            .checked_mul(u64::from(self.depth))?;
+        Some((footprint, size))
+    }
+
+    pub(crate) fn expand_into(&self, source: &[u8], destination: &mut [u8]) -> Option<()> {
+        let (host, size) = self.expanded_host()?;
+        let size = usize::try_from(size).ok()?;
+        if destination.len() < size {
+            return None;
+        }
+        expand_packed_color(
+            self.format,
+            source,
+            self.row_pitch as usize,
+            destination,
+            host.row_pitch as usize,
+            self.width,
+            self.height,
+            self.depth,
+        )
     }
 }
 const _: () = assert!(size_of::<PlacedFootprint>() == 32);
@@ -822,7 +986,7 @@ fn host_texture(
     if d.flags & DEPTH != 0 {
         d.flags &= !UNORDERED;
     }
-    d.format = pc_format(d.format);
+    d.format = host_texture_format(pc_format(d.format));
     const DENY_SHADER_RESOURCE: u32 = 8;
     if d.flags & DENY_SHADER_RESOURCE == 0
         && let Some(&(_, typeless)) = DEPTH_FORMATS.iter().find(|&&(f, _)| f == d.format)
@@ -839,7 +1003,17 @@ fn host_texture(
     let clear_value = (!clear.is_null()).then(|| {
         // SAFETY: the title passes a whole clear value.
         let mut value = unsafe { clear.cast::<[u32; 5]>().read_unaligned() };
-        value[0] = pc_format(value[0]);
+        let original_format = value[0];
+        value[0] = host_texture_format(pc_format(value[0]));
+        if matches!(original_format, 86 | 115) {
+            let color = std::array::from_fn(|i| f32::from_bits(value[i + 1]));
+            for (i, channel) in quantize_clear_color(original_format, color)
+                .into_iter()
+                .enumerate()
+            {
+                value[i + 1] = channel.to_bits();
+            }
+        }
         value
     });
     let heap = D3D12_HEAP_PROPERTIES {
@@ -880,6 +1054,13 @@ pub(crate) fn texture_memory(this: This) -> Option<(*const u8, ResourceDesc)> {
     }
     let r = resource(this);
     (r.desc.dimension != BUFFER).then(|| (r.data().cast_const(), r.desc))
+}
+
+pub(crate) fn texture_format(this: This) -> Option<u32> {
+    if this.is_null() {
+        return None;
+    }
+    Some(resource(this).desc.format)
 }
 
 /// A buffer's host memory and size; `None` for textures.
@@ -1583,6 +1764,78 @@ mod tests {
         assert_eq!((r[0], s[0]), (16, 128));
         let (_, _, _, t) = footprints(&texture(64, 64, 71, 1), 1, 1);
         assert_eq!(t, u64::MAX, "no second subresource");
+    }
+
+    #[test]
+    fn packed_texture_fallback_expands_channels_and_footprints() {
+        assert_eq!(host_texture_format(86), 28);
+        assert_eq!(host_texture_format(115), 28);
+        assert_eq!(host_texture_format(28), 28);
+
+        let packed_5551: u16 = 0x8000 | (16 << 10) | (15 << 5) | 31;
+        let source = packed_5551.to_le_bytes();
+        let mut rgba = [0; 8];
+        expand_packed_color(86, &source, 2, &mut rgba, 4, 1, 1, 1).unwrap();
+        assert_eq!(&rgba[..4], &[255, 123, 132, 255]);
+
+        let packed_4444: u16 = (12 << 12) | (8 << 8) | (4 << 4) | 3;
+        let source = packed_4444.to_le_bytes();
+        expand_packed_color(115, &source, 2, &mut rgba, 4, 1, 1, 1).unwrap();
+        assert_eq!(&rgba[..4], &[68, 136, 204, 51]);
+
+        let mut in_place = [0u8; 8];
+        in_place[..2].copy_from_slice(&packed_4444.to_le_bytes());
+        expand_packed_color_in_place(115, &mut in_place, 8, 1, 1, 1).unwrap();
+        assert_eq!(&in_place[..4], &[68, 136, 204, 51]);
+
+        let footprint = PlacedFootprint {
+            offset: 0,
+            format: 86,
+            width: 4,
+            height: 2,
+            depth: 1,
+            row_pitch: 256,
+        };
+        let (host, size) = footprint.expanded_host().unwrap();
+        assert_eq!(host.format, 28);
+        assert_eq!(host.row_pitch, 256);
+        assert_eq!(size, 512);
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn packed_texture_fallback_allocates_render_target_and_uav_resources() {
+        use windows::Win32::Graphics::Direct3D12::{
+            D3D12_RESOURCE_FLAG_ALLOW_RENDER_TARGET, D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS,
+        };
+        if crate::host::host().is_none() {
+            return;
+        }
+        for (format, flags) in [
+            (
+                86,
+                (D3D12_RESOURCE_FLAG_ALLOW_RENDER_TARGET.0
+                    | D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS.0) as u32,
+            ),
+            (115, D3D12_RESOURCE_FLAG_ALLOW_RENDER_TARGET.0 as u32),
+        ] {
+            let desc = ResourceDesc {
+                flags,
+                ..texture(2560, 1440, format, 1)
+            };
+            let clear = [
+                format,
+                0.0f32.to_bits(),
+                0.0f32.to_bits(),
+                0.0f32.to_bits(),
+                1.0f32.to_bits(),
+            ];
+            let host = host_texture(&desc, 0, clear.as_ptr().cast());
+            let host = host.expect("mapped host texture must allocate");
+            let actual = unsafe { host.GetDesc() };
+            assert_eq!(actual.Format.0 as u32, 28);
+            assert_eq!(actual.Flags.0 as u32, flags);
+        }
     }
 
     /// A 4x4 texture filled from a title buffer through our list and queue,

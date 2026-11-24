@@ -16,7 +16,7 @@
 //! indexed heaps keep what their first use copied.
 
 use std::collections::BTreeMap;
-use std::sync::atomic::{AtomicU8, Ordering};
+use std::sync::atomic::{AtomicU32, AtomicU8, Ordering};
 use std::sync::{Arc, Mutex};
 
 use windows::Win32::Graphics::Direct3D12::ID3D12Resource;
@@ -32,6 +32,8 @@ pub(crate) struct Shadow {
     /// Where the title buffer starts and how long it is.
     start: u64,
     len: u64,
+    /// State of the shared host buffer between submissions.
+    pub(crate) state: AtomicU32,
     /// Per page of title memory from `start`'s on: the write-watch asking
     /// after which it was last copied (0: never).
     copied: Mutex<Vec<u64>>,
@@ -43,6 +45,28 @@ pub(crate) struct Shadow {
     /// The copy's bytes before the submission ran, from an offset on,
     /// covering the ranges its shaders write: what the GPU wrote differs.
     before: Mutex<Option<(usize, Vec<u8>)>>,
+}
+
+pub(crate) const VERTEX_AND_CONSTANT_BUFFER: u32 = 0x1;
+pub(crate) const INDEX_BUFFER: u32 = 0x2;
+pub(crate) const NON_PIXEL_SHADER_RESOURCE: u32 = 0x40;
+pub(crate) const PIXEL_SHADER_RESOURCE: u32 = 0x80;
+pub(crate) const UNORDERED_ACCESS: u32 = 0x8;
+pub(crate) const INDIRECT_ARGUMENT: u32 = 0x200;
+
+/// Moves a host buffer to a state in this list, deferring its initial
+/// transition until submission so independently recorded lists stay ordered.
+pub(crate) fn ensure_state(shadow: &Arc<Shadow>, list: &HostList, wanted: u32) {
+    use windows::Win32::Graphics::Direct3D12::D3D12_RESOURCE_STATES as State;
+    if let Some((before, after)) = list.transition_buffer(shadow.clone(), wanted) {
+        let barrier = crate::host::transition(
+            &shadow.buffer,
+            State(before as i32),
+            State(after as i32),
+        );
+        // SAFETY: an open list and a live shared host buffer.
+        unsafe { list.list.ResourceBarrier(&[barrier]) };
+    }
 }
 
 /// Snapshot memory kept for reuse (already touched, so no page faults).
@@ -114,6 +138,7 @@ impl Shadow {
             gpu,
             start,
             len,
+            state: AtomicU32::new(0),
             copied: Mutex::new(vec![0; pages as usize]),
             watched: AtomicU8::new(0),
             pending: Mutex::default(),
