@@ -53,7 +53,151 @@ pub(crate) struct Host {
     messages: Option<ID3D12InfoQueue>,
     next_rtv: AtomicU32,
     presenter: Mutex<Option<Presenter>>,
+    /// Optional CPU-visible heap for placed buffers (the arena is probed lazily).
+    #[cfg_attr(not(test), allow(dead_code))]
+    unified: OnceLock<Option<UnifiedArena>>,
 }
+
+/// A bump-allocated CPU-visible D3D12 heap. Allocations never overlap.
+// Fits the 174 MiB title heap called out in #407, with room for alignment.
+// The production path remains intentionally unwired for this first probe.
+#[cfg_attr(not(test), allow(dead_code))]
+const UNIFIED_ARENA_SIZE: u64 = 256 << 20;
+#[cfg_attr(not(test), allow(dead_code))]
+const UNIFIED_HEAP_ALIGNMENT: u64 = 64 << 10;
+#[cfg_attr(not(test), allow(dead_code))]
+const UNIFIED_ALIGNMENT: u64 = 256;
+
+#[cfg_attr(not(test), allow(dead_code))]
+struct UnifiedArena {
+    _heap: ID3D12Heap,
+    resource: ID3D12Resource,
+    data: *mut u8,
+    gpu: u64,
+    next: Mutex<u64>,
+}
+
+/// A persistently mapped suballocation in the arena's placed buffer.
+#[cfg_attr(not(test), allow(dead_code))]
+pub(crate) struct UnifiedBuffer {
+    pub(crate) resource: ID3D12Resource,
+    pub(crate) data: *mut u8,
+    pub(crate) gpu: u64,
+    pub(crate) offset: u64,
+}
+
+#[cfg_attr(not(test), allow(dead_code))]
+impl Drop for UnifiedArena {
+    fn drop(&mut self) {
+        // SAFETY: this arena owns the resource and is the only place that
+        // retains its persistent mapping.
+        unsafe { self.resource.Unmap(0, None) };
+    }
+}
+
+impl UnifiedArena {
+    fn new(device: &ID3D12Device) -> windows::core::Result<Self> {
+        let heap_desc = D3D12_HEAP_DESC {
+            SizeInBytes: UNIFIED_ARENA_SIZE,
+            Properties: D3D12_HEAP_PROPERTIES {
+                Type: D3D12_HEAP_TYPE_CUSTOM,
+                CPUPageProperty: D3D12_CPU_PAGE_PROPERTY_WRITE_BACK,
+                MemoryPoolPreference: D3D12_MEMORY_POOL_L0,
+                CreationNodeMask: 1,
+                VisibleNodeMask: 1,
+            },
+            Alignment: UNIFIED_HEAP_ALIGNMENT,
+            Flags: D3D12_HEAP_FLAG_ALLOW_ONLY_BUFFERS,
+        };
+        let mut heap: Option<ID3D12Heap> = None;
+        // SAFETY: the heap description is valid and the output belongs to us.
+        unsafe { device.CreateHeap(&heap_desc, &mut heap)? };
+        let heap = heap.ok_or_else(windows::core::Error::empty)?;
+
+        // One resource spans the heap. Suballocations therefore share one CPU
+        // mapping and one GPU VA; separate placed resources need not have
+        // contiguous GPU virtual addresses.
+        let resource_desc = D3D12_RESOURCE_DESC {
+            Dimension: D3D12_RESOURCE_DIMENSION_BUFFER,
+            Width: UNIFIED_ARENA_SIZE,
+            Height: 1,
+            DepthOrArraySize: 1,
+            MipLevels: 1,
+            SampleDesc: DXGI_SAMPLE_DESC {
+                Count: 1,
+                Quality: 0,
+            },
+            Layout: D3D12_TEXTURE_LAYOUT_ROW_MAJOR,
+            Flags: D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS,
+            ..Default::default()
+        };
+        let mut resource: Option<ID3D12Resource> = None;
+        let mut data = std::ptr::null_mut();
+        // SAFETY: the resource occupies the full buffer-only heap; the Map
+        // output pointer belongs to this arena.
+        unsafe {
+            device
+                .CreatePlacedResource(
+                    &heap,
+                    0,
+                    &resource_desc,
+                    D3D12_RESOURCE_STATE_COMMON,
+                    None,
+                    &mut resource,
+                )
+                .and_then(|()| {
+                    resource
+                        .as_ref()
+                        .ok_or_else(windows::core::Error::empty)?
+                        .Map(0, None, Some(&mut data))
+                })?;
+        }
+        let resource = resource.ok_or_else(windows::core::Error::empty)?;
+        if data.is_null() {
+            return Err(windows::core::Error::empty());
+        }
+        // SAFETY: the resource is live and is a buffer.
+        let gpu = unsafe { resource.GetGPUVirtualAddress() };
+        if gpu == 0 {
+            return Err(windows::core::Error::empty());
+        }
+        Ok(Self {
+            _heap: heap,
+            resource,
+            data: data.cast(),
+            gpu,
+            next: Mutex::new(0),
+        })
+    }
+
+    fn buffer(&self, size: u64) -> Option<UnifiedBuffer> {
+        let size = size.max(1);
+        let allocation = size.checked_next_multiple_of(UNIFIED_ALIGNMENT)?;
+        let mut next = self.next.lock().unwrap_or_else(|e| e.into_inner());
+        let end = (*next).checked_add(allocation)?;
+        if end > UNIFIED_ARENA_SIZE {
+            tracing::warn!(
+                requested = size,
+                available = UNIFIED_ARENA_SIZE.saturating_sub(*next),
+                "CPU/GPU shared buffer arena is full"
+            );
+            return None;
+        }
+        let offset = *next;
+        let data_offset = usize::try_from(offset).ok()?;
+        // SAFETY: the allocation is wholly within the mapped 256 MiB resource.
+        let data = unsafe { self.data.add(data_offset) };
+        let gpu = self.gpu.checked_add(offset)?;
+        *next = end;
+        Some(UnifiedBuffer {
+            resource: self.resource.clone(),
+            data,
+            gpu,
+            offset,
+        })
+    }
+}
+
 
 // SAFETY: D3D12 devices, queues, fences and descriptor heaps are
 // free-threaded; the event handle is only waited on under `submitted`.
@@ -222,6 +366,7 @@ fn create() -> windows::core::Result<Host> {
             messages,
             next_rtv: AtomicU32::new(0),
             presenter: Mutex::new(None),
+            unified: OnceLock::new(),
         })
     }
 }
@@ -251,6 +396,170 @@ fn warp_adapter() -> windows::core::Result<IDXGIAdapter> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Checks CPU writes -> GPU UAV reads and writes -> CPU reads through
+    /// two suballocations of one persistently mapped placed buffer.
+    #[test]
+    fn placed_custom_heap_shares_memory_between_cpu_and_gpu() {
+        use windows::Win32::Graphics::Direct3D::Fxc::D3DCompile;
+        use windows::Win32::Graphics::Direct3D::ID3DBlob;
+        use windows::core::s;
+
+        let Some(host) = host() else {
+            if std::env::var_os("VICTORY_REQUIRE_UNIFIED_ARENA").is_some() {
+                panic!("D3D12 host device unavailable while VICTORY_REQUIRE_UNIFIED_ARENA=1");
+            }
+            eprintln!("no D3D12 device; skipped");
+            return;
+        };
+        const SLOT: u64 = UNIFIED_ALIGNMENT;
+        const INPUT: u32 = 0x1234_5678;
+        const MASK: u32 = 0xA5A5_5A5A;
+
+        // Keep this test independent of the process-wide lazy arena. It must
+        // not depend on being the first caller of Host::unified_buffer.
+        let arena = match UnifiedArena::new(&host.device) {
+            Ok(arena) => arena,
+            Err(error) if std::env::var_os("VICTORY_REQUIRE_UNIFIED_ARENA").is_some() => {
+                panic!(
+                    "CPU-visible custom placed heaps are unavailable while VICTORY_REQUIRE_UNIFIED_ARENA=1: {error}"
+                );
+            }
+            Err(error) => {
+                eprintln!("CPU-visible custom placed heaps are not supported; skipped: {error}");
+                return;
+            }
+        };
+        let source = arena
+            .buffer(4)
+            .expect("first shared-heap suballocation failed");
+        let destination = arena
+            .buffer(4)
+            .expect("second shared-heap suballocation failed");
+        let world_heap = arena
+            .buffer(174 << 20)
+            .expect("arena cannot fit the 174 MiB title heap from #407");
+
+        assert_eq!(source.offset, 0);
+        assert_eq!(destination.offset.checked_sub(source.offset), Some(SLOT));
+        assert_eq!(world_heap.offset.checked_sub(destination.offset), Some(SLOT));
+        assert_eq!(
+            world_heap.gpu.checked_sub(source.gpu),
+            Some(world_heap.offset)
+        );
+        assert_eq!(source.offset % SLOT, 0);
+        assert_eq!(destination.gpu.checked_sub(source.gpu), Some(SLOT));
+        assert_eq!(
+            (destination.data as usize).checked_sub(source.data as usize),
+            Some(SLOT as usize)
+        );
+        assert_eq!(
+            source.gpu.checked_sub(source.offset),
+            destination.gpu.checked_sub(destination.offset)
+        );
+        // SAFETY: both pointers address four-byte ranges within the mapped arena.
+        unsafe {
+            source.data.cast::<u32>().write_volatile(INPUT);
+            destination.data.cast::<u32>().write_volatile(0);
+        }
+
+        const SHADER: &str = r#"
+#define RS "UAV(u0), UAV(u1)"
+RWByteAddressBuffer destination : register(u0);
+RWByteAddressBuffer source : register(u1);
+[RootSignature(RS)]
+[numthreads(1, 1, 1)]
+void main() {
+    destination.Store(0, source.Load(0) ^ 0xA5A55A5A);
+}
+"#;
+        let mut code: Option<ID3DBlob> = None;
+        let mut errors: Option<ID3DBlob> = None;
+        // SAFETY: the source and entry-point strings live through compilation;
+        // both output pointers belong to this test.
+        let compiled = unsafe {
+            D3DCompile(
+                SHADER.as_ptr().cast(),
+                SHADER.len(),
+                s!("unified-memory-probe"),
+                None,
+                None,
+                s!("main"),
+                s!("cs_5_1"),
+                0,
+                0,
+                &mut code,
+                Some(&mut errors),
+            )
+        };
+        if let Err(error) = compiled {
+            let detail = errors.as_ref().map_or_else(String::new, |blob| {
+                // SAFETY: the compiler blob owns the reported byte range.
+                let bytes = unsafe {
+                    std::slice::from_raw_parts(
+                        blob.GetBufferPointer().cast::<u8>(),
+                        blob.GetBufferSize(),
+                    )
+                };
+                String::from_utf8_lossy(bytes).into_owned()
+            });
+            panic!("D3DCompile failed: {error}; {detail}");
+        }
+        let code = code.expect("D3DCompile returned no bytecode");
+        // SAFETY: the compiler blob owns the byte range; the root signature
+        // is embedded in the compiled shader.
+        let bytes = unsafe {
+            std::slice::from_raw_parts(
+                code.GetBufferPointer().cast::<u8>(),
+                code.GetBufferSize(),
+            )
+        };
+        // SAFETY: `bytes` is the serialized root signature compiled above and
+        // the device returns an owned COM interface.
+        let root: ID3D12RootSignature =
+            unsafe { host.device.CreateRootSignature(0, bytes) }.expect("create root signature");
+        // SAFETY: the PSO description borrows the live bytecode and root signature.
+        let pso: ID3D12PipelineState = unsafe {
+            host.device.CreateComputePipelineState(&D3D12_COMPUTE_PIPELINE_STATE_DESC {
+                pRootSignature: std::mem::transmute_copy(&root),
+                CS: D3D12_SHADER_BYTECODE {
+                    pShaderBytecode: bytes.as_ptr().cast(),
+                    BytecodeLength: bytes.len(),
+                },
+                ..Default::default()
+            })
+        }
+        .expect("create compute pipeline");
+
+        let list = host.new_list().expect("create command list");
+        let to_uav = transition(
+            &source.resource,
+            D3D12_RESOURCE_STATE_COMMON,
+            D3D12_RESOURCE_STATE_UNORDERED_ACCESS,
+        );
+        // The arena is one D3D12 resource, so both suballocations use UAV
+        // access while the resource is in UNORDERED_ACCESS state.
+        unsafe {
+            list.list.ResourceBarrier(&[to_uav]);
+            list.list.SetComputeRootSignature(&root);
+            list.list.SetPipelineState(&pso);
+            list.list.SetComputeRootUnorderedAccessView(0, destination.gpu);
+            list.list.SetComputeRootUnorderedAccessView(1, source.gpu);
+            list.list.Dispatch(1, 1, 1);
+        }
+        list.close();
+        host.execute(&[&list]);
+
+        // execute() waits for the queue fence before the CPU reads the UAV.
+        // SAFETY: destination remains mapped and contains a four-byte result.
+        let result = unsafe { destination.data.cast::<u32>().read_volatile() };
+        assert_eq!(result, INPUT ^ MASK);
+
+        // The 174 MiB allocation leaves less than 82 MiB after the two
+        // alignment slots, so exhaustion must preserve the caller's fallback.
+        assert!(host.unified_buffer(82 << 20).is_none());
+        assert!(host.unified_buffer(u64::MAX).is_none());
+    }
 
     #[test]
     fn warp_adapter_accepts_only_software() {
@@ -1762,6 +2071,24 @@ pub(crate) fn legal_for(flags: u32, state: u32) -> u32 {
 }
 
 impl Host {
+    /// A suballocation in a lazily probed CPU-visible buffer shared with the GPU.
+    /// Unsupported adapters or exhausted capacity return None; title allocations
+    /// do not use this arena yet.
+    #[cfg_attr(not(test), allow(dead_code))]
+    pub(crate) fn unified_buffer(&self, size: u64) -> Option<UnifiedBuffer> {
+        let arena = self.unified.get_or_init(|| match UnifiedArena::new(&self.device) {
+            Ok(arena) => {
+                tracing::info!(bytes = UNIFIED_ARENA_SIZE, "CPU/GPU shared buffer arena available");
+                Some(arena)
+            }
+            Err(error) => {
+                tracing::info!(error = %error, "CPU/GPU shared buffer arena unavailable");
+                None
+            }
+        });
+        arena.as_ref()?.buffer(size)
+    }
+
     /// A buffer in system memory that the CPU maps (write-back, so reading
     /// it is fast too) and shaders read and write: for host copies of title
     /// memory that shaders write, which upload memory cannot be. Starts in
