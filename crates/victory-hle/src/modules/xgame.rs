@@ -81,13 +81,18 @@ extern "system" fn launch_new_game(
         .unwrap_or_default();
     let ours: Vec<_> = std::env::args_os().skip(1).collect();
     let command = relaunch_args(ours, current.as_os_str(), &exe, &args);
-    super::lifecycle::end_title(
-        "XLaunchNewGame",
-        Box::new(move || super::lifecycle::relaunch(command)),
-    );
-    loop {
-        std::thread::park();
+    #[cfg(windows)]
+    {
+        super::lifecycle::end_title(
+            "XLaunchNewGame",
+            Box::new(move || super::lifecycle::relaunch(command)),
+        );
+        loop {
+            std::thread::park();
+        }
     }
+    #[cfg(not(windows))]
+    let _ = command;
 }
 
 /// Our own arguments for the relaunch: the title's executable replaced by

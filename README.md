@@ -46,9 +46,21 @@ What each part does today and what it still needs:
 
 ## Getting started
 
-Requirements: Windows 10/11 x64, a CPU with AVX2, a Direct3D 12 GPU with
-shader model 6.6 (and mesh shaders for the world), Rust (pinned in
-`rust-toolchain.toml`).
+The workspace builds and its tests and data/shader tools run on Linux x86-64
+and Windows x64. Rust is pinned in `rust-toolchain.toml`.
+
+Running a title needs Windows 10/11 x64, a CPU with AVX2 and a Direct3D 12 GPU
+with shader model 6.6 (and mesh shaders for the world). The `run` command
+reports this on Linux; the other commands work there.
+
+Run the one-time setup first. It installs the asset-policy hook and creates
+`victory.toml` when it is missing:
+
+```powershell
+cargo xtask setup                       # hooks + local config
+```
+
+Then set your paths in `victory.toml` and check the workspace:
 
 The title also needs several GiB of available Windows commit at startup.
 Check **Committed** under **Task Manager → Performance → Memory**. If
@@ -56,11 +68,11 @@ Check **Committed** under **Task Manager → Performance → Memory**. If
 the Windows paging file size, then retry.
 
 ```powershell
-cargo xtask install-hooks                # asset-policy check on every commit
-copy victory.example.toml victory.toml   # then set your paths (outside the repo)
 cargo test --workspace                   # needs no game data
 cargo run -p victory -- config           # check your paths
 ```
+
+See [CONTRIBUTING.md](CONTRIBUTING.md) for the full workflow.
 
 Run the title:
 
