@@ -46,70 +46,105 @@ RWByteAddressBuffer budget : register(u1);
 static const uint BUDGET = 1u << 27;
 // Groups of one dispatch; more run empty.
 static const uint GROUPS = 1u << 20;
+groupshared uint s_cost[64];
+groupshared uint s_over[64];
+groupshared uint s_budget;
+
 [RootSignature(RS)]
 [numthreads(64, 1, 1)]
-void main(uint3 id : SV_DispatchThreadID) {
+void main(uint3 gtid : SV_GroupThreadID) {
+    uint tid = gtid.x;
     uint eff_count = records;
     if (has_count != 0) {
         eff_count = min(eff_count, count_buf.Load(count_offset));
     }
-    if (id.x >= eff_count) return;
-    uint src_at = args_offset + id.x * stride;
-    uint dst_at = id.x * stride;
-    uint cost;
-    uint2 draw_counts = uint2(0, 0);
-    uint3 groups = uint3(0, 0, 0);
-    if (kind <= 1) {
-        // Draws: vertex or index count, then instances.
-        uint count = min(src_args.Load(src_at), 1u << 24);
-        uint instances = min(src_args.Load(src_at + 4), (1u << 26) / max(count, 1u));
-        cost = count * instances;
-        draw_counts = uint2(count, instances);
-    } else if (kind == 2) {
-        uint3 g = min(src_args.Load3(src_at), uint3(65535u, 65535u, 65535u));
-        // x * y fits 32 bits; the whole count may not.
-        if (g.z != 0 && g.x * g.y > GROUPS / g.z) {
-            g = uint3(0, 0, 0);
-        }
-        cost = g.x * g.y * g.z * 64u;
-        groups = g;
-    } else {
-        // Mesh dispatches: the console's are one-dimensional.
-        uint3 g = src_args.Load3(src_at);
-        g = uint3(min(g.x, 65535u), min(g.y, 1u), min(g.z, 1u));
-        cost = g.x * g.y * g.z * 128u;
-        groups = g;
+    if (eff_count == 0) {
+        return;
     }
-    bool over = false;
-    if (cost > 0) {
-        uint before;
-        budget.InterlockedOr(0, 0, before);
-        [allow_uav_condition]
-        while (before < BUDGET) {
-            uint next = (BUDGET - before <= cost) ? BUDGET : (before + cost);
-            uint prev;
-            budget.InterlockedCompareExchange(0, before, next, prev);
-            if (prev == before) break;
-            before = prev;
-        }
-        over = before >= BUDGET || BUDGET - before < cost;
+    if (tid == 0) {
+        s_budget = budget.Load(0);
     }
-    if (kind <= 1) {
-        if (over) {
-            draw_counts = uint2(0, 0);
+    GroupMemoryBarrierWithGroupSync();
+    uint payload = (kind == 0) ? 16u : (kind == 1) ? 20u : 12u;
+    // Walk tiles of 64 in record order with a single group so budget accounting
+    // needs no cross-thread CAS loop and never runs into GPU TDR on large draws.
+    for (uint base = 0; base < eff_count; base += 64u) {
+        uint idx = base + tid;
+        uint cost = 0u;
+        uint2 draw_counts = uint2(0, 0);
+        uint3 groups = uint3(0, 0, 0);
+        uint src_at = 0u;
+        if (idx < eff_count) {
+            src_at = args_offset + idx * stride;
+            if (kind <= 1) {
+                // Draws: vertex or index count, then instances.
+                uint count = min(src_args.Load(src_at), 1u << 24);
+                uint instances = min(src_args.Load(src_at + 4), (1u << 26) / max(count, 1u));
+                cost = count * instances;
+                draw_counts = uint2(count, instances);
+            } else if (kind == 2) {
+                uint3 g = min(src_args.Load3(src_at), uint3(65535u, 65535u, 65535u));
+                // x * y fits 32 bits; the whole count may not.
+                if (g.z != 0 && g.x * g.y > GROUPS / g.z) {
+                    g = uint3(0, 0, 0);
+                }
+                cost = g.x * g.y * g.z * 64u;
+                groups = g;
+            } else {
+                // Mesh dispatches: the console's are one-dimensional.
+                uint3 g = src_args.Load3(src_at);
+                g = uint3(min(g.x, 65535u), min(g.y, 1u), min(g.z, 1u));
+                cost = g.x * g.y * g.z * 128u;
+                groups = g;
+            }
         }
-        dst_args.Store2(dst_at, draw_counts);
-        for (uint off = 8; off < stride; off += 4) {
-            dst_args.Store(dst_at + off, src_args.Load(src_at + off));
+        s_cost[tid] = cost;
+        GroupMemoryBarrierWithGroupSync();
+        if (tid == 0) {
+            uint n = min(64u, eff_count - base);
+            uint b = s_budget;
+            for (uint i = 0; i < n; ++i) {
+                uint c = s_cost[i];
+                uint over = 0u;
+                if (c > 0u) {
+                    if (b >= BUDGET || BUDGET - b < c) {
+                        b = BUDGET;
+                        over = 1u;
+                    } else {
+                        b += c;
+                    }
+                }
+                s_over[i] = over;
+            }
+            s_budget = b;
         }
-    } else {
-        if (over) {
-            groups = uint3(0, 0, 0);
+        GroupMemoryBarrierWithGroupSync();
+        if (idx < eff_count) {
+            uint dst_at = idx * stride;
+            bool over = s_over[tid] != 0u;
+            // The last record in a tight buffer may end at its payload rather than a full stride.
+            uint copy_end = (idx + 1u == records) ? payload : stride;
+            if (kind <= 1) {
+                if (over) {
+                    draw_counts = uint2(0, 0);
+                }
+                dst_args.Store2(dst_at, draw_counts);
+                for (uint off = 8u; off < copy_end; off += 4u) {
+                    dst_args.Store(dst_at + off, src_args.Load(src_at + off));
+                }
+            } else {
+                if (over) {
+                    groups = uint3(0, 0, 0);
+                }
+                dst_args.Store3(dst_at, groups);
+                for (uint off = 12u; off < copy_end; off += 4u) {
+                    dst_args.Store(dst_at + off, src_args.Load(src_at + off));
+                }
+            }
         }
-        dst_args.Store3(dst_at, groups);
-        for (uint off = 12; off < stride; off += 4) {
-            dst_args.Store(dst_at + off, src_args.Load(src_at + off));
-        }
+    }
+    if (tid == 0) {
+        budget.Store(0, s_budget);
     }
 }
 "#;
@@ -192,8 +227,8 @@ fn make_for(device: &ID3D12Device) -> windows::core::Result<Clamp> {
     }
 }
 
-/// Minimum record byte stride for a supported PC indirect argument `kind`.
-fn min_stride(kind: u32) -> Option<u32> {
+/// Payload byte size read by `ExecuteIndirect` for each supported PC indirect `kind`.
+pub(crate) fn payload_size(kind: u32) -> Option<u32> {
     match kind {
         0 => Some(16),
         1 => Some(20),
@@ -202,20 +237,31 @@ fn min_stride(kind: u32) -> Option<u32> {
     }
 }
 
-/// Validates record alignment and returns the scratch byte size `stride * records`.
+/// Minimum byte span needed for `records` of `kind` at `stride` bytes apart:
+/// `(records - 1) * stride + payload_size` when `records > 0`, else `0`.
+pub(crate) fn required_bytes(kind: u32, stride: u32, records: u32) -> Option<u64> {
+    let payload = payload_size(kind)?;
+    if stride < payload || !stride.is_multiple_of(4) {
+        return None;
+    }
+    if records == 0 {
+        return Some(0);
+    }
+    u64::from(records - 1)
+        .checked_mul(u64::from(stride))?
+        .checked_add(u64::from(payload))
+}
+
+/// Validates record alignment and returns the required byte span `(records - 1) * stride + payload_size` (or `0` when `records == 0`).
 fn validate_layout(
     (kind, stride, records): (u32, u32, u32),
     src_offset: u64,
     count_offset: Option<u64>,
 ) -> Option<u64> {
-    let min = min_stride(kind)?;
-    if stride < min || !stride.is_multiple_of(4) || !src_offset.is_multiple_of(4) {
+    if !src_offset.is_multiple_of(4) || count_offset.is_some_and(|off| !off.is_multiple_of(4)) {
         return None;
     }
-    if count_offset.is_some_and(|off| !off.is_multiple_of(4)) {
-        return None;
-    }
-    let bytes = u64::from(stride).checked_mul(u64::from(records))?;
+    let bytes = required_bytes(kind, stride, records)?;
     (bytes <= u64::from(u32::MAX)).then_some(bytes)
 }
 
@@ -381,7 +427,7 @@ fn record_clamp(
             l.SetComputeRootShaderResourceView(2, count_gpu);
             l.SetComputeRootUnorderedAccessView(3, dst_gpu);
             l.SetComputeRootUnorderedAccessView(4, budget);
-            l.Dispatch(records.div_ceil(64), 1, 1);
+            l.Dispatch(1, 1, 1);
         }
         l.ResourceBarrier(&[
             uav_barrier(),
@@ -745,9 +791,13 @@ void main() {
     #[test]
     fn rejects_unaligned_or_undersized_layouts() {
         assert_eq!(validate_layout((0, 16, 4), 0, None), Some(64));
+        assert_eq!(validate_layout((0, 24, 4), 0, None), Some(88));
+        assert_eq!(required_bytes(0, 24, 4), Some(88));
         assert_eq!(validate_layout((1, 20, 4), 64, Some(128)), Some(80));
+        assert_eq!(validate_layout((1, 24, 2), 0, None), Some(44));
         assert_eq!(validate_layout((2, 12, 0), 0, Some(0)), Some(0));
-        assert_eq!(validate_layout((10, 16, 2), 8, None), Some(32));
+        assert_eq!(validate_layout((2, 24, 2), 0, None), Some(36));
+        assert_eq!(validate_layout((10, 16, 2), 8, None), Some(28));
         // Undersized strides for each kind.
         assert_eq!(validate_layout((0, 12, 1), 0, None), None);
         assert_eq!(validate_layout((1, 16, 1), 0, None), None);
@@ -1150,9 +1200,94 @@ void main() {
             assert_eq!(rec[2], 1000 + i as u32);
             assert_eq!(rec[3], (-200i32 + i as i32) as u32);
             assert_eq!(rec[4], 5000 + i as u32);
-            assert_eq!(rec[5], 0xCAFE_0000 | (i as u32));
+            if i + 1 < RECORDS as usize {
+                assert_eq!(rec[5], 0xCAFE_0000 | (i as u32));
+            }
         }
         assert_eq!((kept, zeroed), (2, (RECORDS as usize) - 2));
+    }
+
+    /// Regression test for 4 x 16-byte DRAW records at 24-byte stride inside an
+    /// exact 88-byte buffer (`(4 - 1) * 24 + 16 = 88`, not `4 * 24 = 96`).
+    #[test]
+    fn warp_tight_stride_buffer_reads_last_draw_within_88_bytes() {
+        let Some(mut warp) = WarpHarness::new() else {
+            return;
+        };
+        const KIND_DRAW: u32 = 0;
+        const STRIDE: u32 = 24;
+        const RECORDS: u32 = 4;
+        const TOTAL_BYTES: usize = 88;
+        assert_eq!(
+            required_bytes(KIND_DRAW, STRIDE, RECORDS),
+            Some(TOTAL_BYTES as u64)
+        );
+
+        let (src_buf, src_ptr, _) = warp.shared_buffer(TOTAL_BYTES as u64);
+        let (_budget_buf, budget_ptr, budget_gpu) = warp.shared_buffer(256);
+        let (readback_buf, readback_ptr, _) = warp.shared_buffer(TOTAL_BYTES as u64);
+        let dst_buf = warp.default_uav(TOTAL_BYTES as u64);
+
+        let mut initial_src = [0xEEu8; TOTAL_BYTES];
+        let records: [[u32; 4]; 4] = [[3, 1, 0, 0], [4, 2, 10, 1], [5, 1, 20, 2], [6, 3, 30, 3]];
+        for (i, words) in records.into_iter().enumerate() {
+            let base = i * (STRIDE as usize);
+            for (w, val) in words.into_iter().enumerate() {
+                initial_src[base + w * 4..base + (w + 1) * 4].copy_from_slice(&val.to_le_bytes());
+            }
+        }
+
+        // SAFETY: buffers are mapped with exact 88-byte capacity.
+        unsafe {
+            std::ptr::copy_nonoverlapping(initial_src.as_ptr(), src_ptr, TOTAL_BYTES);
+            (budget_ptr as *mut u32).write_volatile(0);
+            std::ptr::write_bytes(readback_ptr, 0, TOTAL_BYTES);
+        }
+
+        assert!(record_clamp(
+            &warp.clamp,
+            &warp.list,
+            (&dst_buf, 0),
+            budget_gpu,
+            (&src_buf, 0),
+            None,
+            (KIND_DRAW, STRIDE, RECORDS),
+            &[],
+        ));
+        done_on(&warp.list, &dst_buf, &[]);
+
+        // SAFETY: open command list; copy exactly 88 bytes for verification.
+        unsafe {
+            warp.list.ResourceBarrier(&[transition(
+                &dst_buf,
+                D3D12_RESOURCE_STATE_COMMON,
+                D3D12_RESOURCE_STATE_COPY_SOURCE,
+            )]);
+            warp.list
+                .CopyBufferRegion(&readback_buf, 0, &dst_buf, 0, TOTAL_BYTES as u64);
+            warp.list.ResourceBarrier(&[transition(
+                &dst_buf,
+                D3D12_RESOURCE_STATE_COPY_SOURCE,
+                D3D12_RESOURCE_STATE_COMMON,
+            )]);
+        }
+        warp.submit_and_wait();
+
+        // SAFETY: GPU work completed.
+        let (spent, out_words) = unsafe {
+            let spent = (budget_ptr as *const u32).read_volatile();
+            let out_words = std::slice::from_raw_parts(
+                readback_ptr.cast::<u32>().cast_const(),
+                TOTAL_BYTES / 4,
+            )
+            .to_vec();
+            (spent, out_words)
+        };
+        assert_eq!(spent, 3 + 8 + 5 + 18);
+        for (i, expected) in records.into_iter().enumerate() {
+            let off = i * (STRIDE as usize / 4);
+            assert_eq!(&out_words[off..off + 4], &expected);
+        }
     }
 
     /// Exercises `HostList::indirect_scratch`, `bound`, `done`, `Host::execute`,
