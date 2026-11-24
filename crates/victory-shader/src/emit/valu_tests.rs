@@ -937,3 +937,22 @@ fn v_cmp_class_f16_matches_rdna2() {
         );
     });
 }
+
+#[test]
+fn v_mad_f32_flushes_subnormal_sum_before_omod() {
+    // 1.5 * FLT_MIN - FLT_MIN is a positive subnormal. RDNA flushes it
+    // before mul:2, so it remains +0 instead of becoming FLT_MIN.
+    let [w0, mut w1] = vop3(0x141, 0, vgpr(1), vgpr(2), vgpr(3));
+    w1 |= 1 << 27; // OMOD = multiply by two.
+    let shader = build_valu_cs(&[w0, w1]);
+    let cases = [[0x00c0_0000, 0x0080_0000, 0x8080_0000, 0]];
+
+    if Host::new(false).is_err() && Host::new(true).is_err() {
+        eprintln!("no SM 6.6 host or WARP device; skipped");
+        return;
+    }
+
+    run_cases(&shader, &cases, |backend, _, _, got| {
+        assert_eq!(got, 0, "{backend}: MAD flushes subnormal sum before OMOD");
+    });
+}
