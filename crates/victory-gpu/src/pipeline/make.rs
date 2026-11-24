@@ -108,6 +108,18 @@ pub(crate) fn waiting() -> u64 {
 /// The host pipeline if it is made (or is made within the frame's budget);
 /// queues it on first use.
 pub(crate) fn ready(p: &Arc<Pending>) -> Option<&HostPipeline> {
+    // A stage shader that has already been refused can never make this
+    // pipeline (`HostPipeline::new` asks each shader for its translation),
+    // so answer at once instead of queueing it behind the pipelines the
+    // workers are still making and waiting for them. The refusal is still
+    // recorded, so diagnostics name the shader as usual.
+    if p.shaders
+        .iter()
+        .any(|s| matches!(s.translated.get(), Some(None)))
+    {
+        p.made.get_or_init(|| None);
+        return None;
+    }
     if p.made.get().is_none() {
         start(p);
         wait(p, crate::frame::current());
@@ -234,5 +246,28 @@ mod tests {
             std::thread::yield_now();
         }
         assert!(matches!(p.made.get(), Some(None)));
+    }
+
+    /// A pipeline one of whose stage shaders has already been refused can
+    /// never be made (`HostPipeline::new` asks each shader for its
+    /// translation): it is answered at once, recorded as refused, and not
+    /// queued behind the pipelines the workers are still making.
+    #[cfg(windows)]
+    #[test]
+    fn a_refused_shader_skips_the_worker_queue() {
+        let s = Arc::new(Shader {
+            stage: "pixel",
+            hash: "0123456789abcdef".to_owned(),
+            container: Vec::new(),
+            translated: OnceLock::new(),
+        });
+        assert!(s.translated.set(None).is_ok());
+        let p = Arc::new(Pending::new(vec![s], None));
+        assert!(ready(&p).is_none());
+        assert!(!p.queued.load(Ordering::Relaxed), "not sent to a worker");
+        assert!(
+            matches!(p.made.get(), Some(None)),
+            "recorded as refused, so diagnostics still name the shader"
+        );
     }
 }
