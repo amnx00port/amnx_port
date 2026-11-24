@@ -71,6 +71,8 @@ pub(crate) struct State {
     /// Graphics, compute.
     host_roots: [usize; 2],
     host_heaps: [usize; 2],
+    /// Current depth bounds range (min, max).
+    pub(crate) depth_bounds: (f32, f32),
     /// Tables made afresh in this list: (table, what it holds) → first
     /// dynamic slot.
     fresh_tables: std::collections::HashMap<(u64, u64), u32>,
@@ -455,6 +457,10 @@ impl State {
             // The title may release the pipeline before it submits the list.
             list.keep(&p.pso);
             list.keep(&p.root);
+        }
+        if let Some((min, max)) = p.depth_bounds {
+            self.depth_bounds = (min, max);
+            depth_bounds(list, min, max);
         }
         for stage in &p.stages {
             let t = stage.translated();
@@ -1214,4 +1220,11 @@ pub(crate) fn blend_factor(list: &HostList, factor: Option<&[f32; 4]>) {
 pub(crate) fn stencil_ref(list: &HostList, reference: u32) {
     // SAFETY: an open list.
     unsafe { list.list.OMSetStencilRef(reference) };
+}
+
+pub(crate) fn depth_bounds(list: &HostList, min: f32, max: f32) {
+    if let Ok(list1) = list.list.cast::<ID3D12GraphicsCommandList1>() {
+        // SAFETY: an open list.
+        unsafe { list1.OMSetDepthBounds(min, max) };
+    }
 }

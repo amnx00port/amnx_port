@@ -913,7 +913,7 @@ extern "system" fn ignored_state(_: This) {}
 /// set on the host list at once. Without a host GPU these do nothing.
 #[cfg(windows)]
 mod state {
-    use super::{This, host_list, with_state};
+    use super::{List, This, host_list, with_state};
     use crate::draw::{IndexView, VertexView};
     use windows::Win32::Foundation::RECT;
     use windows::Win32::Graphics::Direct3D12::D3D12_VIEWPORT;
@@ -953,6 +953,19 @@ mod state {
     pub(super) extern "system" fn stencil_ref(this: This, reference: u32) {
         if let Some(list) = host_list(this) {
             crate::draw::stencil_ref(list, reference);
+        }
+    }
+    pub(super) extern "system" fn depth_bounds(this: This, min: f32, max: f32) {
+        if this.is_null() {
+            return;
+        }
+        // SAFETY: the title passes one of our lists.
+        let list_ref = unsafe { &*this.cast::<List>() };
+        if let Ok(mut state) = list_ref.state.lock() {
+            state.depth_bounds = (min, max);
+        }
+        if let Some(list) = list_ref.host.as_ref() {
+            crate::draw::depth_bounds(list, min, max);
         }
     }
     pub(super) extern "system" fn heaps(this: This, count: u32, heaps: *const This) {
@@ -1114,6 +1127,7 @@ mod state {
     pub(super) use super::ignored_state as compute_constants;
     pub(super) use super::ignored_state as compute_table;
     pub(super) use super::ignored_state as compute_view;
+    pub(super) use super::ignored_state as depth_bounds;
     pub(super) use super::ignored_state as graphics_constant;
     pub(super) use super::ignored_state as graphics_constants;
     pub(super) use super::ignored_state as graphics_table;
@@ -1327,7 +1341,7 @@ const METHODS: [(usize, *const ()); 52] = [
     (52, clear_rtv as *const ()),                 // 0x1a0
     (59, execute_indirect as *const ()),          // 0x1d8 indirect
     (60, copy_memory as *const ()),               // 0x1e0
-    (68, ignored_state as *const ()),             // 0x220 depth bounds
+    (68, state::depth_bounds as *const ()),       // 0x220 depth bounds
     (69, write32 as *const ()),                   // 0x228
     (70, write64 as *const ()),                   // 0x230
     (71, wait_value as *const ()),                // 0x238, 32 bits
@@ -1442,6 +1456,31 @@ mod tests {
         assert_eq!(reset(list, allocator, null), S_OK);
         // SAFETY: the list is ours.
         assert!(unsafe { &(*list.cast::<List>()).uploads }.lock().unwrap().is_empty());
+        let release = |o: This| slot::<extern "system" fn(This) -> u32>(o, 0x10)(o);
+        assert_eq!(release(list), 0);
+        assert_eq!(release(allocator), 0);
+    }
+
+    #[test]
+    fn command_list_dispatches_depth_bounds() {
+        let null = std::ptr::null();
+        let mut allocator = null;
+        assert_eq!(
+            create_allocator(null, 0, &ALLOCATOR_IIDS[0], &mut allocator),
+            S_OK
+        );
+        let mut list = null;
+        let hr = create_list(null, 0, 0, allocator, null, &LIST_IIDS[1], &mut list);
+        assert_eq!(hr, S_OK);
+        let slot_offset = if crate::device::newer() { 70 * 8 } else { 68 * 8 };
+        let set_depth_bounds = slot::<extern "system" fn(This, f32, f32)>(list, slot_offset);
+        set_depth_bounds(list, 0.125, 0.875);
+        #[cfg(windows)]
+        {
+            // SAFETY: the list is ours.
+            let state = unsafe { &(*list.cast::<List>()).state };
+            assert_eq!(state.lock().unwrap().depth_bounds, (0.125, 0.875));
+        }
         let release = |o: This| slot::<extern "system" fn(This) -> u32>(o, 0x10)(o);
         assert_eq!(release(list), 0);
         assert_eq!(release(allocator), 0);

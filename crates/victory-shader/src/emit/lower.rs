@@ -2943,19 +2943,27 @@ impl<'a> Lower<'a> {
             Some("x16") => 16,
             _ => return Err("a scalar memory read as data"),
         };
-        // How the program uses the descriptor tells the view's kind.
-        let use_at = self
-            .x
-            .res
-            .descriptors
-            .iter()
-            .filter(|d| d.role == Role::Resource)
-            .find_map(|d| {
-                d.source.leaves().into_iter().find_map(|l| match *l {
-                    Source::Loaded { load, first } if load == site => Some((d.site, first)),
-                    _ => None,
+        // How the program uses the descriptor tells the view's kind. A
+        // waterfall loop that only sizes a lane's entry takes it from a load
+        // of the same entry that an access uses (see `resource::Waterfall`).
+        let use_of = |of: Site| {
+            self.x
+                .res
+                .descriptors
+                .iter()
+                .filter(|d| d.role == Role::Resource)
+                .find_map(|d| {
+                    d.source.leaves().into_iter().find_map(|l| match *l {
+                        Source::Loaded { load, first } if load == of => Some((d.site, first)),
+                        _ => None,
+                    })
                 })
-            });
+        };
+        let use_at = use_of(site).or_else(|| {
+            let w = &self.x.res.waterfall;
+            let &(_, twin) = w.sizes.iter().find(|s| s.0 == site)?;
+            use_of(twin)
+        });
         let Some((at, first)) = use_at else {
             return Err("a descriptor read only as data");
         };
@@ -7238,6 +7246,17 @@ mod tests {
             assert_eq!(l.nonuniform_handles, 1);
             assert!(!l.wave_ops);
         }
+    }
+
+    #[test]
+    fn a_console_waterfall_that_only_sizes_reads_each_lanes_own_dimensions() {
+        use crate::resource::tests::WATERFALL_SIZED_WAVE32;
+        let (layout, used) = texture_and_uav_tables();
+        let l = lower_wave(WATERFALL_SIZED_WAVE32, layout, used, false).unwrap();
+        // The sizing loop's and the sampling loop's handles, both each
+        // lane's own entry.
+        assert_eq!(l.nonuniform_handles, 2);
+        assert!(!l.wave_ops);
     }
 
     /// [`texture_tables`] with a raw buffer UAV at dword 16 of the first.

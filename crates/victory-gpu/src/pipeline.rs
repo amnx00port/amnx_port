@@ -486,6 +486,8 @@ static FUNCTIONS: Table<24> = {
 #[cfg(windows)]
 pub(crate) mod host;
 #[cfg(windows)]
+pub use host::DepthStencilDesc;
+#[cfg(windows)]
 mod library;
 #[cfg(windows)]
 mod make;
@@ -619,6 +621,65 @@ mod tests {
                 (g.targets.NumRenderTargets, g.targets.RTFormats[0].0),
                 (1, 28)
             );
+        }
+    }
+
+    #[test]
+    fn pipeline_depth_bounds_stream_and_translation() {
+        #[cfg(windows)]
+        {
+            let mut g = host::GraphicsState::default();
+            g.set_depth_bounds(0.1, 0.9);
+            assert_eq!(g.depth_bounds(), (true, 0.1, 0.9));
+            assert_eq!(g.depth_desc().DepthBoundsMin, 0.1);
+            assert_eq!(g.depth_desc().DepthBoundsMax, 0.9);
+        }
+
+        let (vs, ps) = ([1u8; 4], [2u8; 4]);
+        let mut stream = vec![0u8; 0x100];
+        let mut put = |at: usize, v: u64| stream[at..at + 8].copy_from_slice(&v.to_le_bytes());
+        // Subobject 1: VS (24 bytes)
+        put(0x00, 1);
+        put(0x08, vs.as_ptr() as u64);
+        put(0x10, vs.len() as u64);
+        // Subobject 2: PS (24 bytes)
+        put(0x18, 2);
+        put(0x20, ps.as_ptr() as u64);
+        put(0x28, ps.len() as u64);
+        // Subobject 21: DEPTH_STENCIL1 (64 bytes)
+        put(0x30, 21);
+        // D3D12_DEPTH_STENCIL_DESC1 data starts at 0x34
+        // DepthEnable at 0x34: BOOL = 1
+        stream[0x34..0x38].copy_from_slice(&1u32.to_le_bytes());
+        // DepthBoundsTestEnable at 0x34 + 48 = 0x64: BOOL = 1
+        stream[0x64..0x68].copy_from_slice(&1u32.to_le_bytes());
+        // DepthBoundsMin at 0x34 + 52 = 0x68: f32 = 0.25
+        stream[0x68..0x6c].copy_from_slice(&0.25f32.to_le_bytes());
+        // DepthBoundsMax at 0x34 + 56 = 0x6c: f32 = 0.85
+        stream[0x6c..0x70].copy_from_slice(&0.85f32.to_le_bytes());
+
+        let desc = StreamDesc {
+            size: 0x70,
+            stream: stream.as_ptr(),
+        };
+        let mut p = std::ptr::null();
+        let hr = create_stream(std::ptr::null(), &desc, &PIPELINE_IIDS[0], &mut p);
+        assert_eq!(hr, S_OK);
+        #[cfg(windows)]
+        {
+            let g = pipeline(p).host.graphics.as_deref().unwrap();
+            let (enabled, min, max) = g.depth_bounds();
+            assert!(enabled);
+            assert_eq!(min, 0.25);
+            assert_eq!(max, 0.85);
+
+            let desc = g.depth_desc();
+            assert!(desc.DepthBoundsTestEnable.as_bool());
+            assert_eq!(desc.DepthBoundsMin, 0.25);
+            assert_eq!(desc.DepthBoundsMax, 0.85);
+
+            let d3d12_desc1 = desc.to_d3d12_desc1();
+            assert!(d3d12_desc1.DepthBoundsTestEnable.as_bool());
         }
     }
 }
