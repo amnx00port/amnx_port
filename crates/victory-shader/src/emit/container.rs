@@ -89,7 +89,7 @@ pub(crate) fn signature(elements: &[SigElement], input: bool) -> Vec<u8> {
         }
     }
     let mut order: Vec<usize> = (0..elements.len()).collect();
-    order.sort_by_key(|&i| (elements[i].row.unwrap_or(u32::MAX), elements[i].col));
+    order.sort_by_key(|&i| elements[i].row.unwrap_or(u32::MAX));
     for i in order {
         let (e, offset) = (&elements[i], offsets[i]);
         let used = e.usage << e.col;
@@ -206,14 +206,10 @@ pub(crate) fn psv(p: &Psv) -> Vec<u8> {
     let mut elements = Vec::new();
     for e in p.inputs.iter().chain(p.outputs).chain(p.prims) {
         let name = if e.kind == 0 {
-            let needle: Vec<u8> = e.name.bytes().chain([0]).collect();
-            match find(&strings, &needle) {
-                Some(at) => at,
-                None => {
-                    strings.extend(&needle);
-                    strings.len() - needle.len()
-                }
-            }
+            let at = strings.len();
+            strings.extend(e.name.bytes());
+            strings.push(0);
+            at
         } else {
             0
         };
@@ -270,10 +266,6 @@ pub(crate) fn psv(p: &Psv) -> Vec<u8> {
         }
     }
     out
-}
-
-fn find(hay: &[u8], needle: &[u8]) -> Option<usize> {
-    hay.windows(needle.len()).position(|w| w == needle)
 }
 
 /// The container: parts in order, hashed.
@@ -385,5 +377,93 @@ mod tests {
             .map(|b| format!("{b:02x}"))
             .collect();
         assert_eq!(hex, "900150983cd24fb0d6963f7d28e17f72");
+    }
+
+    #[test]
+    fn psv_writes_distinct_string_entries_for_repeated_arbitrary_semantics() {
+        let el = |name: &str, index: u32, kind: u8, row: u32| SigElement {
+            name: name.into(),
+            index,
+            kind,
+            comp: 9,
+            interp: 2,
+            row: Some(row),
+            col: 0,
+            cols: 4,
+            usage: 0xF,
+            half: false,
+        };
+        let inputs = [
+            el("SV_Position", 0, 3, 0),
+            el("TEXCOORD", 0, 0, 1),
+            el("TEXCOORD", 1, 0, 2),
+        ];
+        let bytes = psv(&Psv {
+            stage: 0,
+            flag: false,
+            inputs: &inputs,
+            outputs: &[],
+            prims: &[],
+            mesh: None,
+            bindings: &[],
+            threads: [0; 3],
+            wave_size: None,
+        });
+        let u32_at = |off: usize| u32::from_le_bytes(bytes[off..off + 4].try_into().unwrap());
+        let info_sz = u32_at(0) as usize;
+        let mut pos = 4 + info_sz;
+        assert_eq!(u32_at(pos), 0); // 0 bindings
+        pos += 4;
+        let str_len = u32_at(pos) as usize;
+        pos += 4;
+        let strings = &bytes[pos..pos + str_len];
+        // Leading empty string plus two distinct "TEXCOORD\0" entries.
+        assert!(strings.starts_with(b"\0TEXCOORD\0TEXCOORD\0"));
+        pos += str_len;
+        let idx_cnt = u32_at(pos) as usize;
+        pos += 4 + idx_cnt * 4;
+        let el_sz = u32_at(pos) as usize;
+        assert_eq!(el_sz, 16);
+        pos += 4;
+        let name0 = u32_at(pos);
+        let name1 = u32_at(pos + el_sz);
+        let name2 = u32_at(pos + 2 * el_sz);
+        assert_eq!(name0, 0);
+        assert_eq!(name1, 1);
+        assert_eq!(name2, 10);
+    }
+
+    #[test]
+    fn signature_sorts_by_row_only_preserving_co_packed_order() {
+        let el = |name: &str, row: u32, col: u8, cols: u8| SigElement {
+            name: name.into(),
+            index: 0,
+            kind: 0,
+            comp: 9,
+            interp: 2,
+            row: Some(row),
+            col,
+            cols,
+            usage: (1 << cols) - 1,
+            half: false,
+        };
+        let bytes = signature(
+            &[
+                el("SECOND_ROW", 1, 0, 4),
+                el("HI_HALF", 0, 2, 2),
+                el("LO_HALF", 0, 0, 2),
+            ],
+            true,
+        );
+        let u32_at = |off: usize| u32::from_le_bytes(bytes[off..off + 4].try_into().unwrap());
+        assert_eq!(u32_at(0), 3);
+        let row_name = |i: usize| {
+            let name_off = u32_at(8 + i * 32 + 4) as usize;
+            let end = bytes[name_off..].iter().position(|&b| b == 0).unwrap();
+            std::str::from_utf8(&bytes[name_off..name_off + end]).unwrap()
+        };
+        assert_eq!(row_name(0), "HI_HALF");
+        assert_eq!(row_name(1), "LO_HALF");
+        assert_eq!(row_name(2), "SECOND_ROW");
     }
 }
