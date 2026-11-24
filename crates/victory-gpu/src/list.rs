@@ -754,12 +754,147 @@ extern "system" fn clear_dsv(
         let dsv = host.dsv(texture, record.depth_desc().as_ref());
         // SAFETY: an open list, a fresh view of a live texture.
         unsafe {
-            list.list
-                .ClearDepthStencilView(dsv, D3D12_CLEAR_FLAGS(flags as i32 & 3), depth, stencil, rects)
+            list.list.ClearDepthStencilView(
+                dsv,
+                D3D12_CLEAR_FLAGS(flags as i32 & 3),
+                depth,
+                stencil,
+                rects,
+            )
         };
     }
     #[cfg(not(windows))]
     let _ = (this, handle, flags, depth, stencil, count, rects);
+}
+
+#[cfg(windows)]
+enum ClearUavValues<'a> {
+    Uint(&'a [u32; 4]),
+    Float(&'a [f32; 4]),
+}
+
+#[cfg(windows)]
+fn clear_uav(
+    this: This,
+    gpu: u64,
+    cpu: u64,
+    resource: This,
+    values: ClearUavValues<'_>,
+    count: u32,
+    rects: *const Rect,
+) {
+    use windows::Win32::Graphics::Direct3D12::{
+        D3D12_RESOURCE_BARRIER, D3D12_RESOURCE_BARRIER_0, D3D12_RESOURCE_BARRIER_FLAG_NONE,
+        D3D12_RESOURCE_BARRIER_TYPE_UAV, D3D12_RESOURCE_UAV_BARRIER,
+    };
+    let (Some(texture), Some(host)) = (
+        crate::resource::host_resource(resource),
+        crate::host::host(),
+    ) else {
+        return;
+    };
+    let view = crate::descriptor::view(cpu).or_else(|| crate::descriptor::view(gpu));
+    let Some(crate::descriptor::View::Unordered(view_resource, _, desc)) = view else {
+        return;
+    };
+    if view_resource != resource as usize {
+        return;
+    }
+    let Some(desc) = crate::descriptor::host::texture_uav_desc(resource, texture, desc.as_ref())
+    else {
+        return;
+    };
+    let rects = if count > 0 && !rects.is_null() {
+        // SAFETY: the title passes `count` rectangles, laid out as the host's.
+        unsafe { std::slice::from_raw_parts(rects.cast(), count as usize) }
+    } else {
+        &[]
+    };
+    const UNORDERED_ACCESS: u32 = 0x8;
+    with_state(this, |list, state| {
+        let (heap, gpu_handle, cpu_handle) = host.clear_uav(texture, desc.as_ref());
+        ensure_state(list, resource, UNORDERED_ACCESS);
+        crate::texture::host_written(resource);
+        #[cfg(feature = "diagnostics")]
+        list.note_op(|| format!("clear uav {resource:?}"));
+        let barrier = D3D12_RESOURCE_BARRIER {
+            Type: D3D12_RESOURCE_BARRIER_TYPE_UAV,
+            Flags: D3D12_RESOURCE_BARRIER_FLAG_NONE,
+            Anonymous: D3D12_RESOURCE_BARRIER_0 {
+                UAV: std::mem::ManuallyDrop::new(D3D12_RESOURCE_UAV_BARRIER {
+                    // SAFETY: a borrowed pointer; the barrier never releases it.
+                    pResource: unsafe { std::mem::transmute_copy(texture) },
+                }),
+            },
+        };
+        // SAFETY: an open list, our live shader-visible heap, matching host
+        // descriptors, and a live texture in UNORDERED_ACCESS.
+        unsafe {
+            list.list.SetDescriptorHeaps(&[Some(heap.clone())]);
+            state.invalidate_heaps();
+            match values {
+                ClearUavValues::Uint(v) => list
+                    .list
+                    .ClearUnorderedAccessViewUint(gpu_handle, cpu_handle, texture, v, rects),
+                ClearUavValues::Float(v) => list
+                    .list
+                    .ClearUnorderedAccessViewFloat(gpu_handle, cpu_handle, texture, v, rects),
+            }
+            list.list.ResourceBarrier(&[barrier]);
+        }
+    });
+}
+
+extern "system" fn clear_uav_uint(
+    this: This,
+    gpu: u64,
+    cpu: u64,
+    resource: This,
+    values: *const [u32; 4],
+    count: u32,
+    rects: *const Rect,
+) {
+    #[cfg(windows)]
+    // SAFETY: the title passes four integers (null is tolerated).
+    if let Some(values) = unsafe { values.as_ref() } {
+        clear_uav(
+            this,
+            gpu,
+            cpu,
+            resource,
+            ClearUavValues::Uint(values),
+            count,
+            rects,
+        );
+    }
+    #[cfg(not(windows))]
+    let _ = (this, gpu, cpu, resource, values, count, rects);
+}
+
+extern "system" fn clear_uav_float(
+    this: This,
+    gpu: u64,
+    cpu: u64,
+    resource: This,
+    values: *const [f32; 4],
+    count: u32,
+    rects: *const Rect,
+) {
+    #[cfg(windows)]
+    // SAFETY: the title passes four floats (null is tolerated).
+    if let Some(values) = unsafe { values.as_ref() } {
+        clear_uav(
+            this,
+            gpu,
+            cpu,
+            resource,
+            ClearUavValues::Float(values),
+            count,
+            rects,
+        );
+    }
+    #[cfg(not(windows))]
+    let _ = (this, gpu, cpu, resource, values, count, rects);
 }
 
 /// `CopyMemoryToMemoryX(destination, source, size, flags)`: GPU addresses
@@ -887,7 +1022,10 @@ extern "system" fn reset_x(this: This, allocator: This, pipeline: This, _flags: 
 /// `E_NOTIMPL` as a pointer).
 extern "system" fn allocate_upload(this: This, size: u64, alignment: u64) -> *mut u8 {
     let align = usize::try_from(alignment).unwrap_or(0).max(16);
-    let Some(len) = usize::try_from(size).ok().and_then(|s| s.checked_add(align)) else {
+    let Some(len) = usize::try_from(size)
+        .ok()
+        .and_then(|s| s.checked_add(align))
+    else {
         return std::ptr::null_mut();
     };
     if this.is_null() || !align.is_power_of_two() {
@@ -900,7 +1038,10 @@ extern "system" fn allocate_upload(this: This, size: u64, alignment: u64) -> *mu
     // SAFETY: the title passes one of our lists.
     let uploads = unsafe { &(*this.cast::<List>()).uploads };
     // Moving the vector keeps its heap block where it is.
-    uploads.lock().unwrap_or_else(|e| e.into_inner()).push(block);
+    uploads
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .push(block);
     at
 }
 
@@ -1171,7 +1312,11 @@ extern "system" fn execute_indirect(
     {
         const DISPATCH: u32 = 2;
         const DISPATCH_SINGLE: u32 = 105;
-        let kind = if *kind == DISPATCH_SINGLE { DISPATCH } else { *kind };
+        let kind = if *kind == DISPATCH_SINGLE {
+            DISPATCH
+        } else {
+            *kind
+        };
         with_state(this, |list, s| {
             ran = s.execute_indirect(list, (kind, stride, max), address, counter);
         });
@@ -1241,7 +1386,8 @@ extern "system" fn barrier_groups(this: This, count: u32, _groups: *const u8) {
     {
         use windows::Win32::Graphics::Direct3D12::D3D12_RESOURCE_BARRIER;
         // SAFETY: the same layout; no resource named.
-        let barrier = unsafe { std::mem::transmute::<Barrier, D3D12_RESOURCE_BARRIER>(UAV_BARRIER) };
+        let barrier =
+            unsafe { std::mem::transmute::<Barrier, D3D12_RESOURCE_BARRIER>(UAV_BARRIER) };
         // SAFETY: an open list.
         unsafe { list.list.ResourceBarrier(&[barrier]) };
     }
@@ -1284,7 +1430,7 @@ fn defer_write(this: This, address: u64, what: Written, bytes: usize) {
 /// layout): IUnknown 3, object 4, device child 1, list 1, graphics list 96
 /// (59 as on PC, then console ones), then versions 1-6 (6 + 1 + 1 + 11 + 3
 /// + 13): 140 slots.
-const METHODS: [(usize, *const ()); 52] = [
+const METHODS: [(usize, *const ()); 54] = [
     (0, list_query as *const ()),
     (2, list_release as *const ()),
     (7, object::parent_device as *const ()),      // 0x38
@@ -1325,6 +1471,8 @@ const METHODS: [(usize, *const ()); 52] = [
     (50, state::targets as *const ()),            // 0x190
     (51, clear_dsv as *const ()),                 // 0x198
     (52, clear_rtv as *const ()),                 // 0x1a0
+    (53, clear_uav_uint as *const ()),            // 0x1a8
+    (54, clear_uav_float as *const ()),           // 0x1b0
     (59, execute_indirect as *const ()),          // 0x1d8 indirect
     (60, copy_memory as *const ()),               // 0x1e0
     (68, ignored_state as *const ()),             // 0x220 depth bounds
@@ -1438,12 +1586,364 @@ mod tests {
         assert!(!p.is_null() && (p as usize).is_multiple_of(0x100));
         // SAFETY: 40 bytes were handed out.
         unsafe { p.write_bytes(0xab, 40) };
-        assert!(allocate_upload(list, 8, 0x30).is_null(), "not a power of two");
+        assert!(
+            allocate_upload(list, 8, 0x30).is_null(),
+            "not a power of two"
+        );
         assert_eq!(reset(list, allocator, null), S_OK);
         // SAFETY: the list is ours.
-        assert!(unsafe { &(*list.cast::<List>()).uploads }.lock().unwrap().is_empty());
+        let uploads = unsafe { &(*list.cast::<List>()).uploads };
+        assert!(uploads.lock().unwrap().is_empty());
         let release = |o: This| slot::<extern "system" fn(This) -> u32>(o, 0x10)(o);
         assert_eq!(release(list), 0);
         assert_eq!(release(allocator), 0);
+    }
+
+    #[cfg(windows)]
+    #[derive(Clone, Copy)]
+    enum ClearTestOp {
+        Uint([u32; 4], [u32; 4]),
+        Float([f32; 4], [f32; 4]),
+    }
+
+    #[cfg(windows)]
+    fn run_texture_uav_clear_test(
+        format: u32,
+        uav_desc: Option<[u32; 10]>,
+        op: ClearTestOp,
+    ) -> Option<[u32; 16]> {
+        use windows::Win32::Graphics::Direct3D12::*;
+
+        let host = crate::host::host()?;
+        let errors_before = host.errors();
+        let null = std::ptr::null();
+
+        #[repr(C)]
+        struct HeapProperties {
+            kind: u32,
+            cpu_pages: u32,
+            pool: u32,
+            creation_nodes: u32,
+            visible_nodes: u32,
+        }
+        #[repr(C)]
+        struct ResourceDesc {
+            dimension: u32,
+            alignment: u64,
+            width: u64,
+            height: u32,
+            depth_or_array_size: u16,
+            mip_levels: u16,
+            format: u32,
+            sample_count: u32,
+            sample_quality: u32,
+            layout: u32,
+            flags: u32,
+        }
+        #[repr(C)]
+        struct ExtendedHeap {
+            kind: u32,
+            count: u32,
+            flags: u32,
+            nodes: u32,
+            address: u64,
+            size: u64,
+        }
+
+        let props = HeapProperties {
+            kind: 1,
+            cpu_pages: 0,
+            pool: 0,
+            creation_nodes: 1,
+            visible_nodes: 1,
+        };
+        let tex_desc = ResourceDesc {
+            dimension: 3,
+            alignment: 0,
+            width: 4,
+            height: 4,
+            depth_or_array_size: 1,
+            mip_levels: 1,
+            format,
+            sample_count: 1,
+            sample_quality: 0,
+            layout: 0,
+            flags: 4, // ALLOW_UNORDERED_ACCESS
+        };
+        let resource_iid = guid(
+            0x696442be,
+            0xa72e,
+            0x4059,
+            [0xbc, 0x79, 0x5b, 0x5c, 0x98, 0x04, 0x0f, 0xad],
+        );
+        let mut image = null;
+        assert_eq!(
+            crate::resource::create_committed(
+                null,
+                (&raw const props).cast(),
+                0,
+                (&raw const tex_desc).cast(),
+                0,
+                null.cast(),
+                &resource_iid,
+                &mut image,
+            ),
+            S_OK
+        );
+
+        let heap_iid = guid(
+            0x8efb471d,
+            0x616c,
+            0x4f49,
+            [0x90, 0xf7, 0x12, 0x7b, 0xb7, 0x63, 0xfa, 0x51],
+        );
+        let (mut cpu_heap, mut sv_heap) = (null, null);
+        let cpu_desc = ExtendedHeap {
+            kind: 0,
+            count: 2,
+            flags: 0,
+            nodes: 0,
+            address: 0,
+            size: 0,
+        };
+        let sv_desc = ExtendedHeap {
+            flags: 1,
+            ..cpu_desc
+        };
+        assert_eq!(
+            crate::descriptor::create_heap(
+                null,
+                (&raw const cpu_desc).cast(),
+                &heap_iid,
+                &mut cpu_heap,
+            ),
+            S_OK
+        );
+        assert_eq!(
+            crate::descriptor::create_heap(
+                null,
+                (&raw const sv_desc).cast(),
+                &heap_iid,
+                &mut sv_heap,
+            ),
+            S_OK
+        );
+        let cpu_handle = slot::<extern "system" fn(This) -> u64>(cpu_heap, 0x48)(cpu_heap);
+        let gpu_handle = slot::<extern "system" fn(This) -> u64>(sv_heap, 0x50)(sv_heap);
+        let uav_desc_ptr = uav_desc
+            .as_ref()
+            .map_or(std::ptr::null(), std::ptr::from_ref);
+        crate::descriptor::create_uav(null, image, null, uav_desc_ptr, cpu_handle);
+        crate::descriptor::copy_simple(null, 1, gpu_handle, cpu_handle, 0);
+
+        let queue_iid = guid(
+            0x0ec870a6,
+            0x5d7e,
+            0x4c22,
+            [0x8c, 0xfc, 0x5b, 0xaa, 0xe0, 0x76, 0x16, 0xed],
+        );
+        let (mut queue, mut allocator, mut list) = (null, null, null);
+        let queue_desc = [0u32; 4];
+        assert_eq!(
+            crate::queue::create(null, queue_desc.as_ptr().cast(), &queue_iid, &mut queue),
+            S_OK
+        );
+        assert_eq!(
+            create_allocator(null, 0, &ALLOCATOR_IIDS[0], &mut allocator),
+            S_OK
+        );
+        assert_eq!(
+            create_list(null, 0, 0, allocator, null, &LIST_IIDS[1], &mut list),
+            S_OK
+        );
+
+        let heaps = [sv_heap];
+        slot::<extern "system" fn(This, u32, *const This)>(list, 0x100)(list, 1, heaps.as_ptr());
+        let rect = Rect {
+            left: 1,
+            top: 1,
+            right: 3,
+            bottom: 3,
+        };
+        match op {
+            ClearTestOp::Uint(whole, inner) => {
+                type ClearUint =
+                    extern "system" fn(This, u64, u64, This, *const [u32; 4], u32, *const Rect);
+                let clear = slot::<ClearUint>(list, 0x1a8);
+                clear(list, gpu_handle, cpu_handle, image, &whole, 0, null.cast());
+                clear(list, gpu_handle, cpu_handle, image, &inner, 1, &rect);
+            }
+            ClearTestOp::Float(whole, inner) => {
+                type ClearFloat =
+                    extern "system" fn(This, u64, u64, This, *const [f32; 4], u32, *const Rect);
+                let clear = slot::<ClearFloat>(list, 0x1b0);
+                clear(list, gpu_handle, cpu_handle, image, &whole, 0, null.cast());
+                clear(list, gpu_handle, cpu_handle, image, &inner, 1, &rect);
+            }
+        }
+        assert_eq!(
+            slot::<extern "system" fn(This) -> HRESULT>(list, 0x48)(list),
+            S_OK
+        );
+        slot::<extern "system" fn(This, u32, *const This)>(queue, 0x50)(queue, 1, &list);
+
+        assert!(crate::texture::is_host_written(image));
+
+        let readback_heap = D3D12_HEAP_PROPERTIES {
+            Type: D3D12_HEAP_TYPE_READBACK,
+            ..Default::default()
+        };
+        let readback_desc = D3D12_RESOURCE_DESC {
+            Dimension: D3D12_RESOURCE_DIMENSION_BUFFER,
+            Width: 1024,
+            Height: 1,
+            DepthOrArraySize: 1,
+            MipLevels: 1,
+            SampleDesc: windows::Win32::Graphics::Dxgi::Common::DXGI_SAMPLE_DESC {
+                Count: 1,
+                Quality: 0,
+            },
+            Layout: D3D12_TEXTURE_LAYOUT_ROW_MAJOR,
+            ..Default::default()
+        };
+        let mut readback: Option<ID3D12Resource> = None;
+        // SAFETY: plain readback buffer creation.
+        unsafe {
+            host.device
+                .CreateCommittedResource(
+                    &readback_heap,
+                    D3D12_HEAP_FLAG_NONE,
+                    &readback_desc,
+                    D3D12_RESOURCE_STATE_COPY_DEST,
+                    None,
+                    &mut readback,
+                )
+                .unwrap();
+        }
+        let readback = readback.unwrap();
+        let host_image = crate::resource::host_resource(image).unwrap();
+        let (_, before) = crate::resource::host_transition(image, 0x800).unwrap();
+        assert_eq!(before, 0x8, "clear must leave texture in UNORDERED_ACCESS");
+
+        let back = host.new_list().unwrap();
+        let dst = D3D12_TEXTURE_COPY_LOCATION {
+            // SAFETY: borrowed pointer for the copy location.
+            pResource: unsafe { std::mem::transmute_copy(&readback) },
+            Type: D3D12_TEXTURE_COPY_TYPE_PLACED_FOOTPRINT,
+            Anonymous: D3D12_TEXTURE_COPY_LOCATION_0 {
+                PlacedFootprint: D3D12_PLACED_SUBRESOURCE_FOOTPRINT {
+                    Offset: 0,
+                    Footprint: D3D12_SUBRESOURCE_FOOTPRINT {
+                        Format: windows::Win32::Graphics::Dxgi::Common::DXGI_FORMAT(format as i32),
+                        Width: 4,
+                        Height: 4,
+                        Depth: 1,
+                        RowPitch: 256,
+                    },
+                },
+            },
+        };
+        let src = D3D12_TEXTURE_COPY_LOCATION {
+            // SAFETY: borrowed pointer for the copy location.
+            pResource: unsafe { std::mem::transmute_copy(host_image) },
+            Type: D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX,
+            Anonymous: D3D12_TEXTURE_COPY_LOCATION_0 {
+                SubresourceIndex: 0,
+            },
+        };
+        // SAFETY: an open list and live host resources.
+        unsafe {
+            back.list.ResourceBarrier(&[crate::host::transition(
+                host_image,
+                D3D12_RESOURCE_STATES(before as i32),
+                D3D12_RESOURCE_STATE_COPY_SOURCE,
+            )]);
+            back.list.CopyTextureRegion(&dst, 0, 0, 0, &src, None);
+        }
+        back.close();
+        host.execute(&[&back]);
+
+        let mut mapped = std::ptr::null_mut();
+        let mut pixels = [0u32; 16];
+        // SAFETY: execute waited for the copy; readback buffer is 1024 bytes.
+        unsafe {
+            readback
+                .Map(
+                    0,
+                    Some(&D3D12_RANGE {
+                        Begin: 0,
+                        End: 1024,
+                    }),
+                    Some(&mut mapped),
+                )
+                .unwrap();
+            let bytes = std::slice::from_raw_parts(mapped.cast::<u8>(), 1024);
+            for y in 0..4 {
+                let row = std::slice::from_raw_parts(bytes[y * 256..].as_ptr().cast::<u32>(), 4);
+                pixels[y * 4..(y + 1) * 4].copy_from_slice(row);
+            }
+            readback.Unmap(0, None);
+        }
+
+        assert_eq!(host.errors(), errors_before, "unexpected D3D12 debug error");
+
+        let release = |o: This| slot::<extern "system" fn(This) -> u32>(o, 0x10)(o);
+        assert_eq!(release(list), 0);
+        assert_eq!(release(allocator), 0);
+        assert_eq!(release(queue), 0);
+        assert_eq!(release(sv_heap), 0);
+        assert_eq!(release(cpu_heap), 0);
+        assert_eq!(release(image), 0);
+
+        Some(pixels)
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn clear_uav_uint_clears_resource_backed_texture() {
+        let outer = 0x1122_3344;
+        let inner = 0xaabb_ccdd;
+        let uav_desc = [42, 4, 0, 0, 0, 0, 0, 0, 0, 0];
+        let Some(pixels) = run_texture_uav_clear_test(
+            42,
+            Some(uav_desc),
+            ClearTestOp::Uint([outer, 0, 0, 0], [inner, 0, 0, 0]),
+        ) else {
+            return;
+        };
+        for y in 0..4 {
+            for x in 0..4 {
+                let expected = if (1..3).contains(&x) && (1..3).contains(&y) {
+                    inner
+                } else {
+                    outer
+                };
+                assert_eq!(pixels[y * 4 + x], expected, "pixel ({x}, {y})");
+            }
+        }
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn clear_uav_float_clears_resource_backed_texture() {
+        let outer = 1.25_f32;
+        let inner = -3.5_f32;
+        let Some(pixels) = run_texture_uav_clear_test(
+            41,
+            None,
+            ClearTestOp::Float([outer, 0.0, 0.0, 1.0], [inner, 0.0, 0.0, 1.0]),
+        ) else {
+            return;
+        };
+        for y in 0..4 {
+            for x in 0..4 {
+                let expected = if (1..3).contains(&x) && (1..3).contains(&y) {
+                    inner.to_bits()
+                } else {
+                    outer.to_bits()
+                };
+                assert_eq!(pixels[y * 4 + x], expected, "pixel ({x}, {y})");
+            }
+        }
     }
 }
