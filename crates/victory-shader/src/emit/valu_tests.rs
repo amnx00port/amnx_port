@@ -937,3 +937,63 @@ fn v_cmp_class_f16_matches_rdna2() {
         );
     });
 }
+
+#[test]
+fn v_cmp_16bit_ignores_vop3_op_sel() {
+    // v_cmp_lt_f16_e64 s6, v1, v2 (VOP3 encoding of VOPC 0x0c9), op_sel:[1,0];
+    // then v_cndmask_b32_e64 v0, 0, 1, s6.
+    let [mut hi0, hi1] = vop3(0x0c9, 6, vgpr(1), vgpr(2), 0);
+    hi0 |= 1 << 11; // op_sel[0] = high half, which RDNA2 ignores here
+    let f16_hi = build_valu_cs(&[
+        hi0,
+        hi1,
+        vop3(0x101, 0, 0x80, 0x81, sgpr(6))[0],
+        vop3(0x101, 0, 0x80, 0x81, sgpr(6))[1],
+    ]);
+    // The same compare with op_sel clear, as a control.
+    let f16_lo = build_valu_cs(&[
+        vop3(0x0c9, 6, vgpr(1), vgpr(2), 0)[0],
+        vop3(0x0c9, 6, vgpr(1), vgpr(2), 0)[1],
+        vop3(0x101, 0, 0x80, 0x81, sgpr(6))[0],
+        vop3(0x101, 0, 0x80, 0x81, sgpr(6))[1],
+    ]);
+    // v_cmp_lt_u16_e64 with op_sel:[1,0] (VOPC 0x0a9).
+    let [mut hi0, hi1] = vop3(0x0a9, 6, vgpr(1), vgpr(2), 0);
+    hi0 |= 1 << 11;
+    let u16_hi = build_valu_cs(&[
+        hi0,
+        hi1,
+        vop3(0x101, 0, 0x80, 0x81, sgpr(6))[0],
+        vop3(0x101, 0, 0x80, 0x81, sgpr(6))[1],
+    ]);
+
+    // Low halves decide: 1.0 < 1.5 true; 2.0 < 1.5 false. In the second
+    // case honouring op_sel (high half 1.0) would wrongly say true.
+    let f16_inputs = [
+        [0x4000_3C00, 0x0000_3E00, 0, 0],
+        [0x3C00_4000, 0x0000_3E00, 0, 0],
+    ];
+    let f16_wants = [1u32, 0u32];
+    for (name, shader) in [("op_sel high", &f16_hi), ("op_sel low", &f16_lo)] {
+        run_cases(shader, &f16_inputs, |backend, i, inp, got| {
+            let want = f16_wants[i];
+            assert_eq!(
+                got, want,
+                "{backend}: v_cmp_lt_f16({name}) ({:#010x}, {:#010x}) = {got}, want {want}",
+                inp[0], inp[1],
+            );
+        });
+    }
+
+    // u16: low 9 < 5 is false; honouring op_sel (high half 1) would say true.
+    let u16_inputs = [[0x0001_0009, 0x0000_0005, 0, 0]];
+    let u16_wants = [0u32];
+    run_cases(&u16_hi, &u16_inputs, |backend, i, inp, got| {
+        let want = u16_wants[i];
+        assert_eq!(
+            got, want,
+            "{backend}: v_cmp_lt_u16(op_sel high) ({:#010x}, {:#010x}) = {got}, want {want}",
+            inp[0], inp[1],
+        );
+    });
+}

@@ -3,6 +3,7 @@
 
 use victory_pe::layout::{self, dir, dll_flags, file_flags};
 use victory_pe::{ImageInfo, PeError};
+use tracing;
 
 #[derive(Debug, thiserror::Error)]
 pub enum PrepareError {
@@ -106,6 +107,15 @@ pub fn prepare(original: &[u8]) -> Result<PreparedImage, PrepareError> {
         }
     }
 
+    // Apply VICTORY_PATCH if set
+    if let Some(patch_env) = std::env::var_os("VICTORY_PATCH") {
+        let patch_env = patch_env.to_string_lossy().into_owned();
+        let patches = parse_victory_patch(&patch_env);
+        if let Err(e) = apply_victory_patches(&mut bytes, &patches) {
+            tracing::warn!(target: "victory-loader", "VICTORY_PATCH application failed: {e}");
+        }
+    }
+
     Ok(PreparedImage {
         info,
         bytes,
@@ -124,8 +134,7 @@ fn dir64_relocations(bytes: &[u8], info: &ImageInfo) -> Vec<(usize, u32)> {
     let Some(d) = layout::data_directory_offset(bytes, dir::BASERELOC) else {
         return out;
     };
-    let (Some(rva), Some(size)) = (layout::read_u32(bytes, d), layout::read_u32(bytes, d + 4))
-    else {
+    let (Some(rva), Some(size)) = (layout::read_u32(bytes, d), layout::read_u32(bytes, d + 4)) else {
         return out;
     };
     let Some(start) = info.rva_to_file_offset(rva).filter(|_| size != 0) else {
@@ -134,8 +143,7 @@ fn dir64_relocations(bytes: &[u8], info: &ImageInfo) -> Vec<(usize, u32)> {
     let (mut at, end) = (start as usize, start as usize + size as usize);
     while at + 8 <= end {
         let (Some(page), Some(block)) =
-            (layout::read_u32(bytes, at), layout::read_u32(bytes, at + 4))
-        else {
+            (layout::read_u32(bytes, at), layout::read_u32(bytes, at + 4)) else {
             break;
         };
         let block = block as usize;
@@ -170,6 +178,48 @@ fn write(bytes: &mut [u8], at: usize, v: &[u8]) -> Result<(), PrepareError> {
         .get_mut(at..at + v.len())
         .ok_or(PrepareError::Patch("header field outside of file"))?
         .copy_from_slice(v);
+    Ok(())
+}
+
+/// Simple hex decoder for VICTORY_PATCH bytes (no external `hex` crate needed).
+/// Parses a VICTORY_PATCH environment variable value.
+/// Format: "<module basename>:<rva hex>:<hex bytes>"
+/// Multiple patches can be specified by setting the env var multiple times
+/// or using a separator (here we support space-separated multiple entries).
+fn parse_victory_patch(env_val: &str) -> Vec<(String, u32, Vec<u8>)> {
+    let mut patches = Vec::new();
+    for part in env_val.split_whitespace() {
+        let parts: Vec<&str> = part.split(':').collect();
+        if parts.len() != 3 {
+            tracing::warn!(target: "victory-loader", "invalid VICTORY_PATCH format: {part}");
+            continue;
+        }
+        let module = parts[0].to_string();
+        let rva = u32::from_str_radix(parts[1], 16).unwrap_or(0);
+        let bytes = hex::decode(parts[2].trim()).unwrap_or_else(|_| Vec::new());
+        patches.push((module, rva, bytes));
+    }
+    patches
+}
+
+/// Applies a list of VICTORY_PATCH entries to the image bytes.
+/// Each patch is logged via `tracing::info!` with module, rva, old bytes, new bytes.
+fn apply_victory_patches(bytes: &mut [u8], patches: &[(String, u32, Vec<u8>)]) -> Result<(), PrepareError> {
+    for (module, rva, new_bytes) in patches {
+        // Verify the RVA is within the file bounds
+        if *rva as usize >= bytes.len() {
+            tracing::warn!(target: "victory-loader", "VICTORY_PATCH rva {:#x} outside file size {}", rva, bytes.len());
+            continue;
+        }
+        // Save the old bytes for logging
+        let old_bytes = bytes[*rva as usize..*rva as usize + new_bytes.len()].to_vec();
+        // Apply the patch
+        let _ = bytes[*rva as usize..*rva as usize + new_bytes.len()].copy_from_slice(new_bytes);
+        // Log the patch application
+        let old_hex = old_bytes.iter().map(|b| format!("{:02x}", b)).collect::<Vec<_>>().join("");
+        let new_hex = new_bytes.iter().map(|b| format!("{:02x}", b)).collect::<Vec<_>>().join("");
+        tracing::info!(target: "victory-loader", "VICTORY_PATCH: module={}, rva={:#x}, old_bytes=[{}], new_bytes=[{}]", module, rva, old_hex, new_hex);
+    }
     Ok(())
 }
 
