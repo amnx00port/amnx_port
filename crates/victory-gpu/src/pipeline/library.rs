@@ -134,23 +134,35 @@ pub(crate) fn pipeline(
     Ok(pso)
 }
 
-/// Writes the library and the early list if pipelines were added since the
-/// last save and `SAVE_EVERY` has passed (or `now`).
+/// Writes the library (when available and modified) and the early-pipeline
+/// key list (whenever new keys were noted, even without a host library) if
+/// `SAVE_EVERY` has passed (or `now`).
 pub(crate) fn save(now: bool) {
     static LAST: Mutex<Option<std::time::Instant>> = Mutex::new(None);
     const SAVE_EVERY: std::time::Duration = std::time::Duration::from_secs(20);
-    let (Some(dir), Some(library)) = (DIR.get(), library()) else { return };
+    let Some(dir) = DIR.get() else { return };
+    let library = library();
     {
         let mut last = LAST.lock().unwrap_or_else(|e| e.into_inner());
         if !now && last.is_some_and(|t| t.elapsed() < SAVE_EVERY) {
             return;
         }
+        let dirty = USED_CHANGED.load(Ordering::Relaxed)
+            || library.is_some_and(|l| l.lock().unwrap_or_else(|e| e.into_inner()).added > 0);
+        if !dirty {
+            return;
+        }
         *last = Some(std::time::Instant::now());
     }
-    let blob = {
+    save_to(dir, library);
+}
+
+fn save_to(dir: &std::path::Path, library: Option<&Mutex<Library>>) {
+    let early_changed = USED_CHANGED.swap(false, Ordering::Relaxed);
+    let blob = library.and_then(|library| {
         let mut l = library.lock().unwrap_or_else(|e| e.into_inner());
-        if l.added == 0 && !USED_CHANGED.swap(false, Ordering::Relaxed) {
-            return;
+        if l.added == 0 {
+            return None;
         }
         // SAFETY: a buffer of the size the library asks for.
         let bytes = unsafe {
@@ -160,28 +172,62 @@ pub(crate) fn save(now: bool) {
         match bytes {
             Ok(bytes) => {
                 l.added = 0;
-                bytes
+                Some(bytes)
             }
             Err(e) => {
                 tracing::warn!(error = %e, "host pipeline library not serialised");
-                return;
+                None
             }
         }
+    });
+    if blob.is_none() && !early_changed {
+        return;
+    }
+    if let Err(e) = std::fs::create_dir_all(dir) {
+        if early_changed {
+            USED_CHANGED.store(true, Ordering::Relaxed);
+        }
+        tracing::warn!(error = %e, "pipeline cache directory not created");
+        return;
+    }
+    let mut used: Vec<String> = USED
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .iter()
+        .flatten()
+        .cloned()
+        .collect();
+    used.sort_unstable();
+    let early_saved = if early_changed {
+        match write_atomically(&dir.join(EARLY_FILE), used.join("\n").as_bytes()) {
+            Ok(()) => true,
+            Err(e) => {
+                USED_CHANGED.store(true, Ordering::Relaxed);
+                tracing::warn!(error = %e, "early pipeline list not saved");
+                false
+            }
+        }
+    } else {
+        false
     };
-    let used: Vec<String> = USED.lock().unwrap_or_else(|e| e.into_inner()).iter().flatten().cloned().collect();
-    let written = std::fs::create_dir_all(dir)
-        .and_then(|()| write_atomically(&dir.join(LIBRARY_FILE), &blob))
-        .and_then(|()| write_atomically(&dir.join(EARLY_FILE), used.join("\n").as_bytes()));
-    match written {
-        Ok(()) => tracing::info!(
-            bytes = blob.len(),
+    if let Some(blob) = blob {
+        match write_atomically(&dir.join(LIBRARY_FILE), &blob) {
+            Ok(()) => tracing::info!(
+                bytes = blob.len(),
+                early = used.len(),
+                made = MADE.load(Ordering::Relaxed),
+                loaded = LOADED.load(Ordering::Relaxed),
+                started_early = EARLY.load(Ordering::Relaxed),
+                "host pipeline library saved"
+            ),
+            Err(e) => tracing::warn!(error = %e, "host pipeline library not saved"),
+        }
+    } else if early_saved {
+        tracing::info!(
             early = used.len(),
-            made = MADE.load(Ordering::Relaxed),
-            loaded = LOADED.load(Ordering::Relaxed),
             started_early = EARLY.load(Ordering::Relaxed),
-            "host pipeline library saved"
-        ),
-        Err(e) => tracing::warn!(error = %e, "host pipeline library not saved"),
+            "early pipeline list saved"
+        );
     }
 }
 
@@ -197,14 +243,19 @@ fn write_atomically(path: &std::path::Path, bytes: &[u8]) -> std::io::Result<()>
 static USED: Mutex<Option<HashSet<String>>> = Mutex::new(None);
 static USED_CHANGED: AtomicBool = AtomicBool::new(false);
 
+fn read_early_list(dir: &std::path::Path) -> HashSet<String> {
+    let listed = std::fs::read_to_string(dir.join(EARLY_FILE)).unwrap_or_default();
+    listed
+        .lines()
+        .filter(|l| !l.is_empty())
+        .map(str::to_owned)
+        .collect()
+}
+
 fn used() -> std::sync::MutexGuard<'static, Option<HashSet<String>>> {
     let mut used = USED.lock().unwrap_or_else(|e| e.into_inner());
     if used.is_none() {
-        let listed = DIR
-            .get()
-            .and_then(|d| std::fs::read_to_string(d.join(EARLY_FILE)).ok())
-            .unwrap_or_default();
-        let set: HashSet<String> = listed.lines().filter(|l| !l.is_empty()).map(str::to_owned).collect();
+        let set = DIR.get().map_or_else(HashSet::new, |d| read_early_list(d));
         tracing::info!(pipelines = set.len(), "title pipelines to start early");
         *used = Some(set);
     }
@@ -250,5 +301,60 @@ mod tests {
         // SAFETY: a plain query on a live library.
         assert!(unsafe { library.library.GetSerializedSize() } > 0);
         assert!(library._blob.is_empty());
+    }
+
+    #[test]
+    fn early_pipeline_keys_persist_and_reload_without_a_host_library() {
+        let temp = tempfile::tempdir().unwrap();
+        let cache_dir = temp.path().join("pso-cache");
+        use_pipeline_cache(cache_dir.clone());
+        USED_CHANGED.store(false, Ordering::Relaxed);
+
+        // No dirty flag set: saving without a host library creates nothing.
+        save_to(&cache_dir, None);
+        assert!(!cache_dir.join(EARLY_FILE).exists());
+        assert!(!cache_dir.join(LIBRARY_FILE).exists());
+
+        // Record two distinct keys (plus a duplicate) and persist with `library == None`.
+        note_used("gfx:alpha_key");
+        note_used("cs:beta_key");
+        note_used("gfx:alpha_key");
+        assert!(USED_CHANGED.load(Ordering::Relaxed));
+
+        save_to(&cache_dir, None);
+        assert!(cache_dir.join(EARLY_FILE).exists());
+        assert!(!cache_dir.join(LIBRARY_FILE).exists());
+
+        let on_disk = std::fs::read_to_string(cache_dir.join(EARLY_FILE)).unwrap();
+        let lines: Vec<&str> = on_disk.lines().collect();
+        assert!(lines.is_sorted());
+        assert_eq!(lines.iter().filter(|&&l| l == "gfx:alpha_key").count(), 1);
+        assert!(lines.contains(&"cs:beta_key"));
+
+        // Simulate next launch: clear in-memory `USED` and verify `wanted_early` reloads
+        // the saved keys from `EARLY_FILE` when `DIR` points at `cache_dir`.
+        if DIR.get() == Some(&cache_dir) {
+            *USED.lock().unwrap_or_else(|e| e.into_inner()) = None;
+            assert!(wanted_early("gfx:alpha_key"));
+            assert!(wanted_early("cs:beta_key"));
+            assert!(!wanted_early("gfx:missing_key"));
+
+            // Also exercise `save(true)` end-to-end when only a new early key is added.
+            note_used("gfx:gamma_key");
+            save(true);
+        } else {
+            let reloaded = read_early_list(&cache_dir);
+            assert!(reloaded.contains("gfx:alpha_key"));
+            assert!(reloaded.contains("cs:beta_key"));
+            assert!(!reloaded.contains("gfx:missing_key"));
+            note_used("gfx:gamma_key");
+            save_to(&cache_dir, None);
+        }
+
+        let reloaded = read_early_list(&cache_dir);
+        assert!(reloaded.contains("cs:beta_key"));
+        assert!(reloaded.contains("gfx:alpha_key"));
+        assert!(reloaded.contains("gfx:gamma_key"));
+        assert!(!reloaded.contains("gfx:missing_key"));
     }
 }
