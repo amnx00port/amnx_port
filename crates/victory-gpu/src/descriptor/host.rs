@@ -379,21 +379,85 @@ impl HostHeap {
     }
 
     /// The view host slot `index` was made from, in a few words, with the
-    /// title and host addresses of a buffer view (diagnostics). "null" for
-    /// a slot never made or left null.
+    /// title and host addresses of a buffer view and the host resource the
+    /// slot holds (diagnostics). "null" for a slot never made or left null.
     #[cfg(feature = "diagnostics")]
     pub(crate) fn describe_slot(&self, index: u32) -> Option<String> {
-        let key = *self.made.lock().unwrap_or_else(|e| e.into_inner()).get(index as usize)?;
+        let kept = self.slot_host(index)?;
+        if index >= self.count {
+            return Some(format!("dynamic {kept}"));
+        }
+        let key = *self
+            .made
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .get(index as usize)?;
         if key == 0 {
             return Some("null".into());
         }
-        let view = view_at(key as u32, (key >> 32) as u32)?;
+        let Some(view) = view_at(key as u32, (key >> 32) as u32) else {
+            return Some(format!("stale({key:#x}) {kept}"));
+        };
         let mut text: String = format!("{view:?}").chars().take(120).collect();
         if let Some((address, len)) = buffer_range(&view) {
             let host = crate::shadow::find(address, len.max(1)).map(|s| s.gpu(address));
             text.push_str(&format!(" title {address:#x}+{len:#x} host {host:#x?}"));
         }
+        text.push(' ');
+        text.push_str(&kept);
         Some(text)
+    }
+
+    /// Summary of the host `ID3D12Resource` held by slot `index`, or
+    /// `"host none"` when the slot holds none (diagnostics).
+    #[cfg(feature = "diagnostics")]
+    pub(crate) fn slot_host(&self, index: u32) -> Option<String> {
+        let kept = self.kept.lock().unwrap_or_else(|e| e.into_inner());
+        kept.get(index as usize)
+            .map(|r| describe_resource(r.as_ref()))
+    }
+}
+
+#[cfg(feature = "diagnostics")]
+fn describe_resource(resource: Option<&ID3D12Resource>) -> String {
+    let Some(res) = resource else {
+        return "host none".into();
+    };
+    // SAFETY: a live host resource kept by the slot.
+    let d = unsafe { res.GetDesc() };
+    match d.Dimension {
+        D3D12_RESOURCE_DIMENSION_BUFFER => format!("host buffer {:#x}B", d.Width),
+        D3D12_RESOURCE_DIMENSION_TEXTURE1D => {
+            if d.DepthOrArraySize > 1 {
+                format!(
+                    "host 1d {}x{} f{} mips {}",
+                    d.Width, d.DepthOrArraySize, d.Format.0, d.MipLevels
+                )
+            } else {
+                format!("host 1d {} f{} mips {}", d.Width, d.Format.0, d.MipLevels)
+            }
+        }
+        D3D12_RESOURCE_DIMENSION_TEXTURE2D => {
+            if d.DepthOrArraySize > 1 {
+                format!(
+                    "host 2d {}x{}x{} f{} mips {}",
+                    d.Width, d.Height, d.DepthOrArraySize, d.Format.0, d.MipLevels
+                )
+            } else {
+                format!(
+                    "host 2d {}x{} f{} mips {}",
+                    d.Width, d.Height, d.Format.0, d.MipLevels
+                )
+            }
+        }
+        D3D12_RESOURCE_DIMENSION_TEXTURE3D => format!(
+            "host 3d {}x{}x{} f{} mips {}",
+            d.Width, d.Height, d.DepthOrArraySize, d.Format.0, d.MipLevels
+        ),
+        _ => format!(
+            "host dim {} {}x{} f{} mips {}",
+            d.Dimension.0, d.Width, d.Height, d.Format.0, d.MipLevels
+        ),
     }
 }
 
@@ -972,5 +1036,127 @@ mod tests {
         heap.release(a, 50);
         assert_eq!(heap.dynamic(50), Some(4));
         assert_eq!(heap.dynamic(40), Some(4 + heap.dynamic - 40));
+    }
+
+    #[cfg(feature = "diagnostics")]
+    #[test]
+    fn describe_slot_reports_missing_and_live_host_resources() {
+        let Some(host) = host() else {
+            return; // no host GPU
+        };
+        let Some(heap) = HostHeap::new(false, 4) else {
+            return;
+        };
+        assert_eq!(heap.describe_slot(0).as_deref(), Some("null"));
+        assert_eq!(heap.slot_host(0).as_deref(), Some("host none"));
+        assert_eq!(heap.describe_slot(heap.count + heap.dynamic), None);
+
+        // Slot 0: a descriptor whose view names no live resource stays `host none`.
+        let mut raw_slots = [[0u32; 8]; 2];
+        let h0 = raw_slots[0].as_mut_ptr() as u64;
+        crate::descriptor::create_srv(std::ptr::null(), std::ptr::null(), std::ptr::null(), h0);
+        assert!(heap.mirror(0, h0, true).is_some());
+        let empty = heap.describe_slot(0).expect("slot 0 description");
+        assert!(empty.ends_with(" host none"), "got: {empty}");
+        assert_eq!(heap.slot_host(0).as_deref(), Some("host none"));
+
+        // Slot 1: a committed 64x32 RGBA8 texture with 3 mips reports its host desc.
+        let props = D3D12_HEAP_PROPERTIES {
+            Type: D3D12_HEAP_TYPE_DEFAULT,
+            ..Default::default()
+        };
+        let tex2d = D3D12_RESOURCE_DESC {
+            Dimension: D3D12_RESOURCE_DIMENSION_TEXTURE2D,
+            Width: 64,
+            Height: 32,
+            DepthOrArraySize: 1,
+            MipLevels: 3,
+            Format: DXGI_FORMAT_R8G8B8A8_UNORM,
+            SampleDesc: DXGI_SAMPLE_DESC {
+                Count: 1,
+                Quality: 0,
+            },
+            ..Default::default()
+        };
+        let mut tex_obj = std::ptr::null();
+        let hr = crate::resource::create_committed(
+            std::ptr::null(),
+            (&raw const props).cast(),
+            0,
+            (&raw const tex2d).cast(),
+            0xC0,
+            std::ptr::null(),
+            &crate::resource::PAGEABLE_IIDS[0],
+            &mut tex_obj,
+        );
+        assert_eq!(hr, 0);
+        let h1 = raw_slots[1].as_mut_ptr() as u64;
+        crate::descriptor::create_srv(std::ptr::null(), tex_obj, std::ptr::null(), h1);
+        assert!(heap.mirror(1, h1, true).is_some());
+        let live = heap.describe_slot(1).expect("slot 1 description");
+        assert!(live.ends_with(" host 2d 64x32 f28 mips 3"), "got: {live}");
+        assert_eq!(
+            heap.slot_host(1).as_deref(),
+            Some("host 2d 64x32 f28 mips 3")
+        );
+
+        // Dynamic slots report their kept host resource or `host none`.
+        let dyn_base = heap.dynamic(2).expect("2 dynamic slots");
+        heap.make_at(dyn_base, &View::Shader(tex_obj as usize, None));
+        heap.make_null(dyn_base + 1);
+        assert_eq!(
+            heap.describe_slot(dyn_base).as_deref(),
+            Some("dynamic host 2d 64x32 f28 mips 3")
+        );
+        assert_eq!(
+            heap.describe_slot(dyn_base + 1).as_deref(),
+            Some("dynamic host none")
+        );
+        heap.release(dyn_base, 2);
+
+        // Releasing the title resource marks un-rewritten slots stale while
+        // still naming the kept host resource, then resets to `"null"` on mirror.
+        type ReleaseFn = extern "system" fn(crate::object::This) -> u32;
+        assert_eq!(crate::object::slot::<ReleaseFn>(tex_obj, 0x10)(tex_obj), 0);
+        let stale = heap.describe_slot(1).expect("stale slot 1 description");
+        assert!(
+            stale.starts_with("stale(") && stale.ends_with(" host 2d 64x32 f28 mips 3"),
+            "got: {stale}"
+        );
+        assert!(heap.mirror(1, h1, true).is_none());
+        assert_eq!(heap.describe_slot(1).as_deref(), Some("null"));
+        assert_eq!(heap.slot_host(1).as_deref(), Some("host none"));
+
+        // Direct 3D and buffer `ID3D12Resource` formatting checks.
+        let mut buf: Option<ID3D12Resource> = None;
+        let buf_desc = D3D12_RESOURCE_DESC {
+            Dimension: D3D12_RESOURCE_DIMENSION_BUFFER,
+            Width: 0x1000,
+            Height: 1,
+            DepthOrArraySize: 1,
+            MipLevels: 1,
+            SampleDesc: DXGI_SAMPLE_DESC {
+                Count: 1,
+                Quality: 0,
+            },
+            Layout: D3D12_TEXTURE_LAYOUT_ROW_MAJOR,
+            ..Default::default()
+        };
+        // SAFETY: valid default-heap buffer description.
+        unsafe {
+            host.device
+                .CreateCommittedResource(
+                    &props,
+                    D3D12_HEAP_FLAG_NONE,
+                    &buf_desc,
+                    D3D12_RESOURCE_STATE_COMMON,
+                    None,
+                    &mut buf,
+                )
+                .unwrap();
+        }
+        assert_eq!(describe_resource(buf.as_ref()), "host buffer 0x1000B");
+        // SAFETY: plain device health query.
+        assert!(unsafe { host.device.GetDeviceRemovedReason() }.is_ok());
     }
 }

@@ -821,7 +821,17 @@ impl State {
                 let what = match (u.root, self.roots_ref(compute).get(usize::from(u.slot))) {
                     (RootType::Table, Some(Root::Table(table))) => {
                         let handle = table + u64::from(u.table_offset_dwords) * 4;
-                        describe(crate::descriptor::view(handle).as_ref())
+                        let mut what = describe(crate::descriptor::view(handle).as_ref());
+                        if u.kind != ResourceType::Sampler
+                            && let Some(heap) = self.heap_of(handle)
+                            && let Some(index) = heap.index(handle)
+                            && let Some(host) =
+                                heap.existing_host().and_then(|h| h.slot_host(index))
+                        {
+                            what.push(' ');
+                            what.push_str(&host);
+                        }
+                        what
                     }
                     (root, _) => format!("{root:?}"),
                 };
