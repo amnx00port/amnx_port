@@ -114,6 +114,35 @@ fn synthetic(body: usize) -> NativeProgram {
     }
 }
 
+/// A compute program with one natural loop: the header carries the loop
+/// counter and the values the body writes, so the pipeline sees phis and a
+/// back edge, which the straight-line shape above does not.
+fn synthetic_loop(body: usize) -> NativeProgram {
+    const SOPP_CBRANCH_SCC1: u32 = 0xBF85_0000;
+    const SOPC_CMP_EQ_U32: u32 = 0xBF06_0000;
+    let mut words = Vec::with_capacity(body * 2 + 16);
+    words.push(s_mov_b32(5, 0x80));
+    words.extend_from_slice(&s_load_dwordx4(8, 4));
+    for i in 0..4u8 {
+        words.push(vop1(0x001, i + 1, sgpr(i)));
+    }
+    let header = words.len();
+    for i in 0..body {
+        words.extend_from_slice(&vop3(0x103, 3, vgpr(1 + (i % 2) as u8), vgpr(2), 0));
+    }
+    words.push(SOPC_CMP_EQ_U32 | (1 << 8)); // s_cmp_eq_u32 s0, s1
+    // Branch back: target = header, next = words.len() + 1.
+    let smimm = (header as i32) - (words.len() as i32 + 1);
+    words.push(SOPP_CBRANCH_SCC1 | (smimm as u16 as u32 & 0xFFFF));
+    words.extend_from_slice(&buffer_store_dword(0, 8, 0));
+    words.push(S_ENDPGM);
+
+    let code: Vec<u8> = words.iter().flat_map(|w| w.to_le_bytes()).collect();
+    let mut n = synthetic(0);
+    n.code = code;
+    n
+}
+
 fn best_of<T>(rounds: usize, mut f: impl FnMut() -> T) -> Duration {
     let mut best = Duration::MAX;
     for _ in 0..rounds {
@@ -201,4 +230,65 @@ fn translation_stages_by_size() {
         );
     }
     println!("(nanoseconds per instruction; best of N rounds)\n");
+}
+
+#[test]
+#[ignore = "timing; run with --ignored --nocapture"]
+fn loop_shape_by_size() {
+    println!(
+        "\n{:>7} {:>9} {:>10} {:>10} {:>10} {:>10} {:>10} {:>10}",
+        "body", "decode", "ir.build", "structure", "resource", "io", "lower", "total"
+    );
+    // The back edge is an `i16` of words: 8192 body instructions is the most
+    // that fits, and 16384 would encode a target outside the program.
+    for body in [256usize, 1024, 4096, 8192] {
+        let native = synthetic_loop(body);
+        let ninst = body as f64 + 12.0;
+        let rounds = if body >= 8192 { 5 } else { 11 };
+        let t_dec = best_of(rounds, || {
+            crate::gfx10::decode(&native.code).expect("decode")
+        });
+        let t_ir = best_of(rounds, || {
+            ir::build(&native.code, native.wave64, native.vgprs).expect("ir::build")
+        });
+        let p = ir::build(&native.code, native.wave64, native.vgprs).expect("ir::build");
+        let t_st = best_of(rounds, || structure::structure(&p).expect("structure"));
+        let s = structure::structure(&p).expect("structure");
+        let t_res = best_of(rounds, || {
+            resource::track(&p, &native.layout, native.stage, Some(&s)).expect("resource::track")
+        });
+        let r = resource::track(&p, &native.layout, native.stage, Some(&s)).expect("resource");
+        let t_io = best_of(rounds, || io::raise(&p, &native).expect("io::raise"));
+        let i = io::raise(&p, &native).expect("io::raise");
+        let t_low = best_of(rounds, || {
+            lower::lower(&lower::Parts {
+                native: &native,
+                p: &p,
+                st: &s,
+                io: &i,
+                res: &r,
+                inputs: Vec::new(),
+                outputs: Vec::new(),
+                prims: Vec::new(),
+                mesh_stride: 0,
+            })
+            .expect("lower")
+        });
+        let ns = |d: Duration| d.as_nanos() as f64 / ninst;
+        let total = t_dec + t_ir + t_st + t_res + t_io + t_low;
+        println!(
+            "{:>7} {:>9.0} {:>10.0} {:>10.0} {:>10.0} {:>10.0} {:>10.0} {:>10.0}   blocks={} phis={}",
+            body,
+            ns(t_dec),
+            ns(t_ir),
+            ns(t_st),
+            ns(t_res),
+            ns(t_io),
+            ns(t_low),
+            ns(total),
+            p.blocks.len(),
+            p.blocks.iter().map(|b| b.phis.len()).sum::<usize>()
+        );
+    }
+    println!("(loop shape: nanoseconds per instruction; best of N rounds)\n");
 }
