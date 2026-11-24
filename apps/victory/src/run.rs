@@ -4,6 +4,37 @@ use anyhow::{Context, Result};
 
 use crate::{Console, Unimplemented};
 
+#[cfg(any(windows, test))]
+const SKIP_CPU_CHECK_ENV: &str = "VICTORY_SKIP_CPU_CHECK";
+
+#[cfg(any(windows, test))]
+fn skip_cpu_check(value: Option<&str>) -> bool {
+    value == Some("1")
+}
+
+#[cfg(any(windows, test))]
+fn check_cpu_features_with(has_avx2: bool, skip_env: Option<&str>) -> Result<()> {
+    if has_avx2 || skip_cpu_check(skip_env) {
+        return Ok(());
+    }
+    anyhow::bail!(
+        "this CPU does not support AVX2, which Xbox Series titles require; \
+         set {SKIP_CPU_CHECK_ENV}=1 to bypass this check (for example under CPU emulation such as Intel SDE)"
+    );
+}
+
+/// Pre-flight check before executing title code: Xbox Series binaries are
+/// compiled for Zen 2 and require AVX2.
+#[cfg(windows)]
+fn check_cpu_features() -> Result<()> {
+    #[cfg(target_arch = "x86_64")]
+    let has_avx2 = std::arch::is_x86_feature_detected!("avx2");
+    #[cfg(not(target_arch = "x86_64"))]
+    let has_avx2 = true;
+    let skip = std::env::var(SKIP_CPU_CHECK_ENV).ok();
+    check_cpu_features_with(has_avx2, skip.as_deref())
+}
+
 #[cfg(windows)]
 pub fn run(
     exe: &Path,
@@ -16,6 +47,9 @@ pub fn run(
     use victory_hle::{HleResolver, HostPolicy};
     use victory_loader::{BindReport, UnimplementedPolicy, WithTitleDlls};
 
+    if execute {
+        check_cpu_features()?;
+    }
     // A title that relaunched itself: the old process must be gone first.
     victory_hle::modules::lifecycle::wait_for_previous();
     let cfg = victory_core::Config::load()?;
@@ -158,11 +192,7 @@ fn watch(base: usize, size: usize) {
     let Ok(list) = std::env::var("VICTORY_WATCH") else {
         return;
     };
-    let rvas: Vec<usize> = list
-        .split(',')
-        .filter_map(|r| usize::from_str_radix(r.trim().trim_start_matches("0x"), 16).ok())
-        .filter(|&rva| rva + 4 <= size)
-        .collect();
+    let rvas = watch_rvas(&list, size);
     std::thread::spawn(move || {
         let mut seen = vec![None; rvas.len()];
         loop {
@@ -177,6 +207,17 @@ fn watch(base: usize, size: usize) {
             std::thread::sleep(std::time::Duration::from_millis(5));
         }
     });
+}
+
+/// The RVAs `VICTORY_WATCH` asks for, kept only when four bytes fit in the
+/// image. `rva + 4` would wrap for a large value and pass the check, making
+/// the polling thread read in front of the image base instead.
+#[cfg(all(windows, feature = "diagnostics"))]
+fn watch_rvas(list: &str, size: usize) -> Vec<usize> {
+    list.split(',')
+        .filter_map(|r| usize::from_str_radix(r.trim().trim_start_matches("0x"), 16).ok())
+        .filter(|&rva| rva.checked_add(4).is_some_and(|end| end <= size))
+        .collect()
 }
 
 /// DLLs the host or our runtime provide are never taken from the title.
@@ -313,6 +354,14 @@ impl LoaderLock {
 mod tests {
     use std::sync::{Arc, Mutex};
 
+    #[cfg(feature = "diagnostics")]
+    #[test]
+    fn watch_rejects_rvas_that_wrap() {
+        let list = format!("0,{:x}", usize::MAX);
+        assert_eq!(super::watch_rvas(&list, 4), vec![0]);
+        assert_eq!(super::watch_rvas("0x10,1c,20", 0x20), vec![0x10, 0x1c]);
+    }
+
     #[test]
     fn loader_lock_is_reentrant_and_exclusive() {
         let lock = Arc::new(super::LoaderLock::default());
@@ -329,6 +378,45 @@ mod tests {
         });
         other.join().unwrap();
         assert_eq!(*order.lock().unwrap(), [1, 2]);
+    }
+
+    #[test]
+    fn cpu_feature_check_matches_host() {
+        let skip = std::env::var(super::SKIP_CPU_CHECK_ENV).ok();
+        #[cfg(target_arch = "x86_64")]
+        let expected_ok =
+            std::arch::is_x86_feature_detected!("avx2") || skip.as_deref() == Some("1");
+        #[cfg(not(target_arch = "x86_64"))]
+        let expected_ok = true;
+        assert_eq!(super::check_cpu_features().is_ok(), expected_ok);
+    }
+}
+
+#[cfg(test)]
+mod cpu_check_tests {
+    use super::{SKIP_CPU_CHECK_ENV, check_cpu_features_with};
+
+    #[test]
+    fn avx2_present_passes() {
+        assert!(check_cpu_features_with(true, None).is_ok());
+        assert!(check_cpu_features_with(true, Some("0")).is_ok());
+        assert!(check_cpu_features_with(true, Some("1")).is_ok());
+    }
+
+    #[test]
+    fn avx2_missing_fails_with_clear_error() {
+        for skip in [None, Some(""), Some("0"), Some("true")] {
+            let err = check_cpu_features_with(false, skip).unwrap_err();
+            let msg = err.to_string();
+            assert!(msg.contains("AVX2"), "unexpected error: {msg}");
+            assert!(msg.contains("Xbox Series"), "unexpected error: {msg}");
+            assert!(msg.contains(SKIP_CPU_CHECK_ENV), "unexpected error: {msg}");
+        }
+    }
+
+    #[test]
+    fn skip_env_var_bypasses_missing_avx2() {
+        assert!(check_cpu_features_with(false, Some("1")).is_ok());
     }
 }
 
