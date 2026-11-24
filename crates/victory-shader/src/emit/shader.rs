@@ -68,6 +68,9 @@ pub(crate) struct Shader {
     pub flags: u64,
     /// Heap handles made with a non-uniform index.
     pub nonuniform_handles: u32,
+    /// Scalar buffer loads read raw from a descriptor loaded out of the
+    /// resource heap (no used-resource entry names it).
+    pub heap_raw_loads: u32,
     /// A compute shader with this thread-group size.
     pub threads: Option<[u32; 3]>,
     /// The wave size a compute shader requires (`WaveSize`).
@@ -122,6 +125,7 @@ impl Shader {
             root_srvs: Vec::new(),
             flags: 0,
             nonuniform_handles: 0,
+            heap_raw_loads: 0,
             threads: None,
             wave_size: None,
             lds_dwords: 0,

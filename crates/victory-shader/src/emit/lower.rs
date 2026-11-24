@@ -43,6 +43,9 @@ pub(crate) struct Lowered {
     /// Whether the program uses wave operations.
     #[cfg(test)]
     pub wave_ops: bool,
+    /// Scalar buffer loads read raw from a resource-heap descriptor.
+    #[cfg(test)]
+    pub heap_raw_loads: u32,
 }
 
 pub(crate) struct Parts<'a> {
@@ -910,6 +913,8 @@ impl<'a> Lower<'a> {
             nonuniform_handles: self.s.nonuniform_handles,
             #[cfg(test)]
             wave_ops: self.s.flags & flags::WAVE_OPS != 0,
+            #[cfg(test)]
+            heap_raw_loads: self.s.heap_raw_loads,
             dxil: self.s.finish(),
             user_data,
             samplers: self.samplers,
@@ -2829,6 +2834,15 @@ impl<'a> Lower<'a> {
             .copied()
             .ok_or("an untracked descriptor")?;
         let kind = self.used_kind(src);
+        // A descriptor read from the resource heap at a computed index (no
+        // used-resource entry covers it) is a buffer view in the heap, which
+        // the host makes raw (see the module notes): read it raw too. Read as
+        // a constant buffer it is a CBV handle on an SRV slot, which the host
+        // device does not define (WARP faults, a GPU can hang).
+        let from_heap = kind.is_none()
+            && matches!(src, Source::Loaded { load, .. }
+                if self.scalar.get(load).and_then(|a| self.x.native.layout.get(a.param))
+                    .is_some_and(|rp| rp.root == RootType::ResourceHeap));
         let c = self.cur;
         let (base, extra) = self.built_offset(src)?;
         let offset = &((*offset as u32).wrapping_add(base) as i32);
@@ -2850,7 +2864,8 @@ impl<'a> Lower<'a> {
             }
             return Ok(());
         }
-        if matches!(kind, Some(u) if u.kind == ResourceType::Srv) {
+        if from_heap || matches!(kind, Some(u) if u.kind == ResourceType::Srv) {
+            self.s.heap_raw_loads += u32::from(from_heap);
             let h = self.handle(site, src, false, (11, 0))?;
             for k in 0..count {
                 let off = self.s.m.i32(4 * k);
@@ -5780,7 +5795,18 @@ impl<'a> Lower<'a> {
             return Ok(());
         }
         let (op, sample) = match name {
-            "image_sample" | "image_sample_o" => (60, true),
+            "image_sample" | "image_sample_o" if self.s.pixel => (60, true),
+            // Implicit derivatives exist only in pixel shaders: elsewhere
+            // DXIL rejects `sample` (the validator: "features incompatible
+            // with the shader stage"). Vertex and mesh lanes have none, so
+            // level 0 is what the console samples; a compute program in
+            // whole quad mode can have them, and level 0 is the
+            // approximation (single-level targets such as blurs read it).
+            "image_sample" => (62, true),
+            "image_sample_o" => return Err("a sample with offsets outside pixel shaders"),
+            "image_sample_b" if !self.s.pixel => {
+                return Err("a biased sample outside pixel shaders");
+            }
             "image_sample_lz" | "image_sample_l" => (62, true),
             "image_sample_b" => (61, true),
             "image_sample_c_lz" => (65, true),
@@ -7417,5 +7443,41 @@ mod tests {
         assert!(f10(0x3FF).is_nan());
         // A 16-bit float is a half already, sign included.
         assert_eq!(half(0xBC00 << half_shift(16)), -1.0);
+    }
+
+    /// `s_buffer_load_dword s8, s[4:7], 0` on the descriptor loaded with
+    /// `s_load_dwordx4 s[4:7], s[2:3], 0x40` from the root parameter at s0.
+    const SCALAR_LOAD_FROM_S0: &[u32] = &[
+        0xBE82_0300, // s_mov_b32 s2, s0
+        0xBE83_0380, // s_mov_b32 s3, 0
+        0xF408_0101,
+        0xFA00_0040, // s_load_dwordx4 s[4:7], s[2:3], 0x40
+        0xBF8C_0070, // s_waitcnt vmcnt(0) lgkmcnt(0)
+        0xF420_0202,
+        0xFA00_0000, // s_buffer_load_dword s8, s[4:7], 0
+        0xBF8C_0070, // s_waitcnt vmcnt(0) lgkmcnt(0)
+        S_ENDPGM,
+    ];
+
+    #[test]
+    fn scalar_loads_from_a_resource_heap_descriptor_are_raw() {
+        // No used-resource entry names the descriptor: loaded from the
+        // resource heap it is a buffer view the host makes raw, so the load
+        // must not be a constant-buffer read (a CBV handle on a raw slot).
+        let l = lower_with(
+            SCALAR_LOAD_FROM_S0,
+            vec![root(RootType::ResourceHeap, 0, 0)],
+            vec![],
+        )
+        .unwrap();
+        assert_eq!(l.heap_raw_loads, 1);
+        // The same load from a table stays a constant-buffer read.
+        let l = lower_with(
+            SCALAR_LOAD_FROM_S0,
+            vec![root(RootType::Table, 0, 0)],
+            vec![],
+        )
+        .unwrap();
+        assert_eq!(l.heap_raw_loads, 0);
     }
 }

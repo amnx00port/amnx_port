@@ -247,3 +247,29 @@ fn lanes_sample_their_own_texture_in_a_waterfall_narrowed_by_v_cmpx() {
         }
     }
 }
+
+#[test]
+fn compute_image_sample_reads_level_zero() {
+    // `image_sample` outside a pixel shader has no derivatives: it lowers to
+    // SampleLevel at level 0, which DXIL accepts in compute (Sample is
+    // rejected there and fails validation in `build`).
+    use crate::resource::tests::WATERFALL_INDEXED_WAVE32;
+    const IMAGE_SAMPLE_LZ: u32 = 0xF09C_0F08;
+    const IMAGE_SAMPLE: u32 = 0xF080_0F08;
+    assert!(WATERFALL_INDEXED_WAVE32.contains(&IMAGE_SAMPLE_LZ));
+    let words: Vec<u32> = WATERFALL_INDEXED_WAVE32
+        .iter()
+        .map(|&w| {
+            if w == IMAGE_SAMPLE_LZ {
+                IMAGE_SAMPLE
+            } else {
+                w
+            }
+        })
+        .collect();
+    let shader = build(&words, false);
+    for (label, red) in sampled(&shader) {
+        let want: Vec<f32> = (0..32).map(|l| [1.0, 2.0][l & 1]).collect();
+        assert_eq!(red, want, "{label}");
+    }
+}
