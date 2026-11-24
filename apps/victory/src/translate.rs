@@ -319,7 +319,8 @@ fn translate(
     let Some(dxil) = container.part(FourCC::DXIL).map(|p| p.data) else {
         return t.fail("no DXIL part (SM5 or older)".into(), example);
     };
-    if !lock(seen).insert(blake3::hash(dxil)) {
+    let key = translation_key(dxil, &container);
+    if !lock(seen).insert(key) {
         t.duplicates += 1;
         return;
     }
@@ -412,6 +413,25 @@ fn translate(
             }
         }
     }
+}
+
+/// DXIL alone leaves out signatures and the mesh runtime info, which can
+/// change what the same native program emits. Frame every part so a missing
+/// part, an empty part, and the same bytes in another part stay distinct.
+fn translation_key(dxil: &[u8], container: &Container<'_>) -> blake3::Hash {
+    let mut hash = blake3::Hasher::new();
+    for part in std::iter::once(Some(dxil)).chain(emit::emission_metadata(container)) {
+        match part {
+            Some(data) => {
+                hash.update(&(data.len() as u64).to_le_bytes());
+                hash.update(data);
+            }
+            None => {
+                hash.update(&u64::MAX.to_le_bytes());
+            }
+        }
+    }
+    hash.finalize()
 }
 
 /// Validates an emitted shader if asked to.
@@ -668,4 +688,39 @@ fn tally_structured(program: &ir::Program, s: &structure::Structured, t: &mut Ta
 
 fn lock<T>(m: &Mutex<T>) -> std::sync::MutexGuard<'_, T> {
     m.lock().unwrap_or_else(|e| e.into_inner())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn key(parts: &[(FourCC, &[u8])]) -> blake3::Hash {
+        let mut bytes = vec![0; 32 + 4 * parts.len()];
+        bytes[..4].copy_from_slice(b"DXBC");
+        bytes[28..32].copy_from_slice(&(parts.len() as u32).to_le_bytes());
+        for (i, (kind, data)) in parts.iter().enumerate() {
+            let offset = bytes.len() as u32;
+            bytes[32 + 4 * i..36 + 4 * i].copy_from_slice(&offset.to_le_bytes());
+            bytes.extend_from_slice(&kind.0);
+            bytes.extend_from_slice(&(data.len() as u32).to_le_bytes());
+            bytes.extend_from_slice(data);
+        }
+        let size = bytes.len() as u32;
+        bytes[24..28].copy_from_slice(&size.to_le_bytes());
+        let container = Container::parse(&bytes).unwrap();
+        translation_key(container.part(FourCC::DXIL).unwrap().data, &container)
+    }
+
+    #[test]
+    fn deduplication_includes_signature_and_runtime_parts() {
+        let code = (FourCC::DXIL, &[1, 2, 3][..]);
+        let output = (FourCC::OSG1, &[4, 5][..]);
+        let baseline = key(&[code, output]);
+        assert_eq!(baseline, key(&[output, (FourCC::HASH, &[9; 20]), code]));
+        assert_ne!(baseline, key(&[code, (FourCC::OSG1, &[4, 6])]));
+        assert_ne!(baseline, key(&[code, (FourCC::ISG1, output.1)]));
+        assert_ne!(baseline, key(&[code, output, (FourCC::PSG1, &[])]));
+        assert_ne!(baseline, key(&[code, output, (FourCC::PSV0, &[0; 48])]));
+        assert_ne!(baseline, key(&[code, (FourCC::OSG1, &[4, 5, 0])]));
+    }
 }
