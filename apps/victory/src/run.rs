@@ -11,10 +11,15 @@ pub fn run(
     strict: bool,
     execute: bool,
     console: Console,
+    title_args: &[String],
 ) -> Result<()> {
     use std::sync::Arc;
     use victory_hle::{HleResolver, HostPolicy};
     use victory_loader::{BindReport, UnimplementedPolicy, WithTitleDlls};
+
+    if !title_args.is_empty() {
+        println!("title args     {}", title_args.join(" "));
+    }
 
     // A title that relaunched itself: the old process must be gone first.
     victory_hle::modules::lifecycle::wait_for_previous();
@@ -333,6 +338,6 @@ mod tests {
 }
 
 #[cfg(not(windows))]
-pub fn run(_: &Path, _: Unimplemented, _: bool, _: bool, _: Console) -> Result<()> {
+pub fn run(_: &Path, _: Unimplemented, _: bool, _: bool, _: Console, _: &[String]) -> Result<()> {
     anyhow::bail!("running titles requires Windows")
 }
