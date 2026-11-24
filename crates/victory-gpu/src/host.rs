@@ -590,10 +590,12 @@ impl Host {
                 }
             }
         }
-        for (shadow, address, len) in &back {
-            let (address, len) = (*address, *len);
-            let written = shadow.copy_back(address, len);
-            COPY_BACK[1].fetch_add(written as u64, Ordering::Relaxed);
+        if !back.is_empty() {
+            let mut title = vec![0; crate::watch::PAGE];
+            for (shadow, address, len) in &back {
+                let written = shadow.copy_back(*address, *len, &mut title);
+                COPY_BACK[1].fetch_add(written as u64, Ordering::Relaxed);
+            }
         }
         COPY_BACK[0].fetch_add(copying.elapsed().as_micros() as u64, Ordering::Relaxed);
         for list in runs {
@@ -1459,6 +1461,8 @@ struct Presenter {
     copy: HostList,
     hwnd: HWND,
     meter: Meter,
+    #[cfg(feature = "diagnostics")]
+    probe_readback: Option<ID3D12Resource>,
 }
 
 /// The frame rate, shown in the window's caption every second and logged
@@ -1633,7 +1637,7 @@ impl Host {
                 .then(|| crate::capture::read_back(&self.device, list, texture))
                 .flatten();
             #[cfg(feature = "diagnostics")]
-            let probe = crate::capture::probe(&self.device, list, texture);
+            let probe = crate::capture::probe(&self.device, list, texture, &mut p.probe_readback);
             #[cfg(not(feature = "diagnostics"))]
             let _ = frame;
             list.ResourceBarrier(&[
@@ -1653,7 +1657,7 @@ impl Host {
             let _ = p.swap_chain.Present(0, DXGI_PRESENT(0));
             p.meter.frame(p.hwnd);
             #[cfg(feature = "diagnostics")]
-            return Some(probe.is_some_and(|b| crate::capture::black(&b)));
+            return Some(probe.is_some_and(crate::capture::black));
             #[cfg(not(feature = "diagnostics"))]
             Some(false)
         }
@@ -1699,6 +1703,8 @@ impl Host {
                 copy,
                 hwnd,
                 meter: Meter::new(),
+                #[cfg(feature = "diagnostics")]
+                probe_readback: None,
             })
         }
     }

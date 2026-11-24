@@ -186,8 +186,8 @@ impl Shadow {
     /// command memory shares the big GPU heap with what shaders write), and
     /// putting back the copy's older bytes there broke the title's own
     /// records (a fence list read as -1, title+0x4e9b54a). Returns the bytes
-    /// written.
-    pub(crate) fn copy_back(&self, address: usize, len: usize) -> usize {
+    /// written. `title` provides `PAGE` bytes of scratch space.
+    pub(crate) fn copy_back(&self, address: usize, len: usize, title: &mut [u8]) -> usize {
         let mut snapshot = self.before.lock().unwrap_or_else(|e| e.into_inner());
         let mut written = 0;
         let (from, to) = self.inside(address, len);
@@ -200,29 +200,17 @@ impl Shadow {
             let before = &before[from - taken..to - taken];
             // By 64 KiB piece: the copy compared with its bytes before the
             // submission, title memory read only where the GPU wrote.
-            const PIECE: usize = 64 << 10;
-            let mut title = vec![0u8; PIECE];
             let mut synced = Vec::new();
             let mut at = from;
             while at < to {
-                let n = (PIECE - (start + at) % PIECE).min(to - at);
+                let n = (PAGE - (start + at) % PAGE).min(to - at);
                 // SAFETY: inside the mapping; only the submitting thread
                 // writes it.
                 let host = unsafe { std::slice::from_raw_parts_mut(self.data.add(at), n) };
                 let old = &before[at - from..at - from + n];
                 let title = &mut title[..n];
                 if host != old && crate::host::read_into((start + at) as *const u8, title) {
-                    // Title memory with the GPU's bytes put in; the copy
-                    // takes the title's bytes in turn.
-                    let mut changed = false;
-                    for ((t, h), o) in title.iter_mut().zip(host.iter_mut()).zip(old) {
-                        if *h != *o && *t != *h {
-                            *t = *h;
-                            changed = true;
-                        }
-                        *h = *t;
-                    }
-                    if changed {
+                    if merge_copy_back(title, host, old) {
                         crate::watch::writing(start + at, n);
                         crate::host::write_mapped((start + at) as *mut u8, title.as_ptr(), n);
                         written += n;
@@ -365,6 +353,20 @@ impl Shadow {
     }
 }
 
+/// Apply the GPU's bytes where they differ from the snapshot, retaining
+/// the title's bytes elsewhere. Report whether title memory needs a write.
+fn merge_copy_back(title: &mut [u8], host: &mut [u8], before: &[u8]) -> bool {
+    let mut changed = 0u8;
+    // Store both scratch slices uniformly so LLVM can vectorize the merge.
+    for ((t, h), old) in title.iter_mut().zip(host.iter_mut()).zip(before) {
+        let merged = if *h != *old { *h } else { *t };
+        changed |= *t ^ merged;
+        *t = merged;
+        *h = merged;
+    }
+    changed != 0
+}
+
 struct Entry {
     end: u64,
     shadow: Option<Arc<Shadow>>,
@@ -496,4 +498,39 @@ pub(crate) fn near(va: u64) -> String {
         ));
     }
     text
+}
+
+#[cfg(test)]
+mod tests {
+    use super::merge_copy_back;
+
+    #[test]
+    fn copy_back_merge_prefers_gpu_changes_and_retains_title_edits() {
+        let values = [0, 1, 0x7f, 0x80, 0xff];
+        let (mut title, mut host, mut before, mut expected) =
+            (Vec::new(), Vec::new(), Vec::new(), Vec::new());
+        for old in values {
+            for gpu in values {
+                for cpu in values {
+                    title.push(cpu);
+                    host.push(gpu);
+                    before.push(old);
+                    expected.push(if gpu == old { cpu } else { gpu });
+                }
+            }
+        }
+        assert!(merge_copy_back(&mut title, &mut host, &before));
+        assert_eq!(title, expected);
+        assert_eq!(host, expected);
+    }
+
+    #[test]
+    fn copy_back_merge_skips_title_write_when_it_already_has_the_merged_bytes() {
+        let before = [0, 10, 20];
+        let mut title = [1, 11, 20];
+        let mut host = [0, 11, 20];
+        assert!(!merge_copy_back(&mut title, &mut host, &before));
+        assert_eq!(title, [1, 11, 20]);
+        assert_eq!(host, title);
+    }
 }

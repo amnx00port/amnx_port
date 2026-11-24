@@ -8,7 +8,8 @@
 //! "Changed" means a page of the memory was written since the last detiling
 //! ([`crate::watch`]), in write-watched memory; in physical-page views,
 //! which cannot be watched, a content hash of the whole memory at every
-//! submission that samples it.
+//! submission that samples it. A repeatedly changing texture bypasses the
+//! hash for a short burst of full refreshes, then resumes checking.
 //!
 //! shortcut: a change detiles the whole texture, not the pages written.
 //! Only textures read through descriptor tables are brought up to date
@@ -47,14 +48,57 @@ pub(crate) struct Staging {
     last: Mutex<Last>,
 }
 
-/// What a texture's staging buffer holds: the hash of the memory detiled
-/// (memory not watched), or the write-watch asking it was detiled after,
-/// with room to read the memory into.
+/// What a texture's staging buffer holds: its last observed write-watch
+/// state or an unwatched snapshot, with room to read the memory into.
 #[derive(Default)]
 struct Last {
-    hash: Option<blake3::Hash>,
+    unwatched: Unwatched,
     asked: u64,
     read: Vec<u8>,
+}
+
+const CHANGES_BEFORE_BYPASS: u8 = 4;
+const BYPASS_REFRESHES: u8 = 8;
+
+/// Repeatedly rewritten textures, such as movie frames, gain nothing from
+/// hashing each upload. Periodically check again in case the texture settles.
+#[derive(Default)]
+struct Unwatched {
+    hash: Option<blake3::Hash>,
+    changes: u8,
+    bypass_left: u8,
+}
+
+#[derive(Debug, PartialEq, Eq)]
+enum UnwatchedUpdate {
+    Reuse,
+    HashedDetile,
+    UnhashedDetile,
+}
+
+impl Unwatched {
+    fn update(&mut self, tiled: &[u8]) -> UnwatchedUpdate {
+        if self.bypass_left != 0 {
+            self.bypass_left -= 1;
+            // Staging will contain unmeasured data, regardless of the old digest.
+            self.hash = None;
+            return UnwatchedUpdate::UnhashedDetile;
+        }
+        let hash = blake3::hash(tiled);
+        let previous = self.hash.replace(hash);
+        if previous == Some(hash) {
+            self.changes = 0;
+            return UnwatchedUpdate::Reuse;
+        }
+        if previous.is_some() {
+            self.changes += 1;
+            if self.changes == CHANGES_BEFORE_BYPASS {
+                self.changes = 0;
+                self.bypass_left = BYPASS_REFRESHES;
+            }
+        }
+        UnwatchedUpdate::HashedDetile
+    }
 }
 
 // SAFETY: the staging mapping is written only at submission, under
@@ -192,6 +236,7 @@ impl Staging {
                 return 0;
             }
             last.asked = now;
+            last.unwatched = Unwatched::default();
             // Read through the copy, which stands unmapped pages: memory of
             // big pools is too slow to ask page by page.
             last.read.resize(size, 0);
@@ -213,23 +258,33 @@ impl Staging {
         }
         // SAFETY: committed memory of the texture's layout size.
         let tiled = unsafe { std::slice::from_raw_parts(self.memory, size) };
-        let hash = blake3::hash(tiled);
+        // The next watched upload must establish a fresh watch epoch.
+        last.asked = 0;
+        let update = last.unwatched.update(tiled);
         #[cfg(feature = "diagnostics")]
-        crate::copystat::add(crate::copystat::C::TexHashed, size as u64);
-        if last.hash == Some(hash) {
-            return size;
+        if update != UnwatchedUpdate::UnhashedDetile {
+            crate::copystat::add(crate::copystat::C::TexHashed, size as u64);
         }
-        last.hash = Some(hash);
-        self.detile(tiled);
-        #[cfg(feature = "diagnostics")]
-        crate::copystat::add(crate::copystat::C::TexChanged, size as u64);
+        if update != UnwatchedUpdate::Reuse {
+            self.detile(tiled);
+            #[cfg(feature = "diagnostics")]
+            {
+                use crate::copystat::{C, add};
+                let counter = if update == UnwatchedUpdate::UnhashedDetile {
+                    C::TexBypassed
+                } else {
+                    C::TexChanged
+                };
+                add(counter, size as u64);
+            }
+        }
         size
     }
 
     /// Detiles `tiled` (the texture's memory) into the staging buffer.
     fn detile(&self, tiled: &[u8]) {
         #[cfg(feature = "diagnostics")]
-        if tiled.iter().all(|&b| b == 0) {
+        if tracing::enabled!(tracing::Level::DEBUG) && tiled.iter().all(|&b| b == 0) {
             tracing::debug!(
                 memory = ?self.memory,
                 desc = ?self.layout.desc,
@@ -341,4 +396,33 @@ fn staging(resource: This, texture: &ID3D12Resource) -> Option<Arc<Staging>> {
     });
     map.insert(resource as usize, s.clone());
     Some(s)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{BYPASS_REFRESHES, CHANGES_BEFORE_BYPASS, Unwatched, UnwatchedUpdate::*};
+
+    #[test]
+    fn continuously_rewritten_texture_resumes_hash_checks_after_a_bounded_burst() {
+        let mut state = Unwatched::default();
+        for value in 0..=CHANGES_BEFORE_BYPASS {
+            assert_eq!(state.update(&[value]), HashedDetile);
+        }
+        for _ in 0..BYPASS_REFRESHES {
+            assert_eq!(state.update(&[0xff]), UnhashedDetile);
+        }
+        let old_content = [CHANGES_BEFORE_BYPASS];
+        // A digest from before the burst cannot describe the current staging bytes.
+        assert_eq!(state.update(&old_content), HashedDetile);
+        assert_eq!(state.update(&old_content), Reuse);
+    }
+
+    #[test]
+    fn unchanged_snapshot_interrupts_the_streak() {
+        let mut state = Unwatched::default();
+        for value in 0..=CHANGES_BEFORE_BYPASS + BYPASS_REFRESHES {
+            assert_eq!(state.update(&[value]), HashedDetile);
+            assert_eq!(state.update(&[value]), Reuse);
+        }
+    }
 }

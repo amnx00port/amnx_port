@@ -87,9 +87,15 @@ pub(crate) fn writes(start: usize, end: usize, guarded: bool) -> Option<(u64, Ve
     }
     j.asked += 1;
     let now = j.asked;
-    let pages = j.found[..count].iter().map(|&at| at / PAGE).chain(guarded);
-    for page in pages.collect::<Vec<_>>() {
-        j.written.insert(page, now);
+    let Journal { found, written, .. } = j;
+    // Several 4 KiB dirty addresses can refer to the same 64 KiB page.
+    // Repeated entries outside a run are harmless even if the kernel's
+    // list is not sorted.
+    let mut previous = None;
+    for page in found[..count].iter().map(|&at| at / PAGE).chain(guarded) {
+        if previous.replace(page) != Some(page) {
+            written.insert(page, now);
+        }
     }
     Some((
         now,
@@ -304,8 +310,12 @@ mod tests {
         let (start, end) = (p, p + 4 * PAGE);
         let (_, before) = writes(start, end, false).expect("watched");
         assert!(before.is_empty());
+        // Two kernel pages fall within the same title page.
         // SAFETY: committed pages of ours.
-        unsafe { ((p + PAGE + 8) as *mut u8).write(1) };
+        unsafe {
+            ((p + PAGE + 8) as *mut u8).write(1);
+            ((p + PAGE + KERNEL_PAGE + 8) as *mut u8).write(2);
+        }
         let (now, after) = writes(start, end, false).expect("watched");
         assert_eq!(after, [(p / PAGE + 1, now)]);
         // Another asker after the kernel's bit was cleared still sees it.
