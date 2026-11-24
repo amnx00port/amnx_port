@@ -332,3 +332,54 @@ fn lanes_sample_after_vgpr_swap_and_word_extract() {
         assert_eq!(red, want, "{label}");
     }
 }
+
+#[test]
+fn lanes_sample_joined_sampler_with_dead_non_descriptor_arm() {
+    use crate::resource::tests::foliage_joined_sampler_shader;
+    let words = foliage_joined_sampler_shader(&[
+        0x0218_250C, // v_cndmask_b32 v12, v12, v18, vcc_lo
+        0xE070_1000,
+        0x800A_0C10, // buffer_store_dword v12, v16, s[40:43], 0 offen
+        0xBF81_0000, // s_endpgm
+    ]);
+    let shader = build(&words, false);
+    let tex = [[1.0f32, 0.0, 0.0, 1.0], [2.0f32, 0.0, 0.0, 1.0]];
+    let views = [
+        View::Texture(2, 1, &tex),
+        View::Texture(2, 1, &tex),
+        View::RawUav(32),
+    ];
+    let sampler = |addr| D3D12_SAMPLER_DESC {
+        Filter: D3D12_FILTER_MIN_MAG_MIP_POINT,
+        AddressU: addr,
+        AddressV: D3D12_TEXTURE_ADDRESS_MODE_CLAMP,
+        AddressW: D3D12_TEXTURE_ADDRESS_MODE_CLAMP,
+        MaxAnisotropy: 1,
+        MaxLOD: f32::MAX,
+        ..Default::default()
+    };
+    let wrap = sampler(D3D12_TEXTURE_ADDRESS_MODE_WRAP);
+    let clamp = sampler(D3D12_TEXTURE_ADDRESS_MODE_CLAMP);
+
+    for (swapped, samplers) in [(false, [wrap, clamp]), (true, [clamp, wrap])] {
+        let results = run_with_samplers(&shader, &views, &samplers);
+        assert!(!results.is_empty());
+        // Lanes < 16 never consume the sample and output their pre-split float
+        // lane index (v4); lanes >= 16 output the sampled pixel from sampler 1.
+        let want: Vec<f32> = (0..32)
+            .map(|l| {
+                if l < 16 {
+                    l as f32
+                } else if swapped {
+                    1.0
+                } else {
+                    2.0
+                }
+            })
+            .collect();
+        for (label, words) in results {
+            let red: Vec<f32> = words.into_iter().map(f32::from_bits).collect();
+            assert_eq!(red, want, "{label}, swapped {swapped}");
+        }
+    }
+}

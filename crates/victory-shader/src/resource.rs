@@ -12,6 +12,7 @@
 //! memory address is traced through the SSA values back to those
 //! parameters, by data flow: copies, phis that agree, and additions.
 
+use std::cell::OnceCell;
 use std::collections::HashMap;
 
 use crate::ShaderError;
@@ -181,7 +182,7 @@ pub fn track(
             let mut first_lane = Vec::new();
             let mut offset = Vec::new();
             let mut descriptor = |op: &Operand, role| -> Result<(), ShaderError> {
-                let source = t.descriptor(inst, op, b).map_err(fail)?;
+                let source = t.descriptor(inst, op, site).map_err(fail)?;
                 first_lane.extend(t.first_lane_words(inst, op).unwrap_or_default());
                 if let Source::Loaded { load, .. } = source
                     && let Some((_, a)) = out.scalar.iter().find(|s| s.0 == load)
@@ -287,6 +288,19 @@ struct Sum {
     dynamic: Option<Value>,
 }
 
+#[derive(Clone, Copy)]
+enum UseSite {
+    Phi {
+        block: usize,
+        pred_idx: usize,
+        phi_idx: usize,
+    },
+    Inst {
+        block: usize,
+        inst_idx: usize,
+    },
+}
+
 struct Tracer<'a> {
     p: &'a Program,
     layout: &'a [RootParam],
@@ -301,6 +315,8 @@ struct Tracer<'a> {
     lanes: Option<&'a Structured>,
     /// Reverse-postorder index per block.
     rpo: Vec<usize>,
+    /// SSA uses per value, built lazily when a partial per-lane join checks deadness.
+    uses: OnceCell<Vec<Vec<UseSite>>>,
 }
 
 /// What lanes are known to satisfy: each [`Bool`] where its flag is set,
@@ -309,6 +325,7 @@ type Known = Vec<(Bool, bool)>;
 
 const MAX_ROUNDS: usize = 64;
 const MAX_JOINS: usize = 8;
+const MAX_TAINT_STATES: usize = 512;
 
 impl<'a> Tracer<'a> {
     fn new(
@@ -362,6 +379,7 @@ impl<'a> Tracer<'a> {
             origin: Vec::new(),
             lanes,
             rpo,
+            uses: OnceCell::new(),
         };
         t.origin = t.propagate_copies(n)?;
         Ok(t)
@@ -765,8 +783,8 @@ impl<'a> Tracer<'a> {
         self.address(lo, hi, extra)
     }
 
-    /// The source of the descriptor operand `op` of `inst`, in block `at`.
-    fn descriptor(&self, inst: &Inst, op: &Operand, at: usize) -> Result<Source, &'static str> {
+    /// The source of the descriptor operand `op` of `inst`, at `site`.
+    fn descriptor(&self, inst: &Inst, op: &Operand, site: Site) -> Result<Source, &'static str> {
         let Operand::Scalar { code, dwords } = *op else {
             return Err("a descriptor not in SGPRs");
         };
@@ -775,22 +793,23 @@ impl<'a> Tracer<'a> {
             .collect::<Option<Vec<_>>>()
             .ok_or("a descriptor not in SGPRs")?;
         // Only the lanes that reach the access read the descriptor.
-        let mut known = Vec::from_iter(self.lanes.map(|l| (l.reach[at], true)));
-        self.classify(&words, &mut Vec::new(), &mut known)
+        let mut known = Vec::from_iter(self.lanes.map(|l| (l.reach[site.0], true)));
+        self.classify(site, &words, &mut Vec::new(), &mut known)
     }
 
     /// The source of a descriptor's words; `joins` are the phi blocks
     /// being resolved, `known` holds in every lane that reads them.
     fn classify(
         &self,
+        site: Site,
         words: &[Term],
         joins: &mut Vec<usize>,
         known: &mut Known,
     ) -> Result<Source, &'static str> {
-        if let Some(source) = self.phi(words, joins, known)? {
+        if let Some(source) = self.phi(site, words, joins, known)? {
             return Ok(source);
         }
-        if let Some(source) = self.select(words, joins, known)? {
+        if let Some(source) = self.select(site, words, joins, known)? {
             return Ok(source);
         }
         let read = |w: &Term| match *w {
@@ -801,7 +820,7 @@ impl<'a> Tracer<'a> {
             // Read from the first active lane, as a waterfall loop does: the
             // dwords each lane holds.
             let lanes: Vec<Term> = sources.into_iter().map(Term::Value).collect();
-            return self.per_lane(&lanes, joins, known);
+            return self.per_lane(site, &lanes, joins, known);
         }
         if words.iter().any(|w| read(w).is_some()) {
             return Err("a descriptor partly read from the first lane");
@@ -856,6 +875,7 @@ impl<'a> Tracer<'a> {
     /// defined before the join hold on every edge).
     fn phi(
         &self,
+        site: Site,
         words: &[Term],
         joins: &mut Vec<usize>,
         known: &mut Known,
@@ -888,7 +908,7 @@ impl<'a> Tracer<'a> {
                         None => *w,
                     })
                     .collect();
-                self.classify(&edge, joins, known)
+                self.classify(site, &edge, joins, known)
             })
             .collect::<Result<_, _>>();
         joins.pop();
@@ -899,6 +919,7 @@ impl<'a> Tracer<'a> {
     /// per outcome (other words are the same for both).
     fn select(
         &self,
+        site: Site,
         words: &[Term],
         joins: &mut Vec<usize>,
         known: &mut Known,
@@ -940,7 +961,7 @@ impl<'a> Tracer<'a> {
         };
         let args = [true, false]
             .into_iter()
-            .map(|set| self.classify(&side(set), joins, known))
+            .map(|set| self.classify(site, &side(set), joins, known))
             .collect::<Result<_, _>>();
         joins.pop();
         Ok(Some(Source::Select { scc, args: args? }))
@@ -1800,6 +1821,7 @@ impl<'a> Tracer<'a> {
     /// the lane took. `known` holds in every lane that accesses them.
     fn per_lane(
         &self,
+        site: Site,
         words: &[Term],
         joins: &mut Vec<usize>,
         known: &mut Known,
@@ -1810,15 +1832,15 @@ impl<'a> Tracer<'a> {
             .collect::<Result<Vec<_>, _>>()?;
         let words = &words[..];
         let Some(&lane) = words.iter().find(|&&w| self.varies(w)) else {
-            return self.classify(words, joins, known);
+            return self.classify(site, words, joins, known);
         };
         if let Some(source) = self.fetched(words, known)? {
             return Ok(source);
         }
-        if let Some(source) = self.lane_select(words, joins, known)? {
+        if let Some(source) = self.lane_select(site, words, joins, known)? {
             return Ok(source);
         }
-        if let Some(source) = self.lane_phi(words, joins, known)? {
+        if let Some(source) = self.lane_phi(site, words, joins, known)? {
             return Ok(source);
         }
         let Term::Value(v) = lane else { unreachable!() };
@@ -1897,6 +1919,7 @@ impl<'a> Tracer<'a> {
     /// (other words are the same for both).
     fn lane_select(
         &self,
+        site: Site,
         words: &[Term],
         joins: &mut Vec<usize>,
         known: &mut Known,
@@ -1920,9 +1943,9 @@ impl<'a> Tracer<'a> {
         }
         for (w, p) in words.iter().zip(&picks) {
             if let (Term::Value(v), Some(_)) = (*w, p)
-                && let Some(site) = self.defs[v.0 as usize]
+                && let Some(def_site) = self.defs[v.0 as usize]
             {
-                self.runs(site, known)?;
+                self.runs(def_site, known)?;
             }
         }
         let bit = self.lanes.and_then(|l| l.masks.get(&mask).copied());
@@ -1946,7 +1969,7 @@ impl<'a> Tracer<'a> {
             let t_ok = self.feasible_with(known, &[(b, true)]);
             let f_ok = self.feasible_with(known, &[(b, false)]);
             if t_ok != f_ok {
-                return self.per_lane(&side(t_ok), joins, known).map(Some);
+                return self.per_lane(site, &side(t_ok), joins, known).map(Some);
             }
         }
         if joins.len() >= MAX_JOINS {
@@ -1954,18 +1977,41 @@ impl<'a> Tracer<'a> {
         }
         joins.push(usize::MAX);
         // Each side holds where the lane's bit of the mask is set, or clear.
-        let args = [true, false]
-            .into_iter()
-            .map(|set| {
-                let n = known.len();
-                known.extend(bit.map(|b| (b, set)));
-                let arg = self.per_lane(&side(set), joins, known);
-                known.truncate(n);
-                arg
-            })
-            .collect::<Result<_, _>>();
+        let mut results = [true, false].into_iter().map(|set| {
+            let n = known.len();
+            known.extend(bit.map(|b| (b, set)));
+            let arg = self.per_lane(site, &side(set), joins, known);
+            known.truncate(n);
+            arg
+        });
+        let t_res = results.next().unwrap();
+        let f_res = results.next().unwrap();
         joins.pop();
-        Ok(Some(Source::Lanes { mask, args: args? }))
+        match (t_res, f_res) {
+            (Ok(t_src), Ok(f_src)) => Ok(Some(Source::Lanes {
+                mask,
+                args: vec![t_src, f_src],
+            })),
+            (Ok(good_src), Err(err)) => {
+                if let Some(b) = bit
+                    && self.dead_for_bad_lanes(site, known, &[(b, false)])
+                {
+                    Ok(Some(good_src))
+                } else {
+                    Err(err)
+                }
+            }
+            (Err(err), Ok(good_src)) => {
+                if let Some(b) = bit
+                    && self.dead_for_bad_lanes(site, known, &[(b, true)])
+                {
+                    Ok(Some(good_src))
+                } else {
+                    Err(err)
+                }
+            }
+            (Err(err), Err(_)) => Err(err),
+        }
     }
 
     /// For `v` written by a plain `v_cndmask_b32`: the low dword of the
@@ -2016,6 +2062,7 @@ impl<'a> Tracer<'a> {
     /// arm held before, which only they read).
     fn lane_phi(
         &self,
+        site: Site,
         words: &[Term],
         joins: &mut Vec<usize>,
         known: &mut Known,
@@ -2058,7 +2105,8 @@ impl<'a> Tracer<'a> {
         }
         joins.push(block);
         let phis = &self.p.blocks[block].phis;
-        let mut args = Vec::new();
+        let mut results: Vec<(Result<Option<Source>, &'static str>, Known)> =
+            Vec::with_capacity(preds.len());
         for (j, &q) in preds.iter().enumerate() {
             let n = known.len();
             known.push((lanes.reach[q], true));
@@ -2071,6 +2119,7 @@ impl<'a> Tracer<'a> {
             {
                 known.push((when, taken == block));
             }
+            let edge_cond = known[n..].to_vec();
             let arg = if self.feasible(known) {
                 let edge: Vec<Term> = words
                     .iter()
@@ -2079,21 +2128,474 @@ impl<'a> Tracer<'a> {
                         None => *w,
                     })
                     .collect();
-                self.per_lane(&edge, joins, known).map(Some)
+                self.per_lane(site, &edge, joins, known).map(Some)
             } else {
                 Ok(None)
             };
             known.truncate(n);
-            match arg {
+            results.push((arg, edge_cond));
+        }
+        joins.pop();
+        let has_valid = results.iter().any(|(r, _)| matches!(r, Ok(Some(_))));
+        let mut args = Vec::with_capacity(results.len());
+        let mut first_err = None;
+        for (res, edge_cond) in results {
+            match res {
                 Ok(a) => args.push(a),
                 Err(e) => {
-                    joins.pop();
-                    return Err(e);
+                    if has_valid
+                        && first_err.is_none()
+                        && self.dead_for_bad_lanes(site, known, &edge_cond)
+                    {
+                        args.push(None);
+                    } else {
+                        first_err.get_or_insert(e);
+                    }
                 }
             }
         }
-        joins.pop();
+        if let Some(e) = first_err {
+            return Err(e);
+        }
         Ok(Some(Source::LanePhi { block, args }))
+    }
+
+    fn uses(&self) -> &[Vec<UseSite>] {
+        self.uses.get_or_init(|| {
+            let mut uses = vec![Vec::new(); self.defs.len()];
+            for (block, b) in self.p.blocks.iter().enumerate() {
+                for (phi_idx, phi) in b.phis.iter().enumerate() {
+                    for (pred_idx, &arg) in phi.args.iter().enumerate() {
+                        uses[arg.0 as usize].push(UseSite::Phi {
+                            block,
+                            pred_idx,
+                            phi_idx,
+                        });
+                    }
+                }
+                for (inst_idx, inst) in b.insts.iter().enumerate() {
+                    for &(_, v) in &inst.reads {
+                        let list = &mut uses[v.0 as usize];
+                        if !matches!(
+                            list.last(),
+                            Some(&UseSite::Inst { block: pb, inst_idx: pi })
+                                if pb == block && pi == inst_idx
+                        ) {
+                            list.push(UseSite::Inst { block, inst_idx });
+                        }
+                    }
+                }
+            }
+            uses
+        })
+    }
+
+    fn bool_born_before(&self, b: Bool, header_rpo: usize) -> bool {
+        let Some(lanes) = self.lanes else {
+            return false;
+        };
+        lanes.bools.support(b).into_iter().all(|atom| {
+            let born_rpo = match atom {
+                Atom::Constant(_) => 0,
+                Atom::Lane(v)
+                | Atom::Uniform(v)
+                | Atom::Phi(v)
+                | Atom::Quad(v)
+                | Atom::Opaque(v) => {
+                    if self.inputs[v.0 as usize].is_some() {
+                        0
+                    } else if let Some((db, _)) = self.defs[v.0 as usize] {
+                        self.rpo[db]
+                    } else if let Some((pb, _)) = self.phis[v.0 as usize] {
+                        self.rpo[pb]
+                    } else {
+                        return false;
+                    }
+                }
+            };
+            born_rpo < header_rpo
+        })
+    }
+
+    fn cndmask_bool(&self, inst: &Inst, mask_op: &Operand, lanes: &Structured) -> Option<Bool> {
+        let Operand::Scalar { code, .. } = *mask_op else {
+            return None;
+        };
+        if code == NULL {
+            return Some(Bool::FALSE);
+        }
+        let lo = inst.read(Reg::S(code))?;
+        let hi = if self.p.wave64 {
+            Some(inst.read(Reg::S(code + 1))?)
+        } else {
+            None
+        };
+        lanes.mask_bits(lo, hi)
+    }
+
+    fn cndmask_const(&self, mask_op: &Operand) -> Option<bool> {
+        match *mask_op {
+            Operand::Scalar { code: NULL, .. } | Operand::Const(128) | Operand::Literal(0) => {
+                Some(false)
+            }
+            Operand::Const(193) => Some(true),
+            Operand::Literal(u32::MAX) if !self.p.wave64 => Some(true),
+            _ => None,
+        }
+    }
+
+    /// Proves that the VGPR outputs of the pure read/sample at `site` are never
+    /// consumed by any lane satisfying `known` extended with `extra`.
+    fn dead_for_bad_lanes(
+        &self,
+        site: Site,
+        known: &[(Bool, bool)],
+        extra: &[(Bool, bool)],
+    ) -> bool {
+        let Some(lanes) = self.lanes else {
+            return false;
+        };
+        let inst = self.inst(site);
+        let is_pure_read = match &inst.fields {
+            Fields::Image { tfe, lwe, .. } => {
+                !*tfe
+                    && !*lwe
+                    && !inst.name().contains("_store")
+                    && !inst.name().contains("_atomic_")
+            }
+            Fields::Buffer { lds, tfe, .. } => {
+                !*lds
+                    && !*tfe
+                    && !inst.name().contains("_store_")
+                    && !inst.name().contains("_atomic_")
+            }
+            _ => false,
+        };
+        if !is_pure_read
+            || inst.writes.is_empty()
+            || inst.writes.iter().any(|w| !matches!(w.0, Reg::V(_)))
+        {
+            return false;
+        }
+        let Some(bad_known) = extend_known(&[], known.iter().chain(extra).copied()) else {
+            return true;
+        };
+        if !self.feasible(&bad_known) {
+            return true;
+        }
+
+        let uses = self.uses();
+        let mut visited: HashMap<Value, Vec<Known>> = HashMap::new();
+        let mut worklist: Vec<(Value, Known)> = Vec::new();
+        let mut states = 0usize;
+
+        let push = |v: Value,
+                    cond: Known,
+                    visited: &mut HashMap<Value, Vec<Known>>,
+                    worklist: &mut Vec<(Value, Known)>,
+                    states: &mut usize|
+         -> bool {
+            if !self.feasible(&cond) {
+                return true;
+            }
+            let seen = visited.entry(v).or_default();
+            if seen
+                .iter()
+                .any(|prev| prev.iter().all(|item| cond.contains(item)))
+            {
+                return true;
+            }
+            *states += 1;
+            if *states > MAX_TAINT_STATES {
+                return false;
+            }
+            seen.push(cond.clone());
+            worklist.push((v, cond));
+            true
+        };
+
+        for &(_, v) in &inst.writes {
+            if !push(
+                v,
+                bad_known.clone(),
+                &mut visited,
+                &mut worklist,
+                &mut states,
+            ) {
+                return false;
+            }
+        }
+
+        while let Some((v, cond)) = worklist.pop() {
+            for &use_site in &uses[v.0 as usize] {
+                match use_site {
+                    UseSite::Phi {
+                        block,
+                        pred_idx,
+                        phi_idx,
+                    } => {
+                        let phi = &self.p.blocks[block].phis[phi_idx];
+                        if !matches!(phi.reg, Reg::V(_)) {
+                            return false;
+                        }
+                        let q = self.p.blocks[block].preds[pred_idx];
+                        let next_cond = if self.rpo[q] >= self.rpo[block] {
+                            // Backedge: the condition must be loop-invariant so lane
+                            // membership cannot change across iterations.
+                            if !cond
+                                .iter()
+                                .all(|&(b, _)| self.bool_born_before(b, self.rpo[block]))
+                            {
+                                return false;
+                            }
+                            extend_known(&cond, [(lanes.reach[block], true)])
+                        } else {
+                            let branch = match lanes.exits[q] {
+                                LaneExit::Branch {
+                                    when,
+                                    taken,
+                                    not_taken,
+                                } if taken != not_taken => Some((when, taken == block)),
+                                _ => None,
+                            };
+                            extend_known(
+                                &cond,
+                                [(lanes.reach[q], true), (lanes.reach[block], true)]
+                                    .into_iter()
+                                    .chain(branch),
+                            )
+                        };
+                        if let Some(next_cond) = next_cond
+                            && !push(
+                                phi.value,
+                                next_cond,
+                                &mut visited,
+                                &mut worklist,
+                                &mut states,
+                            )
+                        {
+                            return false;
+                        }
+                    }
+                    UseSite::Inst {
+                        block: bu,
+                        inst_idx: iu,
+                    } => {
+                        let Some(reach_cond) = extend_known(&cond, [(lanes.reach[bu], true)])
+                        else {
+                            continue;
+                        };
+                        if !self.feasible(&reach_cond) {
+                            continue;
+                        }
+                        let u_inst = &self.p.blocks[bu].insts[iu];
+                        let guard = lanes.guards[bu][iu];
+
+                        // Disabled lanes skip the instruction and keep destination VGPRs' old values.
+                        if let Some(g) = guard
+                            && let Some(skip_cond) = extend_known(&reach_cond, [(g, false)])
+                            && self.feasible(&skip_cond)
+                        {
+                            for &(w_reg, w_val) in &u_inst.writes {
+                                if matches!(w_reg, Reg::V(_))
+                                    && u_inst.read(w_reg) == Some(v)
+                                    && !push(
+                                        w_val,
+                                        skip_cond.clone(),
+                                        &mut visited,
+                                        &mut worklist,
+                                        &mut states,
+                                    )
+                                {
+                                    return false;
+                                }
+                            }
+                        }
+
+                        let Some(exec_cond) = extend_known(&reach_cond, guard.map(|g| (g, true)))
+                        else {
+                            continue;
+                        };
+                        if !self.feasible(&exec_cond) {
+                            continue;
+                        }
+
+                        match &u_inst.fields {
+                            Fields::Valu(f)
+                                if u_inst.name() == "v_cndmask_b32"
+                                    && f.dpp.is_none()
+                                    && f.sdwa.is_none() =>
+                            {
+                                let [clear_op, set_op, mask_op] = &f.src[..] else {
+                                    return false;
+                                };
+                                if op_reads_value(u_inst, mask_op, v) {
+                                    return false;
+                                }
+                                let reads_clear = op_reads_value(u_inst, clear_op, v);
+                                let reads_set = op_reads_value(u_inst, set_op, v);
+                                if !reads_clear && !reads_set {
+                                    continue;
+                                }
+                                let selected_cond = if reads_clear && reads_set {
+                                    Some(exec_cond.clone())
+                                } else if let Some(m) = self.cndmask_bool(u_inst, mask_op, lanes) {
+                                    extend_known(&exec_cond, [(m, reads_set)])
+                                } else if let Some(const_set) = self.cndmask_const(mask_op) {
+                                    if (const_set && reads_set) || (!const_set && reads_clear) {
+                                        Some(exec_cond.clone())
+                                    } else {
+                                        None
+                                    }
+                                } else {
+                                    Some(exec_cond.clone())
+                                };
+                                let Some(selected_cond) = selected_cond else {
+                                    continue;
+                                };
+                                if !self.feasible(&selected_cond) {
+                                    continue;
+                                }
+                                for &(w_reg, w_val) in &u_inst.writes {
+                                    match w_reg {
+                                        Reg::V(_) => {
+                                            if !push(
+                                                w_val,
+                                                selected_cond.clone(),
+                                                &mut visited,
+                                                &mut worklist,
+                                                &mut states,
+                                            ) {
+                                                return false;
+                                            }
+                                        }
+                                        _ if w_reg == Reg::S(EXEC)
+                                            || w_reg == Reg::S(EXEC + 1)
+                                            || !uses[w_val.0 as usize].is_empty() =>
+                                        {
+                                            return false;
+                                        }
+                                        _ => {}
+                                    }
+                                }
+                            }
+                            Fields::Valu(f)
+                                if u_inst.name() == "v_swap_b32"
+                                    && f.dpp.is_none()
+                                    && f.sdwa.is_none() =>
+                            {
+                                let (
+                                    Some(Operand::Vector { reg: dreg, .. }),
+                                    Some(&Operand::Vector { reg: sreg, .. }),
+                                ) = (f.dst, f.src.first())
+                                else {
+                                    return false;
+                                };
+                                if u_inst.read(Reg::V(dreg)) == Some(v)
+                                    && let Some(w_val) = u_inst.write(Reg::V(sreg))
+                                    && !push(
+                                        w_val,
+                                        exec_cond.clone(),
+                                        &mut visited,
+                                        &mut worklist,
+                                        &mut states,
+                                    )
+                                {
+                                    return false;
+                                }
+                                if u_inst.read(Reg::V(sreg)) == Some(v)
+                                    && let Some(w_val) = u_inst.write(Reg::V(dreg))
+                                    && !push(
+                                        w_val,
+                                        exec_cond.clone(),
+                                        &mut visited,
+                                        &mut worklist,
+                                        &mut states,
+                                    )
+                                {
+                                    return false;
+                                }
+                            }
+                            Fields::Valu(f) if is_pure_per_lane_valu(u_inst, f) => {
+                                let reads_src =
+                                    f.src.iter().any(|op| op_reads_value(u_inst, op, v));
+                                let partial_dst = is_partial_dst_valu(u_inst.name(), f);
+                                for &(w_reg, w_val) in &u_inst.writes {
+                                    match w_reg {
+                                        Reg::V(_) => {
+                                            let keeps_old =
+                                                partial_dst && u_inst.read(w_reg) == Some(v);
+                                            if (reads_src || keeps_old)
+                                                && !push(
+                                                    w_val,
+                                                    exec_cond.clone(),
+                                                    &mut visited,
+                                                    &mut worklist,
+                                                    &mut states,
+                                                )
+                                            {
+                                                return false;
+                                            }
+                                        }
+                                        _ if reads_src
+                                            && (w_reg == Reg::S(EXEC)
+                                                || w_reg == Reg::S(EXEC + 1)
+                                                || !uses[w_val.0 as usize].is_empty()) =>
+                                        {
+                                            return false;
+                                        }
+                                        _ => {}
+                                    }
+                                }
+                            }
+                            Fields::Image {
+                                addr,
+                                rsrc,
+                                sampler,
+                                d16,
+                                ..
+                            } if !u_inst.name().contains("_store")
+                                && !u_inst.name().contains("_atomic_")
+                                && ((bu, iu) == site || !*d16) =>
+                            {
+                                if addr
+                                    .iter()
+                                    .chain([rsrc])
+                                    .chain(sampler)
+                                    .any(|op| op_reads_value(u_inst, op, v))
+                                {
+                                    return false;
+                                }
+                            }
+                            Fields::Buffer {
+                                addr,
+                                rsrc,
+                                soffset,
+                                offen,
+                                idxen,
+                                lds,
+                                ..
+                            } if !*lds
+                                && !u_inst.name().contains("_store_")
+                                && !u_inst.name().contains("_atomic_")
+                                && ((bu, iu) == site || !u_inst.name().contains("_d16")) =>
+                            {
+                                let uses_addr =
+                                    (*offen || *idxen) && op_reads_value(u_inst, addr, v);
+                                if uses_addr
+                                    || op_reads_value(u_inst, rsrc, v)
+                                    || op_reads_value(u_inst, soffset, v)
+                                {
+                                    return false;
+                                }
+                            }
+                            _ => return false,
+                        }
+                    }
+                }
+            }
+        }
+        true
     }
 
     /// Whether a path leads from block `from` to block `to` (to `from`
@@ -2412,6 +2914,78 @@ fn lane_of(op: Operand) -> Option<u32> {
         Operand::Literal(x) => Some(x),
         _ => None,
     }
+}
+
+/// Extends `base` with `extra`, returning `None` on a trivial contradiction.
+fn extend_known(
+    base: &[(Bool, bool)],
+    extra: impl IntoIterator<Item = (Bool, bool)>,
+) -> Option<Known> {
+    let mut out = base.to_vec();
+    for (b, truth) in extra {
+        if b == Bool::TRUE {
+            if !truth {
+                return None;
+            }
+            continue;
+        }
+        if b == Bool::FALSE {
+            if truth {
+                return None;
+            }
+            continue;
+        }
+        if out.contains(&(b, !truth)) {
+            return None;
+        }
+        if !out.contains(&(b, truth)) {
+            out.push((b, truth));
+        }
+    }
+    Some(out)
+}
+
+/// Whether `op` of `inst` reads `v` through any of its VGPR dwords.
+fn op_reads_value(inst: &Inst, op: &Operand, v: Value) -> bool {
+    match *op {
+        Operand::Vector { reg, dwords } => {
+            (0..dwords).any(|k| inst.read(Reg::V(reg + k)) == Some(v))
+        }
+        _ => false,
+    }
+}
+
+/// Whether a VALU instruction is pure per-lane (does not read across lanes
+/// or affect masks/EXEC).
+fn is_pure_per_lane_valu(inst: &Inst, f: &crate::gfx10::Valu) -> bool {
+    if f.dpp.is_some() {
+        return false;
+    }
+    let name = inst.name();
+    !name.is_empty()
+        && !name.starts_with("v_cmp")
+        && !name.starts_with("v_cmpx")
+        && !name.starts_with("v_permlane")
+        && !name.starts_with("v_interp")
+        && !name.starts_with("v_movrel")
+        && !name.starts_with("v_swaprel")
+        && !name.starts_with("v_mbcnt")
+        && !matches!(
+            name,
+            "v_readfirstlane_b32" | "v_readlane_b32" | "v_writelane_b32"
+        )
+}
+
+fn is_partial_dst_valu(name: &str, f: &crate::gfx10::Valu) -> bool {
+    f.sdwa.is_some_and(|s| s.dst_sel != 6)
+        || name.ends_with("_f16")
+        || name.ends_with("_u16")
+        || name.ends_with("_i16")
+        || name.ends_with("_b16")
+        || matches!(
+            name,
+            "v_cvt_f16_f32" | "v_fma_mixlo_f16" | "v_fma_mixhi_f16" | "v_cvt_pk_u8_f32"
+        )
 }
 
 /// What dword `k` of a move's result copies.
@@ -4144,5 +4718,379 @@ pub(crate) mod tests {
             [0xD501_0004, (193 << 18) | ((256 + 4) << 9) | (256 + 20)],
         );
         assert!(waterfall(&w64_inline, true).is_ok());
+    }
+
+    /// 32-thread synthetic compute shader matching the foliage mesh sampler
+    /// pattern: `v[4:7]` hold pre-split computed VGPRs (`v_cvt_f32_u32`,
+    /// `v_sub_f32`, `v_mul_legacy_f32`, `v_add_f32`). A per-lane if/else
+    /// (`v_cmp_gt_u32` + `s_and_saveexec_b32`, then-arm leaves `v[4:7]`
+    /// untouched, `s_andn2_b32` + `s_cbranch_execz`, else-arm loads sampler 1
+    /// and copies to `v[4:7]`, `s_mov_b32 exec_lo` at join) feeds a full-mask
+    /// waterfall loop over `v[4:7]`. With `downstream`, `v[12:15]` is consumed
+    /// only by else-arm lanes; otherwise `v12` is stored unconditionally.
+    pub(crate) fn foliage_joined_sampler_shader(downstream: &[u32]) -> Vec<u32> {
+        let mut words = vec![
+            0xBE84_0300, // s_mov_b32 s4, s0
+            0xBE85_0380, // s_mov_b32 s5, 0
+            0xBE86_0301, // s_mov_b32 s6, s1
+            0xBE87_0380, // s_mov_b32 s7, 0
+            0xF40C_0202,
+            0xFA00_0000, // s_load_dwordx8 s[8:15], s[4:5], 0x0
+            0xF408_0A02,
+            0xFA00_0040, // s_load_dwordx4 s[40:43], s[4:5], 0x40
+            0x7E04_02F4, // v_mov_b32 v2, 2.0
+            0x7E06_0280, // v_mov_b32 v3, 0
+            0x3420_0082, // v_lshlrev_b32 v16, 2, v0
+            0x7E24_0D00, // v_cvt_f32_u32 v18, v0 (then-arm result)
+            // Pre-split non-descriptor computed VGPRs in v[4:7]:
+            0x7E08_0D00, // v_cvt_f32_u32 v4, v0
+            0x080A_0902, // v_sub_f32 v5, v2, v4
+            0x0E0C_0902, // v_mul_legacy_f32 v6, v2, v4
+            0x060E_0902, // v_add_f32 v7, v2, v4
+            0xBF8C_C07F, // s_waitcnt lgkmcnt(0)
+            // Per-lane if/else: then (lane < 16) leaves v[4:7] untouched;
+            // else (lane >= 16) loads sampler 1 and copies into v[4:7].
+            0x7D88_0090, // v_cmp_gt_u32 vcc_lo, 16, v0
+            0xBE94_3C6A, // s_and_saveexec_b32 s20, vcc_lo
+            0x8A7E_7E14, // s_andn2_b32 exec_lo, s20, exec_lo
+            0xBF88_0007, // s_cbranch_execz -> join (+7 dwords)
+            0xF408_0703,
+            0xFA00_0010, // s_load_dwordx4 s[28:31], s[6:7], 0x10
+            0xBF8C_C07F, // s_waitcnt lgkmcnt(0)
+            0x7E08_021C, // v_mov_b32 v4, s28
+            0x7E0A_021D, // v_mov_b32 v5, s29
+            0x7E0C_021E, // v_mov_b32 v6, s30
+            0x7E0E_021F, // v_mov_b32 v7, s31
+            0xBEFE_0314, // join: s_mov_b32 exec_lo, s20
+            // Full-mask waterfall loop over v[4:7]:
+            0xBE97_037E, // s_mov_b32 s23, exec_lo
+            0x7E20_0504, // loop: v_readfirstlane_b32 s16, v4
+            0x7E22_0505, // v_readfirstlane_b32 s17, v5
+            0x7E24_0506, // v_readfirstlane_b32 s18, v6
+            0x7E26_0507, // v_readfirstlane_b32 s19, v7
+            0xD4E2_0015,
+            0x0002_0810, // v_cmp_eq_u64_e64 s21, s[16:17], v[4:5]
+            0xD4E2_0016,
+            0x0002_0C12, // v_cmp_eq_u64_e64 s22, s[18:19], v[6:7]
+            0x8715_1615, // s_and_b32 s21, s21, s22
+            0xBE95_3C15, // s_and_saveexec_b32 s21, s21
+            0xBF80_0000, // s_nop 0
+            0xF09C_0F08,
+            0x0082_0C02, // image_sample_lz v[12:15], v[2:3], s[8:15], s[16:19] dmask:0xf dim:SQ_RSRC_IMG_2D
+            0xBF8C_3F70, // s_waitcnt vmcnt(0)
+            0x897E_157E, // s_xor_b32 exec_lo, exec_lo, s21
+            0xBF89_FFF0, // s_cbranch_execnz -> loop
+            0xBEFE_0317, // s_mov_b32 exec_lo, s23
+        ];
+        words.extend_from_slice(downstream);
+        words
+    }
+
+    #[test]
+    fn joined_sampler_with_computed_non_descriptor_arm_accepted_when_dead_downstream() {
+        // Positive 1: downstream v_cndmask_b32 selects v12 only for else lanes
+        // (vcc_lo clear, i.e., lane >= 16) and v18 for then lanes.
+        let cndmask_shader = foliage_joined_sampler_shader(&[
+            0x0218_250C, // v_cndmask_b32 v12, v12, v18, vcc_lo
+            0xE070_1000,
+            0x800A_0C10, // buffer_store_dword v12, v16, s[40:43], 0 offen
+            S_ENDPGM,
+        ]);
+        let r = waterfall(&cndmask_shader, false).unwrap();
+        let sampler = r
+            .descriptors
+            .iter()
+            .find(|d| d.role == Role::Sampler)
+            .unwrap();
+        let Source::LanePhi { args, .. } = &sampler.source else {
+            panic!("{:?}", sampler.source);
+        };
+        assert_eq!(args.len(), 2);
+        assert!(args.iter().any(Option::is_none));
+        assert!(
+            args.iter()
+                .flatten()
+                .any(|s| matches!(s, Source::Loaded { .. }))
+        );
+        assert_eq!(r.waterfall.compares.len(), 2);
+        assert_eq!(r.waterfall.reads.len(), 4);
+
+        // Positive 2: downstream transitive VALU before v_cndmask_b32.
+        let transitive_shader = foliage_joined_sampler_shader(&[
+            0x0E18_050C, // v_mul_legacy_f32 v12, v12, v2
+            0x0218_250C, // v_cndmask_b32 v12, v12, v18, vcc_lo
+            0xE070_1000,
+            0x800A_0C10, // buffer_store_dword v12, v16, s[40:43], 0 offen
+            S_ENDPGM,
+        ]);
+        assert!(waterfall(&transitive_shader, false).is_ok());
+
+        // Positive 3: downstream guarded consumer under the else-arm mask (!vcc_lo).
+        let guarded_shader = foliage_joined_sampler_shader(&[
+            0xBE96_076A, // s_not_b32 s22, vcc_lo
+            0xBE94_3C16, // s_and_saveexec_b32 s20, s22
+            0xBF88_0002, // s_cbranch_execz -> +2
+            0xE070_1000,
+            0x800A_0C10, // buffer_store_dword v12, v16, s[40:43], 0 offen
+            0xBEFE_0314, // s_mov_b32 exec_lo, s20
+            S_ENDPGM,
+        ]);
+        assert!(waterfall(&guarded_shader, false).is_ok());
+    }
+
+    #[test]
+    fn joined_sampler_with_computed_non_descriptor_arm_refused_when_live() {
+        // Negative 1: exact same 4-step pattern with unconditional full-mask store.
+        let unconditional = foliage_joined_sampler_shader(&[
+            0xE070_1000,
+            0x800A_0C10, // buffer_store_dword v12, v16, s[40:43], 0 offen
+            S_ENDPGM,
+        ]);
+        assert_eq!(
+            refusal(&unconditional, false),
+            "a descriptor read from the first lane of computed VGPRs"
+        );
+
+        // Negative 2: v_cndmask_b32 with swapped polarity (then-lanes select v12!).
+        let wrong_polarity = foliage_joined_sampler_shader(&[
+            0x0218_1912, // v_cndmask_b32 v12, v18, v12, vcc_lo
+            0xE070_1000,
+            0x800A_0C10, // buffer_store_dword v12, v16, s[40:43], 0 offen
+            S_ENDPGM,
+        ]);
+        assert_eq!(
+            refusal(&wrong_polarity, false),
+            "a descriptor read from the first lane of computed VGPRs"
+        );
+
+        // Negative 3: v_cndmask_b32 with an unrelated mask (lane < 8 instead of lane < 16).
+        let wrong_mask = foliage_joined_sampler_shader(&[
+            0x7D88_0088, // v_cmp_gt_u32 vcc_lo, 8, v0
+            0x0218_250C, // v_cndmask_b32 v12, v12, v18, vcc_lo
+            0xE070_1000,
+            0x800A_0C10, // buffer_store_dword v12, v16, s[40:43], 0 offen
+            S_ENDPGM,
+        ]);
+        assert_eq!(
+            refusal(&wrong_mask, false),
+            "a descriptor read from the first lane of computed VGPRs"
+        );
+
+        // Negative 4: second channel v13 stored unconditionally even though v12 is masked.
+        let partial_channels = foliage_joined_sampler_shader(&[
+            0x0218_250C, // v_cndmask_b32 v12, v12, v18, vcc_lo
+            0xE070_1000,
+            0x800A_0D10, // buffer_store_dword v13, v16, s[40:43], 0 offen
+            S_ENDPGM,
+        ]);
+        assert_eq!(
+            refusal(&partial_channels, false),
+            "a descriptor read from the first lane of computed VGPRs"
+        );
+
+        // Negative 5: cross-lane v_readfirstlane_b32 on v12 before v_cndmask_b32.
+        let cross_lane = foliage_joined_sampler_shader(&[
+            0x7E2E_050C, // v_readfirstlane_b32 s23, v12
+            0x0218_250C, // v_cndmask_b32 v12, v12, v18, vcc_lo
+            0xE070_1000,
+            0x800A_0C10, // buffer_store_dword v12, v16, s[40:43], 0 offen
+            S_ENDPGM,
+        ]);
+        assert_eq!(
+            refusal(&cross_lane, false),
+            "a descriptor read from the first lane of computed VGPRs"
+        );
+
+        // Negative 6: guarded v_add_f32 v12, v12, v2 under !vcc_lo leaves old v12
+        // on then-lanes, which is then stored unconditionally.
+        let guarded_overwrite_leak = foliage_joined_sampler_shader(&[
+            0xBE96_076A, // s_not_b32 s22, vcc_lo
+            0xBE94_3C16, // s_and_saveexec_b32 s20, s22
+            0x0618_050C, // v_add_f32 v12, v12, v2
+            0xBEFE_0314, // s_mov_b32 exec_lo, s20
+            0xE070_1000,
+            0x800A_0C10, // buffer_store_dword v12, v16, s[40:43], 0 offen
+            S_ENDPGM,
+        ]);
+        assert_eq!(
+            refusal(&guarded_overwrite_leak, false),
+            "a descriptor read from the first lane of computed VGPRs"
+        );
+
+        // Negative 7: v_cvt_f16_f32 v12, v2 preserves upper 16 bits of v12 on
+        // all lanes, leaking bad-lane sample bits into the unconditional store.
+        let cvt_f16_f32_leak = foliage_joined_sampler_shader(&[
+            0x7E18_1502, // v_cvt_f16_f32 v12, v2
+            0xE070_1000,
+            0x800A_0C10, // buffer_store_dword v12, v16, s[40:43], 0 offen
+            S_ENDPGM,
+        ]);
+        assert_eq!(
+            refusal(&cvt_f16_f32_leak, false),
+            "a descriptor read from the first lane of computed VGPRs"
+        );
+
+        // Negative 8: buffer_load_short_d16 v12, ... preserves upper 16 bits of
+        // v12 on all lanes, leaking bad-lane sample bits into the unconditional store.
+        let d16_buffer_load_leak = foliage_joined_sampler_shader(&[
+            0xE090_1000,
+            0x800A_0C10, // buffer_load_short_d16 v12, v16, s[40:43], 0 offen
+            0xBF8C_3F70, // s_waitcnt vmcnt(0)
+            0xE070_1000,
+            0x800A_0C10, // buffer_store_dword v12, v16, s[40:43], 0 offen
+            S_ENDPGM,
+        ]);
+        assert_eq!(
+            refusal(&d16_buffer_load_leak, false),
+            "a descriptor read from the first lane of computed VGPRs"
+        );
+    }
+
+    #[test]
+    fn cndmask_joined_sampler_with_computed_non_descriptor_arm_respects_liveness() {
+        // Branchless v_cndmask_b32 joining computed VGPRs (v[4:7], when vcc_lo=1)
+        // with uniform sampler (s[28:31], when vcc_lo=0).
+        let build_cndmask = |masked_downstream: bool| {
+            let mut words = vec![
+                0xBE84_0300, // s_mov_b32 s4, s0
+                0xBE85_0380, // s_mov_b32 s5, 0
+                0xBE86_0301, // s_mov_b32 s6, s1
+                0xBE87_0380, // s_mov_b32 s7, 0
+                0xF40C_0202,
+                0xFA00_0000, // s_load_dwordx8 s[8:15], s[4:5], 0x0
+                0xF408_0703,
+                0xFA00_0010, // s_load_dwordx4 s[28:31], s[6:7], 0x10
+                0xF408_0A02,
+                0xFA00_0040, // s_load_dwordx4 s[40:43], s[4:5], 0x40
+                0x7E04_02F4, // v_mov_b32 v2, 2.0
+                0x7E06_0280, // v_mov_b32 v3, 0
+                0x3420_0082, // v_lshlrev_b32 v16, 2, v0
+                0x7E24_0D00, // v_cvt_f32_u32 v18, v0
+                0x7E08_0D00, // v_cvt_f32_u32 v4, v0
+                0x080A_0902, // v_sub_f32 v5, v2, v4
+                0x0E0C_0902, // v_mul_legacy_f32 v6, v2, v4
+                0x060E_0902, // v_add_f32 v7, v2, v4
+                0x7D88_0090, // v_cmp_gt_u32 vcc_lo, 16, v0
+                0xBF8C_C07F, // s_waitcnt lgkmcnt(0)
+                0x0208_081C, // v_cndmask_b32 v4, s28, v4, vcc_lo
+                0x020A_0A1D, // v_cndmask_b32 v5, s29, v5, vcc_lo
+                0x020C_0C1E, // v_cndmask_b32 v6, s30, v6, vcc_lo
+                0x020E_0E1F, // v_cndmask_b32 v7, s31, v7, vcc_lo
+                0xBE97_037E, // s_mov_b32 s23, exec_lo
+                0x7E20_0504, // loop: v_readfirstlane_b32 s16, v4
+                0x7E22_0505, // v_readfirstlane_b32 s17, v5
+                0x7E24_0506, // v_readfirstlane_b32 s18, v6
+                0x7E26_0507, // v_readfirstlane_b32 s19, v7
+                0xD4E2_0015,
+                0x0002_0810, // v_cmp_eq_u64_e64 s21, s[16:17], v[4:5]
+                0xD4E2_0016,
+                0x0002_0C12, // v_cmp_eq_u64_e64 s22, s[18:19], v[6:7]
+                0x8715_1615, // s_and_b32 s21, s21, s22
+                0xBE95_3C15, // s_and_saveexec_b32 s21, s21
+                0xBF80_0000, // s_nop 0
+                0xF09C_0F08,
+                0x0082_0C02, // image_sample_lz v[12:15], v[2:3], s[8:15], s[16:19] dmask:0xf dim:SQ_RSRC_IMG_2D
+                0xBF8C_3F70, // s_waitcnt vmcnt(0)
+                0x897E_157E, // s_xor_b32 exec_lo, exec_lo, s21
+                0xBF89_FFF0, // s_cbranch_execnz -> loop
+                0xBEFE_0317, // s_mov_b32 exec_lo, s23
+            ];
+            if masked_downstream {
+                words.push(0x0218_250C); // v_cndmask_b32 v12, v12, v18, vcc_lo
+            }
+            words.extend([
+                0xE070_1000,
+                0x800A_0C10, // buffer_store_dword v12, v16, s[40:43], 0 offen
+                S_ENDPGM,
+            ]);
+            words
+        };
+        assert!(waterfall(&build_cndmask(true), false).is_ok());
+        assert_eq!(
+            refusal(&build_cndmask(false), false),
+            "a descriptor read from the first lane of computed VGPRs"
+        );
+    }
+
+    #[test]
+    fn foliage_wave64_buffer_load_and_float_math_non_descriptor_arm() {
+        // Wave64 variant matching the exact console pattern:
+        // buffer_load_dwordx3 + v_sub_f32 + v_mul_legacy_f32 into v[4:7],
+        // v_cmp_gt_u32_e64 s[6:7], s_and_saveexec_b64 s[64:65], s_andn2_b64,
+        // s_cbranch_execz, s_load_dwordx4 + v_mov_b32, s_mov_b64 exec,
+        // waterfall over v[4:7], and downstream v_cndmask_b32_e64 using s[6:7].
+        let build_w64 = |masked_downstream: bool| {
+            let mut words = vec![
+                0xBE84_0300, // s_mov_b32 s4, s0
+                0xBE85_0380, // s_mov_b32 s5, 0
+                0xBE82_0301, // s_mov_b32 s2, s1
+                0xBE83_0380, // s_mov_b32 s3, 0
+                0xF40C_0202,
+                0xFA00_0000, // s_load_dwordx8 s[8:15], s[4:5], 0x0
+                0xF408_0A02,
+                0xFA00_0040, // s_load_dwordx4 s[40:43], s[4:5], 0x40
+                0x7E04_02F4, // v_mov_b32 v2, 2.0
+                0x7E06_0280, // v_mov_b32 v3, 0
+                0x3420_0082, // v_lshlrev_b32 v16, 2, v0
+                0x7E24_0D00, // v_cvt_f32_u32 v18, v0
+                0xBF8C_C07F, // s_waitcnt lgkmcnt(0)
+                // Pre-split buffer_load_dwordx3 v[4:6] + float math into v[4:7]:
+                0xE03C_1000,
+                0x800A_0410, // buffer_load_dwordx3 v[4:6], v16, s[40:43], 0 offen
+                0xBF8C_3F70, // s_waitcnt vmcnt(0)
+                0x0808_0902, // v_sub_f32 v4, v2, v4
+                0x0E0E_0B02, // v_mul_legacy_f32 v7, v2, v5
+                // Per-lane if/else on s[6:7]:
+                0xD4C4_0006,
+                0x0002_0090, // v_cmp_gt_u32_e64 s[6:7], 16, v0
+                0xBEC0_2406, // s_and_saveexec_b64 s[64:65], s[6:7]
+                0x8AFE_7E40, // s_andn2_b64 exec, s[64:65], exec
+                0xBF88_0007, // s_cbranch_execz -> join (+7 dwords)
+                0xF408_0701,
+                0xFA00_0010, // s_load_dwordx4 s[28:31], s[2:3], 0x10
+                0xBF8C_C07F, // s_waitcnt lgkmcnt(0)
+                0x7E08_021C, // v_mov_b32 v4, s28
+                0x7E0A_021D, // v_mov_b32 v5, s29
+                0x7E0C_021E, // v_mov_b32 v6, s30
+                0x7E0E_021F, // v_mov_b32 v7, s31
+                0xBEFE_0440, // join: s_mov_b64 exec, s[64:65]
+                // Full-mask waterfall loop over v[4:7]:
+                0xBE94_047E, // s_mov_b64 s[20:21], exec
+                0x7E20_0504, // loop: v_readfirstlane_b32 s16, v4
+                0x7E22_0505, // v_readfirstlane_b32 s17, v5
+                0x7E24_0506, // v_readfirstlane_b32 s18, v6
+                0x7E26_0507, // v_readfirstlane_b32 s19, v7
+                0xD4E2_0018,
+                0x0002_0810, // v_cmp_eq_u64_e64 s[24:25], s[16:17], v[4:5]
+                0xD4E2_001A,
+                0x0002_0C12, // v_cmp_eq_u64_e64 s[26:27], s[18:19], v[6:7]
+                0x8798_1A18, // s_and_b64 s[24:25], s[24:25], s[26:27]
+                0xBE98_2418, // s_and_saveexec_b64 s[24:25], s[24:25]
+                0xBF80_0000, // s_nop 0
+                0xF09C_0F08,
+                0x0082_0C02, // image_sample_lz v[12:15], v[2:3], s[8:15], s[16:19] dmask:0xf dim:SQ_RSRC_IMG_2D
+                0xBF8C_3F70, // s_waitcnt vmcnt(0)
+                0x89FE_187E, // s_xor_b64 exec, exec, s[24:25]
+                0xBF89_FFF0, // s_cbranch_execnz -> loop
+                0xBEFE_0414, // s_mov_b64 exec, s[20:21]
+            ];
+            if masked_downstream {
+                words.extend([
+                    0xD501_000C,
+                    (6 << 18) | ((256 + 18) << 9) | (256 + 12), // v_cndmask_b32_e64 v12, v12, v18, s[6:7]
+                ]);
+            }
+            words.extend([
+                0xE070_1000,
+                0x800A_0C10, // buffer_store_dword v12, v16, s[40:43], 0 offen
+                S_ENDPGM,
+            ]);
+            words
+        };
+        assert!(waterfall(&build_w64(true), true).is_ok());
+        assert_eq!(
+            refusal(&build_w64(false), true),
+            "a descriptor read from the first lane of computed VGPRs"
+        );
     }
 }
