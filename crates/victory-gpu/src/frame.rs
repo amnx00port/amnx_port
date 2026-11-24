@@ -147,16 +147,28 @@ pub(crate) extern "system" fn set_interval(
     match (limit, interval) {
         (Some(0), None) => {
             static LOGGED: std::sync::Once = std::sync::Once::new();
+            let mut first_log = false;
             LOGGED.call_once(|| {
+                first_log = true;
                 tracing::info!(
                     ?title_interval,
                     "frame interval overridden: uncapped (fps_limit = 0)"
                 );
             });
+            if !first_log {
+                tracing::debug!(
+                    ?title_interval,
+                    period = _period,
+                    flags = _flags,
+                    "frame interval re-set; keeping uncapped override (fps_limit = 0)"
+                );
+            }
         }
         (Some(fps), Some(eff)) => {
             static LOGGED: std::sync::Once = std::sync::Once::new();
+            let mut first_log = false;
             LOGGED.call_once(|| {
+                first_log = true;
                 tracing::info!(
                     ?title_interval,
                     effective = ?eff,
@@ -164,6 +176,16 @@ pub(crate) extern "system" fn set_interval(
                     "frame interval overridden by fps_limit"
                 );
             });
+            if !first_log {
+                tracing::debug!(
+                    ?title_interval,
+                    effective = ?eff,
+                    fps,
+                    period = _period,
+                    flags = _flags,
+                    "frame interval re-set; keeping fps_limit override"
+                );
+            }
         }
         _ => {
             tracing::info!(interval = ?title_interval, "frame interval");
@@ -481,6 +503,23 @@ mod tests {
         assert!(uncapped_stats.frames >= frames_before + 8);
         assert!(uncapped_stats.flips >= 12);
         assert!(uncapped_stats.last_timestamp_us > 0);
+
+        // Repeated `set_interval` calls under uncapped mode keep zero wait
+        // across every event kind (origin=0, vblank=1, flip=2).
+        assert_eq!(set_interval(null, null, 33_333, 2, 1), S_OK);
+        assert_eq!(stats().target_interval_us, 0);
+        let recall_start = Instant::now();
+        for kind in [ORIGIN, 1, FLIP] {
+            let mut tok = 0;
+            assert_eq!(
+                wait(null, kind, u32::MAX, std::ptr::null(), 0, &mut tok),
+                S_OK
+            );
+        }
+        assert!(
+            recall_start.elapsed() < Duration::from_millis(20),
+            "repeated set_interval under uncapped mode must not re-enable 30 FPS waits"
+        );
 
         // Fixed FPS override (e.g. 120 FPS) overrides the 30 FPS interval.
         set_fps_limit(Some(120));
