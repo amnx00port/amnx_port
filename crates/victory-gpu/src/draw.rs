@@ -408,7 +408,17 @@ impl State {
                 .heaps
                 .iter()
                 .filter(|&&h| h != 0)
-                .filter_map(|&h| crate::descriptor::heap(h as This).host())
+                .filter_map(|&h| {
+                    let heap = crate::descriptor::heap(h as This);
+                    let host = heap.host();
+                    if host.is_none() {
+                        once!(
+                            sampler = heap.samplers(),
+                            "bound descriptor heap has no host heap"
+                        );
+                    }
+                    host
+                })
                 .map(|h| Some(h.heap.clone()))
                 .collect();
             heaps.iter().flatten().for_each(|h| list.keep(h));
@@ -632,7 +642,7 @@ impl State {
             let (Some(host), Some(index)) = (heap.host(), heap.index(end)) else {
                 continue;
             };
-            if index >= host.count() {
+            if !heap.samplers() && index >= host.count() {
                 fresh.push(u.slot);
             }
         }

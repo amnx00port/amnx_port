@@ -59,10 +59,26 @@ pub(crate) fn near_heaps(va: u64) -> String {
 /// tiers 1 and 2; tier 3 hardware may take more.
 const PORTABLE_VIEWS: u32 = 1_000_000;
 
+/// The host's limit for shader-visible sampler heaps on all resource
+/// binding tiers (`D3D12_MAX_SHADER_VISIBLE_SAMPLER_HEAP_SIZE`).
+const PORTABLE_SAMPLERS: u32 = 2_048;
+
 /// Slots past the title's in a view heap, for tables a draw needs made
 /// afresh (constant buffers copied per draw). A list holds the slots it
 /// took until it is reset (its submissions have run) or released.
 const DYNAMIC: u32 = 1 << 16;
+
+/// Fallback `(total, mirrored)` descriptor counts when the host refuses a
+/// shader-visible heap larger than its portable limit, or `None` when the
+/// request already fits.
+fn cap_for(sampler: bool, count: u32, extra: u32) -> Option<(u32, u32)> {
+    if sampler {
+        (count > PORTABLE_SAMPLERS).then_some((PORTABLE_SAMPLERS, PORTABLE_SAMPLERS))
+    } else {
+        let total = count.saturating_add(extra);
+        (total > PORTABLE_VIEWS).then_some((PORTABLE_VIEWS, PORTABLE_VIEWS.saturating_sub(extra)))
+    }
+}
 
 impl HostHeap {
     pub(crate) fn new(sampler: bool, count: u32) -> Option<Self> {
@@ -85,18 +101,39 @@ impl HostHeap {
             }
         };
         let extra = if sampler { 0 } else { DYNAMIC };
-        let (heap, count) = match make(count + extra) {
-            Ok(heap) => (heap, count),
-            Err(e) if !sampler && count + extra > PORTABLE_VIEWS => {
-                // shortcut: descriptors past the host's limit are left out;
-                // a title that reaches them needs remapping.
-                tracing::warn!(error = %e, count, "host view heap capped at {PORTABLE_VIEWS}");
-                (make(PORTABLE_VIEWS).ok()?, PORTABLE_VIEWS - extra)
-            }
-            Err(e) => {
-                tracing::warn!(error = %e, count, sampler, "no host descriptor heap");
-                return None;
-            }
+        let requested = count.saturating_add(extra);
+        let (heap, count, total) = match make(requested) {
+            Ok(heap) => (heap, count, requested),
+            Err(e) => match cap_for(sampler, count, extra) {
+                Some((cap, mirrored)) => {
+                    // shortcut: descriptors past the host's limit are left out;
+                    // a title that reaches them needs remapping.
+                    let label = if sampler { "sampler" } else { "view" };
+                    tracing::warn!(
+                        error = %e,
+                        requested = count,
+                        cap,
+                        mirrored,
+                        "host {label} heap capped at {cap}"
+                    );
+                    match make(cap) {
+                        Ok(heap) => (heap, mirrored, cap),
+                        Err(e) => {
+                            tracing::warn!(
+                                error = %e,
+                                count = cap,
+                                sampler,
+                                "no host descriptor heap"
+                            );
+                            return None;
+                        }
+                    }
+                }
+                None => {
+                    tracing::warn!(error = %e, count, sampler, "no host descriptor heap");
+                    return None;
+                }
+            },
         };
         // SAFETY: a live heap.
         let (cpu, step) = unsafe {
@@ -110,7 +147,7 @@ impl HostHeap {
         let gpu = unsafe { heap.GetGPUDescriptorHandleForHeapStart().ptr };
         GPU_RANGES.lock().unwrap_or_else(|e| e.into_inner()).push((
             gpu,
-            u64::from(count + extra) * u64::from(step),
+            u64::from(total) * u64::from(step),
             u64::from(step),
             sampler,
         ));
@@ -121,15 +158,15 @@ impl HostHeap {
             count,
             sampler,
             made: Mutex::new(vec![0; count as usize]),
-            kept: Mutex::new(vec![None; (count + extra) as usize]),
-            next: Mutex::new((0, vec![false; DYNAMIC as usize])),
+            kept: Mutex::new(vec![None; total as usize]),
+            next: Mutex::new((0, vec![false; extra as usize])),
         };
         // A slot never written is undefined: shaders reading one (a slot
         // the title wrote in a way we do not know, or a table entry no
         // used-resource entry names) read a wild address. Every slot starts
         // null instead.
         let started = std::time::Instant::now();
-        if let Err(e) = h.fill_null(kind, count + extra) {
+        if let Err(e) = h.fill_null(kind, total) {
             tracing::warn!(error = %e, "host descriptor heap not made null");
         }
         tracing::debug!(ms = started.elapsed().as_millis(), "host descriptor heap made null");
@@ -140,13 +177,17 @@ impl HostHeap {
     /// doubled by copies to a block, the block copied over the heap.
     fn fill_null(&self, kind: D3D12_DESCRIPTOR_HEAP_TYPE, total: u32) -> windows::core::Result<()> {
         const BLOCK: u32 = 1 << 16;
+        if total == 0 {
+            return Ok(());
+        }
+        let block_len = total.min(BLOCK);
         let Some(host) = host() else { return Ok(()) };
         // SAFETY: plain heap creation and copies inside live heaps.
         unsafe {
             let block: ID3D12DescriptorHeap =
                 host.device.CreateDescriptorHeap(&D3D12_DESCRIPTOR_HEAP_DESC {
                     Type: kind,
-                    NumDescriptors: BLOCK,
+                    NumDescriptors: block_len,
                     ..Default::default()
                 })?;
             let start = block.GetCPUDescriptorHandleForHeapStart();
@@ -159,14 +200,14 @@ impl HostHeap {
                 null_view(start);
             }
             let mut filled = 1;
-            while filled < BLOCK {
-                let n = filled.min(BLOCK - filled);
+            while filled < block_len {
+                let n = filled.min(block_len - filled);
                 host.device.CopyDescriptorsSimple(n, at(filled), start, kind);
                 filled += n;
             }
             let mut done = 0;
             while done < total {
-                let n = BLOCK.min(total - done);
+                let n = block_len.min(total - done);
                 host.device.CopyDescriptorsSimple(n, self.cpu(done), start, kind);
                 done += n;
             }
@@ -311,13 +352,18 @@ impl HostHeap {
     /// data: a host copy of a buffer is made on first use.
     pub(crate) fn mirror(&self, index: u32, handle: u64, for_draw: bool) -> Option<View> {
         if index >= self.count {
-            // Diagnostic (NVIDIA heap cap): the highest title slot past the
-            // host heap seen so far.
-            static HIGHEST: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
-            if HIGHEST.fetch_max(index, std::sync::atomic::Ordering::Relaxed) < index {
+            // Diagnostic (host heap cap): the highest title slot past each
+            // host heap kind seen so far.
+            static HIGHEST: [std::sync::atomic::AtomicU32; 2] = [
+                std::sync::atomic::AtomicU32::new(0),
+                std::sync::atomic::AtomicU32::new(0),
+            ];
+            let slot = &HIGHEST[usize::from(self.sampler)];
+            if slot.fetch_max(index, std::sync::atomic::Ordering::Relaxed) < index {
                 tracing::warn!(
                     index,
                     count = self.count,
+                    sampler = self.sampler,
                     for_draw,
                     "title slot past the host heap"
                 );
@@ -853,6 +899,49 @@ fn null_view(at: D3D12_CPU_DESCRIPTOR_HANDLE) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn cap_for_samplers_matches_d3d12_limit() {
+        assert_eq!(cap_for(true, 1, 0), None);
+        assert_eq!(cap_for(true, PORTABLE_SAMPLERS, 0), None);
+        assert_eq!(
+            cap_for(true, PORTABLE_SAMPLERS + 1, 0),
+            Some((PORTABLE_SAMPLERS, PORTABLE_SAMPLERS))
+        );
+        assert_eq!(
+            cap_for(true, 100_000, 0),
+            Some((PORTABLE_SAMPLERS, PORTABLE_SAMPLERS))
+        );
+        // Sampler heaps have no dynamic region, so `extra` is neither added nor subtracted.
+        assert_eq!(cap_for(true, PORTABLE_SAMPLERS, DYNAMIC), None);
+        assert_eq!(
+            cap_for(true, PORTABLE_SAMPLERS + 1, DYNAMIC),
+            Some((PORTABLE_SAMPLERS, PORTABLE_SAMPLERS))
+        );
+    }
+
+    #[test]
+    fn cap_for_views_accounts_for_extra_dynamic_slots() {
+        let max_mirrored = PORTABLE_VIEWS - DYNAMIC;
+        assert_eq!(cap_for(false, 100, DYNAMIC), None);
+        assert_eq!(cap_for(false, max_mirrored, DYNAMIC), None);
+        assert_eq!(
+            cap_for(false, max_mirrored + 1, DYNAMIC),
+            Some((PORTABLE_VIEWS, max_mirrored))
+        );
+        assert_eq!(
+            cap_for(false, PORTABLE_VIEWS, DYNAMIC),
+            Some((PORTABLE_VIEWS, max_mirrored))
+        );
+        assert_eq!(
+            cap_for(false, 2_000_000, DYNAMIC),
+            Some((PORTABLE_VIEWS, max_mirrored))
+        );
+        assert_eq!(
+            cap_for(false, u32::MAX, DYNAMIC),
+            Some((PORTABLE_VIEWS, max_mirrored))
+        );
+    }
 
     /// Dynamic slots stay taken until given back, and runs do not wrap.
     #[test]
