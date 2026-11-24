@@ -14,6 +14,7 @@
 use std::collections::HashMap;
 
 use crate::gfx10::{Dpp, Fields, NULL, Operand};
+use crate::hash::Map;
 use crate::ir::{EXEC, Inst, Program, Reg, Value};
 
 /// An associative operation and its identity.
@@ -109,10 +110,10 @@ pub(crate) struct Section {
 }
 
 /// Every whole-wave section of `block`, by start index.
-pub(crate) fn sections(p: &Program, block: usize) -> HashMap<usize, Section> {
+pub(crate) fn sections(p: &Program, block: usize) -> Map<usize, Section> {
     let insts = &p.blocks[block].insts;
     let wave: u32 = if p.wave64 { 64 } else { 32 };
-    let mut out = HashMap::new();
+    let mut out = Map::default();
     let mut i = 0;
     while i < insts.len() {
         let inst = &insts[i];

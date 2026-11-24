@@ -10,6 +10,7 @@ pub mod dxbc;
 pub mod dxil;
 pub mod emit;
 pub mod gfx10;
+mod hash;
 pub mod io;
 pub mod ir;
 pub mod native;
