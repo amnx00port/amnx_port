@@ -400,6 +400,11 @@ impl<'a> Lower<'a> {
             };
             let wave = if x.native.wave64 { 64 } else { 32 };
             let one_wave = cs.threads.iter().product::<u32>() <= wave;
+            // A shader that uses lane-order-dependent operations, or shares
+            // LDS within one wave, cannot run correctly on a wave32 device:
+            // declare the required wave size so D3D12 refuses the pipeline
+            // cleanly instead of executing with wrong lane masks or looping
+            // forever (TDR / device hung).
             if console_lanes || one_wave && s.lds_dwords > 0 {
                 s.wave_size = Some(wave);
             }
@@ -414,6 +419,13 @@ impl<'a> Lower<'a> {
                 max_primitives: ms.max_primitives,
                 topology: ms.topology,
             });
+            // DXIL does not allow WaveSize on mesh shaders (only compute and
+            // node shaders); the validator would reject the DXIL. Mesh shaders
+            // therefore always run on the host's native wave width. The
+            // translator already refuses mesh shaders that use cross-lane ops
+            // ("a cross-lane operation in a mesh shader"), so a successfully
+            // translated wave64 mesh shader has no cross-lane ops and can
+            // execute correctly in wave32 mode.
             // Barriers order the lanes' LDS accesses; the console's
             // allocation request needs them too, but the host does not. One
             // lane sends that request, and what it dominates (the path for

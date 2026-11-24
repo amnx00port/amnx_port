@@ -823,6 +823,25 @@ fn host_texture(
         d.flags &= !UNORDERED;
     }
     d.format = pc_format(d.format);
+    // Xbox permits certain 16-bit color formats as render targets and UAVs;
+    // PC D3D12 refuses those flag combinations with E_INVALIDARG.
+    // B5G5R5A1_UNORM (86): typed UAV not supported on PC — strip UNORDERED.
+    //   RTV is valid on PC for this format, but the console also requests
+    //   UNORDERED alongside it, so we strip both to match the flag set that
+    //   D3D12 accepts on PC.
+    // B4G4R4A4_UNORM (115): RTV not supported on PC D3D12 — strip RTV.
+    // When RENDER_TARGET is stripped the clear value must also be cleared:
+    // D3D12 returns E_INVALIDARG if pOptimizedClearValue is non-null for a
+    // resource that does not have ALLOW_RENDER_TARGET or ALLOW_DEPTH_STENCIL.
+    const RENDER_TARGET: u32 = 1;
+    let strip_rtv = matches!(d.format, 86 | 115);
+    let strip_uav = d.format == 86;
+    if strip_rtv {
+        d.flags &= !RENDER_TARGET;
+    }
+    if strip_uav {
+        d.flags &= !UNORDERED;
+    }
     const DENY_SHADER_RESOURCE: u32 = 8;
     if d.flags & DENY_SHADER_RESOURCE == 0
         && let Some(&(_, typeless)) = DEPTH_FORMATS.iter().find(|&&(f, _)| f == d.format)
@@ -835,8 +854,10 @@ fn host_texture(
         d.format = family(d.format);
     }
     // The clear value names the format too: format, then color or depth
-    // and stencil (5 words).
-    let clear_value = (!clear.is_null()).then(|| {
+    // and stencil (5 words). D3D12 rejects a non-null clear value if the
+    // resource does not have ALLOW_RENDER_TARGET or ALLOW_DEPTH_STENCIL, so
+    // null it out when we stripped RENDER_TARGET above.
+    let clear_value = (!clear.is_null() && !strip_rtv).then(|| {
         // SAFETY: the title passes a whole clear value.
         let mut value = unsafe { clear.cast::<[u32; 5]>().read_unaligned() };
         value[0] = pc_format(value[0]);
