@@ -786,13 +786,13 @@ impl<'a> Lanes<'a> {
                 let k = self.key(|r| inst.read(r), code)?;
                 self.mask(k)
             }
-            Operand::Const(c @ 128..=208) => {
-                let v = if c <= 192 {
-                    i64::from(c) - 128
+            Operand::Const(c) => {
+                let v = if wave64 {
+                    crate::resource::inline64(c)?
                 } else {
-                    192 - i64::from(c)
+                    u64::from(crate::resource::inline(c)?)
                 };
-                (constant(&mut self.b, v as u64), false)
+                (constant(&mut self.b, v), false)
             }
             Operand::Literal(x) => (constant(&mut self.b, u64::from(x)), false),
             _ => return None,
@@ -1230,5 +1230,37 @@ mod tests {
         assert_eq!(p.blocks[0].exit.successors(), [2, 4]);
         assert_eq!(p.blocks[1].preds, [2]);
         assert!(structure(&p).is_ok());
+    }
+
+    #[test]
+    fn inline_float_constants_form_constant_lane_masks() {
+        // Wave64: s_and_b64 exec, exec, 2.0 -> lane 62 (0x4000_0000_0000_0000).
+        let p64 = build(
+            &[
+                0x87FE_F47E, // s_and_b64 exec, exec, 2.0
+                0x7E02_0280, // v_mov_b32 v1, 0
+                S_ENDPGM,
+            ],
+            true,
+        );
+        let s64 = structure(&p64).unwrap();
+        let g64 = s64.guards[0][1].expect("wave64 guard");
+        assert_eq!(
+            s64.bools.support(g64),
+            vec![Atom::Constant(0x4000_0000_0000_0000)]
+        );
+
+        // Wave32: s_and_b32 exec_lo, exec_lo, -2.0 -> lanes 30..31 (0xC000_0000).
+        let p32 = build(
+            &[
+                0x877E_F57E, // s_and_b32 exec_lo, exec_lo, -2.0
+                0x7E02_0280, // v_mov_b32 v1, 0
+                S_ENDPGM,
+            ],
+            false,
+        );
+        let s32 = structure(&p32).unwrap();
+        let g32 = s32.guards[0][1].expect("wave32 guard");
+        assert_eq!(s32.bools.support(g32), vec![Atom::Constant(0xC000_0000)]);
     }
 }

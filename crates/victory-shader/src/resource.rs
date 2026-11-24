@@ -955,21 +955,14 @@ impl<'a> Tracer<'a> {
             "s_cselect_b64" | "s_cmov_b64" => true,
             _ => return None,
         };
-        // A dword of a 32- or 64-bit operand: 64-bit inline integers are
-        // sign-extended; 64-bit literals and float constants are not
-        // followed.
+        // A dword of a 32- or 64-bit operand: 64-bit inline integers
+        // sign-extend and inline floats expand to binary64; 64-bit literals
+        // are not followed.
         let dword = |op: &Operand| match *op {
             Operand::Scalar { code: NULL, .. } => Some(Term::Const(0)),
             Operand::Scalar { code, .. } => Some(self.origin(inst.read(Reg::S(code + k))?)),
             Operand::Const(c) if !wide => inline(c).map(Term::Const),
-            Operand::Const(c @ 128..=208) => {
-                let low = inline(c)?;
-                Some(Term::Const(if k == 0 {
-                    low
-                } else {
-                    ((low as i32) >> 31) as u32
-                }))
-            }
+            Operand::Const(c) => inline64(c).map(|v| Term::Const((v >> (32 * k)) as u32)),
             Operand::Literal(x) if !wide => Some(Term::Const(x)),
             _ => None,
         };
@@ -1695,14 +1688,9 @@ fn copy_source(inst: &Inst, k: usize) -> Option<Moved> {
         // that has no inline form; fold more if descriptors need it.
         ("s_brev_b32", Operand::Const(c)) => inline(c).map(|x| Moved::Const(x.reverse_bits())),
         ("s_not_b32", Operand::Const(c)) => inline(c).map(|x| Moved::Const(!x)),
-        // 64-bit inline integers are sign-extended.
-        ("s_mov_b64", Operand::Const(c @ 128..=208)) => {
-            let low = inline(c)?;
-            Some(Moved::Const(if k == 0 {
-                low
-            } else {
-                ((low as i32) >> 31) as u32
-            }))
+        // 64-bit inline integers sign-extend and inline floats expand to binary64.
+        ("s_mov_b64", Operand::Const(c)) => {
+            inline64(c).map(|v| Moved::Const((v >> (32 * k)) as u32))
         }
         _ => None,
     }
@@ -1723,6 +1711,27 @@ pub(crate) fn inline(code: u8) -> Option<u32> {
         246 => float(4.0),
         247 => float(-4.0),
         248 => Some(0x3E22_F983),
+        _ => None,
+    }
+}
+
+/// The 64-bit value of an inline constant operand: integer constants
+/// sign-extend; floating-point constants expand to their IEEE-754 binary64
+/// representations (GFX10).
+pub(crate) fn inline64(code: u8) -> Option<u64> {
+    let float = |f: f64| Some(f.to_bits());
+    match code {
+        128..=192 => Some(u64::from(code) - 128),
+        193..=208 => Some((192 - i64::from(code)) as u64),
+        240 => float(0.5),
+        241 => float(-0.5),
+        242 => float(1.0),
+        243 => float(-1.0),
+        244 => float(2.0),
+        245 => float(-2.0),
+        246 => float(4.0),
+        247 => float(-4.0),
+        248 => Some(0x3FC4_5F30_6DC9_C882),
         _ => None,
     }
 }
@@ -3049,5 +3058,95 @@ pub(crate) mod tests {
         assert_eq!(table_offset(&r, other), 0x20);
         assert_eq!(r.waterfall.compares.len(), 2);
         assert_eq!(r.waterfall.reads.len(), 4);
+    }
+
+    #[test]
+    fn inline64_expands_signed_integers_and_binary64_floats() {
+        assert_eq!(inline64(128), Some(0));
+        assert_eq!(inline64(192), Some(64));
+        assert_eq!(inline64(193), Some(u64::MAX));
+        assert_eq!(inline64(194), Some(u64::MAX - 1));
+        assert_eq!(inline64(208), Some((-16i64) as u64));
+        assert_eq!(inline64(240), Some(0x3FE0_0000_0000_0000));
+        assert_eq!(inline64(241), Some(0xBFE0_0000_0000_0000));
+        assert_eq!(inline64(242), Some(0x3FF0_0000_0000_0000));
+        assert_eq!(inline64(243), Some(0xBFF0_0000_0000_0000));
+        assert_eq!(inline64(244), Some(0x4000_0000_0000_0000));
+        assert_eq!(inline64(245), Some(0xC000_0000_0000_0000));
+        assert_eq!(inline64(246), Some(0x4010_0000_0000_0000));
+        assert_eq!(inline64(247), Some(0xC010_0000_0000_0000));
+        assert_eq!(inline64(248), Some(0x3FC4_5F30_6DC9_C882));
+        for special in [235, 251, 252, 253, 254] {
+            assert_eq!(inline64(special), None);
+        }
+    }
+
+    #[test]
+    fn constant_sampler_words_follow_64bit_inline_floats() {
+        // An opaque-black point sampler has words [0x3006, 0x00FF_F000, 0, 0x4000_0000]:
+        // its upper 64 bits are 0x4000_0000_0000_0000, which GFX10 encodes as 2.0 (244).
+        let moved = track_words(
+            &[
+                0xBE82_0308, // s_mov_b32 s2, s8
+                0xBE83_0380, // s_mov_b32 s3, 0
+                0xF40C_0001,
+                0xFA00_0000, // s_load_dwordx8 s[0:7], s[2:3], null
+                0xBE88_03FF,
+                0x0000_3006, // s_mov_b32 s8, 0x3006
+                0xBE89_03FF,
+                0x00FF_F000, // s_mov_b32 s9, 0x00FF_F000
+                0xBE8A_04F4, // s_mov_b64 s[10:11], 2.0
+                0xF080_0F08,
+                0x0040_0002, // image_sample v[0:3], v[2:3], s[0:7], s[8:11]
+                S_ENDPGM,
+            ],
+            &[param(Table, 8, 1)],
+            HwStage::Ps,
+        );
+        let sampler = moved
+            .descriptors
+            .iter()
+            .find(|d| d.role == Role::Sampler)
+            .unwrap();
+        assert_eq!(
+            sampler.source,
+            Source::Constant(vec![0x3006, 0x00FF_F000, 0, 0x4000_0000])
+        );
+
+        // Same upper half chosen by SCC via s_cselect_b64 s[10:11], 2.0, -2.0.
+        let picked = track_words(
+            &[
+                0xBE82_0308, // s_mov_b32 s2, s8
+                0xBE83_0380, // s_mov_b32 s3, 0
+                0xF40C_0001,
+                0xFA00_0000, // s_load_dwordx8 s[0:7], s[2:3], null
+                0xBE88_03FF,
+                0x0000_3006, // s_mov_b32 s8, 0x3006
+                0xBE89_03FF,
+                0x00FF_F000, // s_mov_b32 s9, 0x00FF_F000
+                0xBF06_8009, // s_cmp_eq_u32 s9, 0
+                0x858A_F5F4, // s_cselect_b64 s[10:11], 2.0, -2.0
+                0xF080_0F08,
+                0x0040_0002, // image_sample v[0:3], v[2:3], s[0:7], s[8:11]
+                S_ENDPGM,
+            ],
+            &[param(Table, 8, 1), param(Constants, 9, 1)],
+            HwStage::Ps,
+        );
+        let sampler = picked
+            .descriptors
+            .iter()
+            .find(|d| d.role == Role::Sampler)
+            .unwrap();
+        let Source::Select { args, .. } = &sampler.source else {
+            panic!("{:?}", sampler.source);
+        };
+        assert_eq!(
+            args.as_slice(),
+            &[
+                Source::Constant(vec![0x3006, 0x00FF_F000, 0, 0x4000_0000]),
+                Source::Constant(vec![0x3006, 0x00FF_F000, 0, 0xC000_0000]),
+            ]
+        );
     }
 }

@@ -937,3 +937,156 @@ fn v_cmp_class_f16_matches_rdna2() {
         );
     });
 }
+
+/// SOP1 `op sdst, src0`.
+const fn sop1(op: u8, sdst: u8, src0: u8) -> u32 {
+    0xBE80_0000 | (sdst as u32 & 0x7F) << 16 | (op as u32) << 8 | src0 as u32
+}
+
+/// SOPC `op src0, src1`.
+const fn sopc(op: u8, src0: u8, src1: u8) -> u32 {
+    0xBF00_0000 | (op as u32 & 0x7F) << 16 | (src1 as u32) << 8 | src0 as u32
+}
+
+/// All GFX10 inline constants exercised in 64-bit instructions: signed integers
+/// and the nine binary64 floating-point constants (`240..=248`).
+const INLINE_64_CASES: &[(u8, u64)] = &[
+    (128, 0),
+    (192, 64),
+    (193, u64::MAX),
+    (194, u64::MAX - 1),
+    (208, (-16i64) as u64),
+    (240, 0x3FE0_0000_0000_0000),
+    (241, 0xBFE0_0000_0000_0000),
+    (242, 0x3FF0_0000_0000_0000),
+    (243, 0xBFF0_0000_0000_0000),
+    (244, 0x4000_0000_0000_0000),
+    (245, 0xC000_0000_0000_0000),
+    (246, 0x4010_0000_0000_0000),
+    (247, 0xC010_0000_0000_0000),
+    (248, 0x3FC4_5F30_6DC9_C882),
+];
+
+#[test]
+fn scalar_64bit_ops_expand_inline_constants_as_rdna2() {
+    for &(code, want) in INLINE_64_CASES {
+        // s_mov_b64 s[6:7], code; s_cmp_eq_u32 s0, 0; s_cselect_b32 s6, s6, s7; v_mov_b32 v0, s6
+        let shader = build_valu_cs(&[
+            sop1(0x04, 6, code),
+            sopc(0x06, 0, 128),
+            sop2(0x0A, 6, 6, 7),
+            vop1(0x001, 0, sgpr(6)),
+        ]);
+        let container = crate::Container::parse(&shader.dxil).unwrap();
+        let sfi0 = u64::from_le_bytes(
+            container
+                .part(crate::FourCC::SFI0)
+                .unwrap()
+                .data
+                .try_into()
+                .unwrap(),
+        );
+        assert_eq!(sfi0 & 0x8000, 0, "s_mov_b64 must not require INT64");
+
+        run_cases(
+            &shader,
+            &[[0, 0, 0, 0], [1, 0, 0, 0]],
+            |backend, hi, _, got| {
+                let expected = (want >> (32 * hi)) as u32;
+                assert_eq!(
+                    got, expected,
+                    "{backend}: s_mov_b64 inline {code} half {hi} = {got:#010x}, want {expected:#010x}",
+                );
+            },
+        );
+    }
+
+    // Exercise 64-bit scalar consumers of `half`: s_xor_b64, s_cmp_eq_u64,
+    // s_cselect_b64, s_ff1_i32_b64, and s_bcnt1_i32_b64 (keeping s[8:11] intact).
+    let ops = build_valu_cs(&[
+        sop2(0x13, 6, 0, 248),    // s_xor_b64 s[6:7], s[0:1], 0.15915494
+        sopc(0x12, 6, 243),       // s_cmp_eq_u64 s[6:7], -1.0
+        sop2(0x0B, 6, 244, 245),  // s_cselect_b64 s[6:7], 2.0, -2.0
+        sop1(0x14, 6, 6),         // s_ff1_i32_b64 s6, s[6:7] (62 for 2.0 and -2.0)
+        sop1(0x10, 12, 243),      // s_bcnt1_i32_b64 s12, -1.0 (0xBFF0_0000_0000_0000 -> 11 bits)
+        sop2(0x1E, 12, 12, 136),  // s_lshl_b32 s12, s12, 8
+        sop2(0x00, 6, 6, 12),     // s_add_u32 s6, s6, s12
+        sopc(0x12, 0, 248),       // s_cmp_eq_u64 s[0:1], 0.15915494
+        sop2(0x0A, 12, 129, 128), // s_cselect_b32 s12, 1, 0
+        sop2(0x1E, 12, 12, 144),  // s_lshl_b32 s12, s12, 16
+        sop2(0x00, 6, 6, 12),     // s_add_u32 s6, s6, s12
+        vop1(0x001, 0, sgpr(6)),  // v_mov_b32 v0, s6
+    ]);
+    let match_xor = 0xBFF0_0000_0000_0000u64 ^ 0x3FC4_5F30_6DC9_C882;
+    let exact_248 = 0x3FC4_5F30_6DC9_C882u64;
+    run_cases(
+        &ops,
+        &[
+            [match_xor as u32, (match_xor >> 32) as u32, 0, 0],
+            [exact_248 as u32, (exact_248 >> 32) as u32, 0, 0],
+        ],
+        |backend, i, _, got| {
+            let want = if i == 0 {
+                62 | (11 << 8)
+            } else {
+                62 | (11 << 8) | (1 << 16)
+            };
+            assert_eq!(
+                got, want,
+                "{backend}: case {i} got {got:#x}, want {want:#x}"
+            );
+        },
+    );
+}
+
+#[test]
+fn vector_64bit_ops_expand_inline_constants_as_rdna2() {
+    for &(code, want) in INLINE_64_CASES {
+        // v_lshrrev_b64 v[2:3], v1, code (VOP3 opcode 0x300): shift by 0 or 32
+        // (passed in s0 -> v1) to read both halves of `src64` on the GPU.
+        let shift = vop3(0x300, 2, vgpr(1), u16::from(code), 0);
+        let shader = build_valu_cs(&[
+            shift[0],
+            shift[1],
+            vop1(0x001, 0, vgpr(2)), // v_mov_b32 v0, v2
+        ]);
+        run_cases(
+            &shader,
+            &[[0, 0, 0, 0], [32, 0, 0, 0]],
+            |backend, hi, _, got| {
+                let expected = (want >> (32 * hi)) as u32;
+                assert_eq!(
+                    got, expected,
+                    "{backend}: v_lshrrev_b64 inline {code} half {hi} = {got:#010x}, want {expected:#010x}",
+                );
+            },
+        );
+    }
+
+    // 64-bit vector compares (`v_cmp_eq_u64` 0x0e2 and `v_cmp_lt_i64` 0x0a1)
+    // against binary64 inline constants (-0.5 = 241, 1/(2*pi) = 248).
+    let cmp_eq = vop3(0x0E2, 6, vgpr(1), 248, 0); // v_cmp_eq_u64 s6, v[1:2], 0.15915494
+    let sel_eq = vop3(0x101, 3, 128, 129, sgpr(6)); // v_cndmask_b32 v3, 0, 1, s6
+    let cmp_lt = vop3(0x0A1, 6, 241, vgpr(1), 0); // v_cmp_lt_i64 s6, -0.5, v[1:2]
+    let sel_lt = vop3(0x101, 4, 128, 130, sgpr(6)); // v_cndmask_b32 v4, 0, 2, s6
+    let or = vop3(0x11C, 0, vgpr(3), vgpr(4), 0); // v_or_b32 v0, v3, v4
+    let cmp_shader = build_valu_cs(&[
+        cmp_eq[0], cmp_eq[1], sel_eq[0], sel_eq[1], cmp_lt[0], cmp_lt[1], sel_lt[0], sel_lt[1],
+        or[0], or[1],
+    ]);
+    let inv_2pi = 0x3FC4_5F30_6DC9_C882u64;
+    let neg_one = 0xBFF0_0000_0000_0000u64;
+    let min_i64 = i64::MIN as u64;
+    run_cases(
+        &cmp_shader,
+        &[
+            [inv_2pi as u32, (inv_2pi >> 32) as u32, 0, 0],
+            [neg_one as u32, (neg_one >> 32) as u32, 0, 0],
+            [min_i64 as u32, (min_i64 >> 32) as u32, 0, 0],
+        ],
+        |backend, i, _, got| {
+            let want = [3, 2, 0][i];
+            assert_eq!(got, want, "{backend}: 64-bit compare case {i}");
+        },
+    );
+}
