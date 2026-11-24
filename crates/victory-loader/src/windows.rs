@@ -193,6 +193,15 @@ fn write_if_changed(path: &Path, bytes: &[u8]) -> Result<()> {
 }
 
 impl LoadedImage {
+    #[cfg(test)]
+    pub(super) fn synthetic(module: HMODULE, info: ImageInfo) -> Self {
+        Self {
+            module,
+            path: PathBuf::new(),
+            info,
+        }
+    }
+
     pub fn base(&self) -> usize {
         self.module as usize
     }
@@ -336,6 +345,7 @@ impl LoadedImage {
     /// Runs title code. Imports must be bound first, and the DLLs this one
     /// depends on attached.
     pub unsafe fn attach(&self) -> Result<()> {
+        crate::threads::register_process_detach()?;
         // SAFETY: forwarded from the caller.
         if unsafe { self.notify(DLL_PROCESS_ATTACH, true, std::ptr::null_mut()) } == Some(0) {
             bail!("DllMain returned FALSE");
@@ -395,6 +405,7 @@ impl LoadedImage {
         if self.info.entry_rva == 0 {
             bail!("image has no entry point");
         }
+        crate::threads::register_process_detach()?;
         let stack = usize::try_from(self.info.stack_reserve)
             .unwrap_or(usize::MAX)
             .max(1 << 20);
