@@ -68,6 +68,8 @@ pub(crate) struct Shader {
     pub flags: u64,
     /// Heap handles made with a non-uniform index.
     pub nonuniform_handles: u32,
+    /// Prefix min/max scans lowered in place of `wavePrefixOp` kinds 2 and 3.
+    pub prefix_scans: u32,
     /// A compute shader with this thread-group size.
     pub threads: Option<[u32; 3]>,
     /// The wave size a compute shader requires (`WaveSize`).
@@ -122,6 +124,7 @@ impl Shader {
             root_srvs: Vec::new(),
             flags: 0,
             nonuniform_handles: 0,
+            prefix_scans: 0,
             threads: None,
             wave_size: None,
             lds_dwords: 0,

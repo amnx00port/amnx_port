@@ -40,6 +40,9 @@ pub(crate) struct Lowered {
     /// Heap handles made with a non-uniform index.
     #[cfg(test)]
     pub nonuniform_handles: u32,
+    /// Prefix min/max scans lowered (test builds only).
+    #[cfg(test)]
+    pub prefix_scans: u32,
     /// Whether the program uses wave operations.
     #[cfg(test)]
     pub wave_ops: bool,
@@ -773,7 +776,12 @@ impl<'a> Lower<'a> {
         let sfx = if float { "f32" } else { "i32" };
         let r = match (op, prefix) {
             (Op::AddU | Op::AddF, Some(inclusive)) => {
-                let (k0, k1) = (self.s.m.i8(0), self.s.m.i8(1));
+                let (kind, sop) = if matches!(op, Op::AddU) {
+                    (0, 1)
+                } else {
+                    (0, 0)
+                };
+                let (k0, k1) = (self.s.m.i8(kind), self.s.m.i8(sop));
                 let r = self.s.op(
                     c,
                     &format!("wavePrefixOp.{sfx}"),
@@ -788,7 +796,16 @@ impl<'a> Lower<'a> {
                     r
                 }
             }
-            (_, Some(_)) => return Err("a wave prefix of an operation other than a sum"),
+            (Op::MinU | Op::MaxU | Op::MinI | Op::MaxI | Op::MinF | Op::MaxF, Some(inclusive)) => {
+                // `wavePrefixOp` kinds 2 and 3 are what HLSL uses for a min or
+                // max prefix, and no driver implements them: NVIDIA returns the
+                // unsigned prefix for the signed kinds and refuses to create a
+                // pipeline for the float ones, and AMD returns unrelated values
+                // (PR #470, hardware readback). Scan with `waveReadLaneAt`
+                // instead, which both vendors implement for every type.
+                self.wave_prefix_scan(op, arg, id, inclusive)
+            }
+            (_, Some(_)) => return Err("a wave prefix of a bitwise operation"),
             (Op::Or | Op::And | Op::Xor, None) => {
                 let k = self.s.m.i8(match op {
                     Op::And => 0,
@@ -908,6 +925,8 @@ impl<'a> Lower<'a> {
             root_srvs,
             #[cfg(test)]
             nonuniform_handles: self.s.nonuniform_handles,
+            #[cfg(test)]
+            prefix_scans: self.s.prefix_scans,
             #[cfg(test)]
             wave_ops: self.s.flags & flags::WAVE_OPS != 0,
             dxil: self.s.finish(),
@@ -1379,6 +1398,75 @@ impl<'a> Lower<'a> {
             op,
             &[a, b],
         )
+    }
+
+    /// The prefix of a min or max over the lanes below this one (and its own
+    /// term when `inclusive`), as a Hillis-Steele scan: at each step the lane
+    /// merges the value `step` lanes below, and keeps its own value where the
+    /// step would read off the bottom of the wave. An exclusive prefix is the
+    /// inclusive one read one lane down, with the identity in lane 0.
+    ///
+    /// The merges are the same ones the translator emits for `v_min_u32` and
+    /// friends, so a float prefix folds with `max_min` (FMin/FMax) and keeps
+    /// the non-NaN operand, as the console does.
+    fn wave_prefix_scan(&mut self, op: super::wave::Op, arg: V, id: V, inclusive: bool) -> V {
+        use super::wave::Op;
+        self.s.prefix_scans += 1;
+        let c = self.cur;
+        let float = matches!(op, Op::MinF | Op::MaxF);
+        let lane = self.lane_index();
+        let zero = self.s.m.i32(0);
+        let mut r = arg;
+        let mut step = 1u32;
+        while step < self.wave() {
+            let k = self.s.m.i32(step);
+            // The lane this step reads, and whether it exists for this lane.
+            let enough = self.s.m.cmp(c, pred::IUGE, lane, k);
+            let under = self.s.m.bin(c, Bin::Sub, lane, k);
+            // Clamp the source lane: a step below the bottom of the wave reads
+            // lane 0, and its result is discarded, rather than an index out of
+            // range.
+            let below = self.s.m.select(c, enough, under, zero);
+            let bits = if float { self.as_int(r) } else { r };
+            let raw = self.read_lane(bits, below);
+            let other = if float { self.as_float(raw) } else { raw };
+            let merged = match op {
+                Op::MinU => {
+                    let p = self.s.m.cmp(c, pred::IULT, r, other);
+                    self.s.m.select(c, p, r, other)
+                }
+                Op::MaxU => {
+                    let p = self.s.m.cmp(c, pred::IUGT, r, other);
+                    self.s.m.select(c, p, r, other)
+                }
+                Op::MinI => {
+                    let p = self.s.m.cmp(c, pred::SLT, r, other);
+                    self.s.m.select(c, p, r, other)
+                }
+                Op::MaxI => {
+                    let p = self.s.m.cmp(c, pred::SGT, r, other);
+                    self.s.m.select(c, p, r, other)
+                }
+                Op::MinF => self.max_min(false, r, other),
+                _ => self.max_min(true, r, other),
+            };
+            r = self.s.m.select(c, enough, merged, r);
+            step *= 2;
+        }
+        if inclusive {
+            return r;
+        }
+        // The prefix stops below this lane: read the inclusive one a lane down,
+        // and put the identity in lane 0.
+        let one = self.s.m.i32(1);
+        let nonzero = self.s.m.cmp(c, pred::IUGT, lane, zero);
+        let under = self.s.m.bin(c, Bin::Sub, lane, one);
+        let below = self.s.m.select(c, nonzero, under, zero);
+        let bits = if float { self.as_int(r) } else { r };
+        let raw = self.read_lane(bits, below);
+        let other = if float { self.as_float(raw) } else { raw };
+        let id = if float { self.as_float(id) } else { id };
+        self.s.m.select(c, nonzero, other, id)
     }
 
     /// The hardware's maximum (`max`) or minimum of two floats: as DXIL's
@@ -6957,6 +7045,11 @@ mod tests {
 
     /// Whether a synthetic compute program translates with these input registers.
     fn lowers(words: &[u32], rsrc2: u32) -> Result<(), crate::ShaderError> {
+        lowered(words, rsrc2).map(|_| ())
+    }
+
+    /// [`lowers`], keeping the lowered program so its DXIL can be inspected.
+    fn lowered(words: &[u32], rsrc2: u32) -> Result<Lowered, crate::ShaderError> {
         let code: Vec<u8> = words.iter().flat_map(|w| w.to_le_bytes()).collect();
         let native = NativeProgram {
             stage: HwStage::Cs,
@@ -6985,7 +7078,6 @@ mod tests {
             prims: vec![],
             mesh_stride: 0,
         })
-        .map(|_| ())
     }
 
     /// Lowers a compute program with the root parameters `layout` (in user
@@ -7324,6 +7416,76 @@ mod tests {
         assert_eq!(refusal(&words), refusal(&direct));
         words[8] = 0xBF07_8000; // read the group id instead; the timestamp is dead
         lowers(&words, group_ids_xy).expect("dead timestamp");
+    }
+
+    #[test]
+    fn a_wave_prefix_of_min_lowers() {
+        // A whole-wave section that leaves the inclusive prefix of a min:
+        // each lane the minimum of the lanes up to and including it. The
+        // scan runs with `row_shr` steps inside each row, and the first
+        // row's prefix is read out and folded under the second. The store
+        // after the section reads the prefix, so the value cannot be left
+        // missing: a wave prefix of a min has to lower.
+        let words = [
+            0x7E00_0280, // v_mov_b32 v0, 0
+            // 32-bit scalar forms: the wave32 pass follows their masks.
+            0xBE84_3DC1, // s_or_saveexec_b32 s4, -1
+            0x876A_C104, // s_and_b32 s106, s4, -1
+            0x0202_00C1, // v_cndmask_b32 v1, -1, v0, vcc
+            0x2602_02FA, // v_min_u32 v1, v1 row_shr:1, v1
+            0xFF01_1101,
+            0x2602_02FA, // v_min_u32 v1, v1 row_shr:2, v1
+            0xFF01_1201,
+            0x2602_02FA, // v_min_u32 v1, v1 row_shr:3, v1
+            0xFF01_1301,
+            0x2602_02FA, // v_min_u32 v1, v1 row_shr:4, v1
+            0xFF01_1401,
+            0x2602_02FA, // v_min_u32 v1, v1 row_shr:5, v1
+            0xFF01_1501,
+            0x2602_02FA, // v_min_u32 v1, v1 row_shr:6, v1
+            0xFF01_1601,
+            0x2602_02FA, // v_min_u32 v1, v1 row_shr:7, v1
+            0xFF01_1701,
+            0x2602_02FA, // v_min_u32 v1, v1 row_shr:8, v1
+            0xFF01_1801,
+            0x2602_02FA, // v_min_u32 v1, v1 row_shr:9, v1
+            0xFF01_1901,
+            0x2602_02FA, // v_min_u32 v1, v1 row_shr:10, v1
+            0xFF01_1A01,
+            0x2602_02FA, // v_min_u32 v1, v1 row_shr:11, v1
+            0xFF01_1B01,
+            0x2602_02FA, // v_min_u32 v1, v1 row_shr:12, v1
+            0xFF01_1C01,
+            0x2602_02FA, // v_min_u32 v1, v1 row_shr:13, v1
+            0xFF01_1D01,
+            0x2602_02FA, // v_min_u32 v1, v1 row_shr:14, v1
+            0xFF01_1E01,
+            0x2602_02FA, // v_min_u32 v1, v1 row_shr:15, v1
+            0xFF01_1F01,
+            0xD760_0006, // v_readlane_b32 s6, v1, 15
+            0x0001_1F01,
+            0x7E04_0206, // v_mov_b32 v2, s6
+            0x2602_02FA, // v_min_u32 v1, v2 quad_perm:[0,1,2,3] row_mask:0x2, v1
+            0x2F00_E402,
+            0xBEFE_0304, // s_mov_b32 exec_lo, s4
+            0xD834_0000, // ds_write_b32 v0, v1
+            0x0000_0100,
+            S_ENDPGM,
+        ];
+        let out = lowered(&words, 1 << 15).unwrap();
+        // Drivers do not implement `wavePrefixOp` kinds 2 and 3 (hardware
+        // readback on PR #470), so the min prefix must lower to a
+        // `WaveReadLaneAt` scan instead.
+        assert_eq!(out.prefix_scans, 1, "a min prefix must scan, not prefix-op");
+        // dxil.dll, where there is one, checks the scan's module too.
+        #[cfg(windows)]
+        {
+            if let Ok(mut v) = super::super::validator::Validator::load(
+                super::super::validator::Validator::default_path().as_deref(),
+            ) {
+                v.validate(&mut out.dxil.clone()).unwrap();
+            }
+        }
     }
 
     #[test]
