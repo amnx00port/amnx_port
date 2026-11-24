@@ -69,6 +69,12 @@ const fn vgpr(n: u8) -> u16 {
 /// 4 dwords of root constants in `s0..s3`, runs `body` (leaving its result in
 /// `v0`), and stores `v0` to dword 0 of the raw UAV at heap index 0.
 fn build_valu_cs(body: &[u32]) -> HostShader {
+    build_cs(body, 5 << 1)
+}
+
+/// [`build_valu_cs`] with the program's `COMPUTE_PGM_RSRC2` (user SGPRs and
+/// LDS size).
+fn build_cs(body: &[u32], rsrc2: u32) -> HostShader {
     let mut words = Vec::new();
     // s[4:5] = descriptor table address (heap index 0 -> byte offset 0).
     words.push(s_mov_b32(5, 0x80)); // inline constant 0
@@ -116,7 +122,7 @@ fn build_valu_cs(body: &[u32]) -> HostShader {
             slot: 1,
         }],
         io: StageIo::Cs(ComputeIo {
-            rsrc2: 5 << 1, // 5 user SGPRs: s0..s4
+            rsrc2,
             threads: [1, 1, 1],
         }),
         code,
@@ -172,6 +178,18 @@ pub(super) static ONE_AT_A_TIME: std::sync::Mutex<()> = std::sync::Mutex::new(()
 fn run_cases(
     shader: &HostShader,
     cases: &[[u32; 4]],
+    check: impl FnMut(&str, usize, [u32; 4], u32),
+) {
+    run_cases_on(shader, cases, false, check);
+}
+
+/// [`run_cases`]; with `warp_may_refuse`, a WARP device that refuses the
+/// pipeline is skipped (WARP refuses this harness's programs that declare
+/// group shared memory, even plain dword LDS accesses).
+fn run_cases_on(
+    shader: &HostShader,
+    cases: &[[u32; 4]],
+    warp_may_refuse: bool,
     mut check: impl FnMut(&str, usize, [u32; 4], u32),
 ) {
     let _one = ONE_AT_A_TIME.lock().unwrap_or_else(|e| e.into_inner());
@@ -181,9 +199,14 @@ fn run_cases(
             eprintln!("no SM 6.6 {label} device; skipped");
             continue;
         };
-        let (root, pso) = host
-            .compute_pipeline(shader)
-            .unwrap_or_else(|e| panic!("{label}: compute_pipeline failed: {e}"));
+        let (root, pso) = match host.compute_pipeline(shader) {
+            Ok(p) => p,
+            Err(e) if warp && warp_may_refuse => {
+                eprintln!("{label}: compute_pipeline refused ({e}); skipped");
+                continue;
+            }
+            Err(e) => panic!("{label}: compute_pipeline failed: {e}"),
+        };
         for (i, &inputs) in cases.iter().enumerate() {
             let mut ud = vec![0u32; shader.user_data_dwords().max(1) as usize];
             for u in &shader.user_data {
@@ -935,5 +958,131 @@ fn v_cmp_class_f16_matches_rdna2() {
             "{backend}: v_cmp_class_f16(-hi({:#010x}), {:#05x}) = {got}, want {want}",
             inp[0], inp[1],
         );
+    });
+}
+
+/// DS `op vdst, vaddr, vdata0 offset:off` (`off` < 65536).
+const fn ds(op: u8, vdst: u8, vaddr: u8, vdata0: u8, off: u16) -> [u32; 2] {
+    [
+        0xD800_0000 | (op as u32) << 18 | off as u32,
+        (vdst as u32) << 24 | (vdata0 as u32) << 8 | vaddr as u32,
+    ]
+}
+
+const DS_WRITE_B32: u8 = 0x0D;
+const DS_WRITE_B8: u8 = 0x1E;
+const DS_WRITE_B16: u8 = 0x1F;
+const DS_READ_B32: u8 = 0x36;
+const DS_READ_I8: u8 = 0x39;
+const DS_READ_U16: u8 = 0x3C;
+const DS_READ_U16_D16_HI: u8 = 0xA7;
+
+/// Runs an LDS program over `cases` (inputs in `v1..v4`, the LDS address
+/// `0` in `v5`, 512 bytes of LDS) and compares `v0` with `expect`.
+fn lds_cases(name: &str, body: &[[u32; 2]], cases: &[[u32; 4]], expect: impl Fn([u32; 4]) -> u32) {
+    let mut words = vec![vop1(0x001, 5, 0x80)]; // v_mov_b32 v5, 0
+    for w in body {
+        words.extend_from_slice(w);
+    }
+    // 5 user SGPRs, 1 x 512 bytes of LDS.
+    let shader = build_cs(&words, 5 << 1 | 1 << 15);
+    run_cases_on(&shader, cases, true, |backend, i, inputs, got| {
+        let want = expect(inputs);
+        assert_eq!(
+            got, want,
+            "{name} {backend} case {i} {inputs:x?}: {got:#010x} != {want:#010x}"
+        );
+    });
+}
+
+const LDS_CASES: [[u32; 4]; 3] = [
+    [0x4433_2211, 0x8877_6655, 0xCCBB_AA99, 0xF0E0_D0C0],
+    [0x7D7E_7F80, 0x0102_0304, 0x8182_8384, 0x1234_5678],
+    [0xFFFF_FFFF, 0x0000_0000, 0x0000_80FF, 0xDEAD_BEEF],
+];
+
+#[test]
+fn lds_byte_half_and_dword_writes_share_a_dword() {
+    // [0] = v1; byte 1 = v2; half at 2 = v3; v0 = [0].
+    lds_cases(
+        "mixed writes",
+        &[
+            ds(DS_WRITE_B32, 0, 5, 1, 0),
+            ds(DS_WRITE_B8, 0, 5, 2, 1),
+            ds(DS_WRITE_B16, 0, 5, 3, 2),
+            ds(DS_READ_B32, 0, 5, 0, 0),
+        ],
+        &LDS_CASES,
+        |v| v[0] & 0xFF | (v[1] & 0xFF) << 8 | (v[2] & 0xFFFF) << 16,
+    );
+}
+
+#[test]
+fn lds_halves_straddle_two_dwords() {
+    // A half read at byte 3 takes dword 0's last byte and dword 1's first.
+    lds_cases(
+        "straddling read",
+        &[
+            ds(DS_WRITE_B32, 0, 5, 1, 0),
+            ds(DS_WRITE_B32, 0, 5, 2, 4),
+            ds(DS_READ_U16, 0, 5, 0, 3),
+        ],
+        &LDS_CASES,
+        |v| v[0] >> 24 | (v[1] & 0xFF) << 8,
+    );
+    // A half written at byte 3 changes both dwords' bytes and nothing else.
+    for (dword, expect) in [
+        (
+            0u16,
+            (|v: [u32; 4]| v[0] & 0x00FF_FFFF | (v[2] & 0xFF) << 24) as fn([u32; 4]) -> u32,
+        ),
+        (4, |v| v[1] & !0xFF | v[2] >> 8 & 0xFF),
+    ] {
+        lds_cases(
+            "straddling write",
+            &[
+                ds(DS_WRITE_B32, 0, 5, 1, 0),
+                ds(DS_WRITE_B32, 0, 5, 2, 4),
+                ds(DS_WRITE_B16, 0, 5, 3, 3),
+                ds(DS_READ_B32, 0, 5, 0, dword),
+            ],
+            &LDS_CASES,
+            expect,
+        );
+    }
+}
+
+#[test]
+fn lds_sub_dword_reads_extend_and_keep_halves() {
+    // ds_read_i8 sign-extends byte 1.
+    lds_cases(
+        "signed byte",
+        &[ds(DS_WRITE_B32, 0, 5, 1, 0), ds(DS_READ_I8, 0, 5, 0, 1)],
+        &LDS_CASES,
+        |v| (v[0] >> 8 & 0xFF) as u8 as i8 as i32 as u32,
+    );
+    // ds_read_u16_d16_hi fills the high half and keeps the low half of v0.
+    let mut body = vec![[vop1(0x001, 0, vgpr(4)), 0xBF80_0000]]; // v_mov_b32 v0, v4; s_nop
+    body.extend([
+        ds(DS_WRITE_B32, 0, 5, 1, 0),
+        ds(DS_READ_U16_D16_HI, 0, 5, 0, 0),
+    ]);
+    lds_cases("d16_hi", &body, &LDS_CASES, |v| {
+        v[3] & 0xFFFF | (v[0] & 0xFFFF) << 16
+    });
+}
+
+#[test]
+fn lds_d16_hi_keeps_the_destinations_own_low_half() {
+    // The destination (v6) is neither the data nor the address register: its
+    // low half comes from its own previous value (v4), the high half from LDS.
+    let body = [
+        [vop1(0x001, 6, vgpr(4)), 0xBF80_0000], // v_mov_b32 v6, v4; s_nop
+        ds(DS_WRITE_B32, 0, 5, 1, 0),
+        ds(DS_READ_U16_D16_HI, 6, 5, 2, 0), // data field v2: not read
+        [vop1(0x001, 0, vgpr(6)), 0xBF80_0000], // v_mov_b32 v0, v6; s_nop
+    ];
+    lds_cases("d16_hi into another register", &body, &LDS_CASES, |v| {
+        v[3] & 0xFFFF | (v[0] & 0xFFFF) << 16
     });
 }
