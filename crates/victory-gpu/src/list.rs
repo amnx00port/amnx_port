@@ -133,6 +133,14 @@ fn with_state(this: This, f: impl FnOnce(&crate::host::HostList, &mut crate::dra
     f(list, &mut state.lock().unwrap_or_else(|e| e.into_inner()));
 }
 
+/// After host work that binds its own heaps, root signatures and pipeline
+/// on a title list's host list (an upscaler): the next draw or dispatch
+/// binds the title's again.
+#[cfg(windows)]
+pub(crate) fn forget_host_bindings(this: This) {
+    with_state(this, |_, state| state.forget_host());
+}
+
 /// The host list behind a title list, if there is a host GPU.
 #[cfg(windows)]
 pub(crate) fn host_list<'a>(this: This) -> Option<&'a crate::host::HostList> {
@@ -703,6 +711,11 @@ extern "system" fn clear_rtv(
             unsafe { std::slice::from_raw_parts(rects.cast(), count as usize) }
         });
         const RENDER_TARGET: u32 = 0x4;
+        if crate::host::legal_state(texture, RENDER_TARGET) != RENDER_TARGET {
+            static REPORTED: std::sync::Once = std::sync::Once::new();
+            REPORTED.call_once(|| tracing::warn!(resource = ?record.resource, "title render target clear has no writable host view"));
+            return;
+        }
         let rtv = host.rtv(texture, record.desc().as_ref());
         // SAFETY: an open list, a fresh view of a live texture.
         unsafe {
