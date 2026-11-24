@@ -8,7 +8,7 @@
 //! ```
 
 pub const MAGIC: &[u8; 4] = b"SGD5";
-const MARKER: [u8; 4] = 0x000D_DCE7_u32.to_le_bytes();
+pub const MARKER: [u8; 4] = 0x000D_DCE7_u32.to_le_bytes();
 /// Containers are at most a few MiB; refuse to allocate for absurd sizes.
 const MAX_UNPACKED: usize = 64 << 20;
 
@@ -35,6 +35,16 @@ impl Record<'_> {
     }
 }
 
+/// Record size from the marker onwards. The header starts four bytes
+/// before the marker and includes the unpacked size.
+pub fn encoded_len(header: &[u8; 16]) -> Option<usize> {
+    let n = u32::from_le_bytes(header[..4].try_into().expect("four bytes"));
+    let again = u32::from_le_bytes(header[8..12].try_into().expect("four bytes"));
+    let unpacked = u32::from_le_bytes(header[12..].try_into().expect("four bytes")) as usize;
+    (header[4..8] == MARKER && n == again && n >= 12 && unpacked <= MAX_UNPACKED)
+        .then_some(n as usize)
+}
+
 /// An SGD5 file, or a file holding one (an archive: records are found by
 /// their marker, so no index is needed).
 pub fn is_sgd5(file: &[u8]) -> bool {
@@ -46,22 +56,20 @@ pub fn records(file: &[u8]) -> impl Iterator<Item = Record<'_>> {
     memchr::memmem::find_iter(file, &MARKER).filter_map(|at| record(file, at))
 }
 
-fn record(file: &[u8], at: usize) -> Option<Record<'_>> {
-    let u32_at = |o: usize| {
-        file.get(o..o + 4)
-            .map(|b| u32::from_le_bytes(b.try_into().expect("4 bytes")) as usize)
-    };
-    let n = u32_at(at.checked_sub(4)?)?;
-    let unpacked_size = u32_at(at + 8)?;
-    if u32_at(at + 4)? != n || n < 12 || unpacked_size > MAX_UNPACKED {
-        return None;
-    }
+/// Reads a record at a known marker offset in the supplied slice.
+pub fn record(file: &[u8], at: usize) -> Option<Record<'_>> {
+    let header: &[u8; 16] = file
+        .get(at.checked_sub(4)?..at.checked_add(12)?)?
+        .try_into()
+        .ok()?;
+    let n = encoded_len(header)?;
+    let unpacked_size = u32::from_le_bytes(header[12..].try_into().expect("four bytes")) as usize;
     let nul = at.checked_sub(6)?;
     Some(Record {
         offset: at,
         name: (file[nul] == 0).then(|| name_before(file, nul)).flatten(),
         kind: file[at - 5],
-        packed: file.get(at + 12..at + n)?,
+        packed: file.get(at + 12..at.checked_add(n)?)?,
         unpacked_size,
     })
 }

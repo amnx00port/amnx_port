@@ -15,7 +15,7 @@ use victory_shader::{
 };
 use victory_shader::{io, resource};
 
-use crate::shader::{MAX_FILE, Source, sources};
+use crate::shader::{Source, sources};
 
 #[derive(Default)]
 struct Tally {
@@ -188,37 +188,44 @@ pub fn run(
             .into_iter()
             .filter_map(Result::ok)
         {
-            if !entry.file_type().is_file() || entry.metadata().map_or(0, |m| m.len()) > MAX_FILE {
+            if !entry.file_type().is_file() {
                 continue;
             }
-            let Ok(data) = std::fs::read(entry.path()) else {
-                continue;
-            };
-            let jobs = sources(&data);
-            let next = AtomicUsize::new(0);
-            std::thread::scope(|s| {
-                for _ in 0..threads.min(jobs.len()) {
-                    s.spawn(|| {
-                        let mut t = Tally {
-                            list,
-                            ..Tally::default()
-                        };
-                        let mut checks = Checks {
-                            keep: (!pairs.is_empty()).then(|| kept.clone()),
-                            validator: validate
-                                .then(|| Validator::load(dll.as_deref()).ok())
-                                .flatten(),
-                            host: pipelines
-                                .then(|| Host::new(false).ok().map(|h| (h, host::stub_ps())))
-                                .flatten(),
-                        };
-                        while let Some(job) = jobs.get(next.fetch_add(1, Ordering::Relaxed)) {
-                            translate(job, entry.path(), &seen, &mut t, &mut checks);
-                        }
-                        lock(&total).merge(t);
-                    });
+            // A large archive takes multiple batches. Keep each worker's
+            // validator and D3D device across batches of the same file.
+            let mut workers = Vec::new();
+            if let Err(error) = sources(entry.path(), |jobs| {
+                let next = AtomicUsize::new(0);
+                let count = threads.min(jobs.len());
+                if workers.len() < count {
+                    workers.resize_with(count, || None);
                 }
-            });
+                std::thread::scope(|s| {
+                    for worker in &mut workers[..count] {
+                        s.spawn(|| {
+                            let mut t = Tally {
+                                list,
+                                ..Tally::default()
+                            };
+                            let checks = worker.get_or_insert_with(|| Checks {
+                                keep: (!pairs.is_empty()).then(|| kept.clone()),
+                                validator: validate
+                                    .then(|| Validator::load(dll.as_deref()).ok())
+                                    .flatten(),
+                                host: pipelines
+                                    .then(|| Host::new(false).ok().map(|h| (h, host::stub_ps())))
+                                    .flatten(),
+                            });
+                            while let Some(job) = jobs.get(next.fetch_add(1, Ordering::Relaxed)) {
+                                translate(job, entry.path(), &seen, &mut t, checks);
+                            }
+                            lock(&total).merge(t);
+                        });
+                    }
+                });
+            }) {
+                eprintln!("could not scan {}: {error}", entry.path().display());
+            }
         }
     }
     let t = total.into_inner().unwrap_or_else(|e| e.into_inner());

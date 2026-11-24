@@ -65,21 +65,32 @@ const HEADER_SIZE: usize = 0x20;
 const MAX_PARTS: usize = 256;
 
 impl<'a> Container<'a> {
-    pub fn parse(data: &'a [u8]) -> Result<Self, ShaderError> {
-        if data.len() < HEADER_SIZE || &data[0..4] != b"DXBC" {
+    /// Declared byte length from a complete container header. The caller
+    /// still needs to read and parse the container's parts.
+    pub fn declared_len(header: &[u8]) -> Result<usize, ShaderError> {
+        if header.len() < HEADER_SIZE || &header[..4] != b"DXBC" {
             return Err(ShaderError::NotDxbc);
         }
+        let total = u32_at(header, 0x18)? as usize;
+        let count = u32_at(header, 0x1C)? as usize;
+        if count > MAX_PARTS {
+            return Err(ShaderError::Malformed("implausible part count"));
+        }
+        if total < HEADER_SIZE + 4 * count {
+            return Err(ShaderError::Malformed("container size disagrees with data"));
+        }
+        Ok(total)
+    }
+
+    pub fn parse(data: &'a [u8]) -> Result<Self, ShaderError> {
+        let total = Self::declared_len(data)?;
         let digest = data[4..20].try_into().expect("16 bytes");
         let version = (u16_at(data, 0x14)?, u16_at(data, 0x16)?);
-        let total = u32_at(data, 0x18)? as usize;
-        if total > data.len() || total < HEADER_SIZE {
+        if total > data.len() {
             return Err(ShaderError::Malformed("container size disagrees with data"));
         }
         let data = &data[..total];
         let count = u32_at(data, 0x1C)? as usize;
-        if count > MAX_PARTS {
-            return Err(ShaderError::Malformed("implausible part count"));
-        }
         let mut parts = Vec::with_capacity(count);
         for i in 0..count {
             let offset = u32_at(data, HEADER_SIZE + 4 * i)? as usize;
