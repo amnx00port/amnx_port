@@ -243,6 +243,8 @@ extern "system" fn present(
     _parameters: *const u8,
 ) -> HRESULT {
     let frame = FRAMES.fetch_add(1, Ordering::Relaxed) + 1;
+    #[cfg(all(windows, feature = "diagnostics"))]
+    crate::producers::presented(frame);
     if frame.is_power_of_two() {
         let (draws, dispatches) = crate::list::take_counts();
         #[cfg(windows)]
@@ -272,8 +274,25 @@ extern "system" fn present(
         }
     }
     #[cfg(all(windows, feature = "diagnostics"))]
+    {
+        static LAST: AtomicU64 = AtomicU64::new(0);
+        let now = crate::draw::drawn() + crate::draw::dispatched();
+        crate::capture::note_busy(frame, now - LAST.swap(now, Ordering::Relaxed));
+    }
+    // Show mode (diagnostics builds) picks its target before a dump takes
+    // the frame's list.
+    #[cfg(all(windows, feature = "diagnostics"))]
+    let shown = crate::capture::shown(frame);
+    #[cfg(all(windows, feature = "diagnostics"))]
     if crate::capture::listed(frame) {
         crate::capture::dump_targets(frame);
+    }
+    #[cfg(all(windows, feature = "diagnostics"))]
+    if let (Some(copy), Some(host)) = (&shown, crate::host::host()) {
+        let state = crate::host::legal_state(&copy.texture, copy.state.load(Ordering::Relaxed));
+        if host.present(&copy.texture, Some(state), frame).is_some() {
+            return S_OK;
+        }
     }
     #[cfg(windows)]
     if planes > 0
@@ -287,12 +306,14 @@ extern "system" fn present(
         && let Some(host) = crate::host::host()
     {
         const COPY_SOURCE: u32 = 0x800;
-        let state = crate::resource::host_transition(resource, COPY_SOURCE)
-            .map_or(COPY_SOURCE, |(_, before)| before);
-        let shown = host.present(texture, state, frame);
-        crate::resource::host_transition(resource, state);
+        // `None`: already in COPY_SOURCE, nothing to move.
+        let before = crate::resource::host_transition(resource, COPY_SOURCE).map(|(_, b)| b);
+        let shown = host.present(texture, before, frame);
+        if let Some(before) = before {
+            crate::resource::host_transition(resource, before);
+        }
         #[cfg(feature = "diagnostics")]
-        blinks(frame, resource, state, shown);
+        blinks(frame, resource, before.unwrap_or(COPY_SOURCE), shown);
         #[cfg(not(feature = "diagnostics"))]
         let _ = shown;
     }

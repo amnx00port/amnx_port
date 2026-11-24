@@ -1584,10 +1584,17 @@ impl Meter {
 }
 
 impl Host {
-    /// Shows `texture`, which is in `state` (a host state) and stays in it,
-    /// as frame `frame` (saved if captures are on). `None` if nothing was
-    /// shown; else, in diagnostics builds, whether the frame was black.
-    pub(crate) fn present(&self, texture: &ID3D12Resource, state: u32, frame: u64) -> Option<bool> {
+    /// Shows `texture` as frame `frame` (saved if captures are on). `before`
+    /// is the host state it is in, which the copy moves it out of and back
+    /// to; `None` if it needs no move (it is in `COPY_SOURCE` already).
+    /// `None` if nothing was shown; else, in diagnostics builds, whether the
+    /// frame was black.
+    pub(crate) fn present(
+        &self,
+        texture: &ID3D12Resource,
+        before: Option<u32>,
+        frame: u64,
+    ) -> Option<bool> {
         // SAFETY: a live resource.
         let desc = unsafe { texture.GetDesc() };
         let Some(format) = swap_format(desc.Format) else {
@@ -1620,7 +1627,9 @@ impl Host {
                 }
             }
         }
-        let state = D3D12_RESOURCE_STATES(state as i32);
+        const COPY_SOURCE: u32 = D3D12_RESOURCE_STATE_COPY_SOURCE.0 as u32;
+        let into_source = transition_from(texture, before, COPY_SOURCE);
+        let out_of_source = before.and_then(|b| transition_from(texture, Some(COPY_SOURCE), b));
         // SAFETY: our swap chain, list and a live source texture.
         unsafe {
             let index = p.swap_chain.GetCurrentBackBufferIndex();
@@ -1629,14 +1638,15 @@ impl Host {
             };
             p.copy.reset();
             let list = &p.copy.list;
-            list.ResourceBarrier(&[
-                transition(texture, state, D3D12_RESOURCE_STATE_COPY_SOURCE),
-                transition(
-                    &back,
-                    D3D12_RESOURCE_STATE_PRESENT,
-                    D3D12_RESOURCE_STATE_COPY_DEST,
-                ),
-            ]);
+            let into_back = transition(
+                &back,
+                D3D12_RESOURCE_STATE_PRESENT,
+                D3D12_RESOURCE_STATE_COPY_DEST,
+            );
+            match into_source {
+                Some(into_source) => list.ResourceBarrier(&[into_source, into_back]),
+                None => list.ResourceBarrier(&[into_back]),
+            }
             list.CopyResource(&back, texture);
             #[cfg(feature = "diagnostics")]
             let capture = crate::capture::wanted(frame)
@@ -1646,14 +1656,15 @@ impl Host {
             let probe = crate::capture::probe(&self.device, list, texture);
             #[cfg(not(feature = "diagnostics"))]
             let _ = frame;
-            list.ResourceBarrier(&[
-                transition(texture, D3D12_RESOURCE_STATE_COPY_SOURCE, state),
-                transition(
-                    &back,
-                    D3D12_RESOURCE_STATE_COPY_DEST,
-                    D3D12_RESOURCE_STATE_PRESENT,
-                ),
-            ]);
+            let out_of_back = transition(
+                &back,
+                D3D12_RESOURCE_STATE_COPY_DEST,
+                D3D12_RESOURCE_STATE_PRESENT,
+            );
+            match out_of_source {
+                Some(out_of_source) => list.ResourceBarrier(&[out_of_source, out_of_back]),
+                None => list.ResourceBarrier(&[out_of_back]),
+            }
             p.copy.close();
             self.execute(&[&p.copy]);
             #[cfg(feature = "diagnostics")]
@@ -1881,6 +1892,29 @@ fn in_flight(history: &[D3D12_AUTO_BREADCRUMB_OP], markers: &[(u32, String)], do
     text
 }
 
+/// The states (before, after) a texture in `before` moves between to reach
+/// `after`; `None` if it is not moved: `before` is `None` (nothing to move)
+/// or equal to `after` (a barrier whose states before and after are equal
+/// is invalid).
+pub(crate) fn needed(before: Option<u32>, after: u32) -> Option<(u32, u32)> {
+    before.filter(|&b| b != after).map(|b| (b, after))
+}
+
+/// The barrier that moves `resource` from `before` to `after` (host
+/// states), if it moves at all (see [`needed`]).
+pub(crate) fn transition_from(
+    resource: &ID3D12Resource,
+    before: Option<u32>,
+    after: u32,
+) -> Option<D3D12_RESOURCE_BARRIER> {
+    let (before, after) = needed(before, after)?;
+    Some(transition(
+        resource,
+        D3D12_RESOURCE_STATES(before as i32),
+        D3D12_RESOURCE_STATES(after as i32),
+    ))
+}
+
 pub(crate) fn transition(
     resource: &ID3D12Resource,
     before: D3D12_RESOURCE_STATES,
@@ -1977,6 +2011,23 @@ fn pump() {
             let _ = TranslateMessage(&message);
             DispatchMessageW(&message);
         }
+    }
+}
+
+#[cfg(test)]
+mod barriers {
+    use super::needed;
+
+    #[test]
+    fn a_texture_moves_only_between_different_states() {
+        const COPY_SOURCE: u32 = 0x800;
+        // Nothing to move: no barrier.
+        assert_eq!(needed(None, COPY_SOURCE), None);
+        // Already there: a barrier with equal states would be invalid.
+        assert_eq!(needed(Some(COPY_SOURCE), COPY_SOURCE), None);
+        // Elsewhere: moved there and, for the way back, from there.
+        assert_eq!(needed(Some(0x4), COPY_SOURCE), Some((0x4, COPY_SOURCE)));
+        assert_eq!(needed(Some(COPY_SOURCE), 0x4), Some((COPY_SOURCE, 0x4)));
     }
 }
 

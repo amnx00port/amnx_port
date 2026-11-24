@@ -63,6 +63,10 @@ pub(crate) struct Shader {
     container: Vec<u8>,
     #[cfg(windows)]
     translated: OnceLock<Option<Translated>>,
+    /// Diagnostics: the console resources its native programs use, parsed
+    /// on first ask (see [`native_used`]).
+    #[cfg(all(windows, feature = "diagnostics"))]
+    native: OnceLock<Vec<victory_shader::UsedResource>>,
 }
 
 impl std::fmt::Debug for Shader {
@@ -88,6 +92,8 @@ fn shader(stage: &'static str, bytes: &[u8]) -> Arc<Shader> {
                 container: bytes.to_vec(),
                 #[cfg(windows)]
                 translated: OnceLock::new(),
+                #[cfg(all(windows, feature = "diagnostics"))]
+                native: OnceLock::new(),
             })
         })
         .clone()
@@ -116,17 +122,78 @@ impl Shader {
                         samplers = t.host.samplers.len(),
                         "shader translated"
                     ),
-                    Err(e) => tracing::warn!(
-                        stage = self.stage,
-                        hash = %self.hash,
-                        error = %e,
-                        "shader does not translate; its pipelines' draws are dropped"
-                    ),
+                    Err(e) => {
+                        tracing::warn!(
+                            stage = self.stage,
+                            hash = %self.hash,
+                            error = %e,
+                            "shader does not translate; its pipelines' draws are dropped"
+                        );
+                        // Diagnostics: `VICTORY_DUMP_FAILED=<dir>` keeps the
+                        // container, for `victory shader-info --disasm`.
+                        #[cfg(feature = "diagnostics")]
+                        if let Some(dir) = failed_dump_dir() {
+                            let mut dumped = DUMPED.lock().unwrap_or_else(|e| e.into_inner());
+                            let dumped = dumped.get_or_insert_with(std::collections::HashSet::new);
+                            if let Some((path, Err(e))) =
+                                dump_failed(dir, dumped, self.stage, &self.hash, &self.container)
+                            {
+                                tracing::warn!(path = %path.display(), error = %e, "VICTORY_DUMP_FAILED: not written");
+                            }
+                        }
+                    }
                 }
                 done.ok()
             })
             .as_ref()
     }
+}
+
+/// The folder `VICTORY_DUMP_FAILED` names, made once and checked to be
+/// outside every source tree (the containers are title data). `None` when
+/// unset or refused, which is logged.
+#[cfg(feature = "diagnostics")]
+fn failed_dump_dir() -> Option<&'static std::path::Path> {
+    static DIR: std::sync::OnceLock<Option<std::path::PathBuf>> = std::sync::OnceLock::new();
+    DIR.get_or_init(|| {
+        let dir = std::path::PathBuf::from(std::env::var_os("VICTORY_DUMP_FAILED")?);
+        if let Err(e) = victory_core::ensure_outside_repo(&dir) {
+            tracing::warn!(error = %e, "VICTORY_DUMP_FAILED: refused, nothing is dumped");
+            return None;
+        }
+        if let Err(e) = std::fs::create_dir_all(&dir) {
+            tracing::warn!(dir = %dir.display(), error = %e, "VICTORY_DUMP_FAILED: no folder, nothing is dumped");
+            return None;
+        }
+        Some(dir)
+    })
+    .as_deref()
+}
+
+/// The file names `VICTORY_DUMP_FAILED` wrote (or tried to) this run.
+#[cfg(all(windows, feature = "diagnostics"))]
+static DUMPED: Mutex<Option<std::collections::HashSet<String>>> = Mutex::new(None);
+
+/// Writes a container that does not translate to `<dir>/<stage>-<hash>.shader`:
+/// the console container as the title passed it (not PC DXBC bytecode), which
+/// `victory shader-info` finds in any file by its magic. Once per name per
+/// run (`dumped` holds the names written): `None` if written already, else
+/// the path and how the write went.
+#[cfg(all(windows, feature = "diagnostics"))]
+fn dump_failed(
+    dir: &std::path::Path,
+    dumped: &mut std::collections::HashSet<String>,
+    stage: &str,
+    hash: &str,
+    container: &[u8],
+) -> Option<(std::path::PathBuf, std::io::Result<()>)> {
+    let name = format!("{stage}-{hash}.shader");
+    if !dumped.insert(name.clone()) {
+        return None;
+    }
+    let path = dir.join(name);
+    let written = std::fs::write(&path, container);
+    Some((path, written))
 }
 
 #[cfg(windows)]
@@ -149,6 +216,35 @@ fn translate(container: &[u8]) -> Result<Translated, String> {
         None => Vec::new(),
     };
     Ok(Translated { host, used })
+}
+
+/// Diagnostics: the console resources each stage of pipeline `this` uses
+/// (stage, shader hash, resources), whether or not its shaders translate.
+/// Each container is parsed once, on the first ask for any pipeline that
+/// shares it; later asks borrow that.
+#[cfg(all(windows, feature = "diagnostics"))]
+pub(crate) fn native_used<'a>(
+    this: This,
+) -> impl Iterator<Item = (&'static str, &'a str, &'a [victory_shader::UsedResource])> {
+    use victory_shader::{Container, FourCC};
+    let shaders: &'a [Arc<Shader>] = if this.is_null() {
+        &[]
+    } else {
+        &pipeline(this).shaders
+    };
+    shaders.iter().map(|s| {
+        let used = s.native.get_or_init(|| {
+            Container::parse(&s.container)
+                .ok()
+                .and_then(|c| {
+                    let part = c.part(FourCC::DXIL)?;
+                    victory_shader::native_programs(part.data).ok()
+                })
+                .map(|programs| programs.into_iter().flat_map(|p| p.used).collect())
+                .unwrap_or_default()
+        });
+        (s.stage, s.hash.as_str(), used.as_slice())
+    })
 }
 
 #[repr(C)]
@@ -513,6 +609,26 @@ mod tests {
             super::parse_skip_hashes(" 0123456789ABCDEF, 0123456789abcde, xyz, 0011223344556677,"),
             ["0123456789abcdef", "0011223344556677"]
         );
+    }
+
+    #[cfg(all(windows, feature = "diagnostics"))]
+    #[test]
+    fn a_failed_container_is_dumped_once_per_run_as_a_shader_file() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut dumped = std::collections::HashSet::new();
+        let (path, written) =
+            super::dump_failed(dir.path(), &mut dumped, "pixel", "00112233", b"DXBC1").unwrap();
+        written.unwrap();
+        assert_eq!(path, dir.path().join("pixel-00112233.shader"));
+        assert_eq!(std::fs::read(&path).unwrap(), b"DXBC1");
+        // A retried translation of the same container writes nothing.
+        std::fs::write(&path, b"kept").unwrap();
+        let again = super::dump_failed(dir.path(), &mut dumped, "pixel", "00112233", b"DXBC1");
+        assert!(again.is_none());
+        assert_eq!(std::fs::read(&path).unwrap(), b"kept");
+        // Another stage or hash is its own file.
+        let other = super::dump_failed(dir.path(), &mut dumped, "vertex", "00112233", b"DXBC2");
+        assert!(other.is_some());
     }
 
     use super::*;
