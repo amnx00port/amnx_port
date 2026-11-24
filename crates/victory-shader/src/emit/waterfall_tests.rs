@@ -65,6 +65,7 @@ fn build(words: &[u32], buffers: bool) -> HostShader {
         st: &st,
         io: &io,
         res: &res,
+        psv_bindings: None,
         inputs: Vec::new(),
         outputs: Vec::new(),
         prims: Vec::new(),

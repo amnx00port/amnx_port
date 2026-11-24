@@ -51,6 +51,7 @@ pub(crate) struct Parts<'a> {
     pub st: &'a Structured,
     pub io: &'a Io,
     pub res: &'a Resources,
+    pub(super) psv_bindings: Option<super::PsvBindings<'a>>,
     pub inputs: Vec<SigElement>,
     pub outputs: Vec<SigElement>,
     pub prims: Vec<SigElement>,
@@ -66,8 +67,10 @@ enum Stop {
 
 pub(crate) fn lower(parts: &Parts) -> Result<Lowered, ShaderError> {
     let mut bad = HashMap::new();
+    let scalar = parts.res.scalar.iter().copied().collect();
+    let scalar_srv_uses = ScalarSrvUses::collect(parts, &scalar);
     loop {
-        match Lower::new(parts, &bad).run() {
+        match Lower::new(parts, &bad, &scalar, &scalar_srv_uses).run() {
             Ok(l) => return Ok(l),
             Err(Stop::Retry(v, why)) => {
                 if bad.insert(v, why).is_some() {
@@ -170,7 +173,8 @@ struct Lower<'a> {
     user_reads: BTreeMap<u32, UserData>,
     samplers: Vec<[u32; 4]>,
     descriptors: HashMap<(Site, bool), &'a Source>,
-    scalar: HashMap<Site, Address>,
+    scalar: &'a HashMap<Site, Address>,
+    scalar_srv_uses: &'a ScalarSrvUses,
     exports: HashMap<Site, &'a Export>,
     interps: HashMap<Site, &'a Interp>,
     handles: HashMap<(usize, Site, u8, bool, u32), V>,
@@ -342,8 +346,106 @@ fn unsupported(offset: usize, what: Why) -> Stop {
     Stop::Fail(ShaderError::Unsupported { offset, what })
 }
 
+/// A statically addressed resource-table slot: root slot, user-data dword and table dword.
+type TableSlot = (u8, u8, u32);
+
+fn table_slot(parts: &Parts, scalar: &HashMap<Site, Address>, src: &Source) -> Option<TableSlot> {
+    let Source::Loaded { load, first } = src else {
+        return None;
+    };
+    let a = scalar.get(load)?;
+    let rp = parts.native.layout.get(a.param)?;
+    let byte = a.offset.checked_add(4 * u32::from(*first))?;
+    (a.dynamic.is_none() && rp.root == RootType::Table && byte.is_multiple_of(32)).then_some((
+        rp.slot,
+        rp.user_data,
+        byte / 4,
+    ))
+}
+
+#[derive(Default)]
+struct ScalarSrvUses {
+    other_consumers: HashSet<TableSlot>,
+    data_reads: HashSet<Value>,
+}
+
+fn record_count_word(inst: &Inst, first: u8) -> Option<Value> {
+    let Fields::Smem {
+        data: Some(Operand::Scalar { code, .. }),
+        ..
+    } = inst.fields
+    else {
+        return None;
+    };
+    inst.write(Reg::S(code.checked_add(first)?.checked_add(2)?))
+}
+
+impl ScalarSrvUses {
+    fn collect(x: &Parts, scalar: &HashMap<Site, Address>) -> Self {
+        let mut uses = Self::default();
+        if x.psv_bindings.is_none() {
+            return uses;
+        }
+        let mut counts = HashSet::new();
+        for d in &x.res.descriptors {
+            let inst = &x.p.blocks[d.site.0].insts[d.site.1];
+            if d.role == Role::Resource
+                && let Source::Loaded { load, first } = d.source
+                && inst.name().starts_with("s_buffer_load_dword")
+            {
+                if let Some(v) = record_count_word(&x.p.blocks[load.0].insts[load.1], first) {
+                    counts.insert(v);
+                }
+                continue;
+            }
+            // Keep mixed consumers and phi-selected descriptors on their existing path.
+            for leaf in d.source.leaves() {
+                if let Some(slot) = table_slot(x, scalar, leaf) {
+                    uses.other_consumers.insert(slot);
+                }
+            }
+        }
+        if counts.is_empty() {
+            return uses;
+        }
+        let mut read = |v: Value| {
+            if counts.contains(&v) {
+                uses.data_reads.insert(v);
+            }
+        };
+        for block in &x.p.blocks {
+            for phi in &block.phis {
+                phi.args.iter().copied().for_each(&mut read);
+            }
+            for inst in &block.insts {
+                // Resource operands consume the handle. Their scalar byte offset is data.
+                let offset = match &inst.fields {
+                    Fields::Smem { soffset, .. } if inst.name().starts_with("s_buffer_") => soffset,
+                    Fields::Buffer { soffset, .. } => soffset,
+                    Fields::Image { .. } => continue,
+                    _ => {
+                        inst.reads.iter().for_each(|&(_, v)| read(v));
+                        continue;
+                    }
+                };
+                if let Operand::Scalar { code, .. } = offset
+                    && let Some(v) = inst.read(Reg::S(*code))
+                {
+                    read(v);
+                }
+            }
+        }
+        uses
+    }
+}
+
 impl<'a> Lower<'a> {
-    fn new(x: &'a Parts<'a>, bad: &'a HashMap<Value, Why>) -> Self {
+    fn new(
+        x: &'a Parts<'a>,
+        bad: &'a HashMap<Value, Why>,
+        scalar: &'a HashMap<Site, Address>,
+        scalar_srv_uses: &'a ScalarSrvUses,
+    ) -> Self {
         let p = x.p;
         let mut phi_at = HashMap::new();
         for (b, block) in p.blocks.iter().enumerate() {
@@ -475,7 +577,8 @@ impl<'a> Lower<'a> {
                 .iter()
                 .map(|d| ((d.site, d.role == Role::Sampler), &d.source))
                 .collect(),
-            scalar: x.res.scalar.iter().copied().collect(),
+            scalar,
+            scalar_srv_uses,
             exports: x.io.exports.iter().map(|e| (e.site, e)).collect(),
             interps: x.io.interps.iter().map(|(s, i)| (*s, i)).collect(),
             handles: HashMap::new(),
@@ -2851,19 +2954,32 @@ impl<'a> Lower<'a> {
             return Ok(());
         }
         if matches!(kind, Some(u) if u.kind == ResourceType::Srv) {
-            let h = self.handle(site, src, false, (11, 0))?;
+            let stride = self.scalar_structured_stride(src);
+            let props = stride.map_or((11, 0), |bytes| (12, bytes));
+            let h = self.handle(site, src, false, props)?;
             for k in 0..count {
                 let off = self.s.m.i32(4 * k);
                 let a = self.s.m.bin(c, Bin::Add, addr, off);
                 let mask = self.s.m.i8(1);
-                let (u, al) = (self.s.m.undef(self.s.t.i32), self.s.m.i32(4));
+                // A wide load may cross a record boundary. Split each dword's byte address.
+                let (index, within) = match stride {
+                    Some(bytes) => {
+                        let s = self.s.m.i32(bytes);
+                        (
+                            self.s.m.bin(c, Bin::UDiv, a, s),
+                            self.s.m.bin(c, Bin::URem, a, s),
+                        )
+                    }
+                    None => (a, self.s.m.undef(self.s.t.i32)),
+                };
+                let al = self.s.m.i32(4);
                 let r = self.s.op(
                     c,
                     "rawBufferLoad.f32",
                     Attr::ReadOnly,
                     self.s.t.res_ret,
                     139,
-                    &[h, a, u, mask, al],
+                    &[h, index, within, mask, al],
                 );
                 let x = self.s.m.extract(c, r, 0);
                 let x = self.as_int(x);
@@ -2994,6 +3110,18 @@ impl<'a> Lower<'a> {
                     return Err("a constant buffer's descriptor read as data");
                 }
                 (props, None)
+            }
+            Fields::Smem { .. } if un.starts_with("s_buffer_load_dword") => {
+                let count_word = record_count_word(inst, first);
+                if !count_word.is_some_and(|v| self.scalar_srv_uses.data_reads.contains(&v)) {
+                    return Err("a scalar memory read as data");
+                }
+                let stride = self
+                    .descriptors
+                    .get(&(at, false))
+                    .and_then(|source| self.scalar_structured_stride(source))
+                    .ok_or("a scalar memory read as data")?;
+                ((12, stride), None)
             }
             _ => return Err("a scalar memory read as data"),
         };
@@ -3256,6 +3384,29 @@ impl<'a> Lower<'a> {
             }
             _ => Ok((0, None)),
         }
+    }
+
+    /// Scalar loads carry only a byte offset. Trust a structured stride only for the
+    /// exact table slot whose original shader declares a single structured SRV.
+    fn scalar_structured_stride(&self, src: &Source) -> Option<u32> {
+        let psv = self.x.psv_bindings.as_ref()?;
+        let slot = table_slot(self.x, self.scalar, src)?;
+        if self.scalar_srv_uses.other_consumers.contains(&slot) {
+            return None;
+        }
+        let (root_slot, user_data, offset) = slot;
+        let mut entries = self.x.native.used.iter().filter(|u| {
+            u.root == RootType::Table && u.user_data == user_data && u.table_offset_dwords == offset
+        });
+        let u = entries.next()?;
+        (entries.next().is_none()
+            && u.slot == root_slot
+            && u.kind == ResourceType::Srv
+            && u.dwords == 4
+            && (4..=2048).contains(&u.stride)
+            && u.stride.is_multiple_of(4)
+            && psv.singleton_structured_srv(u.lower_bound))
+        .then_some(u.stride)
     }
 
     /// The used-resource entry a descriptor loaded from a table falls in.
@@ -6980,6 +7131,7 @@ mod tests {
             st: &st,
             io: &io,
             res: &res,
+            psv_bindings: None,
             inputs: vec![],
             outputs: vec![],
             prims: vec![],
@@ -7030,6 +7182,7 @@ mod tests {
             st: &st,
             io: &io,
             res: &res,
+            psv_bindings: None,
             inputs: vec![],
             outputs: vec![],
             prims: vec![],
@@ -7133,6 +7286,7 @@ mod tests {
             st: &st,
             io: &io,
             res: &res,
+            psv_bindings: None,
             inputs: vec![],
             outputs: vec![],
             prims: vec![],

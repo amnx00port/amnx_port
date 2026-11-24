@@ -845,6 +845,251 @@ mod tests {
         assert!(native_programs(&part(&[(KIND_NATIVE, &xbch(&blob))])).is_err());
     }
 
+    /// Reads the last record of a table SRV and stores its first dword to a
+    /// separate UAV. Native metadata gives t7 a stride of 80, independently
+    /// of the original PSV declarations supplied by each test.
+    fn scalar_table_program(bindings: &[crate::emit::TestBinding], load_offset: u32) -> Vec<u8> {
+        scalar_table_program_with_shape(bindings, load_offset, false, None)
+    }
+
+    /// The static-offset form leaves NUM_RECORDS unused. `vector_first` adds a
+    /// MUBUF read of the same t7 descriptor before or after the scalar read.
+    fn scalar_table_program_with_shape(
+        bindings: &[crate::emit::TestBinding],
+        load_offset: u32,
+        static_byte_offset: bool,
+        vector_first: Option<bool>,
+    ) -> Vec<u8> {
+        use crate::dxbc::{FourCC, build};
+        use crate::emit::{TestPsv, test_psv};
+        let mut words = vec![
+            0xbe81_0380, // s_mov_b32 s1, 0 (table high)
+            0xf408_0200,
+            0xfa00_0000 | load_offset, // s_load_dwordx4 s[8:11], s[0:1], offset
+        ];
+        if !static_byte_offset {
+            words.extend([
+                0x808c_810a, // s_sub_u32 s12, s10, 1 (NUM_RECORDS - 1)
+                0x930c_ff0c,
+                80, // s_mul_i32 s12, s12, 80
+            ]);
+        }
+        let vector_load = [
+            0xe030_0000, // buffer_load_dword v4, v2, s[8:11], s1
+            0x0102_0402,
+        ];
+        if vector_first == Some(true) {
+            words.extend(vector_load);
+        }
+        words.extend([
+            0xf420_0344,
+            if static_byte_offset {
+                0xfa00_0028 // s_buffer_load_dword s13, s[8:11], offset:40
+            } else {
+                0x1800_0000 // s_buffer_load_dword s13, s[8:11], s12
+            },
+        ]);
+        if vector_first == Some(false) {
+            words.extend(vector_load);
+        }
+        words.extend([
+            0x7e00_020d, // v_mov_b32 v0, s13
+            0xf408_0400,
+            0xfa00_0000, // s_load_dwordx4 s[16:19], s[0:1], 0
+            0xe070_0000,
+            0x8004_0000, // buffer_store_dword v0, off, s[16:19], 0
+        ]);
+        if vector_first.is_some() {
+            words.extend([
+                0xe070_0004, // buffer_store_dword v4, off, s[16:19], 4
+                0x8004_0400,
+            ]);
+        }
+        words.push(0xbf81_0000); // s_endpgm
+        let code: Vec<_> = words.iter().flat_map(|w| w.to_le_bytes()).collect();
+        let mut blob = fssm(&[(HwStage::Cs, &code)]);
+        let stage = stage_data_at(&blob, HwStage::Cs);
+        blob[stage + CS_RSRC2..][..4].copy_from_slice(&2u32.to_le_bytes());
+        for k in 0..3 {
+            blob[stage + CS_THREADS + 4 * k..][..4].copy_from_slice(&1u32.to_le_bytes());
+        }
+        let record = stage - RECORD_SIZE as usize;
+        let layout = (blob.len() - FSSM_HEADER) as u64;
+        // Both ranges share the table address in s0.
+        for entry in [
+            [3u32, 0, 1, 0, 0],
+            [3, 8, 1, 7, 0],
+            [0x303, 0, 0, 0, 4],
+            [0x300, 8, 7, 80, 4],
+        ] {
+            blob.extend(entry.iter().flat_map(|w| w.to_le_bytes()));
+        }
+        let size = (blob.len() - FSSM_HEADER) as u64;
+        blob[8..16].copy_from_slice(&size.to_le_bytes());
+        blob[record + RECORD_LAYOUT..][..8].copy_from_slice(&layout.to_le_bytes());
+        blob[record + RECORD_USED..][..8].copy_from_slice(&(layout + 2 * ENTRY_SIZE).to_le_bytes());
+        blob[record + RECORD_COUNTS..][..8].copy_from_slice(&[2, 0, 0, 0, 2, 0, 0, 0]);
+        let native = part(&[(KIND_NATIVE, &xbch(&blob))]);
+        let mut bindings = bindings.to_vec();
+        bindings.push(crate::emit::TestBinding {
+            kind: 7,
+            space: 0,
+            register: 0,
+            dxil_kind: 11,
+        });
+        let psv = test_psv(&TestPsv {
+            stage: 5,
+            flag: false,
+            inputs: &[],
+            outputs: &[],
+            prims: &[],
+            mesh: None,
+            bindings: &bindings,
+            threads: [1; 3],
+            wave_size: None,
+        });
+        build(&[(FourCC::DXIL, &native), (FourCC::PSV0, &psv)])
+    }
+
+    #[cfg(windows)]
+    fn validate_with_sdk(shaders: &[&[u8]]) {
+        if let Some(path) = crate::emit::validator::Validator::default_path() {
+            let mut validator =
+                crate::emit::validator::Validator::load(Some(&path)).expect("load DXIL validator");
+            for shader in shaders {
+                validator.validate(&mut shader.to_vec()).unwrap();
+            }
+        }
+    }
+
+    #[test]
+    fn scalar_table_record_count_uses_the_declared_structured_srv() {
+        use crate::emit::TestBinding;
+        let structured = TestBinding {
+            kind: 5,
+            space: 3,
+            register: 7,
+            dxil_kind: 12,
+        };
+        let shader = crate::emit::translate(&scalar_table_program(&[structured], 32)).unwrap();
+        assert_eq!(shader.stage, HwStage::Cs);
+        #[cfg(windows)]
+        if let Ok(mut validator) = crate::emit::validator::Validator::load(
+            crate::emit::validator::Validator::default_path().as_deref(),
+        ) {
+            validator.validate(&mut shader.dxil.clone()).unwrap();
+        }
+    }
+
+    #[test]
+    fn scalar_table_record_count_requires_an_exact_unambiguous_declaration() {
+        use crate::emit::TestBinding;
+        let structured = TestBinding {
+            kind: 5,
+            space: 3,
+            register: 7,
+            dxil_kind: 12,
+        };
+        let raw = TestBinding {
+            kind: 4,
+            dxil_kind: 11,
+            ..structured
+        };
+        for (bindings, offset) in [
+            (vec![raw], 32), // Native stride alone cannot distinguish a raw SRV.
+            (vec![structured, TestBinding { space: 4, ..raw }], 32),
+            (
+                vec![TestBinding {
+                    register: 8,
+                    ..structured
+                }],
+                32,
+            ),
+            (vec![structured], 64), // An earlier used-resource entry also has stride 80.
+        ] {
+            let result = crate::emit::translate(&scalar_table_program(&bindings, offset));
+            assert!(
+                matches!(
+                    result,
+                    Err(ShaderError::Unsupported {
+                        what: "a scalar memory read as data",
+                        ..
+                    })
+                ),
+                "{bindings:?} at {offset}"
+            );
+        }
+    }
+
+    #[test]
+    fn static_scalar_table_offset_only_uses_an_exact_structured_declaration() {
+        use crate::emit::TestBinding;
+        let structured = TestBinding {
+            kind: 5,
+            space: 3,
+            register: 7,
+            dxil_kind: 12,
+        };
+        let raw = TestBinding {
+            kind: 4,
+            dxil_kind: 11,
+            ..structured
+        };
+        let translate = |bindings: &[TestBinding]| {
+            crate::emit::translate(&scalar_table_program_with_shape(bindings, 32, true, None))
+                .unwrap()
+        };
+        let raw_shader = translate(&[raw]);
+        let missing_shader = translate(&[]);
+        let structured_shader = translate(&[structured]);
+
+        assert_eq!(raw_shader.dxil, missing_shader.dxil);
+        assert_ne!(raw_shader.dxil, structured_shader.dxil);
+        #[cfg(windows)]
+        validate_with_sdk(&[
+            &raw_shader.dxil,
+            &missing_shader.dxil,
+            &structured_shader.dxil,
+        ]);
+    }
+
+    #[test]
+    fn mixed_scalar_and_vector_reads_keep_the_raw_baseline_in_either_order() {
+        use crate::emit::TestBinding;
+        let structured = TestBinding {
+            kind: 5,
+            space: 3,
+            register: 7,
+            dxil_kind: 12,
+        };
+        let raw = TestBinding {
+            kind: 4,
+            dxil_kind: 11,
+            ..structured
+        };
+        for vector_first in [true, false] {
+            let translate = |bindings: &[TestBinding]| {
+                crate::emit::translate(&scalar_table_program_with_shape(
+                    bindings,
+                    32,
+                    true,
+                    Some(vector_first),
+                ))
+                .unwrap()
+            };
+            // Raw and missing PSV declarations capture the pre-existing behavior
+            // for this same mixed-consumer shader; structured metadata must opt
+            // out rather than change only the scalar half of the resource use.
+            let raw_shader = translate(&[raw]);
+            let missing_shader = translate(&[]);
+            let structured_shader = translate(&[structured]);
+            assert_eq!(raw_shader.dxil, missing_shader.dxil, "{vector_first}");
+            assert_eq!(raw_shader.dxil, structured_shader.dxil, "{vector_first}");
+            #[cfg(windows)]
+            validate_with_sdk(&[&structured_shader.dxil]);
+        }
+    }
+
     #[test]
     fn reads_pixel_io_and_applies_the_full_export_patch() {
         let code = [0xBF80_0000u32; 4]; // s_nop

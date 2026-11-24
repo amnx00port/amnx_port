@@ -133,6 +133,7 @@ fn build_valu_cs(body: &[u32]) -> HostShader {
         st: &st,
         io: &io,
         res: &res,
+        psv_bindings: None,
         inputs: Vec::new(),
         outputs: Vec::new(),
         prims: Vec::new(),

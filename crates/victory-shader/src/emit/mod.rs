@@ -43,7 +43,9 @@
 //!   them: raw (ByteAddressBuffer) for dword loads and stores, atomics and
 //!   typed-format loads without an index; structured with the used-resource
 //!   entry's stride when indexed; typed with four 32-bit float channels for
-//!   `buffer_load_format_*` and `buffer_store_format_*`. The host's view at
+//!   `buffer_load_format_*` and `buffer_store_format_*`. Scalar buffer loads
+//!   also use a structured view when the original PSV0 declares a unique,
+//!   single-register structured SRV at the exact table binding. The host's view at
 //!   that index must be of that kind and start at the console descriptor's
 //!   base address (raw: `R32_TYPELESS` with the raw flag), whatever kind the
 //!   title's view description says. Typed-format loads from heap
@@ -77,6 +79,9 @@
 
 mod bitcode;
 mod container;
+#[cfg(test)]
+pub(crate) use container::{Binding as TestBinding, Psv as TestPsv, psv as test_psv};
+
 #[cfg(all(test, windows))]
 mod diff_tests;
 #[cfg(all(windows, any(test, feature = "host")))]
@@ -284,6 +289,9 @@ pub fn emit(
         st,
         io,
         res,
+        psv_bindings: c
+            .part(FourCC::PSV0)
+            .and_then(|p| PsvBindings::parse(p.data)),
         inputs,
         outputs,
         prims,
@@ -309,6 +317,45 @@ pub fn emit(
         root_cbvs: l.root_cbvs,
         root_srvs: l.root_srvs,
     })
+}
+
+/// The resource declarations in the original PSV0, when the records include a kind.
+struct PsvBindings<'a>(std::slice::ChunksExact<'a, u8>);
+
+impl<'a> PsvBindings<'a> {
+    fn parse(data: &'a [u8]) -> Option<Self> {
+        use crate::dxbc::u32_at;
+        let info_size = u32_at(data, 0).ok()? as usize;
+        if info_size < 24 || !info_size.is_multiple_of(4) {
+            return None;
+        }
+        let table = data.get(4..)?.get(info_size..)?;
+        let count = u32_at(table, 0).ok()? as usize;
+        let size = u32_at(table, 4).ok()? as usize;
+        // PSVResourceBindInfo1 adds resource kind and flags to the four-word header.
+        if size < 24 || !size.is_multiple_of(4) {
+            return None;
+        }
+        let records = table.get(8..)?.get(..count.checked_mul(size)?)?;
+        Some(Self(records.chunks_exact(size)))
+    }
+
+    fn singleton_structured_srv(&self, register: u32) -> bool {
+        let mut found = false;
+        for record in self.0.clone() {
+            let word = |at| crate::dxbc::u32_at(record, at).expect("complete PSV binding");
+            let (ty, lo, hi) = (word(0), word(8), word(12));
+            // Only SRVTyped, SRVRaw and SRVStructured share the t-register namespace.
+            if (3..=5).contains(&ty) && (lo..=hi).contains(&register) {
+                // The native used-resource entry omits the register space.
+                if found || lo != hi || hi == u32::MAX || ty != 5 || word(16) != 12 {
+                    return false;
+                }
+                found = true;
+            }
+        }
+        found
+    }
 }
 
 /// The rows of an `ISG1`/`OSG1` part.
@@ -422,6 +469,28 @@ mod tests {
     use super::shader::Shader;
     use super::*;
     use crate::native::{ComputeIo, StageIo};
+
+    #[test]
+    fn structured_srv_proof_requires_a_complete_single_register_binding() {
+        // RuntimeInfo0, one ResourceBindInfo1 for a structured t7 in space 3.
+        let mut words = [24u32, 0, 0, 0, 0, 0, 0, 1, 24, 5, 3, 7, 7, 12, 0];
+        let bytes = |w: &[u32]| w.iter().flat_map(|x| x.to_le_bytes()).collect::<Vec<_>>();
+        let psv = bytes(&words);
+        assert!(
+            PsvBindings::parse(&psv)
+                .unwrap()
+                .singleton_structured_srv(7)
+        );
+        assert!(PsvBindings::parse(&psv[..psv.len() - 1]).is_none());
+        words[12] = 9; // A range starting at t7.
+        assert!(
+            !PsvBindings::parse(&bytes(&words))
+                .unwrap()
+                .singleton_structured_srv(7)
+        );
+        words[8] = 16; // ResourceBindInfo0 omits the resource kind.
+        assert!(PsvBindings::parse(&bytes(&words)).is_none());
+    }
 
     /// A pixel shader writing SV_StencilRef (channel y of `exp mrtz`).
     /// DXC sets ShaderFlags.StencilRef (bit 11) for a pixel shader whose
