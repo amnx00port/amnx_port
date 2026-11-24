@@ -651,6 +651,8 @@ dependencies = [
  "blake3",
  "clap",
  "memchr",
+ "tempfile",
+ "toml",
  "victory-core",
  "victory-game",
  "victory-hle",
@@ -658,6 +660,8 @@ dependencies = [
  "victory-pe",
  "victory-shader",
  "walkdir",
+ "windows",
+ "windows-sys",
 ]
 
 [[package]]

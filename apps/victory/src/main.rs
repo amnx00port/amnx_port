@@ -4,7 +4,9 @@
 //! the user's cache directory (outside the repository).
 
 mod census;
+mod doctor;
 mod inspect;
+mod menu;
 mod run;
 mod shader;
 mod translate;
@@ -105,6 +107,10 @@ enum Command {
         #[arg(last = true)]
         title_args: Vec<String>,
     },
+    /// Name the known problems a run's log or crash log shows, in plain
+    /// words, with where each is tracked. Defaults to the data folder's
+    /// crash logs.
+    Doctor { files: Vec<PathBuf> },
     /// Show the resolved configuration and check it.
     Config,
 }
@@ -127,6 +133,11 @@ fn main() -> Result<()> {
     #[cfg(all(windows, feature = "diagnostics"))]
     if victory_hle::modules::audio::capture::child() {
         return Ok(());
+    }
+    // Opened from Explorer (no arguments, a console of its own): a menu
+    // instead of the help in a window that closes at once.
+    if menu::wanted() {
+        return menu::run();
     }
     let cli = Cli::parse();
     match cli.command {
@@ -161,6 +172,7 @@ fn main() -> Result<()> {
             console,
             title_args: _,
         } => run::run(&exe, unimplemented, strict, execute, console),
+        Command::Doctor { files } => doctor::run(files),
         Command::Config => show_config(),
     }
 }
