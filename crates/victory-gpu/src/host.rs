@@ -278,8 +278,9 @@ mod tests {
     }
 
     /// Submitting the same `HostList` twice in one `Host::execute` call must
-    /// record each occurrence's state prelude into a distinct command list /
-    /// allocator so the second run does not clobber the first prelude's barriers.
+    /// split into separate `ExecuteCommandLists` batches separated by a fence
+    /// wait so neither the `prelude` allocator is clobbered nor the same direct
+    /// command list is submitted twice in a single `ExecuteCommandLists` call.
     #[test]
     fn duplicate_list_in_execute_uses_distinct_preludes() {
         let Some(host) = host() else {
@@ -330,11 +331,9 @@ mod tests {
         }
         list.close();
 
-        // Execute the SAME `HostList` twice in one batch:
-        //   Run 1 prelude: COMMON (0) -> RENDER_TARGET (0x4), then list ends at COPY_SOURCE (0x800).
-        //   Run 2 prelude: COPY_SOURCE (0x800) -> RENDER_TARGET (0x4), then list ends at COPY_SOURCE (0x800).
-        // Without per-duplicate prelude allocation, Run 2 resets `list.prelude`'s allocator
-        // while Run 1's prelude is still queued for execution.
+        // Execute the SAME `HostList` twice in one submission:
+        //   Chunk 1 prelude: COMMON (0) -> RENDER_TARGET (0x4), list ends at COPY_SOURCE (0x800), fence wait.
+        //   Chunk 2 prelude: COPY_SOURCE (0x800) -> RENDER_TARGET (0x4), list ends at COPY_SOURCE (0x800), fence wait.
         host.execute(&[&list, &list]);
         assert_eq!(
             crate::resource::host_copy(tex)
@@ -343,12 +342,57 @@ mod tests {
                 .load(Ordering::Relaxed),
             0x800
         );
+
+        // Distinct-list batching control: two distinct lists stay in one chunk.
+        let list2 = host.new_list().unwrap();
+        list2.close();
+        assert_eq!(unique_run_chunks(&[&list, &list2]).len(), 1);
+        assert_eq!(unique_run_chunks(&[&list, &list]).len(), 2);
+        host.execute(&[&list, &list2]);
         // SAFETY: plain device query.
         assert!(unsafe { host.device.GetDeviceRemovedReason() }.is_ok());
 
         type Release = extern "system" fn(crate::object::This) -> u32;
         crate::object::slot::<Release>(tex, 0x10)(tex);
     }
+
+    #[test]
+    fn unique_run_chunks_preserves_distinct_batching_and_splits_repeats() {
+        let (a, b, c) = (1u8, 2u8, 3u8);
+        assert_eq!(unique_run_chunks::<u8>(&[]).len(), 0);
+        assert_eq!(unique_run_chunks(&[&a, &b, &c]).len(), 1);
+        let dup_in = [&a, &a];
+        let dup = unique_run_chunks(&dup_in);
+        assert_eq!(dup.len(), 2);
+        assert_eq!((dup[0].len(), dup[1].len()), (1, 1));
+        let mixed_in = [&a, &b, &a, &c, &b];
+        let mixed = unique_run_chunks(&mixed_in);
+        assert_eq!(mixed.len(), 2);
+        assert_eq!((mixed[0].len(), mixed[1].len()), (2, 3));
+    }
+}
+
+/// Partitions `runs` into maximal contiguous chunks in which no list pointer
+/// repeats. Distinct lists remain batched in one `ExecuteCommandLists` call,
+/// while a repeated list waits on the GPU fence before its prelude allocator is
+/// reset and its body is resubmitted.
+fn unique_run_chunks<'a, T>(runs: &'a [&'a T]) -> Vec<&'a [&'a T]> {
+    let mut chunks = Vec::new();
+    let mut start = 0;
+    let mut seen: Vec<usize> = Vec::with_capacity(runs.len());
+    for (i, item) in runs.iter().enumerate() {
+        let id = std::ptr::from_ref(*item) as usize;
+        if seen.contains(&id) {
+            chunks.push(&runs[start..i]);
+            start = i;
+            seen.clear();
+        }
+        seen.push(id);
+    }
+    if start < runs.len() {
+        chunks.push(&runs[start..]);
+    }
+    chunks
 }
 
 /// A host command list and its allocator, always used together.
@@ -570,80 +614,80 @@ impl Host {
         let started = std::time::Instant::now();
         #[cfg(feature = "diagnostics")]
         crate::copystat::add(crate::copystat::C::Submissions, 1);
+        // Split only when a `HostList` repeats so distinct lists stay batched in
+        // a single `ExecuteCommandLists` call, while a repeated direct list
+        // waits on the GPU fence before its prelude allocator is reset and its
+        // body is resubmitted (per D3D12 ExecuteCommandLists ordering rules).
+        let chunks = unique_run_chunks(runs);
         let mut lists: Vec<Option<ID3D12CommandList>> = Vec::with_capacity(2 * runs.len());
         // Where each run's lists start in `lists`.
         let mut firsts = Vec::with_capacity(runs.len());
-        // Keep per-run prelude allocations alive until the GPU finishes if the
-        // same `HostList` is submitted more than once in `runs` (resetting its
-        // own `prelude` allocator would clobber the earlier entry in `lists`).
-        let mut used_preludes: Vec<usize> = Vec::with_capacity(runs.len());
-        let mut extra_preludes: Vec<(ID3D12CommandAllocator, ID3D12GraphicsCommandList)> = Vec::new();
-        let mut batch = Batch::default();
-        for list in runs {
-            list.run_deferred(&mut batch);
-            firsts.push(lists.len());
-            let barriers = list.prelude_barriers();
-            if !barriers.is_empty() {
-                let id = std::ptr::from_ref(*list) as usize;
-                let prelude = if !used_preludes.contains(&id) {
-                    used_preludes.push(id);
-                    list.record_prelude(&barriers)
-                } else {
-                    self.record_extra_prelude(&barriers, &mut extra_preludes)
-                };
-                if let Some(prelude) = prelude {
+        let mut prep_us = 0u64;
+        let mut gpu_total = std::time::Duration::ZERO;
+        for chunk in chunks {
+            let chunk_start = std::time::Instant::now();
+            lists.clear();
+            firsts.clear();
+            let mut batch = Batch::default();
+            for list in chunk {
+                list.run_deferred(&mut batch);
+                firsts.push(lists.len());
+                if let Some(prelude) = list.prelude() {
                     lists.push(Some(prelude));
                 }
+                lists.push(list.list.cast().ok());
             }
-            lists.push(list.list.cast().ok());
-        }
-        batch.flush();
-        let prepared = std::time::Instant::now();
-        // Diagnostics: each list on its own, timed (`VICTORY_GPU_TIMING`).
-        #[cfg(feature = "diagnostics")]
-        let groups: Vec<&[Option<ID3D12CommandList>]> = if timing() {
-            firsts
-                .iter()
-                .zip(firsts.iter().skip(1).chain([&lists.len()]))
-                .map(|(&a, &b)| &lists[a..b])
-                .collect()
-        } else {
-            vec![&lists[..]]
-        };
-        #[cfg(not(feature = "diagnostics"))]
-        let groups = [&lists[..]];
-        for (i, group) in groups.iter().enumerate() {
-            *submitted += 1;
-            let started = std::time::Instant::now();
-            // SAFETY: closed lists; the fence and event are ours.
-            unsafe {
-                self.queue.ExecuteCommandLists(group);
-                let waited = self
-                    .queue
-                    .Signal(&self.fence, *submitted)
-                    .and_then(|()| self.fence.SetEventOnCompletion(*submitted, self.event));
-                match waited {
-                    Ok(()) => {
-                        WaitForSingleObject(self.event, INFINITE);
-                    }
-                    Err(e) => tracing::warn!(error = %e, "host submission not waited for"),
-                }
-            }
+            batch.flush();
+            let prepared = std::time::Instant::now();
+            prep_us += (prepared - chunk_start).as_micros() as u64;
+            // Diagnostics: each list on its own, timed (`VICTORY_GPU_TIMING`).
             #[cfg(feature = "diagnostics")]
-            if groups.len() > 1 && started.elapsed() > std::time::Duration::from_millis(50) {
-                // SAFETY: a plain query.
-                let frequency = unsafe { self.queue.GetTimestampFrequency() }.unwrap_or(1);
-                let commands = runs[i].notes.lock().unwrap_or_else(|e| e.into_inner()).len();
-                tracing::warn!(ms = started.elapsed().as_millis(), commands, "slow host list");
-                for (ms, op) in runs[i].slowest(frequency, 6) {
-                    tracing::warn!("slow list command, {ms:.1} ms: {op}");
+            let groups: Vec<&[Option<ID3D12CommandList>]> = if timing() {
+                firsts
+                    .iter()
+                    .zip(firsts.iter().skip(1).chain([&lists.len()]))
+                    .map(|(&a, &b)| &lists[a..b])
+                    .collect()
+            } else {
+                vec![&lists[..]]
+            };
+            #[cfg(not(feature = "diagnostics"))]
+            let groups = [&lists[..]];
+            for (i, group) in groups.iter().enumerate() {
+                *submitted += 1;
+                let group_started = std::time::Instant::now();
+                // SAFETY: closed lists; the fence and event are ours.
+                unsafe {
+                    self.queue.ExecuteCommandLists(group);
+                    let waited = self
+                        .queue
+                        .Signal(&self.fence, *submitted)
+                        .and_then(|()| self.fence.SetEventOnCompletion(*submitted, self.event));
+                    match waited {
+                        Ok(()) => {
+                            WaitForSingleObject(self.event, INFINITE);
+                        }
+                        Err(e) => tracing::warn!(error = %e, "host submission not waited for"),
+                    }
                 }
+                #[cfg(feature = "diagnostics")]
+                if groups.len() > 1 && group_started.elapsed() > std::time::Duration::from_millis(50)
+                {
+                    // SAFETY: a plain query.
+                    let frequency = unsafe { self.queue.GetTimestampFrequency() }.unwrap_or(1);
+                    let commands = chunk[i].notes.lock().unwrap_or_else(|e| e.into_inner()).len();
+                    tracing::warn!(ms = group_started.elapsed().as_millis(), commands, "slow host list");
+                    for (ms, op) in chunk[i].slowest(frequency, 6) {
+                        tracing::warn!("slow list command, {ms:.1} ms: {op}");
+                    }
+                }
+                let _ = (i, group_started);
             }
-            let _ = (i, started);
+            gpu_total += prepared.elapsed();
         }
-        let _ = &firsts;
-        let gpu = prepared.elapsed();
-        SUBMISSION_US[0].fetch_add((prepared - started).as_micros() as u64, Ordering::Relaxed);
+        let _ = (started, &firsts);
+        let gpu = gpu_total;
+        SUBMISSION_US[0].fetch_add(prep_us, Ordering::Relaxed);
         SUBMISSION_US[1].fetch_add(gpu.as_micros() as u64, Ordering::Relaxed);
         // The host resets a device whose submission runs for about 2 s.
         if gpu > std::time::Duration::from_millis(250) {
@@ -691,43 +735,7 @@ impl Host {
                 what.write(at as *mut u8, bytes);
             }
         }
-        drop(extra_preludes);
         self.log_messages();
-    }
-
-    /// Allocates and records a temporary prelude list when the same `HostList`
-    /// appears more than once in one submission so the earlier prelude's
-    /// allocator and recorded barriers are not overwritten.
-    fn record_extra_prelude(
-        &self,
-        barriers: &[D3D12_RESOURCE_BARRIER],
-        keep: &mut Vec<(ID3D12CommandAllocator, ID3D12GraphicsCommandList)>,
-    ) -> Option<ID3D12CommandList> {
-        let made = (|| -> windows::core::Result<(ID3D12CommandAllocator, ID3D12GraphicsCommandList)> {
-            // SAFETY: plain D3D12 allocator/list creation and barrier recording on live textures.
-            unsafe {
-                let allocator: ID3D12CommandAllocator = self
-                    .device
-                    .CreateCommandAllocator(D3D12_COMMAND_LIST_TYPE_DIRECT)?;
-                let list: ID3D12GraphicsCommandList = self.device.CreateCommandList(
-                    0,
-                    D3D12_COMMAND_LIST_TYPE_DIRECT,
-                    &allocator,
-                    None,
-                )?;
-                list.ResourceBarrier(barriers);
-                list.Close()?;
-                Ok((allocator, list))
-            }
-        })();
-        match made {
-            Ok((allocator, list)) => {
-                let out = list.cast().ok();
-                keep.push((allocator, list));
-                out
-            }
-            Err(e) => fail(format_args!("a host state prelude did not record ({e})")),
-        }
     }
 
     /// With `VICTORY_D3D12_DRED`: the faulting address and the allocations
@@ -1051,10 +1059,10 @@ impl HostList {
 
     /// At submission: the barriers that move each texture this list uses from
     /// its real state to the one the list starts with; the textures' real
-    /// states become those the list ends with.
-    fn prelude_barriers(&self) -> Vec<D3D12_RESOURCE_BARRIER> {
+    /// states become those the list ends with. `None` if nothing moves.
+    fn prelude(&self) -> Option<ID3D12CommandList> {
         let states = self.states.lock().unwrap_or_else(|e| e.into_inner());
-        states
+        let barriers: Vec<D3D12_RESOURCE_BARRIER> = states
             .values()
             .filter_map(|(first, last, copy)| {
                 let real = copy.state.swap(*last, Ordering::Relaxed);
@@ -1066,18 +1074,18 @@ impl HostList {
                     )
                 })
             })
-            .collect()
-    }
-
-    /// Records `barriers` into this list's own prelude allocator/list.
-    fn record_prelude(&self, barriers: &[D3D12_RESOURCE_BARRIER]) -> Option<ID3D12CommandList> {
+            .collect();
+        if barriers.is_empty() {
+            return None;
+        }
         let (allocator, list) = &self.prelude;
         // SAFETY: the prelude is not executing (every submission is waited
-        // for) and is used at most once per `Host::execute`; the textures are live.
+        // for) and `Host::execute` splits repeated lists across fence-waited
+        // chunks; the textures are live.
         let recorded = unsafe {
             allocator.Reset().and_then(|()| {
                 list.Reset(allocator, None)?;
-                list.ResourceBarrier(barriers);
+                list.ResourceBarrier(&barriers);
                 list.Close()
             })
         };
