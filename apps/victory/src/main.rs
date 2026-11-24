@@ -81,6 +81,9 @@ enum Command {
         /// Print one line per program and outcome.
         #[arg(long)]
         list: bool,
+        /// Translate only these 16-digit runtime shader hashes (comma-separated or repeated).
+        #[arg(long, value_delimiter = ',', value_parser = translate::parse_hash)]
+        shader_hash: Vec<u64>,
         /// Worker threads (default: every logical core).
         #[arg(long)]
         jobs: Option<usize>,
@@ -152,7 +155,8 @@ fn main() -> Result<()> {
             pipelines,
             list,
             jobs,
-        } => translate::run(paths, validate, pipelines, list, jobs),
+            shader_hash,
+        } => translate::run(paths, validate, pipelines, list, jobs, shader_hash),
         Command::Run {
             exe,
             unimplemented,
