@@ -5780,14 +5780,14 @@ impl<'a> Lower<'a> {
             return Ok(());
         }
         let (op, sample) = match name {
-            "image_sample" | "image_sample_o" => (60, true),
+            "image_sample" | "image_sample_o" | "image_sample_cl" => (60, true),
             "image_sample_lz" | "image_sample_l" => (62, true),
-            "image_sample_b" => (61, true),
+            "image_sample_b" | "image_sample_b_cl" => (61, true),
             "image_sample_c_lz" => (65, true),
-            "image_sample_d" => (63, true),
+            "image_sample_d" | "image_sample_d_cl" => (63, true),
             "image_get_lod" if self.s.pixel => (81, true),
             // Implicit derivatives: pixel shaders only.
-            "image_sample_c" if self.s.pixel => (64, true),
+            "image_sample_c" | "image_sample_c_cl" if self.s.pixel => (64, true),
             "image_gather4" | "image_gather4_lz" | "image_gather4_lz_o" => (73, true),
             "image_load" | "image_load_mip" => (66, false),
             "image_get_resinfo" => (72, false),
@@ -5849,11 +5849,12 @@ impl<'a> Lower<'a> {
             // Texel offsets (`_o`) come first: x in bits 0-5, y in 8-13,
             // signed (programmable offsets: gathers only).
             let offset_word = name.ends_with("_o");
-            let first =
-                usize::from(offset_word) + usize::from(name == "image_sample_b") + usize::from(cmp);
+            let first = usize::from(offset_word)
+                + usize::from(name.starts_with("image_sample_b"))
+                + usize::from(cmp);
             // Coordinates the size divides (not the array slice); explicit
             // gradients (x then y) come before the coordinates.
-            let spatial = coords - usize::from(kind == 6 || kind == 7);
+            let spatial = coords - usize::from(matches!(kind, 5..=7));
             let grads = if op == 63 { 2 * spatial } else { 0 };
             let mut cs = vec![fu; 4];
             // With a16, sampling coordinates and LOD are f16.
@@ -5921,6 +5922,12 @@ impl<'a> Lower<'a> {
             for o in os.iter_mut().take(offsets) {
                 *o = zero;
             }
+            let clamp = if name.contains("_cl") {
+                let x = addr_val(self, first + grads + coords)?;
+                to_float(self, x)
+            } else {
+                fu
+            };
             let mut args = vec![h, sh];
             args.extend(&cs);
             match op {
@@ -5945,7 +5952,7 @@ impl<'a> Lower<'a> {
                         }
                     }
                     args.extend(&os);
-                    args.push(fu);
+                    args.push(clamp);
                     self.s
                         .op(c, "sample.f32", Attr::ReadOnly, self.s.t.res_ret, 60, &args)
                 }
@@ -5953,7 +5960,7 @@ impl<'a> Lower<'a> {
                     let bias = addr_val(self, 0)?;
                     let bias = self.as_float(bias);
                     args.extend(&os);
-                    args.extend([bias, fu]);
+                    args.extend([bias, clamp]);
                     self.s.op(
                         c,
                         "sampleBias.f32",
@@ -5973,7 +5980,7 @@ impl<'a> Lower<'a> {
                     }
                     args.extend(&os);
                     args.extend(g);
-                    args.push(fu);
+                    args.push(clamp);
                     self.s.op(
                         c,
                         "sampleGrad.f32",
@@ -5989,7 +5996,7 @@ impl<'a> Lower<'a> {
                     args.extend(&os);
                     args.push(reference);
                     let name = if op == 64 {
-                        args.push(fu);
+                        args.push(clamp);
                         "sampleCmp.f32"
                     } else {
                         "sampleCmpLevelZero.f32"
@@ -7099,9 +7106,7 @@ mod tests {
             S_ENDPGM,
         ];
 
-        let code: Vec<u8> = words.iter()
-            .flat_map(|w| w.to_le_bytes())
-            .collect();
+        let code: Vec<u8> = words.iter().flat_map(|w| w.to_le_bytes()).collect();
 
         let native = NativeProgram {
             stage: HwStage::Cs,
@@ -7118,9 +7123,12 @@ mod tests {
 
         let p = ir::build(&native.code, false, 256).unwrap();
 
-        assert!(p.blocks.iter()
-            .flat_map(|b| &b.insts)
-            .any(|i| i.name() == "v_perm_b32"));
+        assert!(
+            p.blocks
+                .iter()
+                .flat_map(|b| &b.insts)
+                .any(|i| i.name() == "v_perm_b32")
+        );
 
         let st = structure::structure(&p).unwrap();
         let res = resource::track(&p, &native.layout, native.stage, Some(&st)).unwrap();
@@ -7137,13 +7145,12 @@ mod tests {
             outputs: vec![],
             prims: vec![],
             mesh_stride: 0,
-        }).unwrap();
+        })
+        .unwrap();
 
-        let container =
-            crate::Container::parse(&emitted.dxil).unwrap();
+        let container = crate::Container::parse(&emitted.dxil).unwrap();
 
-        let features =
-            container.part(crate::FourCC::SFI0).unwrap();
+        let features = container.part(crate::FourCC::SFI0).unwrap();
 
         u64::from_le_bytes(features.data.try_into().unwrap())
     }
@@ -7417,5 +7424,90 @@ mod tests {
         assert!(f10(0x3FF).is_nan());
         // A 16-bit float is a half already, sign included.
         assert_eq!(half(0xBC00 << half_shift(16)), -1.0);
+    }
+
+    #[test]
+    fn clamped_image_samples_lower_and_validate() {
+        use crate::FourCC;
+        use crate::emit::container::{SigElement, signature};
+        use crate::emit::validator::Validator;
+        use crate::native::{PsInput, Usage};
+        use crate::resource::tests::WATERFALL_FETCHED_WAVE32;
+
+        let mut validator = Validator::default_path().and_then(|p| Validator::load(Some(&p)).ok());
+        let cases = [
+            (0x21u32, "image_sample_cl"),
+            (0x26u32, "image_sample_b_cl"),
+            (0x23u32, "image_sample_d_cl"),
+        ];
+        let img_idx = WATERFALL_FETCHED_WAVE32
+            .iter()
+            .position(|&w| w == 0xF09C_0F08)
+            .unwrap();
+        let (layout, used) = texture_tables();
+
+        let el = |name: &str, kind, usage| SigElement {
+            name: name.into(),
+            index: 0,
+            kind,
+            comp: 9,
+            interp: 0,
+            row: Some(0),
+            col: 0,
+            cols: 4,
+            usage,
+            half: false,
+        };
+        let isg1 = signature(&[el("TEXCOORD", 0, 0)], true);
+        let osg1 = signature(&[el("SV_Target", 16, 15)], false);
+        let sig_bytes = crate::dxbc::build(&[(FourCC::ISG1, &isg1), (FourCC::OSG1, &osg1)]);
+        let container = crate::Container::parse(&sig_bytes).unwrap();
+
+        for (op, expected_name) in cases {
+            let mut words = WATERFALL_FETCHED_WAVE32.to_vec();
+            words[img_idx] = (words[img_idx] & !(0x7F << 18)) | ((op & 0x7F) << 18);
+            words[img_idx + 1] &= !0xFF;
+            let ds_idx = words.iter().position(|&w| w == 0xD834_0000).unwrap();
+            words[ds_idx] = 0xBF80_0000;
+            words[ds_idx + 1] = 0xBF80_0000;
+
+            let native = NativeProgram {
+                stage: HwStage::Ps,
+                wave64: false,
+                vgprs: 256,
+                layout: layout.clone(),
+                used: used.clone(),
+                io: StageIo::Ps {
+                    inputs: vec![PsInput {
+                        usage: Usage::Generic,
+                        row: 0,
+                        mask: 0b1111,
+                        attr: 0,
+                        flat: false,
+                        fp16: false,
+                        pack2: false,
+                        row2: 0,
+                    }],
+                    input_addr: 0b11,
+                    db_shader_control: 0,
+                    patches: vec![],
+                },
+                code: words.iter().flat_map(|w| w.to_le_bytes()).collect(),
+            };
+            let p = ir::build(&native.patched_code(), native.wave64, native.vgprs).unwrap();
+            assert!(
+                p.blocks
+                    .iter()
+                    .flat_map(|b| &b.insts)
+                    .any(|i| i.name() == expected_name)
+            );
+            let st = structure::structure(&p).unwrap();
+            let res = resource::track(&p, &native.layout, native.stage, Some(&st)).unwrap();
+            let io = io::raise(&p, &native).unwrap();
+            let mut out = crate::emit::emit(&container, &native, &p, &st, &io, &res).unwrap();
+            if let Some(v) = validator.as_mut() {
+                v.validate(&mut out.dxil).unwrap();
+            }
+        }
     }
 }
