@@ -5625,10 +5625,18 @@ impl<'a> Lower<'a> {
                 regs.extend((0..dwords).map(|k| reg + k));
             }
         }
-        // With a16, two 16-bit components per VGPR, low half first.
-        let addr_val = |l: &mut Self, k: usize| -> Result<V, Why> {
+        // Full 32-bit address VGPR (offset, bias, reference, resinfo mip:
+        // always 32-bit even when `a16` is set).
+        let whole_val = |l: &mut Self, k: usize| -> Result<V, Why> {
+            let r = *regs.get(k).ok_or("an image address")?;
+            let v = inst.read(Reg::V(r)).ok_or("an image address")?;
+            l.i32_of(v)
+        };
+        // Component `k` starting at VGPR `base`: with `a16`, two 16-bit
+        // components per VGPR, low half first.
+        let packed_val = |l: &mut Self, base: usize, k: usize| -> Result<V, Why> {
             let r = *regs
-                .get(if *a16 { k / 2 } else { k })
+                .get(base + if *a16 { k / 2 } else { k })
                 .ok_or("an image address")?;
             let v = inst.read(Reg::V(r)).ok_or("an image address")?;
             let x = l.i32_of(v)?;
@@ -5682,7 +5690,7 @@ impl<'a> Lower<'a> {
             let iu = self.s.m.undef(self.s.t.i32);
             let mut cs = vec![iu; 3];
             for (k, slot) in cs.iter_mut().enumerate().take(coords) {
-                *slot = addr_val(self, k)?;
+                *slot = packed_val(self, 0, k)?;
             }
             let Operand::Vector { reg, .. } = *data else {
                 return Err("image atomic data");
@@ -5738,7 +5746,7 @@ impl<'a> Lower<'a> {
             let iu = self.s.m.undef(self.s.t.i32);
             let mut cs = vec![iu; 3];
             for (k, slot) in cs.iter_mut().enumerate().take(coords) {
-                *slot = addr_val(self, k)?;
+                *slot = packed_val(self, 0, k)?;
             }
             let Operand::Vector { reg, .. } = *data else {
                 return Err("image store data");
@@ -5801,7 +5809,7 @@ impl<'a> Lower<'a> {
             let mip = if uav {
                 self.s.m.undef(self.s.t.i32)
             } else {
-                addr_val(self, 0)?
+                whole_val(self, 0)?
             };
             let i32t = self.s.t.i32;
             let dims = self.s.m.named_struct("dx.types.Dimensions", vec![i32t; 4]);
@@ -5852,9 +5860,12 @@ impl<'a> Lower<'a> {
             let first =
                 usize::from(offset_word) + usize::from(name == "image_sample_b") + usize::from(cmp);
             // Coordinates the size divides (not the array slice); explicit
-            // gradients (x then y) come before the coordinates.
+            // gradients (x then y, each padded to whole VGPRs under a16) come
+            // after whole 32-bit words (`_o`, `_b`, `_c`) and before coordinates.
             let spatial = coords - usize::from(kind == 6 || kind == 7);
-            let grads = if op == 63 { 2 * spatial } else { 0 };
+            let deriv_stride = if *a16 { spatial.div_ceil(2) } else { spatial };
+            let derivs_regs = if op == 63 { 2 * deriv_stride } else { 0 };
+            let coords_base = first + derivs_regs;
             let mut cs = vec![fu; 4];
             // With a16, sampling coordinates and LOD are f16.
             let to_float = |l: &mut Self, x: V| {
@@ -5866,7 +5877,7 @@ impl<'a> Lower<'a> {
                 }
             };
             for (k, slot) in cs.iter_mut().enumerate().take(coords) {
-                let x = addr_val(self, first + grads + k)?;
+                let x = packed_val(self, coords_base, k)?;
                 *slot = to_float(self, x);
             }
             if kind == 5 {
@@ -5928,7 +5939,7 @@ impl<'a> Lower<'a> {
                     if offset_word {
                         // DXIL takes immediate offsets in -8..=7; the
                         // console's are 6-bit and may be computed.
-                        let w = addr_val(self, 0)?;
+                        let w = whole_val(self, 0)?;
                         let w = self
                             .s
                             .m
@@ -5950,7 +5961,7 @@ impl<'a> Lower<'a> {
                         .op(c, "sample.f32", Attr::ReadOnly, self.s.t.res_ret, 60, &args)
                 }
                 61 => {
-                    let bias = addr_val(self, 0)?;
+                    let bias = whole_val(self, usize::from(offset_word))?;
                     let bias = self.as_float(bias);
                     args.extend(&os);
                     args.extend([bias, fu]);
@@ -5966,9 +5977,9 @@ impl<'a> Lower<'a> {
                 63 => {
                     let mut g = vec![fu; 6];
                     for k in 0..spatial {
-                        let x = addr_val(self, first + k)?;
+                        let x = packed_val(self, first, k)?;
                         g[k] = to_float(self, x);
-                        let y = addr_val(self, first + spatial + k)?;
+                        let y = packed_val(self, first + deriv_stride, k)?;
                         g[3 + k] = to_float(self, y);
                     }
                     args.extend(&os);
@@ -5984,7 +5995,7 @@ impl<'a> Lower<'a> {
                     )
                 }
                 64 | 65 => {
-                    let reference = addr_val(self, first - 1)?;
+                    let reference = whole_val(self, first - 1)?;
                     let reference = self.as_float(reference);
                     args.extend(&os);
                     args.push(reference);
@@ -5999,7 +6010,7 @@ impl<'a> Lower<'a> {
                 }
                 62 => {
                     let lod = if name == "image_sample_l" {
-                        let x = addr_val(self, coords)?;
+                        let x = packed_val(self, coords_base, coords)?;
                         to_float(self, x)
                     } else {
                         self.s.m.f32(0)
@@ -6023,7 +6034,7 @@ impl<'a> Lower<'a> {
                         return Err("a gather of several channels");
                     }
                     if offset_word {
-                        let w = addr_val(self, 0)?;
+                        let w = whole_val(self, 0)?;
                         for (k, at) in [(0, 26), (1, 18)] {
                             // Bits at..at+5 sign-extended: shift up, then down.
                             let left = self.s.m.i32(at);
@@ -6047,10 +6058,10 @@ impl<'a> Lower<'a> {
         } else {
             let mut cs = vec![iu; 3];
             for (k, slot) in cs.iter_mut().enumerate().take(coords) {
-                *slot = addr_val(self, k)?;
+                *slot = packed_val(self, 0, k)?;
             }
             let mip = if name == "image_load_mip" {
-                addr_val(self, coords)?
+                packed_val(self, 0, coords)?
             } else if uav {
                 // Our declarations have four channels.
                 self.s.flags |= flags::TYPED_UAV_LOADS;
