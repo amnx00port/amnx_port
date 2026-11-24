@@ -1785,6 +1785,16 @@ impl<'a> Lower<'a> {
     }
 
     fn write_f(&mut self, inst: &Inst, f: V, guard: Option<V>) -> Result<(), Why> {
+        self.write_f_with_ftz(inst, f, guard, false)
+    }
+
+    fn write_f_with_ftz(
+        &mut self,
+        inst: &Inst,
+        f: V,
+        guard: Option<V>,
+        flush_subnormals: bool,
+    ) -> Result<(), Why> {
         let Fields::Valu(v) = &inst.fields else {
             unreachable!()
         };
@@ -1796,6 +1806,9 @@ impl<'a> Lower<'a> {
                 let c = self.s.m.f32(factor.to_bits());
                 f = self.s.m.bin(self.cur, Bin::Mul, f, c);
             }
+        }
+        if flush_subnormals {
+            f = self.flush_f32(f);
         }
         if v.clamp {
             f = self.unary(7, f);
@@ -1812,6 +1825,20 @@ impl<'a> Lower<'a> {
             self.floats.insert(new, f);
         }
         Ok(())
+    }
+
+    /// Flushes binary32 subnormals to signed zero, as RDNA MAD instructions do.
+    fn flush_f32(&mut self, f: V) -> V {
+        let c = self.cur;
+        let bits = self.as_int(f);
+        let exponent_mask = self.s.m.i32(0x7F80_0000);
+        let exponent = self.s.m.bin(c, Bin::And, bits, exponent_mask);
+        let zero = self.s.m.i32(0);
+        let subnormal = self.s.m.cmp(c, pred::EQ, exponent, zero);
+        let sign_mask = self.s.m.i32(0x8000_0000);
+        let signed_zero = self.s.m.bin(c, Bin::And, bits, sign_mask);
+        let flushed = self.s.m.select(c, subnormal, signed_zero, bits);
+        self.as_float(flushed)
     }
 
     fn write_i(&mut self, inst: &Inst, x: V, guard: Option<V>) -> Result<(), Why> {
@@ -3923,40 +3950,61 @@ impl<'a> Lower<'a> {
                 float(self, r)
             }
             "v_fmac_f32" | "v_mac_f32" | "v_mac_legacy_f32" => {
-                let (a, bb) = (f(self, 0)?, f(self, 1)?);
+                let flush = name != "v_fmac_f32";
+                let (mut a, mut bb) = (f(self, 0)?, f(self, 1)?);
+                if flush {
+                    a = self.flush_f32(a);
+                    bb = self.flush_f32(bb);
+                }
                 let Some(Operand::Vector { reg, .. }) = v.dst else {
                     return Err("an accumulator");
                 };
                 let acc = inst.read(Reg::V(reg)).ok_or("an accumulator")?;
-                let acc = match self.floats.get(&acc) {
+                let mut acc = match self.floats.get(&acc) {
                     Some(&x) => x,
                     None => {
                         let x = self.i32_of(acc)?;
                         self.as_float(x)
                     }
                 };
+                if flush {
+                    acc = self.flush_f32(acc);
+                }
                 let r = match name {
                     "v_fmac_f32" => self.fmad(a, bb, acc),
                     "v_mac_f32" => {
                         let m = self.s.m.bin(c, Bin::Mul, a, bb);
-                        self.s.m.bin(c, Bin::Add, m, acc)
+                        let m = self.flush_f32(m);
+                        let r = self.s.m.bin(c, Bin::Add, m, acc);
+                        self.flush_f32(r)
                     }
                     _ => {
                         let m = self.legacy_mul(a, bb);
-                        self.s.m.bin(c, Bin::Add, m, acc)
+                        let m = self.flush_f32(m);
+                        let r = self.s.m.bin(c, Bin::Add, m, acc);
+                        self.flush_f32(r)
                     }
                 };
-                float(self, r)
+                if flush {
+                    self.write_f_with_ftz(inst, r, guard, true)
+                } else {
+                    float(self, r)
+                }
             }
             "v_mad_f32" | "v_madak_f32" | "v_madmk_f32" | "v_mad_legacy_f32" => {
-                let (a, bb, cc) = (f(self, 0)?, f(self, 1)?, f(self, 2)?);
+                let (mut a, mut bb, mut cc) = (f(self, 0)?, f(self, 1)?, f(self, 2)?);
+                a = self.flush_f32(a);
+                bb = self.flush_f32(bb);
+                cc = self.flush_f32(cc);
                 let m = if name == "v_mad_legacy_f32" {
                     self.legacy_mul(a, bb)
                 } else {
                     self.s.m.bin(c, Bin::Mul, a, bb)
                 };
+                let m = self.flush_f32(m);
                 let r = self.s.m.bin(c, Bin::Add, m, cc);
-                float(self, r)
+                let r = self.flush_f32(r);
+                self.write_f_with_ftz(inst, r, guard, true)
             }
             "v_max3_f32" | "v_min3_f32" | "v_med3_f32" => {
                 let (a, bb, cc) = (f(self, 0)?, f(self, 1)?, f(self, 2)?);
