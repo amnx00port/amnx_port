@@ -62,6 +62,9 @@ pub(crate) fn near_heaps(va: u64) -> String {
 /// tiers 1 and 2; tier 3 hardware may take more.
 const PORTABLE_VIEWS: u32 = 1_000_000;
 
+/// The D3D12 limit for shader-visible sampler heaps, on every binding tier.
+const PORTABLE_SAMPLERS: u32 = 2_048;
+
 /// Slots past the title's in a view heap, for tables a draw needs made
 /// afresh (constant buffers copied per draw). A list holds the slots it
 /// took until it is reset (its submissions have run) or released.
@@ -95,9 +98,18 @@ impl HostHeap {
         };
         // The larger dynamic range only where the host takes it on top of
         // every title slot; else the smaller one, and the cap after that.
+        let requested = count;
         let (heap, count, extra) = if sampler {
-            match make(count) {
-                Ok(heap) => (heap, count, 0),
+            let supported = count.min(PORTABLE_SAMPLERS);
+            if supported < count {
+                tracing::warn!(
+                    requested = count,
+                    supported,
+                    "host sampler heap capped; higher sampler slots are unavailable"
+                );
+            }
+            match make(supported) {
+                Ok(heap) => (heap, supported, 0),
                 Err(e) => {
                     tracing::warn!(error = %e, count, sampler, "no host descriptor heap");
                     return None;
@@ -127,7 +139,7 @@ impl HostHeap {
                 host.device.GetDescriptorHandleIncrementSize(kind),
             )
         };
-        tracing::debug!(count, sampler, "host descriptor heap");
+        tracing::debug!(requested, count, sampler, "host descriptor heap");
         // SAFETY: a live shader-visible heap.
         let gpu = unsafe { heap.GetGPUDescriptorHandleForHeapStart().ptr };
         GPU_RANGES.lock().unwrap_or_else(|e| e.into_inner()).push((
@@ -230,26 +242,18 @@ impl HostHeap {
         let mut guard = self.next.lock().unwrap_or_else(|e| e.into_inner());
         let (next, taken) = &mut *guard;
         let n = n as usize;
-        // Search from `next` on, then from the start.
-        let starts = (*next as usize..self.dynamic as usize).chain(0..*next as usize);
-        let mut run = 0;
-        let mut found = None;
-        let mut last = usize::MAX;
-        for at in starts {
-            // A run cannot wrap past the end.
-            if at != last.wrapping_add(1) {
-                run = 0;
-            }
-            last = at;
-            run = if taken[at] { 0 } else { run + 1 };
-            if run == n {
-                found = Some(at + 1 - n);
-                break;
-            }
-        }
-        let Some(first) = found else {
+        let Some(first) = free_table(taken, *next as usize, n) else {
             static ONCE: std::sync::Once = std::sync::Once::new();
-            ONCE.call_once(|| tracing::warn!(n, "no free dynamic descriptor slots: a table is not made"));
+            ONCE.call_once(|| {
+                let (free, longest) = free_space(taken);
+                tracing::warn!(
+                    n,
+                    cap = taken.len(),
+                    free,
+                    longest,
+                    "no free dynamic descriptor slots: a table is not made"
+                );
+            });
             return None;
         };
         taken[first..first + n].fill(true);
@@ -397,6 +401,34 @@ impl HostHeap {
     }
 }
 
+/// Total free slots and the longest contiguous run in the physical heap.
+fn free_space(taken: &[bool]) -> (usize, usize) {
+    let mut free = 0;
+    let mut longest = 0;
+    for gap in taken.split(|&held| held) {
+        free += gap.len();
+        longest = longest.max(gap.len());
+    }
+    (free, longest)
+}
+
+/// Try each possible table start from the cursor, then from slot zero.
+/// A table may cross the cursor on the second pass, but must fit in the heap.
+fn free_table(taken: &[bool], cursor: usize, n: usize) -> Option<usize> {
+    let end = taken.len().checked_sub(n)? + 1;
+    let split = cursor.min(end);
+    for starts in [split..end, 0..split] {
+        let mut first = starts.start;
+        while first < starts.end {
+            match taken[first..first + n].iter().position(|&held| held) {
+                Some(offset) => first += offset + 1,
+                None => return Some(first),
+            }
+        }
+    }
+    None
+}
+
 /// Logs `what` the first time it happens.
 macro_rules! once {
     ($($arg:tt)*) => {{
@@ -493,6 +525,15 @@ fn unordered_range(base: u64, words: &[u32; 10]) -> Option<(u64, u64)> {
     ))
 }
 
+/// Whether a raw buffer view may start at element `first` (4 bytes each):
+/// the host wants 16-byte aligned starts, the console only 4, and refuses
+/// the call (removing the device) for the rest.
+/// shortcut: a view the host refuses reads nothing (a null view); starting
+/// it 16 bytes lower would need the shader to add the difference.
+fn raw_start_fits(first: u64) -> bool {
+    first.is_multiple_of(4)
+}
+
 /// The host resource a slot made by [`make`] views, if any.
 type Kept = Option<ID3D12Resource>;
 
@@ -516,6 +557,11 @@ fn buffer_srv(
         return None;
     }
     buffer.FirstElement += offset / element;
+    if buffer.Flags.0 & D3D12_BUFFER_SRV_FLAG_RAW.0 != 0 && !raw_start_fits(buffer.FirstElement) {
+        let first = buffer.FirstElement;
+        once!(first, "raw buffer view not on 16 bytes of its host copy");
+        return None;
+    }
     let host = host()?;
     // SAFETY: a live buffer and a slot of our heap.
     unsafe {
@@ -558,6 +604,14 @@ fn buffer_uav(
         return None;
     }
     buffer.FirstElement += offset / element;
+    if buffer.Flags.0 & D3D12_BUFFER_UAV_FLAG_RAW.0 != 0 && !raw_start_fits(buffer.FirstElement) {
+        let first = buffer.FirstElement;
+        once!(
+            first,
+            "raw unordered buffer view not on 16 bytes of its host copy"
+        );
+        return None;
+    }
     buffer.CounterOffsetInBytes = 0;
     let host = host()?;
     // SAFETY: a live buffer and a slot of our heap.
@@ -923,6 +977,35 @@ fn null_view(at: D3D12_CPU_DESCRIPTOR_HANDLE) {
 mod tests {
     use super::*;
 
+    #[test]
+    fn free_space_counts_separate_runs_at_the_heap_ends() {
+        assert_eq!(free_space(&[true; 8]), (0, 0));
+        assert_eq!(free_space(&[false; 8]), (8, 8));
+        let fragmented = [false, false, true, false, true, false, false, false];
+        assert_eq!(free_space(&fragmented), (6, 3));
+    }
+
+    #[test]
+    fn free_table_chooses_the_first_contiguous_fit_in_cursor_order() {
+        for mask in 0u16..256 {
+            let taken: [bool; 8] = std::array::from_fn(|slot| mask & (1 << slot) != 0);
+            for cursor in 0..taken.len() {
+                for n in 1..=taken.len() {
+                    let expected = (cursor..taken.len()).chain(0..cursor).find(|&start| {
+                        taken
+                            .get(start..start + n)
+                            .is_some_and(|table| table.iter().all(|&held| !held))
+                    });
+                    assert_eq!(
+                        free_table(&taken, cursor, n),
+                        expected,
+                        "{mask:#x} {cursor} {n}"
+                    );
+                }
+            }
+        }
+    }
+
     /// A null texture UAV keeps the title's dimension (3D for the world's
     /// wind field), and is 2D when the title names none.
     #[test]
@@ -958,6 +1041,103 @@ mod tests {
         assert!(unsafe { host.device.GetDeviceRemovedReason() }.is_ok());
     }
 
+    /// Raw views start on 16 bytes on the host: element (4 bytes) 0, 4, 8...
+    /// The rest, 4, 8 and 12 bytes past a boundary as in the user report
+    /// (FirstElement 42261210), are refused.
+    #[test]
+    fn raw_views_start_on_16_bytes() {
+        for first in [0, 4, 8, 42_261_208, 42_261_212] {
+            assert!(raw_start_fits(first), "{first}");
+        }
+        for first in [1, 2, 3, 5, 42_261_209, 42_261_210, 42_261_211] {
+            assert!(!raw_start_fits(first), "{first}");
+        }
+    }
+
+    /// The raw views the check lets through, at starts other than 0, are
+    /// made on the real device as SRVs and UAVs and leave it alive.
+    #[test]
+    fn raw_views_that_fit_are_accepted_by_the_device() {
+        let Some(host) = host() else {
+            return; // no host GPU
+        };
+        let Some(heap) = HostHeap::new(false, 4) else {
+            return;
+        };
+        let properties = D3D12_HEAP_PROPERTIES {
+            Type: D3D12_HEAP_TYPE_DEFAULT,
+            ..Default::default()
+        };
+        let desc = D3D12_RESOURCE_DESC {
+            Dimension: D3D12_RESOURCE_DIMENSION_BUFFER,
+            Width: 1024,
+            Height: 1,
+            DepthOrArraySize: 1,
+            MipLevels: 1,
+            SampleDesc: DXGI_SAMPLE_DESC {
+                Count: 1,
+                Quality: 0,
+            },
+            Layout: D3D12_TEXTURE_LAYOUT_ROW_MAJOR,
+            Flags: D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS,
+            ..Default::default()
+        };
+        let mut buffer: Option<ID3D12Resource> = None;
+        // SAFETY: plain creation from valid descriptions.
+        unsafe {
+            host.device.CreateCommittedResource(
+                &properties,
+                D3D12_HEAP_FLAG_NONE,
+                &desc,
+                D3D12_RESOURCE_STATE_COMMON,
+                None,
+                &mut buffer,
+            )
+        }
+        .expect("buffer");
+        let buffer = buffer.expect("buffer");
+        for first in (0..64).filter(|&f| raw_start_fits(f)) {
+            let srv = D3D12_SHADER_RESOURCE_VIEW_DESC {
+                Format: DXGI_FORMAT_R32_TYPELESS,
+                ViewDimension: D3D12_SRV_DIMENSION_BUFFER,
+                Shader4ComponentMapping: D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING,
+                Anonymous: D3D12_SHADER_RESOURCE_VIEW_DESC_0 {
+                    Buffer: D3D12_BUFFER_SRV {
+                        FirstElement: first,
+                        NumElements: 16,
+                        Flags: D3D12_BUFFER_SRV_FLAG_RAW,
+                        ..Default::default()
+                    },
+                },
+            };
+            let uav = D3D12_UNORDERED_ACCESS_VIEW_DESC {
+                Format: DXGI_FORMAT_R32_TYPELESS,
+                ViewDimension: D3D12_UAV_DIMENSION_BUFFER,
+                Anonymous: D3D12_UNORDERED_ACCESS_VIEW_DESC_0 {
+                    Buffer: D3D12_BUFFER_UAV {
+                        FirstElement: first,
+                        NumElements: 16,
+                        Flags: D3D12_BUFFER_UAV_FLAG_RAW,
+                        ..Default::default()
+                    },
+                },
+            };
+            // SAFETY: a live buffer and slots of our heap.
+            unsafe {
+                host.device
+                    .CreateShaderResourceView(&buffer, Some(&srv), heap.cpu(0));
+                host.device.CreateUnorderedAccessView(
+                    &buffer,
+                    None::<&ID3D12Resource>,
+                    Some(&uav),
+                    heap.cpu(1),
+                );
+            }
+        }
+        // SAFETY: a plain device query.
+        assert!(unsafe { host.device.GetDeviceRemovedReason() }.is_ok());
+    }
+
     /// Dynamic slots stay taken until given back, and runs do not wrap.
     #[test]
     fn dynamic_slots_are_held_until_released() {
@@ -972,5 +1152,27 @@ mod tests {
         heap.release(a, 50);
         assert_eq!(heap.dynamic(50), Some(4));
         assert_eq!(heap.dynamic(40), Some(4 + heap.dynamic - 40));
+    }
+
+    #[test]
+    fn a_free_table_can_straddle_the_search_cursor() {
+        if host().is_none() {
+            return;
+        }
+        let heap = HostHeap::new(false, 4).expect("the host must create the test view heap");
+        let left = heap.dynamic(4).unwrap();
+        let right = heap.dynamic(5).unwrap();
+        let tail_len = heap.dynamic - 9;
+        let tail = heap.dynamic(tail_len).unwrap();
+
+        heap.release(left, 4);
+        assert_eq!(heap.dynamic(4), Some(left)); // cursor now separates the two tables
+        heap.release(right, 5);
+        heap.release(left, 4);
+        assert_eq!(heap.dynamic(9), Some(left));
+        assert_eq!(heap.dynamic(1), None, "the tail is still held");
+
+        heap.release(tail, tail_len);
+        assert_eq!(heap.dynamic(tail_len), Some(tail));
     }
 }
