@@ -3951,10 +3951,7 @@ impl<'a> Lower<'a> {
                     let flipped = self.s.m.cmp(c, pred::SLT, ps_xor, k0);
                     let ov = self.s.m.bin(c, Bin::And, same_sign, flipped);
                     let pos = self.s.m.cmp(c, pred::SGE, prod, k0);
-                    let (imin, imax) = (
-                        self.s.m.i32(i32::MIN as u32),
-                        self.s.m.i32(i32::MAX as u32),
-                    );
+                    let (imin, imax) = (self.s.m.i32(i32::MIN as u32), self.s.m.i32(i32::MAX as u32));
                     let sat = self.s.m.select(c, pos, imax, imin);
                     self.s.m.select(c, ov, sat, sum)
                 } else {

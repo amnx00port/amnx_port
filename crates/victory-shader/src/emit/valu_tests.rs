@@ -1025,7 +1025,15 @@ fn valu16_min3_max3_med3_and_mad32_16_match_rdna2() {
     let mad_u32 = build_valu_cs(&vop3_mod(0x373, 0, false, 0, vgpr(1), vgpr(2), vgpr(3)));
     let mad_u32_clamp = build_valu_cs(&vop3_mod(0x373, 0, true, 0, vgpr(1), vgpr(2), vgpr(3)));
     // op_sel = 0b0010 => src0=lo, src1=hi
-    let mad_u32_hi1 = build_valu_cs(&vop3_mod(0x373, 0b0010, false, 0, vgpr(1), vgpr(2), vgpr(3)));
+    let mad_u32_hi1 = build_valu_cs(&vop3_mod(
+        0x373,
+        0b0010,
+        false,
+        0,
+        vgpr(1),
+        vgpr(2),
+        vgpr(3),
+    ));
     let mad_i32 = build_valu_cs(&vop3_mod(0x375, 0, false, 0, vgpr(1), vgpr(2), vgpr(3)));
     let mad_i32_clamp = build_valu_cs(&vop3_mod(0x375, 0, true, 0, vgpr(1), vgpr(2), vgpr(3)));
 
@@ -1047,13 +1055,21 @@ fn valu16_min3_max3_med3_and_mad32_16_match_rdna2() {
         assert_eq!(g, u32_cases[i].2, "{b}: v_mad_u32_u16 clamp case {i}");
     });
     // src0.lo = 10, src1.hi = 20, acc = 3 => 203.
-    run_cases(&mad_u32_hi1, &[[0x9999_000A, 0x0014_8888, 3, 0]], |b, _, _, g| {
-        assert_eq!(g, 203, "{b}: v_mad_u32_u16 opsel=0b0010");
-    });
+    run_cases(
+        &mad_u32_hi1,
+        &[[0x9999_000A, 0x0014_8888, 3, 0]],
+        |b, _, _, g| {
+            assert_eq!(g, 203, "{b}: v_mad_u32_u16 opsel=0b0010");
+        },
+    );
 
     let i32_cases: &[([u32; 4], u32, u32)] = &[
         // (-100) * 50 + 20 = -4980
-        ([0x0000_FF9C, 0x0000_0032, 20, 0], (-4980i32) as u32, (-4980i32) as u32),
+        (
+            [0x0000_FF9C, 0x0000_0032, 20, 0],
+            (-4980i32) as u32,
+            (-4980i32) as u32,
+        ),
         // (-32768) * (-32768) + i32::MAX => +2^30 + (2^31 - 1), positive overflow -> i32::MAX
         (
             [0x0000_8000, 0x0000_8000, i32::MAX as u32, 0],
