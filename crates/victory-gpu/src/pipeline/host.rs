@@ -288,6 +288,19 @@ fn refuse(reason: &'static str, shaders: &[Arc<Shader>]) -> Option<HostPipeline>
     None
 }
 
+#[cfg(feature = "diagnostics")]
+struct HostCreationTimer(std::time::Instant);
+
+#[cfg(feature = "diagnostics")]
+impl Drop for HostCreationTimer {
+    fn drop(&mut self) {
+        tracing::debug!(
+            elapsed_us = self.0.elapsed().as_micros() as u64,
+            "host pipeline preparation and creation"
+        );
+    }
+}
+
 impl HostPipeline {
     /// A host pipeline for vertex and pixel shaders with the graphics
     /// state `g`, or for one compute shader.
@@ -326,6 +339,10 @@ impl HostPipeline {
         for (s, _) in &stages {
             s.translated()?;
         }
+        // Measure host pipeline preparation after shader dependencies resolve.
+        // A drop guard records early returns as well as successful creation.
+        #[cfg(feature = "diagnostics")]
+        let _creation_timer = HostCreationTimer(std::time::Instant::now());
         let host = host()?;
 
         // The root signature the translated shaders' bindings define.
