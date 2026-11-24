@@ -937,3 +937,52 @@ fn v_cmp_class_f16_matches_rdna2() {
         );
     });
 }
+
+/// VOP3P `op vdst, src0, src1` with `op_sel` and `op_sel_hi` (bit k for
+/// source k); the third source is the unused inline 0.
+const fn vop3p(op: u8, vdst: u8, src0: u16, src1: u16, opsel: u32, opsel_hi: u32) -> [u32; 2] {
+    [
+        0x33 << 26 | (op as u32) << 16 | 1 << 14 | (opsel & 7) << 11 | vdst as u32,
+        (src0 as u32 & 0x1FF) | (src1 as u32 & 0x1FF) << 9 | 128 << 18 | (opsel_hi & 3) << 27,
+    ]
+}
+
+#[test]
+fn v_pk_mul_lo_u16_keeps_each_half_to_16_bits() {
+    const LITERAL: u16 = 255;
+    // s0..s3 -> v1..v4: run-time values, so no compiler can fold them.
+    let inputs = [0x0001_1234, 0x0003_ffff, 0x1234_abcd, 0x0007_beef];
+    let with = |w: [u32; 2], literal: u32| vec![w[0], w[1], literal];
+    let cases: [(Vec<u32>, u32); 4] = [
+        // v_pk_mul_lo_u16 v0, v1, 0xaaaa0000 op_sel:[0,1] op_sel_hi:[0,0]:
+        // lo = 0x1234 * 0xaaaa, hi = 0x1234 * 0.
+        (
+            with(vop3p(0x01, 0, vgpr(1), LITERAL, 0b10, 0b00), 0xaaaa_0000),
+            0x0000_9e88,
+        ),
+        // v_pk_mul_lo_u16 v0, s1, v3 op_sel_hi:[1,0]
+        (
+            vop3p(0x01, 0, sgpr(1), vgpr(3), 0, 0b01).to_vec(),
+            0x0367_5433,
+        ),
+        // v_pk_mul_lo_u16 v0, v4, 0x00050000
+        (
+            with(vop3p(0x01, 0, vgpr(4), LITERAL, 0, 0b11), 0x0005_0000),
+            0x0023_0000,
+        ),
+        // v_pk_mul_lo_u16 v0, v1, 7 op_sel_hi:[1,0]
+        (
+            vop3p(0x01, 0, vgpr(1), 128 + 7, 0, 0b01).to_vec(),
+            0x0007_7f6c,
+        ),
+    ];
+    for (words, want) in cases {
+        let shader = build_valu_cs(&words);
+        run_cases(&shader, &[inputs], |backend, _, _, got| {
+            assert_eq!(
+                got, want,
+                "{backend}: {words:08x?} = {got:#010x}, want {want:#010x}"
+            );
+        });
+    }
+}
