@@ -46,25 +46,36 @@ fn is_ours(id: *const c_char) -> bool {
     text(id).is_some_and(|id| id == identifier())
 }
 
+/// Bytes in a directory tree, skipping reparse/symlink entries so directory
+/// cycles cannot recurse infinitely.
+fn dir_bytes(dir: &Path) -> u64 {
+    let Ok(entries) = std::fs::read_dir(dir) else {
+        return 0;
+    };
+    entries
+        .flatten()
+        .map(|e| {
+            let Ok(ft) = e.file_type() else {
+                return 0;
+            };
+            if ft.is_symlink() {
+                return 0;
+            }
+            if ft.is_dir() {
+                dir_bytes(&e.path())
+            } else {
+                e.metadata().map_or(0, |m| m.len())
+            }
+        })
+        .fold(0u64, u64::saturating_add)
+}
+
 /// Bytes in the package folder, counted once.
 fn package_bytes() -> u64 {
-    fn size(dir: &Path) -> u64 {
-        let Ok(entries) = std::fs::read_dir(dir) else {
-            return 0;
-        };
-        entries
-            .flatten()
-            .map(|e| match e.metadata() {
-                Ok(m) if m.is_dir() => size(&e.path()),
-                Ok(m) => m.len(),
-                Err(_) => 0,
-            })
-            .sum()
-    }
     static BYTES: OnceLock<u64> = OnceLock::new();
     *BYTES.get_or_init(|| {
         let exe = runtime::main_image().and_then(runtime::image_path);
-        exe.as_deref().and_then(Path::parent).map_or(0, size)
+        exe.as_deref().and_then(Path::parent).map_or(0, dir_bytes)
     })
 }
 
@@ -110,6 +121,7 @@ pub struct Progress {
     pub launchable: bool,
     pub completed: bool,
 }
+const _: () = assert!(size_of::<Progress>() == 32);
 
 extern "system" fn progress(_: This, _: *const c_void, out: *mut Progress) {
     let bytes = package_bytes();
@@ -125,6 +137,11 @@ extern "system" fn progress(_: This, _: *const c_void, out: *mut Progress) {
     );
 }
 
+/// Installation is already complete, so updating a monitor never observes a change.
+extern "system" fn update_monitor(_: This, _monitor: *const c_void) -> bool {
+    false
+}
+
 /// The installation is complete, so progress never changes.
 extern "system" fn register_progress(
     _: This,
@@ -134,6 +151,15 @@ extern "system" fn register_progress(
     out: *mut u64,
 ) -> HRESULT {
     put(out, token())
+}
+
+extern "system" fn unregister_progress(
+    _: This,
+    _monitor: *const c_void,
+    token: u64,
+    _wait: bool,
+) -> bool {
+    token != 0
 }
 
 /// 0: ready.
@@ -202,6 +228,9 @@ extern "system" fn estimate_download(
     if !is_ours(id) {
         return NO_PACKAGE;
     }
+    if bytes.is_null() {
+        return xasync::E_INVALIDARG;
+    }
     if !confirm.is_null() {
         // SAFETY: checked non-null.
         unsafe { confirm.write(false) };
@@ -223,6 +252,9 @@ extern "system" fn uninstall_chunks(
 
 /// Mount handles only come from mounting another package, and there is
 /// none.
+extern "system" fn mount_path_size(_: This, _: *const c_void, _: *mut usize) -> HRESULT {
+    xasync::E_INVALIDARG
+}
 extern "system" fn mount_path(_: This, _: *const c_void, _: usize, _: *mut u8) -> HRESULT {
     xasync::E_INVALIDARG
 }
@@ -277,9 +309,9 @@ static VTABLE: Methods<40> = Methods([
     create_monitor as *const (),        // 0x28
     close_monitor as *const (),         // 0x30
     progress as *const (),              // 0x38
-    missing::<8> as *const (),          // 0x40 update a monitor
+    update_monitor as *const (),        // 0x40
     register_progress as *const (),     // 0x48
-    missing::<10> as *const (),         // 0x50 unregister it
+    unregister_progress as *const (),   // 0x50
     missing::<11> as *const (),         // 0x58 user locale
     find_availability as *const (),     // 0x60
     missing::<13> as *const (),         // 0x68 enumerate chunk availability
@@ -293,7 +325,7 @@ static VTABLE: Methods<40> = Methods([
     missing::<21> as *const (),         // 0xa8
     missing::<22> as *const (),         // 0xb0
     missing::<23> as *const (),         // 0xb8 mount (deprecated)
-    missing::<24> as *const (),         // 0xc0 mount path size
+    mount_path_size as *const (),       // 0xc0
     mount_path as *const (),            // 0xc8
     close_mount as *const (),           // 0xd0
     missing::<27> as *const (),         // 0xd8
@@ -315,6 +347,15 @@ static VTABLE: Methods<40> = Methods([
 mod tests {
     use super::*;
     use crate::modules::xgameruntime::method;
+
+    fn empty_block() -> AsyncBlock {
+        AsyncBlock {
+            queue: std::ptr::null(),
+            context: std::ptr::null_mut(),
+            callback: None,
+            internal: [0; 4],
+        }
+    }
 
     #[test]
     fn the_installation_is_complete_and_alone() {
@@ -356,16 +397,313 @@ mod tests {
         assert!(p.completed && p.launchable && p.installed_bytes == p.total_bytes);
 
         type Mount = extern "system" fn(This, *const c_char, *mut AsyncBlock) -> HRESULT;
-        let mut block = AsyncBlock {
-            queue: std::ptr::null(),
-            context: std::ptr::null_mut(),
-            callback: None,
-            internal: [0; 4],
-        };
+        let mut block = empty_block();
         assert_eq!(
             method::<Mount>(&OBJECT, 0x128)(this, c"dlc".as_ptr(), &mut block),
             S_OK
         );
         assert_eq!(xasync::XAsyncGetStatus(&mut block, true), NO_PACKAGE);
+    }
+
+    #[test]
+    fn current_identifier_checks_buffer_size_and_null() {
+        let this: This = &OBJECT;
+        type Id = extern "system" fn(This, usize, *mut u8) -> HRESULT;
+        let get_id = method::<Id>(&OBJECT, 0x18);
+        let expected = identifier();
+        let exact = expected.len() + 1;
+
+        assert_eq!(
+            get_id(this, exact, std::ptr::null_mut()),
+            xasync::E_NOT_SUFFICIENT_BUFFER
+        );
+        let mut small = vec![0xAAu8; exact - 1];
+        assert_eq!(
+            get_id(this, small.len(), small.as_mut_ptr()),
+            xasync::E_NOT_SUFFICIENT_BUFFER
+        );
+        let mut buf = vec![0xAAu8; exact];
+        assert_eq!(get_id(this, buf.len(), buf.as_mut_ptr()), S_OK);
+        assert_eq!(&buf[..expected.len()], expected.as_bytes());
+        assert_eq!(buf[expected.len()], 0);
+    }
+
+    #[test]
+    fn monitor_update_and_progress_registration_slots() {
+        let this: This = &OBJECT;
+        type CreateMonitor = extern "system" fn(
+            This,
+            *const c_char,
+            u32,
+            *const c_void,
+            u32,
+            *const c_void,
+            *mut *const c_void,
+        ) -> HRESULT;
+        type UpdateMonitor = extern "system" fn(This, *const c_void) -> bool;
+        type Register = extern "system" fn(
+            This,
+            *const c_void,
+            *mut c_void,
+            *const c_void,
+            *mut u64,
+        ) -> HRESULT;
+        type Unregister = extern "system" fn(This, *const c_void, u64, bool) -> bool;
+        type CloseMonitor = extern "system" fn(This, *const c_void);
+
+        let ours = format!("{}\0", identifier());
+        let create = method::<CreateMonitor>(&OBJECT, 0x28);
+        let mut handle = std::ptr::null();
+
+        assert_eq!(
+            create(
+                this,
+                std::ptr::null(),
+                0,
+                std::ptr::null(),
+                0,
+                std::ptr::null(),
+                &mut handle
+            ),
+            NO_PACKAGE
+        );
+        assert_eq!(
+            create(
+                this,
+                ours.as_ptr().cast(),
+                0,
+                std::ptr::null(),
+                0,
+                std::ptr::null(),
+                std::ptr::null_mut()
+            ),
+            xasync::E_INVALIDARG
+        );
+        assert_eq!(
+            create(
+                this,
+                ours.as_ptr().cast(),
+                0,
+                std::ptr::null(),
+                0,
+                std::ptr::null(),
+                &mut handle
+            ),
+            S_OK
+        );
+        assert_eq!(handle, monitor());
+
+        // Installation is complete, so update reports no changes.
+        assert!(!method::<UpdateMonitor>(&OBJECT, 0x40)(this, handle));
+
+        // Register/unregister progress tokens.
+        let reg = method::<Register>(&OBJECT, 0x48);
+        let unreg = method::<Unregister>(&OBJECT, 0x50);
+        assert_eq!(
+            reg(
+                this,
+                handle,
+                std::ptr::null_mut(),
+                std::ptr::null(),
+                std::ptr::null_mut()
+            ),
+            xasync::E_INVALIDARG
+        );
+        let (mut tok1, mut tok2) = (0u64, 0u64);
+        assert_eq!(
+            reg(this, handle, std::ptr::null_mut(), std::ptr::null(), &mut tok1),
+            S_OK
+        );
+        assert_eq!(
+            reg(this, handle, std::ptr::null_mut(), std::ptr::null(), &mut tok2),
+            S_OK
+        );
+        assert_ne!(tok1, 0);
+        assert_ne!(tok1, tok2);
+        assert!(unreg(this, handle, tok1, true));
+        assert!(!unreg(this, handle, 0, false));
+
+        // Null progress output is tolerated without crashing.
+        type ProgressFn = extern "system" fn(This, *const c_void, *mut Progress);
+        method::<ProgressFn>(&OBJECT, 0x38)(this, handle, std::ptr::null_mut());
+        method::<CloseMonitor>(&OBJECT, 0x30)(this, handle);
+    }
+
+    #[test]
+    fn install_order_and_uninstall_chunks_handle_known_and_unknown_ids() {
+        let this: This = &OBJECT;
+        let ours = format!("{}\0", identifier());
+
+        type OrderOrUninstall =
+            extern "system" fn(This, *const c_char, u32, *const c_void) -> HRESULT;
+        for slot in [0x70, 0x98] {
+            let f = method::<OrderOrUninstall>(&OBJECT, slot);
+            assert_eq!(f(this, ours.as_ptr().cast(), 0, std::ptr::null()), S_OK);
+            assert_eq!(f(this, c"other".as_ptr(), 0, std::ptr::null()), NO_PACKAGE);
+            assert_eq!(f(this, std::ptr::null(), 0, std::ptr::null()), NO_PACKAGE);
+        }
+
+        type InstallAsync = extern "system" fn(
+            This,
+            *const c_char,
+            u32,
+            *const c_void,
+            u32,
+            bool,
+            *mut AsyncBlock,
+        ) -> HRESULT;
+        type InstallResult = extern "system" fn(This, *mut AsyncBlock, *mut *const c_void) -> HRESULT;
+
+        let mut ok_block = empty_block();
+        assert_eq!(
+            method::<InstallAsync>(&OBJECT, 0x80)(
+                this,
+                ours.as_ptr().cast(),
+                0,
+                std::ptr::null(),
+                0,
+                true,
+                &mut ok_block
+            ),
+            S_OK
+        );
+        let mut handle = std::ptr::null();
+        assert_eq!(
+            method::<InstallResult>(&OBJECT, 0x88)(this, &mut ok_block, &mut handle),
+            S_OK
+        );
+        assert_eq!(handle, monitor());
+
+        let mut err_block = empty_block();
+        assert_eq!(
+            method::<InstallAsync>(&OBJECT, 0x80)(
+                this,
+                c"other".as_ptr(),
+                0,
+                std::ptr::null(),
+                0,
+                false,
+                &mut err_block
+            ),
+            S_OK
+        );
+        assert_eq!(
+            method::<InstallResult>(&OBJECT, 0x88)(this, &mut err_block, &mut handle),
+            NO_PACKAGE
+        );
+    }
+
+    #[test]
+    fn estimate_download_does_not_mutate_confirm_when_bytes_is_null() {
+        let this: This = &OBJECT;
+        let ours = format!("{}\0", identifier());
+        type Estimate = extern "system" fn(
+            This,
+            *const c_char,
+            u32,
+            *const c_void,
+            *mut u64,
+            *mut bool,
+        ) -> HRESULT;
+        let est = method::<Estimate>(&OBJECT, 0x90);
+
+        let mut confirm = true;
+        assert_eq!(
+            est(
+                this,
+                ours.as_ptr().cast(),
+                0,
+                std::ptr::null(),
+                std::ptr::null_mut(),
+                &mut confirm
+            ),
+            xasync::E_INVALIDARG
+        );
+        assert!(confirm, "confirm must not be overwritten on E_INVALIDARG");
+
+        let mut bytes = 1234u64;
+        assert_eq!(
+            est(this, c"other".as_ptr(), 0, std::ptr::null(), &mut bytes, &mut confirm),
+            NO_PACKAGE
+        );
+        assert_eq!(bytes, 1234);
+        assert!(confirm);
+
+        assert_eq!(
+            est(
+                this,
+                ours.as_ptr().cast(),
+                0,
+                std::ptr::null(),
+                &mut bytes,
+                &mut confirm
+            ),
+            S_OK
+        );
+        assert_eq!(bytes, 0);
+        assert!(!confirm);
+
+        // Optional `confirm` pointer may be null.
+        bytes = 99;
+        assert_eq!(
+            est(
+                this,
+                ours.as_ptr().cast(),
+                0,
+                std::ptr::null(),
+                &mut bytes,
+                std::ptr::null_mut()
+            ),
+            S_OK
+        );
+        assert_eq!(bytes, 0);
+    }
+
+    #[test]
+    fn mount_uninstall_enumerate_and_dir_bytes() {
+        let this: This = &OBJECT;
+        type MountPathSize = extern "system" fn(This, *const c_void, *mut usize) -> HRESULT;
+        type MountPath = extern "system" fn(This, *const c_void, usize, *mut u8) -> HRESULT;
+        type UninstallPkg = extern "system" fn(This, *const c_char) -> bool;
+        type Enumerate =
+            extern "system" fn(This, u32, u32, *mut c_void, *const c_void) -> HRESULT;
+
+        let mut size = 0usize;
+        assert_eq!(
+            method::<MountPathSize>(&OBJECT, 0xc0)(this, std::ptr::null(), &mut size),
+            xasync::E_INVALIDARG
+        );
+        assert_eq!(
+            method::<MountPath>(&OBJECT, 0xc8)(this, std::ptr::null(), 0, std::ptr::null_mut()),
+            xasync::E_INVALIDARG
+        );
+        assert!(!method::<UninstallPkg>(&OBJECT, 0x110)(this, c"dlc".as_ptr()));
+        assert!(!method::<UninstallPkg>(&OBJECT, 0x110)(this, std::ptr::null()));
+        assert_eq!(
+            method::<Enumerate>(&OBJECT, 0x138)(
+                this,
+                1,
+                0,
+                std::ptr::null_mut(),
+                std::ptr::null()
+            ),
+            S_OK
+        );
+
+        // `dir_bytes` sums nested regular files and returns 0 for missing directories.
+        let root = std::env::temp_dir().join(format!(
+            "victory_xpackage_test_{}",
+            std::process::id()
+        ));
+        let sub = root.join("nested");
+        std::fs::create_dir_all(&sub).unwrap();
+        std::fs::write(root.join("a.bin"), [1u8; 17]).unwrap();
+        std::fs::write(sub.join("b.bin"), [2u8; 25]).unwrap();
+        assert_eq!(dir_bytes(&root), 42);
+        let _ = std::fs::remove_file(root.join("a.bin"));
+        let _ = std::fs::remove_file(sub.join("b.bin"));
+        let _ = std::fs::remove_dir(&sub);
+        let _ = std::fs::remove_dir(&root);
+        assert_eq!(dir_bytes(&root), 0);
     }
 }
