@@ -29,6 +29,15 @@
 //!   `b<i>` / `t<i>` in [`ROOT_CBV_SPACE`], `i` the title's root parameter
 //!   index ([`HostShader::root_cbvs`], [`HostShader::root_srvs`]); the
 //!   address the title sets is the buffer's.
+//! * **Addresses in root constants** (added 2026-11-24): a 64-bit address
+//!   the title passes as two root-constant dwords (low half first, in
+//!   consecutive user SGPRs) and the shader only reads through
+//!   (`global_load_*`, `s_buffer_load_*` on a descriptor built around it) is
+//!   a root SRV (raw buffer) `t<n>` in [`ROOT_ADDRESS_SPACE`], `n` the
+//!   position in [`HostShader::address_srvs`]. The host composes the
+//!   address from the two constants' current values at every draw and binds
+//!   the buffer there. Writes, typed views and scalar loads through such an
+//!   address stop the translation.
 //! * **Vertex fetch** (added 2026-11-23). Grand Theft Auto VI's mesh and
 //!   vertex programs fetch vertices themselves with typed-format loads
 //!   (`tbuffer_load_format_*`): the format (8_8_8_8 unorm, 16_16 snorm,
@@ -95,7 +104,7 @@ use crate::native::{HwStage, NativeProgram, RootType};
 use crate::{ShaderError, io, ir, resource, structure};
 
 pub use sampler::StaticSampler;
-pub use shader::{ROOT_CBV_SPACE, SAMPLER_SPACE, USER_DATA_SPACE};
+pub use shader::{ROOT_ADDRESS_SPACE, ROOT_CBV_SPACE, SAMPLER_SPACE, USER_DATA_SPACE};
 
 /// The loop limit without an override: 2^20.
 pub const DEFAULT_LOOP_LIMIT: u32 = lower::LOOP_LIMIT;
@@ -154,6 +163,17 @@ pub struct HostShader {
     /// Root SRVs (raw buffers) the shader reads: `t<index>` in
     /// [`ROOT_CBV_SPACE`].
     pub root_srvs: Vec<u8>,
+    /// Root SRVs (raw buffers) at addresses in root constants: `t<n>` in
+    /// [`ROOT_ADDRESS_SPACE`] for the view at position n.
+    pub address_srvs: Vec<AddressView>,
+}
+
+/// A root SRV at the 64-bit address two root-constant dwords hold (both
+/// with `root` [`RootType::Constants`]).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct AddressView {
+    pub lo: UserData,
+    pub hi: UserData,
 }
 
 impl HostShader {
@@ -202,7 +222,15 @@ pub fn translate(container: &[u8]) -> Result<HostShader, ShaderError> {
             offset: 0,
             what: "a container without a vertex, pixel, compute or mesh program",
         })?;
-    let p = ir::build(&native.patched_code(), native.wave64, native.vgprs)?;
+    // A compute program whose root arguments all sit past the 16 user SGPRs
+    // finds them through the spill table `s[0:1]` points to.
+    let spilled = native.stage == HwStage::Cs
+        && !native.layout.is_empty()
+        && native
+            .layout
+            .iter()
+            .all(|r| native.stage.user_sgpr(r.user_data) >= 16);
+    let p = ir::build_with(&native.patched_code(), native.wave64, native.vgprs, spilled)?;
     let res = resource::track(&p, &native.layout, native.stage)?;
     let io = io::raise(&p, &native)?;
     let st = structure::structure(&p)?;
@@ -296,6 +324,7 @@ pub fn emit(
         samplers: l.samplers,
         root_cbvs: l.root_cbvs,
         root_srvs: l.root_srvs,
+        address_srvs: l.address_srvs,
     })
 }
 
@@ -490,6 +519,7 @@ mod tests {
             static_samplers: Vec::new(),
             root_cbvs: Vec::new(),
             root_srvs: Vec::new(),
+            address_srvs: Vec::new(),
         };
         let file = |var: &str, stage| {
             std::env::var(var).ok().map(|p| super::HostShader {
@@ -500,6 +530,7 @@ mod tests {
                 static_samplers: Vec::new(),
                 root_cbvs: Vec::new(),
                 root_srvs: Vec::new(),
+                address_srvs: Vec::new(),
             })
         };
         let ps = file("VICTORY_REF_PS", crate::HwStage::Ps).unwrap_or(ps);
