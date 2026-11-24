@@ -5963,8 +5963,12 @@ impl<'a> Lower<'a> {
                 } else {
                     vals[0]
                 };
-                let value = self.s.m.cast(c, Cast::Trunc, value, self.s.t.i16);
-                let undef = self.s.m.undef(self.s.t.i16);
+                // RawBufferStore.i16 is a DXIL 1.2 native low-precision
+                // operation; advertise the SM 6.2 capability in the module.
+                self.s.flags |= flags::NATIVE_LOW_PRECISION;
+                let i16 = self.s.m.int(16);
+                let value = self.s.m.cast(c, Cast::Trunc, value, i16);
+                let undef = self.s.m.undef(i16);
                 let (handle, coord0, coord1) = match index {
                     Some(index) => {
                         let stride = used.map_or(0, |u| u.stride);
