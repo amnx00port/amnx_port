@@ -405,7 +405,7 @@ impl Layout {
             let mut sizes = vec![];
             for i in 0..d.mips {
                 let (w, h) = padded(i);
-                if w <= fixed[0] && h <= fixed[1] && d.mips - i <= max_in_tail {
+                if w <= fixed[0] && h <= fixed[1] && mip_depth(i) <= fixed[2] && d.mips - i <= max_in_tail {
                     first_tail_mip = i;
                     slice_size += block_bytes / u64::from(block[2]);
                     break;
@@ -987,6 +987,29 @@ mod tests {
         assert_eq!(l.mips[2].offset, 4096);
         assert_eq!(l.mips[1].offset, 8192);
         assert_eq!(l.mips[0].offset, 8192 + 16384);
+    }
+
+    /// Thick 3D layouts must also bound tail mips by depth: a base mip whose
+    /// depth exceeds `fixed[2]` is not a tail mip even when its width/height
+    /// fit. Without the depth check mip 0 is wrongly folded into the tail.
+    #[test]
+    fn thick_3d_mip_tail_respects_depth_bound() {
+        let l = Layout::new(&Desc {
+            dimension: Dimension::Tex3d,
+            width: 4,
+            height: 4,
+            depth: 16,
+            mips: 5,
+            element_bytes: 4,
+            block: 1,
+            samples: 1,
+            swizzle: Swizzle::SW_4KB_S,
+        })
+        .unwrap();
+        // Mip 0 has depth 16 > fixed[2]=8, so it cannot be the tail.
+        assert_eq!(l.first_tail_mip, 1);
+        assert_eq!(l.mips[0].tail, None);
+        assert!(l.mips[0].depth > 8);
     }
 
     #[test]
