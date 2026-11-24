@@ -5827,6 +5827,7 @@ impl<'a> Lower<'a> {
             .or(plain.strip_prefix("tbuffer_load_"))
         {
             _ if atomic.is_some() => (false, 1),
+            Some("short" | "short_d16_hi") if store => (false, 1),
             Some("dword") => (false, 1),
             Some("dwordx2") => (false, 2),
             Some("dwordx3") => (false, 3),
@@ -5952,6 +5953,46 @@ impl<'a> Lower<'a> {
             let regs = if d16 { count.div_ceil(2) } else { count };
             let mut vals =
                 self.vgprs(inst, data.as_ref().ok_or("buffer store data")?, regs as u8)?;
+            // GFX10 buffer_store_short writes one native 16-bit value. DXIL
+            // RawBufferStore.i16 preserves the write width; widening it to an
+            // i32 store would overwrite the adjacent halfword.
+            if matches!(name, "buffer_store_short" | "buffer_store_short_d16_hi") {
+                let value = if name == "buffer_store_short_d16_hi" {
+                    let sixteen = self.s.m.i32(16);
+                    self.s.m.bin(c, Bin::LShr, vals[0], sixteen)
+                } else {
+                    vals[0]
+                };
+                let value = self.s.m.cast(c, Cast::Trunc, value, self.s.t.i16);
+                let undef = self.s.m.undef(self.s.t.i16);
+                let (handle, coord0, coord1) = match index {
+                    Some(index) => {
+                        let stride = used.map_or(0, |u| u.stride);
+                        if stride < 4 || !stride.is_multiple_of(4) {
+                            return Err("a structured buffer of unknown stride");
+                        }
+                        (self.handle(site, src, false, (12 | u, stride))?, index, off)
+                    }
+                    None => (self.handle(site, src, false, (11 | u, 0))?, off, iu),
+                };
+                let args = [
+                    handle,
+                    coord0,
+                    coord1,
+                    value,
+                    undef,
+                    undef,
+                    undef,
+                    self.s.m.i8(1),
+                    self.s.m.i32(2),
+                ];
+                let at = self.begin_guarded(guard);
+                let void = self.s.t.void;
+                self.s
+                    .op(self.cur, "rawBufferStore.i16", Attr::NoUnwind, void, 140, &args);
+                self.end_guarded(at, &[]);
+                return Ok(());
+            }
             if d16 {
                 // shortcut: d16 data is taken as f16 (integer formats would
                 // keep 16 bits), widened for the 32-bit float store.
