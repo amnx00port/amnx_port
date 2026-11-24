@@ -123,6 +123,7 @@ fn shader_slot<'a>(handle: u64) -> Option<(&'a Heap, u32)> {
     let heaps = SHADER_HEAPS.lock().unwrap_or_else(|e| e.into_inner());
     let &(_, _, at) = heaps
         .iter()
+        .rev()
         .find(|&&(start, end, _)| (start..end).contains(&handle))?;
     // SAFETY: registered heaps are live (removed when dropped).
     let heap = unsafe { &*(at as *const Heap) };
@@ -143,6 +144,32 @@ fn mirror(handle: u64) {
             drop(pending);
             if let Some(host) = host {
                 host.mirror(index, handle, false);
+            }
+        }
+    }
+}
+
+/// Mirrors a contiguous range of `count` descriptors starting at `dst` under
+/// range-level locks (`SHADER_HEAPS`, `pending`, `VIEWS`, `made`, `kept`).
+#[cfg(windows)]
+fn mirror_range(dst: u64, count: u32, step: u64) {
+    if count == 0 {
+        return;
+    }
+    let Some((heap, first)) = shader_slot(dst) else {
+        return;
+    };
+    let n = count.min(heap.desc.count.saturating_sub(first));
+    if n == 0 {
+        return;
+    }
+    let mut pending = heap.pending.lock().unwrap_or_else(|e| e.into_inner());
+    match heap.host.get() {
+        None => pending.extend(first..first + n),
+        Some(host) => {
+            drop(pending);
+            if let Some(host) = host {
+                host.mirror_range(first, dst, n, step);
             }
         }
     }
@@ -411,6 +438,23 @@ fn view_at(i: u32, generation: u32) -> Option<View> {
     (*current == generation).then(|| view.clone())
 }
 
+/// Resolves a batch of `[tag, index, generation]` records under one `VIEWS`
+/// lock.
+#[cfg(windows)]
+fn views_at_batch(records: &[[u32; 3]]) -> Vec<Option<View>> {
+    let views = VIEWS.lock().unwrap_or_else(|e| e.into_inner());
+    records
+        .iter()
+        .map(|&[tag, i, generation]| {
+            if tag != VIEW_TAG {
+                return None;
+            }
+            let (view, current) = views.list.get(i as usize)?;
+            (*current == generation).then(|| view.clone())
+        })
+        .collect()
+}
+
 /// The view recorded at `handle`, if one is (and its resource is alive).
 pub(crate) fn view(handle: u64) -> Option<View> {
     if handle == 0 {
@@ -506,9 +550,7 @@ pub(crate) extern "system" fn copy_simple(_: This, count: u32, dst: u64, src: u6
         // SAFETY: both ranges are descriptor slots the title owns.
         unsafe { std::ptr::copy(src as *const u8, dst as *mut u8, len as usize) };
         #[cfg(windows)]
-        for i in 0..u64::from(count) {
-            mirror(dst + i * step);
-        }
+        mirror_range(dst, count, step);
     }
 }
 
