@@ -445,6 +445,16 @@ pub(crate) extern "system" fn create_stream(
             );
             break;
         };
+        if size > desc.size - at {
+            tracing::warn!(
+                kind,
+                at,
+                size,
+                total = desc.size,
+                "truncated pipeline subobject; the rest is ignored"
+            );
+            break;
+        }
         if let Some(stage) = stage {
             // SAFETY: a shader subobject has its bytecode at +8.
             let code = unsafe { &*desc.stream.add(at + 8).cast::<Bytecode>() };
@@ -619,6 +629,50 @@ mod tests {
                 (g.targets.NumRenderTargets, g.targets.RTFormats[0].0),
                 (1, 28)
             );
+        }
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn truncated_stream_subobject_does_not_read_past_end() {
+        use windows_sys::Win32::System::Memory::{
+            MEM_COMMIT, MEM_RELEASE, MEM_RESERVE, PAGE_NOACCESS, PAGE_READWRITE, VirtualAlloc,
+            VirtualFree, VirtualProtect,
+        };
+        // SAFETY: two fresh pages, the second PAGE_NOACCESS so reading past
+        // the end of the stream faults immediately.
+        unsafe {
+            let page = VirtualAlloc(
+                std::ptr::null(),
+                0x2000,
+                MEM_RESERVE | MEM_COMMIT,
+                PAGE_READWRITE,
+            )
+            .cast::<u8>();
+            assert!(!page.is_null());
+            let mut old = 0;
+            assert_ne!(
+                VirtualProtect(page.add(0x1000).cast(), 0x1000, PAGE_NOACCESS, &mut old),
+                0
+            );
+            let tail = page.add(0x1000 - 8);
+            // Kind 1 (vertex shader, 24 bytes) and kind 8 (blend state, 336 bytes)
+            // with only 8 bytes left before the guard page.
+            for kind in [1u64, 8u64] {
+                tail.copy_from_nonoverlapping(kind.to_le_bytes().as_ptr(), 8);
+                let desc = StreamDesc {
+                    size: 8,
+                    stream: tail,
+                };
+                let mut p = std::ptr::null();
+                assert_eq!(
+                    create_stream(std::ptr::null(), &desc, &PIPELINE_IIDS[0], &mut p),
+                    S_OK
+                );
+                assert!(shaders(p).is_empty());
+                assert_eq!(slot::<extern "system" fn(This) -> u32>(p, 0x10)(p), 0);
+            }
+            VirtualFree(page.cast(), 0, MEM_RELEASE);
         }
     }
 }
