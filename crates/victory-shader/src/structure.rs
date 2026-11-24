@@ -231,6 +231,19 @@ impl Bools {
         self.meet_in(all.to_vec(), &mut budget)
     }
 
+    /// [`Bools::meet`] of `all` and `aside`, asking first without `aside`:
+    /// a no from `meet` is exact and fewer conditions are met at least as
+    /// often, so when the others meet in no lane that settles it, without
+    /// the search a large `aside` (a deep block's reach) can make give up.
+    pub fn meet_beside(&self, aside: (Bool, bool), all: &[(Bool, bool)]) -> bool {
+        if !self.meet(all) {
+            return false;
+        }
+        let mut with = vec![aside];
+        with.extend_from_slice(all);
+        self.meet(&with)
+    }
+
     fn meet_in(&self, mut all: Vec<(Bool, bool)>, budget: &mut usize) -> bool {
         let fails = |&(b, holds): &(Bool, bool)| b == if holds { Bool::FALSE } else { Bool::TRUE };
         if all.iter().any(fails) {
@@ -1110,6 +1123,29 @@ mod tests {
 
     fn guarded(s: &Structured) -> usize {
         s.guards.iter().flatten().filter(|g| g.is_some()).count()
+    }
+
+    /// A condition so large that `meet`'s search gives up on it (the parity
+    /// of 20 atoms born first, split one by one) does not hide that the
+    /// others meet in no lane.
+    #[test]
+    fn a_large_condition_aside_does_not_hide_that_the_others_never_meet() {
+        let mut b = Bools::new();
+        let mut large = Bool::FALSE;
+        for n in 0..20 {
+            let a = b.atom(Atom::Uniform(Value(n)), n as usize);
+            large = b.xor(large, a);
+        }
+        let x = b.atom(Atom::Uniform(Value(100)), 100);
+        let never = [(x, true), (x, false)];
+        assert!(!b.meet(&never));
+        // The search over the large condition first gives up: yes.
+        let mut with = vec![(large, true)];
+        with.extend(never);
+        assert!(b.meet(&with));
+        assert!(!b.meet_beside((large, true), &never));
+        // Conditions that do meet still do.
+        assert!(b.meet_beside((large, true), &[(x, true)]));
     }
 
     #[test]

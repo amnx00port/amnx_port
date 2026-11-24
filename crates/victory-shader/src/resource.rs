@@ -1483,7 +1483,13 @@ impl<'a> Tracer<'a> {
             return Err(SELECT);
         }
         let reach = (lanes.reach[b], true);
-        let meet = |conditions: &[(Bool, bool)]| lanes.bools.meet(conditions);
+        // The reach of a block deep in a program can make the search give
+        // up and answer yes; asked aside, it settles only what the other
+        // conditions leave open.
+        let meet = |conditions: &[(Bool, bool)]| {
+            let others: Vec<_> = conditions.iter().copied().filter(|&c| c != reach).collect();
+            lanes.bools.meet_beside(reach, &others)
+        };
         let mut out = Waterfall::default();
         let mut required = vec![(remaining, true)];
         for (i, inst) in block.insts[..access].iter().enumerate() {
