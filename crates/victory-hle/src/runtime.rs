@@ -95,7 +95,13 @@ impl Title {
                 .find(|(p, _)| p == path)
                 .map(|(_, text)| text.as_str())
         };
-        let id = get("Game/TitleId").and_then(|v| u32::from_str_radix(v, 16).ok());
+        let id = get("Game/TitleId").and_then(|v| {
+            let digits = v
+                .strip_prefix("0x")
+                .or_else(|| v.strip_prefix("0X"))
+                .unwrap_or(v);
+            u32::from_str_radix(digits, 16).ok()
+        });
         let storage_mb = get("Game/PersistentLocalStorage/SizeMB").and_then(|v| v.parse().ok());
         Title {
             id: id.unwrap_or(0),
@@ -148,10 +154,20 @@ fn elements(text: &str) -> Vec<(String, String)> {
             .next()
             .unwrap_or("");
         path.push(name);
-        let body = rest[..rest.find('<').unwrap_or(rest.len())].trim();
-        let body = [("&lt;", "<"), ("&gt;", ">"), ("&quot;", "\""), ("&apos;", "'"), ("&amp;", "&")]
-            .iter()
-            .fold(body.to_owned(), |b, (entity, c)| b.replace(entity, c));
+        let body = if closed {
+            ""
+        } else {
+            rest[..rest.find('<').unwrap_or(rest.len())].trim()
+        };
+        let body = [
+            ("&lt;", "<"),
+            ("&gt;", ">"),
+            ("&quot;", "\""),
+            ("&apos;", "'"),
+            ("&amp;", "&"),
+        ]
+        .iter()
+        .fold(body.to_owned(), |b, (entity, c)| b.replace(entity, c));
         out.push((path.join("/"), body));
         if closed {
             path.pop();
@@ -222,5 +238,32 @@ mod tests {
         assert_eq!((t.id, t.storage_bytes), (0x639A_A8DD, 1024 << 20));
         assert_eq!(t.store_id, "9&C");
         assert_eq!(Title::from_manifest("").storage_bytes, 0);
+    }
+
+    #[test]
+    fn reads_hex_prefixed_title_ids() {
+        for title_id in ["0x639AA8DD", "0X639AA8DD"] {
+            let manifest = format!("<Game><TitleId>{title_id}</TitleId></Game>");
+            assert_eq!(Title::from_manifest(&manifest).id, 0x639A_A8DD);
+        }
+    }
+
+    #[test]
+    fn self_closing_elements_have_no_body() {
+        let parsed = elements("<Game><Identity/>text after tag<TitleId>639AA8DD</TitleId></Game>");
+        assert_eq!(
+            parsed
+                .iter()
+                .find(|(path, _)| path == "Game/Identity")
+                .map(|(_, body)| body.as_str()),
+            Some("")
+        );
+        assert_eq!(
+            parsed
+                .iter()
+                .find(|(path, _)| path == "Game/TitleId")
+                .map(|(_, body)| body.as_str()),
+            Some("639AA8DD")
+        );
     }
 }
