@@ -937,3 +937,192 @@ fn v_cmp_class_f16_matches_rdna2() {
         );
     });
 }
+
+/// SMEM `s_load_dwordx2 s[dst:dst+1], s[base:base+1], byte_off`.
+const fn s_load_dwordx2(dst: u8, base: u8, byte_off: u32) -> [u32; 2] {
+    [
+        0x3D << 26 | 0x01 << 18 | (dst as u32) << 6 | (base as u32 >> 1),
+        125 << 25 | byte_off,
+    ]
+}
+
+/// GLOBAL `global_load_dword vdst, vaddr, s[saddr:saddr+1]`.
+const fn global_load_dword(vdst: u8, vaddr: u8, saddr: u8) -> [u32; 2] {
+    [
+        0x37 << 26 | 0x00C << 18 | 2 << 14,
+        (vdst as u32) << 24 | (saddr as u32 & 0x7F) << 16 | vaddr as u32,
+    ]
+}
+
+/// A shader whose data bindings the GPU drives: the program loads a
+/// pointer from the root constants (dword 4), loads a descriptor through
+/// it, reads dword 0 of what it points at with a global load, and stores
+/// that dword through the UAV table (read back by the harness). The host
+/// side must bind the pointed-to buffer as a root SRV whose register
+/// encodes the pointer's own place in the constants: `((4 + 1) << 8) | 0`.
+fn pointer_chase_shader() -> HostShader {
+    let words: Vec<u32> = s_load_dwordx2(4, 0, 0x10) // s[4:5] = the pointer
+        .into_iter()
+        .chain(s_load_dwordx4(10, 4)) // s[10:13] = the descriptor it names
+        .chain([
+            0xBE89_0380, // s_mov_b32 s9, 0 (inline constant; table high half)
+        ])
+        .chain(s_load_dwordx4(16, 8)) // s[16:19] = the UAV table descriptor
+        .chain([
+            0x7E00_0280, // v_mov_b32 v0, 0
+        ])
+        .chain(global_load_dword(1, 0, 4)) // v1 = *(u32*)pointer
+        .chain(buffer_store_dword(1, 16, 0))
+        .chain([S_ENDPGM])
+        .collect();
+    let code: Vec<u8> = words.iter().flat_map(|w| w.to_le_bytes()).collect();
+    let native = NativeProgram {
+        stage: HwStage::Cs,
+        wave64: false,
+        vgprs: 8,
+        layout: vec![
+            RootParam {
+                root: RootType::Constants,
+                table_offset_dwords: 0,
+                sgprs: 8,
+                base_register: 0,
+                user_data: 0,
+                slot: 0,
+            },
+            RootParam {
+                root: RootType::Table,
+                table_offset_dwords: 0,
+                sgprs: 2,
+                base_register: 0,
+                user_data: 8,
+                slot: 1,
+            },
+        ],
+        used: vec![UsedResource {
+            kind: ResourceType::Uav,
+            root: RootType::Table,
+            table_offset_dwords: 0,
+            lower_bound: 0,
+            stride: 0,
+            dwords: 4,
+            user_data: 8,
+            slot: 1,
+        }],
+        io: StageIo::Cs(ComputeIo {
+            rsrc2: 10 << 1, // 10 user SGPRs: s0..s9
+            threads: [1, 1, 1],
+        }),
+        code,
+    };
+
+    let p = ir::build(&native.code, native.wave64, native.vgprs).expect("ir::build");
+    let io = io::raise(&p, &native).expect("io::raise");
+    let st = structure::structure(&p).expect("structure");
+    let res =
+        resource::track(&p, &native.layout, native.stage, Some(&st)).expect("resource::track");
+    let lowered = lower::lower(&lower::Parts {
+        native: &native,
+        p: &p,
+        st: &st,
+        io: &io,
+        res: &res,
+        inputs: Vec::new(),
+        outputs: Vec::new(),
+        prims: Vec::new(),
+        mesh_stride: 0,
+    })
+    .expect("lower");
+
+    assert_eq!(
+        lowered.root_srvs,
+        vec![0x501],
+        "the pointer's root SRV register"
+    );
+
+    let shader = HostShader {
+        stage: HwStage::Cs,
+        dxil: lowered.dxil,
+        user_data: lowered.user_data,
+        samplers: lowered.samplers,
+        static_samplers: Vec::new(),
+        root_cbvs: lowered.root_cbvs,
+        root_srvs: lowered.root_srvs,
+    };
+
+    if let Ok(mut v) = validator::Validator::load(validator::Validator::default_path().as_deref())
+    {
+        let mut copy = shader.dxil.clone();
+        let ours = copy[4..20].to_vec();
+        v.validate(&mut copy).expect("DXIL validation failed");
+        assert_eq!(copy[4..20], ours[..], "container hash mismatch");
+    }
+
+    shader
+}
+
+/// Lowering alone runs everywhere: the pointer chase must translate and
+/// carry the pointer root view with its 16-bit register.
+#[test]
+fn a_pointer_chase_lowers_to_a_pointer_root_view() {
+    let shader = pointer_chase_shader();
+    for u in &shader.user_data {
+        match (u.root, u.slot) {
+            (RootType::Constants, 0) => {}
+            (RootType::Table, 1) => {}
+            other => panic!("unexpected user data {other:?}"),
+        }
+    }
+}
+
+/// The translated shader reads a buffer the host names only by an address
+/// in the root constants: dispatching with a `Pointer` root writes the
+/// buffer's GPU address into the constants and binds the buffer, and the
+/// loaded dword comes back through the UAV table.
+#[test]
+#[cfg(windows)]
+fn a_buffer_reached_through_a_pointer_loaded_from_the_constants() {
+    let shader = pointer_chase_shader();
+    let target: Vec<u32> = (0..16u32)
+        .map(|i| i.wrapping_mul(0x0101_0101).wrapping_add(0x0302_0100))
+        .collect();
+    for (label, warp) in [("hardware", false), ("warp", true)] {
+        let Ok(host) = Host::new(warp) else {
+            eprintln!("no SM 6.6 {label} device; skipped");
+            continue;
+        };
+        let (root, pso) = host
+            .compute_pipeline(&shader)
+            .unwrap_or_else(|e| panic!("{label}: compute_pipeline failed: {e}"));
+        let mut ud = vec![0u32; shader.user_data_dwords().max(1) as usize];
+        for u in &shader.user_data {
+            match (u.root, u.slot) {
+                (RootType::Constants, 0) => ud[u.index as usize] = u.index,
+                (RootType::Table, 1) => ud[u.index as usize] = 0,
+                other => panic!("unexpected user data {other:?}"),
+            }
+        }
+        let out = host
+            .dispatch(
+                &root,
+                &pso,
+                &Dispatch {
+                    roots: vec![
+                        (0, Root::Constants(ud)),
+                        (
+                            1,
+                            Root::Pointer {
+                                slot: 0,
+                                dword: 4,
+                                data: target.clone(),
+                            },
+                        ),
+                    ],
+                    views: &[View::RawUav(1)],
+                    samplers: &[],
+                    groups: [1, 1, 1],
+                },
+            )
+            .unwrap_or_else(|e| panic!("{label}: dispatch failed: {e}"));
+        assert_eq!(out[0][0], target[0], "{label}: the chased dword");
+    }
+}

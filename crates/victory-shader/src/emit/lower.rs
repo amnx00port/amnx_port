@@ -34,7 +34,7 @@ pub(crate) struct Lowered {
     /// Bit n: immediate sampler n is used for comparisons.
     pub cmp_samplers: u64,
     pub root_cbvs: Vec<u8>,
-    pub root_srvs: Vec<u8>,
+    pub root_srvs: Vec<u16>,
     pub user_data: Vec<UserData>,
     pub samplers: Vec<[u32; 4]>,
     /// Heap handles made with a non-uniform index.
@@ -577,6 +577,123 @@ impl<'a> Lower<'a> {
         Ok(self.s.m.load(c, at))
     }
 
+    /// `s_load_dword*` whose dwords no descriptor takes: the qwords of the
+    /// root arguments, as the title set them (a pointer's location, say).
+    fn constants_smem(&mut self, inst: &Inst, a: Address) -> Result<(), Why> {
+        let Fields::Smem {
+            data: Some(Operand::Scalar { code, .. }),
+            ..
+        } = &inst.fields
+        else {
+            return Err("a scalar memory read as data");
+        };
+        let Some(count) = self.load_count(inst.name()) else {
+            return Err("a scalar memory read as data");
+        };
+        if !a.offset.is_multiple_of(4) {
+            return Err("an unaligned read of the root arguments");
+        }
+        for k in 0..count {
+            let Val::I32(x) = self.user(a.param, a.offset / 4 + k) else {
+                return Err("a root constant read as data");
+            };
+            self.write(inst, Reg::S(code + k as u8), x, None);
+        }
+        Ok(())
+    }
+
+    /// A scalar load through a pointer the program loaded from the root
+    /// constants: the host binds a root view at the pointer's value, and
+    /// the load reads it as a raw buffer. The view's register names the
+    /// parameter and the dword of the pointer's low half.
+    fn pointer_smem(&mut self, inst: &Inst, a: Address) -> Result<(), Why> {
+        if inst.name().contains("_store_") {
+            return Err("a store through a pointer");
+        }
+        let Some(count) = self.load_count(inst.name()) else {
+            return Err("a scalar load through a pointer");
+        };
+        let (code, offset, soffset) = match &inst.fields {
+            Fields::Smem {
+                data: Some(Operand::Scalar { code, .. }),
+                offset,
+                soffset,
+                ..
+            } => (*code, *offset, *soffset),
+            _ => return Err("a scalar load through a pointer"),
+        };
+        let h = self.pointer_handle(&a)?;
+        let c = self.cur;
+        let mut addr = self.s.m.i32(a.bias.wrapping_add(offset as u32));
+        if !matches!(soffset, Operand::Scalar { code: NULL, .. }) {
+            let so = self.operand(inst, &soffset)?;
+            addr = self.s.m.bin(c, Bin::Add, addr, so);
+        }
+        for k in 0..count {
+            let d = self.s.m.i32(4 * k);
+            let at = self.s.m.bin(c, Bin::Add, addr, d);
+            let mask = self.s.m.i8(1);
+            let (u, al) = (self.s.m.undef(self.s.t.i32), self.s.m.i32(4));
+            let r = self.s.op(
+                c,
+                "rawBufferLoad.f32",
+                Attr::ReadOnly,
+                self.s.t.res_ret,
+                139,
+                &[h, at, u, mask, al],
+            );
+            let x = self.s.m.extract(c, r, 0);
+            let x = self.as_int(x);
+            self.write(inst, Reg::S(code + k as u8), x, None);
+        }
+        Ok(())
+    }
+
+    /// The root view of the pointer loaded from `a`'s location.
+    fn pointer_handle(&mut self, a: &Address) -> Result<V, Why> {
+        let rp = self
+            .x
+            .native
+            .layout
+            .get(a.param)
+            .ok_or("a pointer outside the root constants")?;
+        if rp.root != RootType::Constants || !a.offset.is_multiple_of(4) {
+            return Err("a pointer outside the root constants");
+        }
+        let dword = a.offset / 4;
+        if dword > 254 {
+            return Err("a pointer too far into the root constants");
+        }
+        let reg = ((dword + 1) << 8) | u32::from(rp.slot);
+        Ok(self.s.root_srv_handle(reg as u16))
+    }
+
+    /// Does the descriptor set take the qwords the load at `site` read?
+    fn fetches_descriptor(&self, site: Site) -> bool {
+        self.x.res.descriptors.iter().any(|d| {
+            d.role == Role::Resource
+                && d.source
+                    .leaves()
+                    .into_iter()
+                    .any(|l| matches!(l, Source::Loaded { load, .. } if *load == site))
+        })
+    }
+
+    /// The dword count of an `s_load_dword*`/`s_buffer_load_dword*` name.
+    fn load_count(&self, name: &str) -> Option<u32> {
+        match name
+            .strip_prefix("s_buffer_load_dword")
+            .or_else(|| name.strip_prefix("s_load_dword"))?
+        {
+            "" => Some(1),
+            "x2" => Some(2),
+            "x4" => Some(4),
+            "x8" => Some(8),
+            "x16" => Some(16),
+            _ => None,
+        }
+    }
+
     /// A global memory load (`global_load_*`): from the program's constant
     /// table, or from a root SRV at the address the title sets.
     fn flat(&mut self, inst: &Inst, b: usize, i: usize) -> Result<(), Why> {
@@ -607,11 +724,27 @@ impl<'a> Lower<'a> {
             return Err("a global load result");
         };
         let c = self.cur;
-        let mut off = self.s.m.i32(a.offset);
-        if let Some(d) = a.dynamic {
-            let d = self.i32_of(d)?;
-            off = self.s.m.bin(c, Bin::Add, off, d);
-        }
+        let off = if a.deref {
+            // The address is the pointer the program loaded; the terms of
+            // the VGPR address apply to what it points at.
+            let Fields::Flat { addr, offset, .. } = &inst.fields else {
+                unreachable!()
+            };
+            let addr = addr.as_ref().ok_or("a global address not in VGPRs")?;
+            if !matches!(addr, Operand::Vector { .. }) {
+                return Err("a global address not in VGPRs");
+            }
+            let base = self.s.m.i32((*offset as i32 as u32).wrapping_add(a.bias));
+            let v = self.operand(inst, addr)?;
+            self.s.m.bin(c, Bin::Add, base, v)
+        } else {
+            let mut off = self.s.m.i32(a.offset);
+            if let Some(d) = a.dynamic {
+                let d = self.i32_of(d)?;
+                off = self.s.m.bin(c, Bin::Add, off, d);
+            }
+            off
+        };
         let h = if a.param == CODE {
             None
         } else {
@@ -900,7 +1033,7 @@ impl<'a> Lower<'a> {
         let user_data = self.user_reads.values().copied().collect();
         self.s.samplers = self.samplers.len() as u32;
         let root_cbvs = self.s.root_cbvs.iter().map(|r| r.0).collect();
-        let root_srvs = self.s.root_srvs.iter().map(|r| r.0).collect();
+        let root_srvs = self.s.root_srvs.iter().map(|r| r.0).collect::<Vec<u16>>();
         let cmp_samplers = self.s.cmp_samplers;
         Ok(Lowered {
             cmp_samplers,
@@ -2806,10 +2939,22 @@ impl<'a> Lower<'a> {
             unreachable!()
         };
         let name = inst.name();
-        if let Some(a) = self.scalar.get(&site).copied().filter(|a| a.param == CODE) {
+        let a = self.scalar.get(&site).copied();
+        if let Some(a) = a.filter(|a| a.param == CODE) {
             return self.code_smem(inst, a);
         }
+        if let Some(a) = a.filter(|a| a.deref) {
+            return self.pointer_smem(inst, a);
+        }
         let Some(rest) = name.strip_prefix("s_buffer_load_dword") else {
+            // A descriptor fetch, a store, or a read of the root
+            // arguments' dwords.
+            if name.starts_with("s_load_dword")
+                && let Some(a) = a
+                && !self.fetches_descriptor(site)
+            {
+                return self.constants_smem(inst, a);
+            }
             return self.descriptor_data(inst, site);
         };
         let count = match rest {
@@ -3343,6 +3488,9 @@ impl<'a> Lower<'a> {
             }
             Source::Constant(_) => Err("a constant resource descriptor"),
             Source::Built { address, .. } => {
+                if address.deref {
+                    return self.pointer_handle(address);
+                }
                 let rp = *self
                     .x
                     .native
@@ -3361,7 +3509,7 @@ impl<'a> Lower<'a> {
                         Ok(self.s.root_cbv_handle(rp.slot))
                     }
                     (RootType::Descriptor, Some(ResourceType::Srv), 11) => {
-                        Ok(self.s.root_srv_handle(rp.slot))
+                        Ok(self.s.root_srv_handle(u16::from(rp.slot)))
                     }
                     _ => Err("a root UAV or typed root view"),
                 }
@@ -3529,6 +3677,9 @@ impl<'a> Lower<'a> {
             .scalar
             .get(&load)
             .ok_or("an untracked descriptor load")?;
+        if a.deref {
+            return Err("a descriptor loaded through a pointer");
+        }
         match self.x.native.layout.get(a.param).map(|p| p.root) {
             Some(RootType::Table | RootType::ResourceHeap | RootType::SamplerHeap) => {}
             _ => return Err("a descriptor outside the heaps"),
@@ -7417,5 +7568,239 @@ mod tests {
         assert!(f10(0x3FF).is_nan());
         // A 16-bit float is a half already, sign included.
         assert_eq!(half(0xBC00 << half_shift(16)), -1.0);
+    }
+
+    /// A pointer read from the root constants, a descriptor loaded through
+    /// it, and a global load through it again: the lowering must bind one
+    /// root SRV whose 16-bit register encodes where the pointer lives —
+    /// `((dword + 1) << 8) | slot` — for the scalar load and the flat load
+    /// alike. (The pointer itself rides in the user data; the host sets it.)
+    #[test]
+    fn a_pointer_chase_binds_the_pointed_buffer_as_a_root_view() {
+        let words: Vec<u32> = [0x3D << 26 | 0x01 << 18 | 4 << 6, 125 << 25 | 0x10] // s_load_dwordx2 s[4:5], s[0:1], 0x10
+            .into_iter()
+            .chain([0xF408_0282, 0xFA00_0000]) // s_load_dwordx4 s[10:13], s[4:5]
+            .chain([
+                0xBE89_0380, // s_mov_b32 s9, 0 (the table's high half)
+            ])
+            .chain([0xF408_0404, 0xFA00_0000]) // s_load_dwordx4 s[16:19], s[8:9]
+            .chain([
+                0x7E00_0280, // v_mov_b32 v0, 0
+            ])
+            .chain([0xDC30_8000, 0x0104_0000]) // global_load_dword v1, v0, s[4:5]
+            .chain([0xE070_0000, 0x8004_0100]) // buffer_store_dword v1, s[16:19]
+            .chain([S_ENDPGM])
+            .collect();
+        let code: Vec<u8> = words.iter().flat_map(|w| w.to_le_bytes()).collect();
+        let native = NativeProgram {
+            stage: HwStage::Cs,
+            wave64: false,
+            vgprs: 8,
+            layout: vec![
+                crate::native::RootParam {
+                    root: RootType::Constants,
+                    table_offset_dwords: 0,
+                    sgprs: 8,
+                    base_register: 0,
+                    user_data: 0,
+                    slot: 0,
+                },
+                crate::native::RootParam {
+                    root: RootType::Table,
+                    table_offset_dwords: 0,
+                    sgprs: 2,
+                    base_register: 0,
+                    user_data: 8,
+                    slot: 1,
+                },
+            ],
+            used: vec![UsedResource {
+                kind: ResourceType::Uav,
+                root: RootType::Table,
+                table_offset_dwords: 0,
+                lower_bound: 0,
+                stride: 0,
+                dwords: 4,
+                user_data: 8,
+                slot: 1,
+            }],
+            io: StageIo::Cs(ComputeIo {
+                rsrc2: 10 << 1, // 10 user SGPRs: s0..s9
+                threads: [1, 1, 1],
+            }),
+            code,
+        };
+        let p = ir::build(&native.code, native.wave64, native.vgprs).unwrap();
+        let res = resource::track(&p, &native.layout, native.stage, None).unwrap();
+        let io = io::raise(&p, &native).unwrap();
+        let st = structure::structure(&p).unwrap();
+        let lowered = lower(&Parts {
+            native: &native,
+            p: &p,
+            st: &st,
+            io: &io,
+            res: &res,
+            inputs: vec![],
+            outputs: vec![],
+            prims: vec![],
+            mesh_stride: 0,
+        })
+        .unwrap();
+        assert_eq!(lowered.root_srvs, [0x500], "the pointer's root register");
+        assert_eq!(
+            lowered
+                .user_data
+                .iter()
+                .map(|u| (u.root, u.slot, u.index))
+                .collect::<Vec<_>>(),
+            [
+                (RootType::Constants, 0, 4),
+                (RootType::Constants, 0, 5),
+                (RootType::Table, 1, 8),
+            ],
+            "the pointer's dwords feed the root view"
+        );
+    }
+
+    /// The same binding, through a pointer whose halves are masked, biased
+    /// by a constant, and dereferenced by a global load carrying its own
+    /// offset: the masking, the bias and the offset must all lower without
+    /// disturbing where the root view is bound.
+    #[test]
+    fn a_masked_biased_pointer_chase_binds_the_same_root_view() {
+        let words: Vec<u32> = [0x3D << 26 | 0x01 << 18 | 4 << 6, 125 << 25 | 0x10] // s_load_dwordx2 s[4:5], s[0:1], 0x10
+            .into_iter()
+            .chain([
+                0x8706_FF04, 0xFFFF, // s_and_b32 s6, s4, 0xffff
+                0x8707_FF05, 0xFFFF, // s_and_b32 s7, s5, 0xffff
+                0x8006_FF06, 8, // s_add_u32 s6, s6, 8
+                0xF408_0203,
+                0xFA00_0000, // s_load_dwordx4 s[8:11], s[6:7]
+                0x7E00_0280, // v_mov_b32 v0, 0
+                0xDC30_8014,
+                0x0106_0000, // global_load_dword v1, v0, s[6:7] offset:20
+                S_ENDPGM,
+            ])
+            .collect();
+        let code: Vec<u8> = words.iter().flat_map(|w| w.to_le_bytes()).collect();
+        let native = NativeProgram {
+            stage: HwStage::Cs,
+            wave64: false,
+            vgprs: 8,
+            layout: vec![crate::native::RootParam {
+                root: RootType::Constants,
+                table_offset_dwords: 0,
+                sgprs: 8,
+                base_register: 0,
+                user_data: 0,
+                slot: 0,
+            }],
+            used: vec![],
+            io: StageIo::Cs(ComputeIo {
+                rsrc2: 10 << 1, // 10 user SGPRs: s0..s9
+                threads: [1, 1, 1],
+            }),
+            code,
+        };
+        let p = ir::build(&native.code, native.wave64, native.vgprs).unwrap();
+        let res = resource::track(&p, &native.layout, native.stage, None).unwrap();
+        let io = io::raise(&p, &native).unwrap();
+        let st = structure::structure(&p).unwrap();
+        let lowered = lower(&Parts {
+            native: &native,
+            p: &p,
+            st: &st,
+            io: &io,
+            res: &res,
+            inputs: vec![],
+            outputs: vec![],
+            prims: vec![],
+            mesh_stride: 0,
+        })
+        .unwrap();
+        assert_eq!(lowered.root_srvs, [0x500], "the pointer's root register");
+        assert_eq!(
+            lowered
+                .user_data
+                .iter()
+                .map(|u| (u.root, u.slot, u.index))
+                .collect::<Vec<_>>(),
+            [
+                (RootType::Constants, 0, 4),
+                (RootType::Constants, 0, 5),
+            ],
+            "the pointer's dwords feed the root view"
+        );
+    }
+
+    /// The same binding, through a pointer biased by a constant whose add
+    /// carries into the high half (`s_add_u32` plus `s_addc_u32`, the
+    /// compiler's 64-bit add): the carry only carries the bias, so the root
+    /// view is bound where it was, for the scalar load and the flat load
+    /// alike.
+    #[test]
+    fn a_bias_carrying_into_the_high_half_binds_the_same_root_view() {
+        let words: Vec<u32> = [0x3D << 26 | 0x01 << 18 | 4 << 6, 125 << 25 | 0x10] // s_load_dwordx2 s[4:5], s[0:1], 0x10
+            .into_iter()
+            .chain([
+                0x8006_FF04, 8, // s_add_u32 s6, s4, 8
+                0x8207_0580, // s_addc_u32 s7, s5, 0 (the carry)
+                0xF408_0203,
+                0xFA00_0000, // s_load_dwordx4 s[8:11], s[6:7]
+                0x7E00_0280, // v_mov_b32 v0, 0
+                0xDC30_8000,
+                0x0106_0000, // global_load_dword v1, v0, s[6:7]
+                S_ENDPGM,
+            ])
+            .collect();
+        let code: Vec<u8> = words.iter().flat_map(|w| w.to_le_bytes()).collect();
+        let native = NativeProgram {
+            stage: HwStage::Cs,
+            wave64: false,
+            vgprs: 8,
+            layout: vec![crate::native::RootParam {
+                root: RootType::Constants,
+                table_offset_dwords: 0,
+                sgprs: 8,
+                base_register: 0,
+                user_data: 0,
+                slot: 0,
+            }],
+            used: vec![],
+            io: StageIo::Cs(ComputeIo {
+                rsrc2: 10 << 1, // 10 user SGPRs: s0..s9
+                threads: [1, 1, 1],
+            }),
+            code,
+        };
+        let p = ir::build(&native.code, native.wave64, native.vgprs).unwrap();
+        let res = resource::track(&p, &native.layout, native.stage, None).unwrap();
+        let io = io::raise(&p, &native).unwrap();
+        let st = structure::structure(&p).unwrap();
+        let lowered = lower(&Parts {
+            native: &native,
+            p: &p,
+            st: &st,
+            io: &io,
+            res: &res,
+            inputs: vec![],
+            outputs: vec![],
+            prims: vec![],
+            mesh_stride: 0,
+        })
+        .unwrap();
+        assert_eq!(lowered.root_srvs, [0x500], "the pointer's root register");
+        assert_eq!(
+            lowered
+                .user_data
+                .iter()
+                .map(|u| (u.root, u.slot, u.index))
+                .collect::<Vec<_>>(),
+            [
+                (RootType::Constants, 0, 4),
+                (RootType::Constants, 0, 5),
+            ],
+            "the pointer's dwords feed the root view"
+        );
     }
 }

@@ -131,8 +131,8 @@ fn cached(
     (converter.translate)(container)
 }
 
-const MAGIC: &[u8; 4] = b"VSH1";
-const STAGES: [HwStage; 8] = [
+    const MAGIC: &[u8; 4] = b"VSH2";
+    const STAGES: [HwStage; 8] = [
     HwStage::Ls,
     HwStage::Hs,
     HwStage::Es,
@@ -206,9 +206,14 @@ fn encode(s: &HostShader) -> Vec<u8> {
             word(&mut out, v);
         }
     }
-    for slots in [&s.root_cbvs, &s.root_srvs] {
+    for slots in [
+        s.root_cbvs.iter().map(|&r| u32::from(r)).collect::<Vec<_>>(),
+        s.root_srvs.iter().map(|&r| u32::from(r)).collect::<Vec<_>>(),
+    ] {
         word(&mut out, slots.len() as u32);
-        out.extend(slots);
+        for slot in slots {
+            word(&mut out, slot);
+        }
     }
     out
 }
@@ -227,6 +232,15 @@ fn decode(bytes: &[u8]) -> Option<HostShader> {
         fn list(&mut self) -> Option<Vec<u8>> {
             let n = self.word()? as usize;
             Some(self.take(n)?.to_vec())
+        }
+        /// The second format's register list: a count, then u32 words.
+        fn regs(&mut self) -> Option<Vec<u16>> {
+            let n = self.word()? as usize;
+            let mut out = Vec::with_capacity(n.min(256));
+            for _ in 0..n {
+                out.push(u16::try_from(self.word()?).ok()?);
+            }
+            Some(out)
         }
     }
     let mut r = Reader(bytes);
@@ -264,8 +278,8 @@ fn decode(bytes: &[u8]) -> Option<HostShader> {
             max_lod: f32::from_bits(r.word()?),
         });
     }
-    let root_cbvs = r.list()?;
-    let root_srvs = r.list()?;
+    let root_cbvs = r.regs()?.into_iter().map(|r| r as u8).collect();
+    let root_srvs = r.regs()?;
     r.0.is_empty().then_some(HostShader {
         stage,
         dxil,
@@ -303,6 +317,14 @@ mod tests {
         }
     }
 
+    /// A `0x500` root SRV register is a pointer the shader loaded: wider
+    /// than a byte, so the first format lost it.
+    fn pointer_shader() -> HostShader {
+        let mut s = shader();
+        s.root_srvs = vec![0x500];
+        s
+    }
+
     #[test]
     fn translations_come_back_from_the_cache() {
         let dir = tempfile::tempdir().unwrap();
@@ -324,7 +346,7 @@ mod tests {
 
         // A damaged entry is a miss, translated and stored again.
         for e in walk(dir.path()) {
-            std::fs::write(e, b"VSH1 broken").unwrap();
+            std::fs::write(e, b"VSH2 broken").unwrap();
         }
         assert_eq!(cached(&cache, &build, container, translate), Ok(shader()));
         assert_eq!(runs.load(Ordering::Relaxed), 3);
@@ -355,5 +377,15 @@ mod tests {
         assert_eq!(decode(&bytes[..bytes.len() - 1]), None);
         assert_eq!(decode(&[bytes.as_slice(), &[0]].concat()), None);
         assert_eq!(decode(b"VSH0"), None);
+        // The first format's magic is not the second's: its entries, which
+        // could not carry a pointer register anyway, are refused.
+        assert_eq!(decode(b"VSH1"), None);
+        let mut relabeled = bytes.clone();
+        relabeled[..4].copy_from_slice(b"VSH1");
+        assert_eq!(decode(&relabeled), None);
+
+        // A pointer register survives the round trip.
+        let bytes = encode(&pointer_shader());
+        assert_eq!(decode(&bytes), Some(pointer_shader()));
     }
 }

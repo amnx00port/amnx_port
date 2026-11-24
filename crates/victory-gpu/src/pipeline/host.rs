@@ -249,8 +249,8 @@ pub(crate) struct Stage {
     /// The root parameter of its user data, and its size in dwords.
     pub(crate) user_data: Option<(u32, u32)>,
     /// Root parameters of its root views: (title root parameter, ours).
-    pub(crate) root_cbvs: Vec<(u8, u32)>,
-    pub(crate) root_srvs: Vec<(u8, u32)>,
+    pub(crate) root_cbvs: Vec<(u16, u32)>,
+    pub(crate) root_srvs: Vec<(u16, u32)>,
 }
 
 impl Stage {
@@ -357,17 +357,17 @@ impl HostPipeline {
             }
             for (slots, kind, out) in [
                 (
-                    &t.root_cbvs,
+                    t.root_cbvs.iter().copied().map(u16::from).collect::<Vec<_>>(),
                     D3D12_ROOT_PARAMETER_TYPE_CBV,
                     &mut stage.root_cbvs,
                 ),
                 (
-                    &t.root_srvs,
+                    t.root_srvs.clone(),
                     D3D12_ROOT_PARAMETER_TYPE_SRV,
                     &mut stage.root_srvs,
                 ),
             ] {
-                for &slot in slots {
+                for slot in slots {
                     out.push((slot, params.len() as u32));
                     params.push(D3D12_ROOT_PARAMETER1 {
                         ParameterType: kind,

@@ -28,9 +28,18 @@ pub struct Address {
     /// Index into the layout, or [`CODE`].
     pub param: usize,
     /// Added modulo 2^32 (with carry into the high half of a root
-    /// descriptor's address).
+    /// descriptor's address). When [`Address::deref`] is set, the byte
+    /// offset of the pointer's location instead.
     pub offset: u32,
     pub dynamic: Option<Value>,
+    /// The qword at `{param, offset}` holds the address. The location is
+    /// in the root constants and never computed; what the pointer points
+    /// at is reached at run time through a root view the host binds there.
+    pub deref: bool,
+    /// Bytes added to the pointer before it was dereferenced (an
+    /// `s_add_u32` on its low half, an offset on the load through it):
+    /// they apply to what the pointer points at, not to its location.
+    pub bias: u32,
 }
 
 /// [`Address::param`] of the program's own code: a constant table the
@@ -208,7 +217,9 @@ pub fn track(
                     soffset,
                     ..
                 } if inst.name().contains("_load_") || inst.name().contains("_store_") => {
-                    let address = t.smem_address(inst, base, *offset, soffset).map_err(fail)?;
+                    let address = t
+                        .smem_address(inst, base, *offset, soffset, 0)
+                        .map_err(fail)?;
                     out.scalar.push((site, address));
                 }
                 Fields::Flat {
@@ -218,7 +229,7 @@ pub fn track(
                     ..
                 } if inst.name().starts_with("global_") => {
                     let address = t
-                        .flat_address(inst, addr.as_ref(), saddr.as_ref(), *offset)
+                        .flat_address(inst, addr.as_ref(), saddr.as_ref(), *offset, 0)
                         .map_err(fail)?;
                     out.scalar.push((site, address));
                 }
@@ -587,6 +598,7 @@ impl<'a> Tracer<'a> {
         addr: Option<&Operand>,
         saddr: Option<&Operand>,
         offset: i16,
+        depth: u8,
     ) -> Result<Address, &'static str> {
         let Some(&Operand::Vector { reg, .. }) = addr else {
             return Err("a global address not in VGPRs");
@@ -604,7 +616,7 @@ impl<'a> Tracer<'a> {
                     return Err("an offset from a root parameter");
                 }
                 extra.offset = extra.offset.wrapping_add(off);
-                self.address(lo, hi, extra)
+                self.address(lo, hi, extra, depth)
             }
             _ => {
                 let word = |k| inst.read(Reg::V(reg + k)).map(|v| self.vorigin(v));
@@ -619,6 +631,7 @@ impl<'a> Tracer<'a> {
                         offset: off,
                         dynamic: None,
                     },
+                    depth,
                 )
             }
         }
@@ -626,12 +639,33 @@ impl<'a> Tracer<'a> {
 
     /// The address `lo` and `hi` hold, plus `extra` (an instruction's
     /// immediate and offset register).
-    fn address(&self, lo: Term, hi: Term, extra: Sum) -> Result<Address, &'static str> {
+    fn address(
+        &self,
+        lo: Term,
+        hi: Term,
+        extra: Sum,
+        depth: u8,
+    ) -> Result<Address, &'static str> {
         let s = self.sum(lo);
         if s.dynamic.is_some() && extra.dynamic.is_some() {
             return Err("an address with two computed terms");
         }
-        let base = s.base.ok_or_else(|| self.why_no_base(s.dynamic))?;
+        let base = match s.base {
+            Some(b) => b,
+            None => {
+                if let Some(at) = self.pointer_location(s.dynamic, hi, depth)? {
+                    // The bias is only what the program added to the pointer
+                    // itself: the instruction's own offset and any constants
+                    // in the VGPR address are applied again by the lowering,
+                    // which reads them back from the instruction.
+                    return Ok(Address {
+                        bias: s.offset,
+                        ..at
+                    });
+                }
+                return Err(self.why_no_base(s.dynamic));
+            }
+        };
         if let Some(pc) = self.getpc(base) {
             // A table in the code: the base is the next instruction's offset.
             let high = pc.writes.get(1).map(|w| w.1);
@@ -644,6 +678,8 @@ impl<'a> Tracer<'a> {
                     .wrapping_add(s.offset)
                     .wrapping_add(extra.offset),
                 dynamic: s.dynamic.or(extra.dynamic),
+                deref: false,
+                bias: 0,
             });
         }
         let reg = self.inputs[base.0 as usize].ok_or("an address not from a root parameter")?;
@@ -656,6 +692,21 @@ impl<'a> Tracer<'a> {
                 let high = Reg::S(self.stage.user_sgpr(self.layout[param].user_data) + 1);
                 let input = self.p.inputs.iter().find(|i| i.0 == high);
                 Some(input.ok_or("a root descriptor without its high half")?.1)
+            }
+            RootType::Constants => {
+                // The high half is the parameter's next dword: an address
+                // the title passes as two root constants (the pointer
+                // views it feeds are read from the constants).
+                let Reg::S(code) = reg else {
+                    return Err("an address from a root parameter that is no address");
+                };
+                let next = Reg::S(code + 1);
+                match self.param_of(next) {
+                    Some((p, _)) if p == param => {}
+                    _ => return Err("an address from a root parameter that is no address"),
+                }
+                let input = self.p.inputs.iter().find(|i| i.0 == next);
+                Some(input.ok_or("an address from a root parameter that is no address")?.1)
             }
             _ => return Err("an address from a root parameter that is no address"),
         };
@@ -671,7 +722,115 @@ impl<'a> Tracer<'a> {
             param,
             offset: s.offset.wrapping_add(extra.offset),
             dynamic: s.dynamic.or(extra.dynamic),
+            deref: false,
+            bias: 0,
         })
+    }
+
+    /// The location the pointer in `dynamic` was loaded from, when its
+    /// `s_load`'s own address traces into the root constants (`hi` must be
+    /// the same load's high half, through the masks and the carry of a
+    /// low-half add). `extra`'s terms apply to what the
+    /// pointer points at, so they travel in [`Address::deref`]. One level:
+    /// a pointer's location is itself never loaded. The pointer's value is
+    /// read from the root constants as the title set them; masks on its
+    /// halves (the 40-bit address mask, say) are taken not to drop address
+    /// bits.
+    fn pointer_location(
+        &self,
+        dynamic: Option<Value>,
+        hi: Term,
+        depth: u8,
+    ) -> Result<Option<Address>, &'static str> {
+        let Some(v) = dynamic else {
+            return Ok(None);
+        };
+        let Some((load, low)) = self.shaped_load(v) else {
+            return Ok(None);
+        };
+        if low != 0 || !self.pointer_high(hi, load) {
+            return Ok(None);
+        }
+        if depth != 0 {
+            return Err("a pointer to a pointer");
+        }
+        let inst = self.inst(load);
+        let Fields::Smem {
+            base,
+            offset,
+            soffset,
+            ..
+        } = &inst.fields
+        else {
+            unreachable!()
+        };
+        let at = self.smem_address(inst, base, *offset, soffset, depth + 1)?;
+        if at.deref {
+            return Err("a pointer to a pointer");
+        }
+        if at.dynamic.is_some() {
+            return Err("a pointer at a computed location");
+        }
+        if at.offset % 4 != 0 {
+            return Err("a pointer at an unaligned location");
+        }
+        if self.layout.get(at.param).map(|p| p.root) != Some(RootType::Constants) {
+            return Err("a pointer outside the root constants");
+        }
+        Ok(Some(Address {
+            param: at.param,
+            offset: at.offset,
+            dynamic: None,
+            deref: true,
+            bias: 0,
+        }))
+    }
+
+    /// The `s_load` dword `v` holds, through at most one `s_and_b32`/
+    /// `s_or_b32` with a constant (the compiler masks pointer halves), as
+    /// its site and the index of the dword within the load.
+    fn shaped_load(&self, v: Value) -> Option<(Site, u8)> {
+        if let Some(site) = self.defs[v.0 as usize] {
+            let inst = self.inst(site);
+            if inst.name().starts_with("s_load_") {
+                let index = inst.writes.iter().position(|w| w.1 == v)? as u8;
+                return Some((site, index));
+            }
+        }
+        let (_, [a, b]) = self.sop2(v, &["s_and_b32", "s_or_b32"])?;
+        for (x, c) in [a, b].map(|x| (x, if x == a { b } else { a })) {
+            let Term::Const(_) = c else { continue };
+            let Term::Value(w) = x else { continue };
+            let site = self.defs[w.0 as usize]?;
+            let inst = self.inst(site);
+            if inst.name().starts_with("s_load_") {
+                let index = inst.writes.iter().position(|q| q.1 == w)? as u8;
+                return Some((site, index));
+            }
+        }
+        None
+    }
+
+    /// `hi` is the qword at `load`'s high half, through the masks on the
+    /// pointer's halves ([`Self::shaped_load`]) and the carry of the low
+    /// half's add (`s_addc_u32` adding nothing else: the bias is below
+    /// 4 GB, so its carry into the high half is one bit at most).
+    fn pointer_high(&self, hi: Term, load: Site) -> bool {
+        let Term::Value(mut v) = hi else {
+            return false;
+        };
+        loop {
+            if self.shaped_load(v) == Some((load, 1)) {
+                return true;
+            }
+            let Some((_, [a, b])) = self.sop2(v, &["s_addc_u32"]) else {
+                return false;
+            };
+            match (a, b) {
+                (Term::Value(w), Term::Const(0)) | (Term::Const(0), Term::Value(w)) => v = w,
+                _ => return false,
+            }
+        }
     }
 
     /// `hi` is `high` (0 for a table), possibly plus a carry.
@@ -742,6 +901,7 @@ impl<'a> Tracer<'a> {
         base: &Operand,
         offset: i32,
         soffset: &Operand,
+        depth: u8,
     ) -> Result<Address, &'static str> {
         let Operand::Scalar { code, .. } = *base else {
             return Err("an address not in SGPRs");
@@ -758,7 +918,7 @@ impl<'a> Tracer<'a> {
             return Err("an offset from a root parameter");
         }
         extra.offset = extra.offset.wrapping_add(offset as u32);
-        self.address(lo, hi, extra)
+        self.address(lo, hi, extra, depth)
     }
 
     /// The source of the descriptor operand `op` of `inst`, in block `at`.
@@ -830,6 +990,7 @@ impl<'a> Tracer<'a> {
                     offset: 0,
                     dynamic: None,
                 },
+                0,
             )?;
             return Ok(Source::Built {
                 address,
@@ -1205,7 +1366,7 @@ impl<'a> Tracer<'a> {
             else {
                 return Err("a global load");
             };
-            self.flat_address(inst, addr.as_ref(), saddr.as_ref(), *offset)
+            self.flat_address(inst, addr.as_ref(), saddr.as_ref(), *offset, 0)
         };
         let (load, first) = sites[0];
         let a0 = address(load)?;
@@ -1761,6 +1922,18 @@ pub(crate) mod tests {
             param,
             offset,
             dynamic: None,
+            deref: false,
+            bias: 0,
+        }
+    }
+
+    fn pointer(param: usize, offset: u32) -> Address {
+        Address {
+            param,
+            offset,
+            dynamic: None,
+            deref: true,
+            bias: 0,
         }
     }
 
@@ -2941,6 +3114,80 @@ pub(crate) mod tests {
         );
     }
 
+    /// `s_load_dwordx2 s[dst:dst+1], s[base:base+1], byte_off`.
+    fn s_load_dwordx2(dst: u8, base: u8, byte_off: u32) -> [u32; 2] {
+        [
+            0x3D << 26 | 0x01 << 18 | (dst as u32) << 6 | (base as u32 >> 1),
+            125 << 25 | byte_off,
+        ]
+    }
+
+    #[test]
+    fn a_pointer_loaded_from_the_root_constants_is_traced() {
+        let words: Vec<u32> = s_load_dwordx2(4, 8, 0x10) // s[4:5] = the qword at dword 4
+            .into_iter()
+            .chain([
+                0xF408_0202, // s_load_dwordx4 s[8:11], s[4:5]
+                0xFA00_0000,
+                S_ENDPGM,
+            ])
+            .collect();
+        let r = track_words(&words, &[param(Constants, 8, 8)], HwStage::Ps);
+        assert_eq!(
+            r.scalar,
+            [
+                ((0, 0), at(0, 0x10)),
+                ((0, 1), pointer(0, 0x10)),
+            ]
+        );
+    }
+
+    #[test]
+    fn a_pointer_outside_the_root_constants_is_refused() {
+        let code: Vec<u8> = [0xBE89_0380] // s_mov_b32 s9, 0
+            .into_iter()
+            .chain(s_load_dwordx2(4, 8, 0x10))
+            .chain([
+                0xF408_0202, // s_load_dwordx4 s[8:11], s[4:5]
+                0xFA00_0000,
+                S_ENDPGM,
+            ])
+            .flat_map(|w: u32| w.to_le_bytes())
+            .collect();
+        let p = crate::ir::build(&code, false, 256).unwrap();
+        let err = track(&p, &[param(Table, 8, 1)], HwStage::Ps, None).unwrap_err();
+        assert_eq!(
+            err,
+            ShaderError::Unsupported {
+                offset: 0xc, // the second load
+                what: "a pointer outside the root constants"
+            }
+        );
+    }
+
+    #[test]
+    fn a_pointer_with_an_unpaired_high_half_stays_refused() {
+        let code: Vec<u8> = s_load_dwordx2(4, 8, 0x10)
+            .into_iter()
+            .chain([
+                0xBE85_0380, // s_mov_b32 s5, 0
+                0xF408_0202, // s_load_dwordx4 s[8:11], s[4:5]
+                0xFA00_0000,
+                S_ENDPGM,
+            ])
+            .flat_map(|w: u32| w.to_le_bytes())
+            .collect();
+        let p = crate::ir::build(&code, false, 256).unwrap();
+        let err = track(&p, &[param(Constants, 8, 8)], HwStage::Ps, None).unwrap_err();
+        assert_eq!(
+            err,
+            ShaderError::Unsupported {
+                offset: 0xc,
+                what: "an address loaded from memory"
+            }
+        );
+    }
+
     #[test]
     fn descriptors_joined_from_a_per_lane_load_and_a_per_lane_choice_are_traced_per_path() {
         let words = WATERFALL_JOINED_MIXED_WAVE32;
@@ -2990,6 +3237,68 @@ pub(crate) mod tests {
     }
 
     #[test]
+    fn an_offset_added_to_a_pointer_survives_the_dereference() {
+        // The pointer's low half gains a constant before both a scalar load
+        // and a global load reach through it: the constant applies to what
+        // the pointer points at, never to its place in the constants.
+        let words: Vec<u32> = s_load_dwordx2(4, 8, 0x10) // s[4:5] = the qword at dword 4
+            .into_iter()
+            .chain([
+                0x8006_FF04, 8, // s_add_u32 s6, s4, 8
+                0xBE87_0305, // s_mov_b32 s7, s5
+                0xF408_0203,
+                0xFA00_0000, // s_load_dwordx4 s[8:11], s[6:7]
+                0x7E00_0280, // v_mov_b32 v0, 0
+                0xDC30_8000,
+                0x0106_0000, // global_load_dword v1, v0, s[6:7]
+                S_ENDPGM,
+            ])
+            .collect();
+        let r = track_words(&words, &[param(Constants, 8, 8)], HwStage::Ps);
+        let biased = Address {
+            param: 0,
+            offset: 0x10,
+            dynamic: None,
+            deref: true,
+            bias: 8,
+        };
+        assert_eq!(
+            r.scalar,
+            [
+                ((0, 0), at(0, 0x10)),
+                ((0, 3), biased),
+                ((0, 5), biased),
+            ]
+        );
+    }
+
+    #[test]
+    fn a_pointer_to_a_pointer_stays_refused() {
+        // The host learns pointers from the constants it is handed; a
+        // second hop's value lives only in GPU memory, so it cannot be
+        // bound. (The refusal names the limit.)
+        let words: Vec<u32> = s_load_dwordx2(4, 8, 0x10) // s[4:5] = the qword at dword 4
+            .into_iter()
+            .chain(s_load_dwordx2(6, 4, 0)) // s[6:7] = *s[4:5]
+            .chain([
+                0xF408_0203,
+                0xFA00_0000, // s_load_dwordx4 s[8:11], s[6:7]
+                S_ENDPGM,
+            ])
+            .collect();
+        let code: Vec<u8> = words.iter().flat_map(|w| w.to_le_bytes()).collect();
+        let p = crate::ir::build(&code, false, 256).unwrap();
+        let err = track(&p, &[param(Constants, 8, 8)], HwStage::Ps, None).unwrap_err();
+        assert_eq!(
+            err,
+            ShaderError::Unsupported {
+                offset: 0x10, // the third load
+                what: "a pointer to a pointer"
+            }
+        );
+    }
+
+    #[test]
     fn a_per_lane_descriptor_some_lanes_do_not_write_fails() {
         // The else arm of WATERFALL_JOINED_WAVE32 not skipped (its
         // s_cbranch_execz an s_nop): it runs with EXEC clear in the lanes
@@ -3008,6 +3317,46 @@ pub(crate) mod tests {
                 }
             ),
             "{err:?}"
+        );
+    }
+
+    #[test]
+    fn a_masked_pointer_keeps_its_bias() {
+        // The compiler masks a pointer's halves (the 48-bit VA mask), then
+        // adds a constant to the masked low half: the masks shape where the
+        // pointer was loaded from, the constant applies to what it points
+        // at — both a scalar load and a global load through it see the
+        // masked, biased pointer.
+        let words: Vec<u32> = s_load_dwordx2(4, 8, 0x10) // s[4:5] = the qword at dword 4
+            .into_iter()
+            .chain([
+                0x8706_FF04, 0xFFFF, // s_and_b32 s6, s4, 0xffff
+                0x8707_FF05, 0xFFFF, // s_and_b32 s7, s5, 0xffff
+                0x800A_FF06, 8, // s_add_u32 s10, s6, 8
+                0xBE8B_0307, // s_mov_b32 s11, s7
+                0xF408_0405,
+                0xFA00_0000, // s_load_dwordx4 s[16:19], s[10:11]
+                0x7E00_0280, // v_mov_b32 v0, 0
+                0xDC30_8000,
+                0x010A_0000, // global_load_dword v1, v0, s[10:11]
+                S_ENDPGM,
+            ])
+            .collect();
+        let r = track_words(&words, &[param(Constants, 8, 8)], HwStage::Ps);
+        let biased = Address {
+            param: 0,
+            offset: 0x10,
+            dynamic: None,
+            deref: true,
+            bias: 8,
+        };
+        assert_eq!(
+            r.scalar,
+            [
+                ((0, 0), at(0, 0x10)),
+                ((0, 5), biased),
+                ((0, 7), biased),
+            ]
         );
     }
 
@@ -3049,5 +3398,110 @@ pub(crate) mod tests {
         assert_eq!(table_offset(&r, other), 0x20);
         assert_eq!(r.waterfall.compares.len(), 2);
         assert_eq!(r.waterfall.reads.len(), 4);
+    }
+
+    #[test]
+    fn a_flat_offsets_stay_out_of_the_bias() {
+        // The same masked, biased pointer as above, dereferenced by a global
+        // load carrying its own offset of 20 bytes: the offset applies at
+        // what the pointer points at, and the lowering adds it again from
+        // the instruction, so it must not reach the recorded bias (else it
+        // would be counted twice).
+        let words: Vec<u32> = s_load_dwordx2(4, 8, 0x10) // s[4:5] = the qword at dword 4
+            .into_iter()
+            .chain([
+                0x8706_FF04, 0xFFFF, // s_and_b32 s6, s4, 0xffff
+                0x8707_FF05, 0xFFFF, // s_and_b32 s7, s5, 0xffff
+                0x800A_FF06, 8, // s_add_u32 s10, s6, 8
+                0xBE8B_0307, // s_mov_b32 s11, s7
+                0xF408_0405,
+                0xFA00_0000, // s_load_dwordx4 s[16:19], s[10:11]
+                0x7E00_0280, // v_mov_b32 v0, 0
+                0xDC30_8014,
+                0x010A_0000, // global_load_dword v1, v0, s[10:11] offset:20
+                S_ENDPGM,
+            ])
+            .collect();
+        let r = track_words(&words, &[param(Constants, 8, 8)], HwStage::Ps);
+        let biased = Address {
+            param: 0,
+            offset: 0x10,
+            dynamic: None,
+            deref: true,
+            bias: 8,
+        };
+        assert_eq!(
+            r.scalar,
+            [
+                ((0, 0), at(0, 0x10)),
+                ((0, 5), biased),
+                ((0, 7), biased),
+            ]
+        );
+    }
+
+    #[test]
+    fn a_bias_carrying_into_the_high_half_stays_a_pointer_chase() {
+        // The pointer's low half gains a constant whose add carries into the
+        // high half (s_add_u32 plus s_addc_u32, the compiler's 64-bit add):
+        // the carry only carries the bias, so both a scalar load and a
+        // global load through the pointer still chase the pointer the
+        // constants hold.
+        let words: Vec<u32> = s_load_dwordx2(4, 8, 0x10) // s[4:5] = the qword at dword 4
+            .into_iter()
+            .chain([
+                0x8006_FF04, 8, // s_add_u32 s6, s4, 8
+                0x8207_0580, // s_addc_u32 s7, s5, 0 (the carry)
+                0xF408_0203,
+                0xFA00_0000, // s_load_dwordx4 s[8:11], s[6:7]
+                0x7E00_0280, // v_mov_b32 v0, 0
+                0xDC30_8000,
+                0x0106_0000, // global_load_dword v1, v0, s[6:7]
+                S_ENDPGM,
+            ])
+            .collect();
+        let r = track_words(&words, &[param(Constants, 8, 8)], HwStage::Ps);
+        let chased = Address {
+            param: 0,
+            offset: 0x10,
+            dynamic: None,
+            deref: true,
+            bias: 8,
+        };
+        assert_eq!(
+            r.scalar,
+            [
+                ((0, 0), at(0, 0x10)),
+                ((0, 3), chased),
+                ((0, 5), chased),
+            ]
+        );
+    }
+
+    #[test]
+    fn a_pointer_whose_high_half_gains_a_constant_stays_refused() {
+        // The high half's s_addc_u32 may add nothing but the carry: a
+        // constant on it shifts the pointer by 4 GB, which the root view
+        // the host binds at the pointer's value cannot follow.
+        let code: Vec<u8> = s_load_dwordx2(4, 8, 0x10)
+            .into_iter()
+            .chain([
+                0x8006_FF04, 8, // s_add_u32 s6, s4, 8
+                0x8207_0584, // s_addc_u32 s7, s5, 4
+                0xF408_0203,
+                0xFA00_0000, // s_load_dwordx4 s[8:11], s[6:7]
+                S_ENDPGM,
+            ])
+            .flat_map(|w: u32| w.to_le_bytes())
+            .collect();
+        let p = crate::ir::build(&code, false, 256).unwrap();
+        let err = track(&p, &[param(Constants, 8, 8)], HwStage::Ps, None).unwrap_err();
+        assert_eq!(
+            err,
+            ShaderError::Unsupported {
+                offset: 0x14, // the load through the pointer
+                what: "an address loaded from memory"
+            }
+        );
     }
 }
