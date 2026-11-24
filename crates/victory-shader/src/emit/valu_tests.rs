@@ -82,6 +82,12 @@ fn build_valu_cs(body: &[u32]) -> HostShader {
 
 /// Builds a synthetic compute shader with a caller-selected final MUBUF store.
 fn build_valu_cs_with_store(body: &[u32], store: [u32; 2]) -> HostShader {
+    build_valu_cs_with_stores(body, &[store])
+}
+
+/// Builds and lowers a synthetic compute shader with an ordered sequence of
+/// caller-selected MUBUF stores.
+fn build_valu_cs_with_stores(body: &[u32], stores: &[[u32; 2]]) -> HostShader {
     let mut words = Vec::new();
     // s[4:5] = descriptor table address (heap index 0 -> byte offset 0).
     words.push(s_mov_b32(5, 0x80)); // inline constant 0
@@ -92,7 +98,9 @@ fn build_valu_cs_with_store(body: &[u32], store: [u32; 2]) -> HostShader {
         words.push(vop1(0x001, i + 1, sgpr(i))); // v_mov_b32
     }
     words.extend_from_slice(body);
-    words.extend_from_slice(&store);
+    for store in stores {
+        words.extend_from_slice(store);
+    }
     words.push(S_ENDPGM);
 
     let code: Vec<u8> = words.iter().flat_map(|w| w.to_le_bytes()).collect();
@@ -689,39 +697,47 @@ fn bfe_signed_and_unsigned_match_rdna2() {
 
 
 #[test]
-fn buffer_store_short_writes_only_the_low_halfword() {
-    let body = [vop1(0x001, 0, vgpr(1))]; // v0 = s0
-    let shader = build_valu_cs_with_store(&body, buffer_store_short(0, 8, 0, false));
+fn buffer_store_short_preserves_the_adjacent_high_halfword() {
+    // Seed both halves, then replace only the low half. A widened dword store
+    // would clobber the high sentinel and fail this readback.
+    let stores = [
+        buffer_store_dword(1, 8, 0),
+        buffer_store_short(2, 8, 0, false),
+    ];
+    let shader = build_valu_cs_with_stores(&[], &stores);
     let cases = &[
-        [0x1234_5678, 0, 0, 0],
-        [0xdead_abcd, 0, 0, 0],
-        [0xffff_0001, 0, 0, 0],
+        [0xaabb_ccdd, 0x1234_5678, 0, 0],
+        [0xfedc_ba98, 0xdead_beef, 0, 0],
+        [0x1357_9bdf, 0xffff_0001, 0, 0],
     ];
     run_cases(&shader, cases, |backend, i, inputs, result| {
+        let expected = (inputs[0] & 0xffff_0000) | (inputs[1] & 0xffff);
         assert_eq!(
-            result & 0xffff,
-            inputs[0] & 0xffff,
-            "{backend} case {i}: buffer_store_short must write the low 16 bits"
+            result, expected,
+            "{backend} case {i}: buffer_store_short must update only the low 16 bits"
         );
     });
 }
 
 #[test]
-fn buffer_store_short_d16_hi_writes_the_high_halfword() {
-    let body = [vop1(0x001, 0, vgpr(1))]; // v0 = s0
-    // Write the high half of v0 to byte offset 2; the readback checks the
-    // upper halfword of the first output dword.
-    let shader = build_valu_cs_with_store(&body, buffer_store_short(0, 8, 2, true));
+fn buffer_store_short_d16_hi_preserves_the_adjacent_low_halfword() {
+    // Seed both halves, then replace only the high half. A widened dword store
+    // would clobber the low sentinel and fail this readback.
+    let stores = [
+        buffer_store_dword(1, 8, 0),
+        buffer_store_short(2, 8, 2, true),
+    ];
+    let shader = build_valu_cs_with_stores(&[], &stores);
     let cases = &[
-        [0x1234_5678, 0, 0, 0],
-        [0xdead_abcd, 0, 0, 0],
-        [0xffff_0001, 0, 0, 0],
+        [0xaabb_ccdd, 0x1234_5678, 0, 0],
+        [0xfedc_ba98, 0xdead_beef, 0, 0],
+        [0x1357_9bdf, 0xffff_0001, 0, 0],
     ];
     run_cases(&shader, cases, |backend, i, inputs, result| {
+        let expected = (inputs[0] & 0x0000_ffff) | (inputs[1] & 0xffff_0000);
         assert_eq!(
-            (result >> 16) & 0xffff,
-            inputs[0] >> 16,
-            "{backend} case {i}: buffer_store_short_d16_hi must write the high 16 bits"
+            result, expected,
+            "{backend} case {i}: buffer_store_short_d16_hi must update only the high 16 bits"
         );
     });
 }
