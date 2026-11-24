@@ -3123,14 +3123,13 @@ impl<'a> Lower<'a> {
     }
 
     /// `channels` channels of the element at byte `off` of raw buffer `h`,
-    /// converted from the GFX10 buffer format `format` as the hardware's
-    /// typed loads do (channels past the format's read 0, 0, 0, 1).
-    // shortcut: the descriptor's channel swizzle is taken as the identity
-    // (it is for raw views and the descriptors code builds), elements of 4
-    // bytes or more as dword-aligned. Norm formats divide, which the AMD
-    // driver does 1 ULP off the hardware's correctly rounded conversion for
-    // some values; correct it with an integer check if a title compares
-    // converted values exactly.
+    /// converted from the GFX10 buffer format `format`. MTBUF uses identity
+    /// channel selection, which yields zero for missing components (RDNA 2
+    /// ISA §8.1.4).
+    // shortcut: elements of 4 bytes or more are taken as dword-aligned.
+    // Norm formats divide, which the AMD driver does 1 ULP off the hardware's
+    // correctly rounded conversion for some values; correct it with an
+    // integer check if a title compares converted values exactly.
     fn format_load(&mut self, h: V, off: V, format: u8, channels: u32) -> Result<Vec<V>, Why> {
         let (bits, numeric) = buffer_format(format).ok_or("a buffer format")?;
         let c = self.cur;
@@ -3232,14 +3231,7 @@ impl<'a> Lower<'a> {
             };
             out.push(x);
         }
-        let one = match numeric {
-            Numeric::Uint | Numeric::Sint => 1,
-            _ => 1.0f32.to_bits(),
-        };
-        for k in out.len() as u32..channels {
-            out.push(self.s.m.i32(if k == 3 { one } else { 0 }));
-        }
-        out.truncate(channels as usize);
+        out.resize(channels as usize, self.s.m.i32(0));
         Ok(out)
     }
 
@@ -6954,6 +6946,49 @@ mod tests {
     use crate::{io, ir, resource, structure};
 
     const S_ENDPGM: u32 = 0xBF81_0000;
+
+    #[test]
+    fn missing_typed_buffer_channels_are_zero() {
+        let native = NativeProgram {
+            stage: HwStage::Cs,
+            wave64: false,
+            vgprs: 8,
+            layout: vec![],
+            used: vec![],
+            io: StageIo::Cs(ComputeIo {
+                rsrc2: 0,
+                threads: [1, 1, 1],
+            }),
+            code: S_ENDPGM.to_le_bytes().to_vec(),
+        };
+        let p = ir::build(&native.code, false, native.vgprs).unwrap();
+        let st = structure::structure(&p).unwrap();
+        let parts = Parts {
+            native: &native,
+            p: &p,
+            st: &st,
+            io: &io::raise(&p, &native).unwrap(),
+            res: &resource::Resources::default(),
+            inputs: vec![],
+            outputs: vec![],
+            prims: vec![],
+            mesh_stride: 0,
+        };
+        let bad = Default::default();
+        let mut lower = super::Lower::new(&parts, &bad);
+        let zero = lower.s.m.i32(0);
+        let h = lower.s.heap_handle(0, zero, false, false, (11, 0));
+        for (format, present) in [(20, 1), (22, 1), (29, 2), (74, 3), (77, 4)] {
+            let channels = lower.format_load(h, zero, format, 4).unwrap();
+            assert_eq!(channels.len(), 4);
+            assert!(channels[..present].iter().all(|&v| v != zero));
+            assert_eq!(
+                &channels[present..],
+                &[zero; 4][present..],
+                "format {format}"
+            );
+        }
+    }
 
     /// Whether a synthetic compute program translates with these input registers.
     fn lowers(words: &[u32], rsrc2: u32) -> Result<(), crate::ShaderError> {

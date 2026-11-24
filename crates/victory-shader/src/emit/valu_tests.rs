@@ -212,6 +212,24 @@ fn run_cases(
     assert!(ran > 0, "neither hardware nor WARP SM 6.6 device available");
 }
 
+#[test]
+fn typed_buffer_loads_zero_missing_channels() {
+    for (format, input) in [(20, 0x0123_4567), (22, 0x3F80_0000)] {
+        // Store a 32_UINT or 32_FLOAT element, then read its four channels.
+        // XOR X and W together to check that X survived and W is zero.
+        let mut body = buffer_store_dword(1, 8, 0).to_vec();
+        body.extend([
+            0xE803_0000 | format << 19,
+            0x8002_0400, // tbuffer_load_format_xyzw v[4:7], off, s[8:11], 0
+        ]);
+        body.extend(vop3(0x11D, 0, vgpr(4), vgpr(7), 0)); // v_xor_b32 v0, v4, v7
+        let shader = build_valu_cs(&body);
+        run_cases(&shader, &[[input, 0, 0, 0]], |label, _, _, got| {
+            assert_eq!(got, input, "{label}, format {format}");
+        });
+    }
+}
+
 fn is_f16_nan(bits: u16) -> bool {
     (bits & 0x7FFF) > 0x7C00
 }
