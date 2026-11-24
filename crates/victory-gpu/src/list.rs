@@ -398,6 +398,24 @@ pub(crate) fn ensure_state(list: &crate::host::HostList, resource: This, state: 
     }
 }
 
+/// Moves a title buffer's host copy to `state` in the list, if needed.
+#[cfg(windows)]
+pub(crate) fn ensure_buffer_state(
+    list: &crate::host::HostList,
+    shadow: &std::sync::Arc<crate::shadow::Shadow>,
+    state: u32,
+) {
+    use windows::Win32::Graphics::Direct3D12::D3D12_RESOURCE_STATES as State;
+    if let Some((buffer, before)) = list.transition_buffer(shadow, state) {
+        // SAFETY: an open list and a live buffer.
+        let barrier = unsafe {
+            crate::host::transition(&*buffer, State(before as i32), State(state as i32))
+        };
+        // SAFETY: an open list and a live buffer.
+        unsafe { list.list.ResourceBarrier(&[barrier]) };
+    }
+}
+
 #[cfg(windows)]
 const COPY_DEST: u32 = 0x400;
 #[cfg(windows)]

@@ -294,6 +294,8 @@ pub(crate) struct HostList {
     /// list names alive until it is reset, even if the title releases the
     /// resource first.
     states: Mutex<States>,
+    /// Host buffer states the list assumes, by shadow copy.
+    buffer_states: Mutex<BufferStates>,
     /// The list that runs those transitions just before this one.
     prelude: (ID3D12CommandAllocator, ID3D12GraphicsCommandList),
     /// The pipelines the list binds, for reports of slow submissions.
@@ -323,6 +325,8 @@ type States = std::collections::HashMap<
     usize,
     (u32, u32, std::sync::Arc<crate::resource::HostTexture>),
 >;
+type BufferStates =
+    std::collections::HashMap<usize, (u32, u32, std::sync::Arc<crate::shadow::Shadow>)>;
 
 /// Whether device-removed data is on (`VICTORY_D3D12_DRED`, diagnostics
 /// builds).
@@ -478,6 +482,7 @@ impl Host {
                 deferred: Mutex::default(),
                 scratch: Mutex::default(),
                 states: Mutex::default(),
+                buffer_states: Mutex::default(),
                 prelude: (prelude_allocator, prelude),
                 pipelines: Mutex::default(),
                 budget: OnceLock::new(),
@@ -882,6 +887,10 @@ impl HostList {
     pub(crate) fn reset(&self) {
         *self.deferred() = Deferred::default();
         self.states.lock().unwrap_or_else(|e| e.into_inner()).clear();
+        self.buffer_states
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .clear();
         self.pipelines.lock().unwrap_or_else(|e| e.into_inner()).clear();
         #[cfg(feature = "diagnostics")]
         self.notes.lock().unwrap_or_else(|e| e.into_inner()).clear();
@@ -925,12 +934,35 @@ impl HostList {
         }
     }
 
+    /// Moves a title buffer's host copy to `wanted` in this list: the
+    /// host buffer and the state it leaves, if that is a change.
+    pub(crate) fn transition_buffer(
+        &self,
+        shadow: &std::sync::Arc<crate::shadow::Shadow>,
+        wanted: u32,
+    ) -> Option<(*const ID3D12Resource, u32)> {
+        let mut states = self
+            .buffer_states
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        match states.entry(std::sync::Arc::as_ptr(shadow) as usize) {
+            std::collections::hash_map::Entry::Vacant(v) => {
+                v.insert((wanted, wanted, shadow.clone()));
+                None
+            }
+            std::collections::hash_map::Entry::Occupied(mut o) => {
+                let before = std::mem::replace(&mut o.get_mut().1, wanted);
+                (before != wanted).then_some((&shadow.buffer as *const ID3D12Resource, before))
+            }
+        }
+    }
+
     /// At submission: the list that moves each texture this list uses from
     /// its real state to the one the list starts with; the textures' real
     /// states become those the list ends with.
     fn prelude(&self) -> Option<ID3D12CommandList> {
         let states = self.states.lock().unwrap_or_else(|e| e.into_inner());
-        let barriers: Vec<D3D12_RESOURCE_BARRIER> = states
+        let mut barriers: Vec<D3D12_RESOURCE_BARRIER> = states
             .values()
             .filter_map(|(first, last, copy)| {
                 let real = copy.state.swap(*last, Ordering::Relaxed);
@@ -943,12 +975,24 @@ impl HostList {
                 })
             })
             .collect();
+        drop(states);
+        let buffer_states = self.buffer_states.lock().unwrap_or_else(|e| e.into_inner());
+        barriers.extend(buffer_states.values().filter_map(|(first, last, copy)| {
+            let real = copy.state.swap(*last, Ordering::Relaxed);
+            (real != *first).then(|| {
+                transition(
+                    &copy.buffer,
+                    D3D12_RESOURCE_STATES(real as i32),
+                    D3D12_RESOURCE_STATES(*first as i32),
+                )
+            })
+        }));
         if barriers.is_empty() {
             return None;
         }
         let (allocator, list) = &self.prelude;
         // SAFETY: the prelude is not executing (every submission is waited
-        // for); the textures are live.
+        // for); the resources are live.
         let recorded = unsafe {
             allocator.Reset().and_then(|()| {
                 list.Reset(allocator, None)?;

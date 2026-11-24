@@ -357,6 +357,8 @@ impl State {
         }
         let l = &list.list;
         // Vertex buffers the input layout reads.
+        const VERTEX_AND_CONSTANT_BUFFER: u32 = 0x1;
+        const INDEX_BUFFER: u32 = 0x2;
         let mut views = [D3D12_VERTEX_BUFFER_VIEW::default(); 32];
         let mut count = 0;
         for (slot, (view, &v)) in views.iter_mut().zip(&self.vertex).enumerate() {
@@ -371,6 +373,7 @@ impl State {
                 continue;
             };
             shadow.refresh(list, v.address, u64::from(v.size));
+            crate::list::ensure_buffer_state(list, &shadow, VERTEX_AND_CONSTANT_BUFFER);
             *view = D3D12_VERTEX_BUFFER_VIEW {
                 BufferLocation: shadow.gpu(v.address),
                 SizeInBytes: v.size,
@@ -389,6 +392,7 @@ impl State {
                 return false;
             };
             shadow.refresh(list, v.address, u64::from(v.size));
+            crate::list::ensure_buffer_state(list, &shadow, INDEX_BUFFER);
             let view = D3D12_INDEX_BUFFER_VIEW {
                 BufferLocation: shadow.gpu(v.address),
                 SizeInBytes: v.size,
@@ -1116,6 +1120,9 @@ fn readable(list: &HostList, u: &UsedResource, view: &View) {
         shadow.refresh(list, address, len);
         if u.kind == ResourceType::Uav {
             shadow.gpu_writes(list, address, len);
+            crate::list::ensure_buffer_state(list, &shadow, UNORDERED_ACCESS);
+        } else if u.kind == ResourceType::Srv {
+            crate::list::ensure_buffer_state(list, &shadow, SHADER_RESOURCE);
         }
     }
     match (view, u.kind) {
