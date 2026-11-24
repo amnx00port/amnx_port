@@ -937,3 +937,268 @@ fn v_cmp_class_f16_matches_rdna2() {
         );
     });
 }
+
+#[test]
+fn dpp16_and_dpp8_honor_fi_and_source_lane_exec() {
+    // 32-thread Wave32 compute shader:
+    //   v0 = threadIdInGroup.x (0..31)
+    //   v1 = 0x1000 + v0
+    //   v2 = 0xAAAA_0000 | v0  (old destination sentinel)
+    //   EXEC narrowed to lanes where (v0 & 3) < 3 (0x7777_7777: lanes 3,7,11,... inactive),
+    //   either guarded in-block or via s_cbranch_execz.
+    //   v_add_nc_u32 v2, <dpp v1>, v0
+    //   restore EXEC and store v2[lane] into raw UAV.
+    let build_dpp_wave32 = |dpp_src0: u32, dpp_ext: u32, branched: bool| -> HostShader {
+        let mut words = Vec::new();
+        words.push(s_mov_b32(5, 0x80)); // high half of descriptor table addr = 0
+        words.extend_from_slice(&s_load_dwordx4(8, 4));
+        // v_add_nc_u32 v1, 0x1000, v0 (VOP2 op 0x25, src0 = 0xFF literal, vsrc1 = v0)
+        words.push((0x25u32 << 25) | (1u32 << 17) | 0xFF);
+        words.push(0x1000);
+        // v_or_b32 v2, 0xAAAA_0000, v0 (VOP2 op 0x1C, src0 = 0xFF literal, vsrc1 = v0)
+        words.push((0x1Cu32 << 25) | (2u32 << 17) | 0xFF);
+        words.push(0xAAAA_0000);
+        // v_and_b32 v3, 3 (0x83), v0 (VOP2 op 0x1B, vsrc1 = v0)
+        words.push((0x1Bu32 << 25) | (3u32 << 17) | 0x83);
+        // v_cmp_lt_u32 vcc_lo, v3, 3 -> EXEC mask 0x7777_7777
+        words.extend_from_slice(&vop3(0x0c1, 0x6a, vgpr(3), 0x83, 0));
+        // s_and_saveexec_b32 s2, vcc_lo (SOP1 op 0x3C)
+        words.push(0xBE80_0000 | (2u32 << 16) | (0x3Cu32 << 8) | 0x6A);
+        if branched {
+            // s_cbranch_execz +2 dwords (skips the 2-dword DPP instruction)
+            words.push(0xBF88_0002);
+        }
+        // v_add_nc_u32_dpp v2, <dpp v1>, v0 (VOP2 op 0x25, vsrc1 = v0)
+        words.push((0x25u32 << 25) | (2u32 << 17) | dpp_src0);
+        words.push(dpp_ext);
+        // s_mov_b32 exec_lo, s2
+        words.push(s_mov_b32(0x7E, 2));
+        // v_lshlrev_b32 v4, 2 (0x82), v0 (VOP2 op 0x1A, vsrc1 = v0)
+        words.push((0x1Au32 << 25) | (4u32 << 17) | 0x82);
+        // buffer_store_dword v2, v4, s[8:11], 0 offen
+        words.push((0x38u32 << 26) | (0x1Cu32 << 18) | (1u32 << 12));
+        words.push((0x80u32 << 24) | ((8u32 >> 2) << 16) | (2u32 << 8) | 4u32);
+        words.push(S_ENDPGM);
+
+        let code: Vec<u8> = words.iter().flat_map(|w| w.to_le_bytes()).collect();
+        let native = NativeProgram {
+            stage: HwStage::Cs,
+            wave64: false,
+            vgprs: 8,
+            layout: vec![
+                RootParam {
+                    root: RootType::Constants,
+                    table_offset_dwords: 0,
+                    sgprs: 4,
+                    base_register: 0,
+                    user_data: 0,
+                    slot: 0,
+                },
+                RootParam {
+                    root: RootType::Table,
+                    table_offset_dwords: 0,
+                    sgprs: 1,
+                    base_register: 0,
+                    user_data: 4,
+                    slot: 1,
+                },
+            ],
+            used: vec![UsedResource {
+                kind: ResourceType::Uav,
+                root: RootType::Table,
+                table_offset_dwords: 0,
+                lower_bound: 0,
+                stride: 0,
+                dwords: 4,
+                user_data: 4,
+                slot: 1,
+            }],
+            io: StageIo::Cs(ComputeIo {
+                rsrc2: 5 << 1,
+                threads: [32, 1, 1],
+            }),
+            code,
+        };
+        let p = ir::build(&native.code, native.wave64, native.vgprs).expect("ir::build");
+        let st = structure::structure(&p).expect("structure");
+        let res =
+            resource::track(&p, &native.layout, native.stage, Some(&st)).expect("resource::track");
+        let io = io::raise(&p, &native).expect("io::raise");
+        let lowered = lower::lower(&lower::Parts {
+            native: &native,
+            p: &p,
+            st: &st,
+            io: &io,
+            res: &res,
+            inputs: Vec::new(),
+            outputs: Vec::new(),
+            prims: Vec::new(),
+            mesh_stride: 0,
+        })
+        .expect("lower");
+        let shader = HostShader {
+            stage: HwStage::Cs,
+            dxil: lowered.dxil,
+            user_data: lowered.user_data,
+            samplers: lowered.samplers,
+            static_samplers: Vec::new(),
+            root_cbvs: lowered.root_cbvs,
+            root_srvs: lowered.root_srvs,
+        };
+        if let Ok(mut v) =
+            validator::Validator::load(validator::Validator::default_path().as_deref())
+        {
+            let mut copy = shader.dxil.clone();
+            let ours = copy[4..20].to_vec();
+            v.validate(&mut copy).expect("DXIL validation failed");
+            assert_eq!(copy[4..20], ours[..], "container hash mismatch");
+        }
+        shader
+    };
+
+    let dpp16_ext = |ctrl: u32, bound_ctrl: bool, fi: bool| -> u32 {
+        (0xFu32 << 28)
+            | (0xFu32 << 24)
+            | (u32::from(bound_ctrl) << 19)
+            | (u32::from(fi) << 18)
+            | (ctrl << 8)
+            | 1u32 // v1
+    };
+    // DPP8 sel: lane p in 0..7 reads (p + 7) & 7 -> [7, 0, 1, 2, 3, 4, 5, 6]
+    let dpp8_sel: u32 = 7
+        | (1 << 6)
+        | (2 << 9)
+        | (3 << 12)
+        | (4 << 15)
+        | (5 << 18)
+        | (6 << 21);
+    let dpp8_ext = (dpp8_sel << 8) | 1u32; // v1
+
+    let row_shr1_bc1_fi0_guarded = build_dpp_wave32(0xFA, dpp16_ext(0x111, true, false), false);
+    let row_shr1_bc1_fi0_branched = build_dpp_wave32(0xFA, dpp16_ext(0x111, true, false), true);
+    let row_shr1_bc0_fi0_guarded = build_dpp_wave32(0xFA, dpp16_ext(0x111, false, false), false);
+    let row_shr1_bc1_fi1_guarded = build_dpp_wave32(0xFA, dpp16_ext(0x111, true, true), false);
+    let dpp8_fi0_guarded = build_dpp_wave32(0xE9, dpp8_ext, false);
+    let dpp8_fi1_guarded = build_dpp_wave32(0xEA, dpp8_ext, false);
+
+    let expected_row_shr1 = |bound_ctrl: bool, fi: bool| -> Vec<u32> {
+        (0u32..32)
+            .map(|l| {
+                let old = 0xAAAA_0000 | l;
+                if l & 3 == 3 {
+                    return old; // lane inactive
+                }
+                let in_row = (l & 15) >= 1;
+                let src_active = in_row && ((l - 1) & 3 != 3);
+                if in_row && (fi || src_active) {
+                    (0x1000 + (l - 1)) + l
+                } else if bound_ctrl {
+                    l // 0 + l
+                } else {
+                    old // write disabled
+                }
+            })
+            .collect()
+    };
+    let expected_dpp8 = |fi: bool| -> Vec<u32> {
+        (0u32..32)
+            .map(|l| {
+                let old = 0xAAAA_0000 | l;
+                if l & 3 == 3 {
+                    return old;
+                }
+                let src = (l & !7) | ((l + 7) & 7);
+                let src_active = src & 3 != 3;
+                if fi || src_active {
+                    (0x1000 + src) + l
+                } else {
+                    l // DPP8 0xE9 substitutes 0 for inactive source lanes (0 + l)
+                }
+            })
+            .collect()
+    };
+
+    let cases: &[(&str, &HostShader, Vec<u32>)] = &[
+        (
+            "dpp16 row_shr:1 bc:1 fi:0 (guarded)",
+            &row_shr1_bc1_fi0_guarded,
+            expected_row_shr1(true, false),
+        ),
+        (
+            "dpp16 row_shr:1 bc:1 fi:0 (branched)",
+            &row_shr1_bc1_fi0_branched,
+            expected_row_shr1(true, false),
+        ),
+        (
+            "dpp16 row_shr:1 bc:0 fi:0 (guarded)",
+            &row_shr1_bc0_fi0_guarded,
+            expected_row_shr1(false, false),
+        ),
+        (
+            "dpp16 row_shr:1 bc:1 fi:1 (guarded)",
+            &row_shr1_bc1_fi1_guarded,
+            expected_row_shr1(true, true),
+        ),
+        ("dpp8 fi:0 (guarded)", &dpp8_fi0_guarded, expected_dpp8(false)),
+        ("dpp8 fi:1 (guarded)", &dpp8_fi1_guarded, expected_dpp8(true)),
+    ];
+
+    let _serial = ONE_AT_A_TIME.lock().unwrap_or_else(|e| e.into_inner());
+    let mut ran = 0;
+    for (name, warp) in [("hardware", false), ("WARP", true)] {
+        let Ok(host) = Host::new(warp) else {
+            eprintln!("no SM 6.6 {name} device; skipped");
+            continue;
+        };
+        let mut opts =
+            windows::Win32::Graphics::Direct3D12::D3D12_FEATURE_DATA_D3D12_OPTIONS1::default();
+        // SAFETY: plain D3D12 feature query with a properly sized output struct.
+        let supports_wave32 = unsafe {
+            host.device
+                .CheckFeatureSupport(
+                    windows::Win32::Graphics::Direct3D12::D3D12_FEATURE_D3D12_OPTIONS1,
+                    (&raw mut opts).cast(),
+                    size_of_val(&opts) as u32,
+                )
+                .is_ok()
+        } && opts.WaveOps.as_bool()
+            && opts.WaveLaneCountMin <= 32
+            && 32 <= opts.WaveLaneCountMax;
+        if !supports_wave32 {
+            eprintln!(
+                "{name} device does not support WaveSize(32) ({}..={}); skipped",
+                opts.WaveLaneCountMin, opts.WaveLaneCountMax
+            );
+            continue;
+        }
+        ran += 1;
+        for (label, shader, want) in cases {
+            let (root, pso) = host
+                .compute_pipeline(shader)
+                .unwrap_or_else(|e| panic!("{name}: {label} compute_pipeline failed: {e}"));
+            let mut ud = vec![0u32; shader.user_data_dwords().max(1) as usize];
+            for u in &shader.user_data {
+                ud[u.index as usize] = match (u.root, u.slot) {
+                    (RootType::Constants, 0) | (RootType::Table, 1) => 0,
+                    other => panic!("unexpected user data {other:?}"),
+                };
+            }
+            let out = host
+                .dispatch(
+                    &root,
+                    &pso,
+                    &Dispatch {
+                        roots: vec![(0, Root::Constants(ud))],
+                        views: &[View::RawUav(32)],
+                        samplers: &[],
+                        groups: [1, 1, 1],
+                    },
+                )
+                .unwrap_or_else(|e| panic!("{name}: {label} dispatch failed: {e}"));
+            assert_eq!(out[0], *want, "{name}: {label}");
+        }
+    }
+    if ran == 0 {
+        eprintln!("no SM 6.6 WaveSize(32) device available; GPU execution skipped");
+    }
+}

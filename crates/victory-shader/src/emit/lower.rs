@@ -3588,7 +3588,7 @@ impl<'a> Lower<'a> {
         }
         let mut guard = self.guard(b, i)?;
         if let Some(d) = v.dpp {
-            let (x, enable) = self.dpp(inst, d)?;
+            let (x, enable) = self.dpp(inst, d, guard)?;
             guard = match (guard, enable) {
                 (Some(g), Some(e)) => Some(self.s.m.bin(self.cur, Bin::And, g, e)),
                 (g, e) => g.or(e),
@@ -3602,7 +3602,7 @@ impl<'a> Lower<'a> {
 
     /// DPP: src0 as read from another lane, and which lanes write their
     /// result (none: all).
-    fn dpp(&mut self, inst: &Inst, dpp: Dpp) -> Result<(V, Option<V>), Why> {
+    fn dpp(&mut self, inst: &Inst, dpp: Dpp, guard: Option<V>) -> Result<(V, Option<V>), Why> {
         let Fields::Valu(v) = &inst.fields else {
             unreachable!()
         };
@@ -3610,9 +3610,10 @@ impl<'a> Lower<'a> {
             return Err("a DPP operand");
         };
         let x = self.i32_of(inst.read(Reg::V(reg)).ok_or("a DPP operand")?)?;
-        // Quad permutations and DPP8 stay in groups the pixel layout shares.
+        // Quad permutations stay in groups the pixel layout shares.
         let quad = matches!(dpp, Dpp::Row { ctrl: 0..=0xFF, .. });
         let mesh_quad = self.s.mesh.is_some() && quad;
+        let pixel_quad = self.s.pixel && quad;
         if !mesh_quad {
             self.cross_lane(quad)?;
         }
@@ -3623,8 +3624,11 @@ impl<'a> Lower<'a> {
         let row = self.s.m.bin(c, Bin::And, lane, sixteen_mask);
         let pos = self.s.m.bin(c, Bin::And, lane, low);
         // Source lane, and whether it lies in the row.
-        let (src, inside, masks, zero) = match dpp {
-            Dpp::Lanes { sel, .. } => {
+        let (src, inside, masks, zero, fi) = match dpp {
+            Dpp::Lanes { sel, fi } => {
+                // On RDNA2, DPP8 0xE9 (fi:0) substitutes 0 for inactive source
+                // lanes (active destination lanes always write); 0xEA (fi:1)
+                // fetches inactive source lanes.
                 let (seven, not7, three) = (k(self, 7), k(self, !7), k(self, 3));
                 let p = self.s.m.bin(c, Bin::And, lane, seven);
                 let sh = self.s.m.bin(c, Bin::Mul, p, three);
@@ -3632,14 +3636,14 @@ impl<'a> Lower<'a> {
                 let pick = self.s.m.bin(c, Bin::LShr, sel, sh);
                 let pick = self.s.m.bin(c, Bin::And, pick, seven);
                 let base = self.s.m.bin(c, Bin::And, lane, not7);
-                (self.s.m.bin(c, Bin::Or, base, pick), None, None, false)
+                (self.s.m.bin(c, Bin::Or, base, pick), None, None, true, fi)
             }
             Dpp::Row {
                 ctrl,
                 row_mask,
                 bank_mask,
                 bound_ctrl,
-                ..
+                fi,
             } => {
                 let n = u32::from(ctrl & 15);
                 let (src, inside) = match ctrl {
@@ -3688,21 +3692,88 @@ impl<'a> Lower<'a> {
                     _ => return Err("a DPP lane pattern"),
                 };
                 let masks = (row_mask != 0xF || bank_mask != 0xF).then_some((row_mask, bank_mask));
-                (src, inside, masks, bound_ctrl)
+                (src, inside, masks, bound_ctrl, fi)
             }
         };
-        let mut r = if mesh_quad {
-            self.quad_pick(x, src)
+        // With fi:0, an inactive source lane (EXEC[src] == 0) is treated as
+        // out of bounds: bound_ctrl:1 (and DPP8 0xE9) supplies 0, bound_ctrl:0
+        // disables writing vdst so the destination keeps its old value.
+        // In pixel shaders, avoid `waveActiveBallot` so WQM helper lanes keep
+        // participating in quad derivatives; test any in-block `guard` via
+        // `quadReadLaneAt` instead.
+        let src_active = if fi {
+            None
+        } else if pixel_quad {
+            guard.map(|g| {
+                let (one, z) = (k(self, 1), k(self, 0));
+                let g_i32 = self.s.m.select(c, g, one, z);
+                let picked = self.quad_pick(g_i32, src);
+                self.s.m.cmp(c, pred::NE, picked, z)
+            })
         } else {
-            self.read_lane(x, src)
+            let active_cond = guard.unwrap_or_else(|| self.s.m.bool(true));
+            let four = self
+                .s
+                .m
+                .named_struct("dx.types.fouri32", vec![self.s.t.i32; 4]);
+            let ballot =
+                self.s
+                    .op(c, "waveActiveBallot", Attr::NoUnwind, four, 116, &[active_cond]);
+            self.s.flags |= flags::WAVE_OPS;
+            let ballot_lane = if mesh_quad {
+                let host_lane = self.s.op(
+                    c,
+                    "waveGetLaneIndex",
+                    Attr::ReadOnly,
+                    self.s.t.i32,
+                    111,
+                    &[],
+                );
+                let (not3, three) = (k(self, !3), k(self, 3));
+                let base = self.s.m.bin(c, Bin::And, host_lane, not3);
+                let q = self.s.m.bin(c, Bin::And, src, three);
+                self.s.m.bin(c, Bin::Or, base, q)
+            } else {
+                src
+            };
+            let b0 = self.s.m.extract(c, ballot, 0);
+            let word = if self.x.native.wave64 || mesh_quad {
+                let b1 = self.s.m.extract(c, ballot, 1);
+                let k32 = k(self, 32);
+                let hi = self.s.m.cmp(c, pred::IUGE, ballot_lane, k32);
+                self.s.m.select(c, hi, b1, b0)
+            } else {
+                b0
+            };
+            let k31 = k(self, 31);
+            let bit_idx = self.s.m.bin(c, Bin::And, ballot_lane, k31);
+            let shifted = self.s.m.bin(c, Bin::LShr, word, bit_idx);
+            let one = k(self, 1);
+            let bit = self.s.m.bin(c, Bin::And, shifted, one);
+            let z = k(self, 0);
+            Some(self.s.m.cmp(c, pred::NE, bit, z))
+        };
+        let valid = match (inside, src_active) {
+            (Some(a), Some(b)) => Some(self.s.m.bin(c, Bin::And, a, b)),
+            (a, b) => a.or(b),
+        };
+        // Avoid passing out-of-row or inactive lane indices to `waveReadLaneAt`.
+        let safe_src = match valid {
+            Some(v) => self.s.m.select(c, v, src, lane),
+            None => src,
+        };
+        let mut r = if mesh_quad || pixel_quad {
+            self.quad_pick(x, safe_src)
+        } else {
+            self.read_lane(x, safe_src)
         };
         let mut enable = None;
-        if let Some(inside) = inside {
+        if let Some(valid) = valid {
             if zero {
                 let z = k(self, 0);
-                r = self.s.m.select(c, inside, r, z);
+                r = self.s.m.select(c, valid, r, z);
             } else {
-                enable = Some(inside);
+                enable = Some(valid);
             }
         }
         if let Some((rows, banks)) = masks {
