@@ -201,6 +201,44 @@ pub(crate) fn host_pipeline<'a>(this: This) -> Option<&'a host::HostPipeline> {
     make::ready(&pipeline(this).host)
 }
 
+#[cfg(all(windows, test))]
+pub(crate) fn mip_test_pipeline(
+    mut native: host::HostPipeline,
+    used: victory_shader::UsedResource,
+) -> This {
+    let translated = Translated {
+        host: victory_shader::emit::HostShader {
+            stage: victory_shader::HwStage::Ps,
+            dxil: Vec::new(),
+            user_data: Vec::new(),
+            samplers: Vec::new(),
+            static_samplers: Vec::new(),
+            root_cbvs: Vec::new(),
+            root_srvs: Vec::new(),
+        },
+        used: vec![used],
+    };
+    let shader = Arc::new(Shader {
+        stage: "pixel",
+        hash: "mip-test".into(),
+        container: Vec::new(),
+        translated: OnceLock::from(Some(translated)),
+    });
+    native.stages.push(host::Stage {
+        shader,
+        user_data: None,
+        root_cbvs: Vec::new(),
+        root_srvs: Vec::new(),
+    });
+    let mut handle = std::ptr::null();
+    assert_eq!(
+        hand_out(Vec::new(), None, &PIPELINE_IIDS[0], &mut handle),
+        crate::object::S_OK
+    );
+    pipeline(handle).host.set_mip_test_pipeline(native);
+    handle
+}
+
 /// Host pipelines queued and not made yet.
 #[cfg(windows)]
 pub(crate) fn making() -> u64 {
