@@ -37,9 +37,9 @@ pub(crate) fn counts() -> (u64, u64) {
 }
 
 /// What identifies this build: the BLAKE3 of our executable file and of
-/// the translation settings it runs with (the loop limit, which a
-/// diagnostics build can change at run time).
-fn build() -> &'static [u8; 32] {
+/// the translation settings it runs with (the loop limit and host max wave
+/// size).
+fn build(max_wave: u32) -> &'static [u8; 32] {
     static BUILD: OnceLock<[u8; 32]> = OnceLock::new();
     BUILD.get_or_init(|| {
         let exe = std::env::current_exe().and_then(std::fs::read);
@@ -53,6 +53,7 @@ fn build() -> &'static [u8; 32] {
         match exe {
             Ok(mut bytes) => {
                 bytes.extend_from_slice(&limit.to_le_bytes());
+                bytes.extend_from_slice(&max_wave.to_le_bytes());
                 *blake3::hash(&bytes).as_bytes()
             }
             Err(e) => {
@@ -70,9 +71,12 @@ fn build() -> &'static [u8; 32] {
 /// The translation of a console shader container, from the cache when
 /// there is one.
 pub(crate) fn host_shader(container: &[u8]) -> Result<HostShader, String> {
-    let translate = |c: &[u8]| victory_shader::emit::translate(c).map_err(|e| e.to_string());
+    let max_wave = crate::host::host().map_or(64, crate::host::Host::max_wave_size);
+    let translate = move |c: &[u8]| {
+        victory_shader::emit::translate_for_wave(c, max_wave).map_err(|e| e.to_string())
+    };
     match CACHE.get() {
-        Some(cache) => cached(cache, build(), container, translate),
+        Some(cache) => cached(cache, build(max_wave), container, translate),
         None => translate(container),
     }
 }

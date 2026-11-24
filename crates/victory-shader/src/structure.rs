@@ -98,7 +98,8 @@ impl Hasher for Fx {
 }
 
 const TERMINAL: u32 = u32::MAX;
-const MAX_NODES: usize = 1 << 21;
+const MAX_NODES: usize = 1 << 19;
+const MAX_MEMO: usize = 1 << 18;
 /// Case splits [`Bools::meet`] makes before it gives up.
 const MAX_MEET: usize = 1 << 16;
 
@@ -158,6 +159,9 @@ impl Bools {
     }
 
     fn mk(&mut self, v: u32, lo: Bool, hi: Bool) -> Bool {
+        if self.overflow {
+            return Bool::FALSE;
+        }
         if lo == hi {
             return lo;
         }
@@ -184,6 +188,9 @@ impl Bools {
     }
 
     fn ite(&mut self, f: Bool, g: Bool, h: Bool) -> Bool {
+        if self.overflow {
+            return Bool::FALSE;
+        }
         if f == Bool::TRUE || g == h {
             return g;
         }
@@ -202,6 +209,12 @@ impl Bools {
         let lo = self.ite(f0, g0, h0);
         let hi = self.ite(f1, g1, h1);
         let r = self.mk(v, lo, hi);
+        if self.overflow {
+            return Bool::FALSE;
+        }
+        if self.memo.len() >= MAX_MEMO {
+            self.memo.clear();
+        }
         self.memo.insert((f, g, h), r);
         r
     }
@@ -504,6 +517,8 @@ impl<'a> Lanes<'a> {
             self.masks.insert((lo, hi), Bool::TRUE);
             self.active.insert(lo);
         }
+        let idom = crate::ir::idoms(&p.blocks, &self.order, &self.index);
+        let mut exec_out: Vec<Option<Bool>> = vec![None; p.blocks.len()];
         let mut execs: Vec<Vec<Option<Bool>>> =
             p.blocks.iter().map(|b| vec![None; b.insts.len()]).collect();
         for n in 0..self.order.len() {
@@ -523,8 +538,28 @@ impl<'a> Lanes<'a> {
                     self.active.insert(phi.value);
                 }
             }
-            // EXEC where known in this block (read or written so far).
-            let mut now = None;
+            // EXEC at block entry (live-in from entry/phi or unique reaching dominator),
+            // updated as instructions in this block read or write EXEC.
+            let exec_phi = p.blocks[b]
+                .phis
+                .iter()
+                .find(|phi| phi.reg == Reg::S(EXEC))
+                .map(|phi| phi.value);
+            let exec_hi_phi = p.blocks[b]
+                .phis
+                .iter()
+                .find(|phi| p.wave64 && phi.reg == Reg::S(EXEC + 1))
+                .map(|phi| phi.value);
+            let mut now = if n == 0 {
+                input(Reg::S(EXEC)).map(|_| Bool::TRUE)
+            } else if let Some(lo) = exec_phi {
+                let hi = exec_hi_phi.unwrap_or(lo);
+                Some(self.mask((lo, hi)).0)
+            } else if exec_hi_phi.is_some() {
+                None
+            } else {
+                exec_out[idom[b]]
+            };
             for (i, inst) in p.blocks[b].insts.iter().enumerate() {
                 if inst.read(Reg::S(EXEC)).is_some() {
                     let e = self.exec(inst);
@@ -536,6 +571,7 @@ impl<'a> Lanes<'a> {
                     now = self.masks.get(&k).or(self.other.get(&k)).copied();
                 }
             }
+            exec_out[b] = now;
             if let Exit::Branch { .. } = p.blocks[b].exit
                 && let Some(last) = p.blocks[b].insts.last()
             {
@@ -1230,5 +1266,39 @@ mod tests {
         assert_eq!(p.blocks[0].exit.successors(), [2, 4]);
         assert_eq!(p.blocks[1].preds, [2]);
         assert!(structure(&p).is_ok());
+    }
+
+    #[test]
+    fn overflow_short_circuits_ite_and_bounds_memo() {
+        let mut b = Bools::new();
+        let x = b.atom(Atom::Uniform(ir::Value(0)), 0);
+        let y = b.atom(Atom::Uniform(ir::Value(1)), 0);
+        b.overflow = true;
+        let memo_before = b.memo.len();
+        assert_eq!(b.ite(x, y, Bool::FALSE), Bool::FALSE);
+        assert_eq!(b.memo.len(), memo_before);
+    }
+
+    #[test]
+    fn s_and_exec_at_block_top_inherits_live_in_exec_as_active() {
+        // Entry branches uniformly on SCC; taken block immediately runs
+        // `s_and_b64 s[4:5], exec, s[2:3]` before any other EXEC read.
+        let p = build(
+            &[
+                0x7D84_0080, // v_cmp_eq_u32 vcc, 0, v0
+                0xBE82_046A, // s_mov_b64 s[2:3], vcc
+                0xBF06_0100, // s_cmp_eq_u32 s0, s1
+                0xBF84_0001, // s_cbranch_scc0 -> end
+                0x8784_027E, // s_and_b64 s[4:5], exec, s[2:3]
+                S_ENDPGM,
+            ],
+            true,
+        );
+        let s = structure(&p).unwrap();
+        let and_dst = p.blocks[1].insts[0].write(Reg::S(4)).expect("s4 write");
+        assert!(
+            s.active.contains(&and_dst),
+            "mask narrowed by live-in EXEC should be active"
+        );
     }
 }

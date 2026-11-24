@@ -71,22 +71,11 @@ pub(crate) struct State {
     /// Graphics, compute.
     host_roots: [usize; 2],
     host_heaps: [usize; 2],
-    /// Tables made afresh in this list: (table, what it holds) → first
-    /// dynamic slot.
-    fresh_tables: std::collections::HashMap<(u64, u64), u32>,
-    /// The dynamic slots the list holds: title heap, first, count; given
-    /// back when the list is reset or released.
-    dynamic: Vec<(usize, u32, u32)>,
+    /// Tables made afresh in this list: table address → `(count, words, first)`
+    /// entries so prefix-compatible draws reuse existing dynamic slots.
+    fresh_tables: std::collections::HashMap<u64, Vec<FreshTable>>,
     /// A fresh table of the stage being bound could not be made.
     table_failed: bool,
-}
-
-impl Drop for State {
-    fn drop(&mut self) {
-        for &(heap, first, n) in &self.dynamic {
-            crate::descriptor::release_dynamic(heap, first, n);
-        }
-    }
 }
 
 /// Draws recorded on the host GPU since the last frame line.
@@ -703,17 +692,18 @@ impl State {
                 .max()
                 .unwrap_or(1);
             // The table and what its entries hold (record words).
-            let key = {
-                use std::hash::{Hash, Hasher};
-                let mut h = std::collections::hash_map::DefaultHasher::new();
-                for k in 0..n {
+            let words: Vec<[u32; 3]> = (0..n)
+                .map(|k| {
                     let at = table + u64::from(k) * 32;
                     // SAFETY: a descriptor slot in title memory.
-                    unsafe { (at as *const [u32; 3]).read_unaligned() }.hash(&mut h);
-                }
-                (table, h.finish())
-            };
-            if let Some(&first) = self.fresh_tables.get(&key) {
+                    unsafe { (at as *const [u32; 3]).read_unaligned() }
+                })
+                .collect();
+            if let Some(first) = self
+                .fresh_tables
+                .get(&table)
+                .and_then(|prior| find_matching_prefix(prior, &words))
+            {
                 for u in entries.iter().filter(|u| u.kind != ResourceType::Cbv) {
                     let handle = table + u64::from(u.table_offset_dwords) * 4;
                     if let Some(view) = crate::descriptor::view(handle) {
@@ -723,7 +713,15 @@ impl State {
                 made.push((slot, first * 32));
                 continue;
             }
-            let Some(first) = host.dynamic(n) else {
+            let first = loop {
+                if let Some(first) = host.dynamic(n) {
+                    break Some(first);
+                }
+                if !crate::host::reclaim_one_completed_dynamic() {
+                    break None;
+                }
+            };
+            let Some(first) = first else {
                 // Without its fresh table the shader would read the title's
                 // slots, which for constant buffer tables hold no constant
                 // view: a texture or null descriptor read as a buffer gives
@@ -732,9 +730,11 @@ impl State {
                 self.table_failed = true;
                 continue;
             };
-            self.fresh_tables.insert(key, first);
-            self.dynamic
-                .push((std::ptr::from_ref(heap) as usize, first, n));
+            self.fresh_tables
+                .entry(table)
+                .or_default()
+                .push((n, words, first));
+            list.keep_dynamic(std::ptr::from_ref(heap) as usize, first, n);
             // The whole range: a shader may index past the entries its
             // used-resource list names (descriptor arrays).
             for k in 0..n {
@@ -1214,4 +1214,47 @@ pub(crate) fn blend_factor(list: &HostList, factor: Option<&[f32; 4]>) {
 pub(crate) fn stencil_ref(list: &HostList, reference: u32) {
     // SAFETY: an open list.
     unsafe { list.list.OMSetStencilRef(reference) };
+}
+
+/// Dynamic table entry `(slot_count, descriptor_words, first_dynamic_slot)`.
+type FreshTable = (u32, Vec<[u32; 3]>, u32);
+
+/// Finds an earlier dynamic table allocation whose prefix matches `words`.
+fn find_matching_prefix(prior: &[FreshTable], words: &[[u32; 3]]) -> Option<u32> {
+    prior
+        .iter()
+        .rev()
+        .find(|(existing_n, existing_words, _)| {
+            *existing_n as usize >= words.len() && existing_words[..words.len()] == *words
+        })
+        .map(|&(_, _, first)| first)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::find_matching_prefix;
+
+    #[test]
+    fn prefix_matching_reuses_larger_table_only_when_prefix_matches() {
+        let entries = vec![(
+            4,
+            vec![[1, 2, 3], [4, 5, 6], [7, 8, 9], [10, 11, 12]],
+            900_000,
+        )];
+        assert_eq!(
+            find_matching_prefix(&entries, &[[1, 2, 3], [4, 5, 6]]),
+            Some(900_000)
+        );
+        assert_eq!(
+            find_matching_prefix(&entries, &[[1, 2, 3], [4, 5, 99]]),
+            None
+        );
+        assert_eq!(
+            find_matching_prefix(
+                &entries,
+                &[[1, 2, 3], [4, 5, 6], [7, 8, 9], [10, 11, 12], [13, 14, 15]],
+            ),
+            None
+        );
+    }
 }

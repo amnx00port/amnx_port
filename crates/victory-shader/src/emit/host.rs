@@ -68,6 +68,14 @@ impl Host {
         let warp = warp || std::env::var("VICTORY_WARP").is_ok_and(|v| v == "1");
         // SAFETY: plain D3D12/DXGI calls with valid out pointers.
         unsafe {
+            if std::env::var("VICTORY_D3D12_DEBUG").is_ok_and(|v| v == "1") {
+                let mut layer: Option<ID3D12Debug> = None;
+                if D3D12GetDebugInterface(&mut layer).is_ok()
+                    && let Some(layer) = layer
+                {
+                    layer.EnableDebugLayer();
+                }
+            }
             let mut device: Option<ID3D12Device> = None;
             if warp {
                 let factory: IDXGIFactory4 =
@@ -75,7 +83,23 @@ impl Host {
                 let adapter: IDXGIAdapter = factory.EnumWarpAdapter().map_err(err)?;
                 D3D12CreateDevice(&adapter, D3D_FEATURE_LEVEL_12_0, &mut device).map_err(err)?;
             } else {
-                D3D12CreateDevice(None, D3D_FEATURE_LEVEL_12_0, &mut device).map_err(err)?;
+                let high_perf = CreateDXGIFactory2::<IDXGIFactory6>(DXGI_CREATE_FACTORY_FLAGS(0))
+                    .ok()
+                    .and_then(|f| {
+                        f.EnumAdapterByGpuPreference::<IDXGIAdapter>(
+                            0,
+                            DXGI_GPU_PREFERENCE_HIGH_PERFORMANCE,
+                        )
+                        .ok()
+                    });
+                match high_perf {
+                    Some(adapter) => {
+                        D3D12CreateDevice(&adapter, D3D_FEATURE_LEVEL_12_0, &mut device)
+                            .map_err(err)?
+                    }
+                    None => D3D12CreateDevice(None, D3D_FEATURE_LEVEL_12_0, &mut device)
+                        .map_err(err)?,
+                }
             }
             let device = device.ok_or("no device")?;
             let mut sm = D3D12_FEATURE_DATA_SHADER_MODEL {
@@ -95,6 +119,50 @@ impl Host {
                 ));
             }
             Ok(Host { device })
+        }
+    }
+
+    /// Supported `(WaveLaneCountMin, WaveLaneCountMax)` from `D3D12_OPTIONS1`.
+    pub fn wave_range(&self) -> Result<(u32, u32), String> {
+        let mut opts = D3D12_FEATURE_DATA_D3D12_OPTIONS1::default();
+        // SAFETY: plain feature query into `opts`.
+        unsafe {
+            self.device.CheckFeatureSupport(
+                D3D12_FEATURE_D3D12_OPTIONS1,
+                (&raw mut opts).cast(),
+                size_of_val(&opts) as u32,
+            )
+        }
+        .map_err(err)?;
+        Ok((opts.WaveLaneCountMin, opts.WaveLaneCountMax))
+    }
+
+    /// DXGI adapter description string for this device.
+    pub fn adapter_name(&self) -> String {
+        // SAFETY: plain DXGI adapter enumeration matching `GetAdapterLuid`.
+        unsafe {
+            let luid = self.device.GetAdapterLuid();
+            let Ok(factory) = CreateDXGIFactory2::<IDXGIFactory4>(DXGI_CREATE_FACTORY_FLAGS(0))
+            else {
+                return String::from("<unknown>");
+            };
+            for i in 0.. {
+                let Ok(adapter) = factory.EnumAdapters1(i) else {
+                    break;
+                };
+                if let Ok(desc) = adapter.GetDesc1()
+                    && desc.AdapterLuid.LowPart == luid.LowPart
+                    && desc.AdapterLuid.HighPart == luid.HighPart
+                {
+                    let end = desc
+                        .Description
+                        .iter()
+                        .position(|&c| c == 0)
+                        .unwrap_or(desc.Description.len());
+                    return String::from_utf16_lossy(&desc.Description[..end]);
+                }
+            }
+            String::from("<unknown>")
         }
     }
 
@@ -218,6 +286,34 @@ impl Host {
         Ok((root, pso))
     }
 
+    fn debug_messages(&self) -> String {
+        let Ok(queue) = self.device.cast::<ID3D12InfoQueue>() else {
+            return String::new();
+        };
+        let mut out = String::new();
+        // SAFETY: each message is read into a buffer of the size the queue reports.
+        unsafe {
+            for i in 0..queue.GetNumStoredMessages() {
+                let mut size = 0;
+                if queue.GetMessage(i, None, &mut size).is_err() || size == 0 {
+                    continue;
+                }
+                let mut buffer = vec![0u64; size.div_ceil(8)];
+                let message = buffer.as_mut_ptr().cast::<D3D12_MESSAGE>();
+                if queue.GetMessage(i, Some(message), &mut size).is_ok() {
+                    let m = &*message;
+                    let text = std::slice::from_raw_parts(m.pDescription, m.DescriptionByteLength);
+                    let text = String::from_utf8_lossy(text);
+                    let text = text.trim_end_matches('\0');
+                    out.push_str("\n  D3D12: ");
+                    out.push_str(text);
+                }
+            }
+            queue.ClearStoredMessages();
+        }
+        out
+    }
+
     pub fn compute_pipeline_with(
         &self,
         root: &ID3D12RootSignature,
@@ -233,7 +329,10 @@ impl Host {
             ..Default::default()
         };
         // SAFETY: the description points at live data.
-        unsafe { self.device.CreateComputePipelineState(&desc) }.map_err(err)
+        unsafe { self.device.CreateComputePipelineState(&desc) }.map_err(|e| {
+            let msgs = self.debug_messages();
+            format!("{}{msgs}", err(e))
+        })
     }
 
     /// A graphics pipeline from a vertex and a pixel shader, with float or

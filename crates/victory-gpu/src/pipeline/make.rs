@@ -157,14 +157,34 @@ fn wait(p: &Pending, frame: u64) {
     WAITED_US.fetch_add(started.elapsed().as_micros() as u64, Ordering::Relaxed);
 }
 
-/// Hands `p` to the workers (half the logical processors, 2 to 8), started
-/// on first use.
+/// Bounds parallel shader/PSO worker threads on <= 16 GiB RAM hosts so
+/// concurrent `victory-shader` structurisation and DXIL compiles stay within
+/// Windows commit and physical memory limits.
+fn worker_count() -> usize {
+    let cores = std::thread::available_parallelism().map_or(2, |n| n.get());
+    // SAFETY: `dwLength` initialized to the struct size.
+    let total_phys = unsafe {
+        use windows_sys::Win32::System::SystemInformation::{GlobalMemoryStatusEx, MEMORYSTATUSEX};
+        let mut mem: MEMORYSTATUSEX = std::mem::zeroed();
+        mem.dwLength = size_of::<MEMORYSTATUSEX>() as u32;
+        (GlobalMemoryStatusEx(&mut mem) != 0).then_some(mem.ullTotalPhys)
+    };
+    match total_phys {
+        Some(bytes) if bytes <= 18 << 30 => 2,
+        Some(bytes) if bytes <= 26 << 30 => (cores / 2).clamp(2, 4),
+        Some(_) => (cores / 2).clamp(2, 8),
+        None => 2,
+    }
+}
+
+/// Hands `p` to the workers (bounded by physical RAM and logical cores),
+/// started on first use.
 fn queue(p: Arc<Pending>) {
     static SENDER: OnceLock<std::sync::mpsc::Sender<Arc<Pending>>> = OnceLock::new();
     let sender = SENDER.get_or_init(|| {
         let (sender, receiver) = std::sync::mpsc::channel::<Arc<Pending>>();
         let receiver = Arc::new(Mutex::new(receiver));
-        let workers = std::thread::available_parallelism().map_or(2, |n| (n.get() / 2).clamp(2, 8));
+        let workers = worker_count();
         for i in 0..workers {
             let receiver = receiver.clone();
             let spawned = std::thread::Builder::new()

@@ -24,6 +24,11 @@ use windows::Win32::Graphics::Direct3D12::ID3D12Resource;
 use crate::host::{HostList, host};
 use crate::watch::PAGE;
 
+type SnapshotSegment = (usize, Vec<u8>);
+
+/// Maximum gap between two GPU-write snapshot ranges coalesced into one segment.
+const COALESCE_GAP: usize = 64 << 10;
+
 /// A title buffer's host copy.
 pub(crate) struct Shadow {
     pub(crate) buffer: ID3D12Resource,
@@ -40,9 +45,9 @@ pub(crate) struct Shadow {
     /// Ranges shaders of a submission not yet copied back may be writing:
     /// title memory there is older than the copy.
     pending: Mutex<Vec<(usize, usize)>>,
-    /// The copy's bytes before the submission ran, from an offset on,
-    /// covering the ranges its shaders write: what the GPU wrote differs.
-    before: Mutex<Option<(usize, Vec<u8>)>>,
+    /// Sorted disjoint pre-write segments `(offset, bytes)` covering the
+    /// ranges a submission's shaders write: what the GPU wrote differs.
+    before: Mutex<Vec<SnapshotSegment>>,
 }
 
 /// Snapshot memory kept for reuse (already touched, so no page faults).
@@ -65,23 +70,93 @@ fn pooled(n: usize) -> Vec<u8> {
     v
 }
 
-/// Returns a snapshot buffer to the pool (at most 8 kept, the largest).
+/// Maximum bytes held idle in the snapshot pool across all buffers.
+const MAX_POOLED_BYTES: usize = 64 << 20;
+
+/// Returns a snapshot buffer to the pool (at most 2 kept and at most
+/// [`MAX_POOLED_BYTES`] total, so large heaps do not pin ~1.4 GiB idle).
 fn give_back(v: Vec<u8>) {
+    if v.capacity() > MAX_POOLED_BYTES {
+        return;
+    }
     let mut pool = POOL.lock().unwrap_or_else(|e| e.into_inner());
     pool.push(v);
-    if pool.len() > 8 {
-        pool.sort_by_key(|v| std::cmp::Reverse(v.capacity()));
-        pool.truncate(8);
+    pool.sort_by_key(|v| std::cmp::Reverse(v.capacity()));
+    pool.truncate(2);
+    let mut total: usize = pool.iter().map(Vec::capacity).sum();
+    while total > MAX_POOLED_BYTES {
+        let Some(dropped) = pool.pop() else { break };
+        total -= dropped.capacity();
     }
 }
 
+const WATCHED: u8 = 1;
 const NOT_WATCHED: u8 = 2;
+const GUARDED: u8 = 3;
 
 // SAFETY: D3D12 resources are free-threaded; `data` is a persistent mapping
 // written only on the submitting thread.
 unsafe impl Send for Shadow {}
 // SAFETY: as above.
 unsafe impl Sync for Shadow {}
+
+/// Merges `[from, to)` into sorted disjoint pre-write snapshot segments,
+/// copying newly covered bytes from `source` while keeping prior bytes intact.
+fn record_snapshot(
+    segments: &mut Vec<SnapshotSegment>,
+    from: usize,
+    to: usize,
+    source: &[u8],
+) {
+    if from >= to {
+        return;
+    }
+    if segments
+        .iter()
+        .any(|(at, bytes)| *at <= from && to <= at + bytes.len())
+    {
+        return;
+    }
+    let mut first = segments.len();
+    let mut last = 0usize;
+    let mut start = from;
+    let mut end = to;
+    for (i, (at, bytes)) in segments.iter().enumerate() {
+        let seg_end = at + bytes.len();
+        if from <= seg_end.saturating_add(COALESCE_GAP)
+            && *at <= to.saturating_add(COALESCE_GAP)
+        {
+            first = first.min(i);
+            last = last.max(i + 1);
+            start = start.min(*at);
+            end = end.max(seg_end);
+        }
+    }
+    if first >= last {
+        let mut buf = pooled(end - start);
+        buf.extend_from_slice(&source[start..end]);
+        let pos = segments.partition_point(|&(at, _)| at < start);
+        segments.insert(pos, (start, buf));
+        return;
+    }
+    let mut grown = pooled(end - start);
+    let mut cursor = start;
+    for (at, bytes) in segments.drain(first..last) {
+        if at > cursor {
+            grown.extend_from_slice(&source[cursor..at]);
+        }
+        if at + bytes.len() > cursor {
+            let skip = cursor.saturating_sub(at);
+            grown.extend_from_slice(&bytes[skip..]);
+            cursor = at + bytes.len();
+        }
+        give_back(bytes);
+    }
+    if cursor < end {
+        grown.extend_from_slice(&source[cursor..end]);
+    }
+    segments.insert(first, (start, grown));
+}
 
 impl Shadow {
     /// The host GPU address of a title address inside the buffer.
@@ -144,40 +219,22 @@ impl Shadow {
 
     /// At submission, after the range's refresh: a submitted list's shaders
     /// write this range. Its bytes are kept to tell later what the GPU wrote:
-    /// one snapshot per copy and submission, grown to cover every range the
-    /// submission declares (the world declares overlapping views of its
-    /// 174 MB heap dozens of times), in reused memory (fresh snapshots cost
-    /// ~2.3 million page faults per world frame).
+    /// disjoint snapshot segments per copy and submission, coalesced only when
+    /// within [`COALESCE_GAP`] (so sparse UAV ranges across a 174 MB heap do
+    /// not snapshot unused gaps in between).
     pub(crate) fn writing(&self, address: usize, len: usize) {
         self.pending
             .lock()
             .unwrap_or_else(|e| e.into_inner())
             .push((address, address + len));
         let (from, to) = self.inside(address, len);
-        // SAFETY: inside the mapping.
-        let host = |a: usize, b: usize| unsafe { std::slice::from_raw_parts(self.data.add(a), b - a) };
-        let mut before = self.before.lock().unwrap_or_else(|e| e.into_inner());
-        let (start, end) = match &*before {
-            Some((at, bytes)) => ((*at).min(from), (at + bytes.len()).max(to)),
-            None => (from, to),
-        };
-        if let Some((at, bytes)) = &*before
-            && (*at, at + bytes.len()) == (start, end)
-        {
+        if from >= to {
             return;
         }
-        // Parts newly covered from the copy, the rest as it was taken.
-        let mut grown = pooled(end - start);
-        match before.take() {
-            Some((at, bytes)) => {
-                grown.extend_from_slice(host(start, at));
-                grown.extend_from_slice(&bytes);
-                grown.extend_from_slice(host(at + bytes.len(), end));
-                give_back(bytes);
-            }
-            None => grown.extend_from_slice(host(start, end)),
-        }
-        *before = Some((start, grown));
+        // SAFETY: `self.data` is valid for `self.len` bytes inside the mapping.
+        let source = unsafe { std::slice::from_raw_parts(self.data, self.len as usize) };
+        let mut before = self.before.lock().unwrap_or_else(|e| e.into_inner());
+        record_snapshot(&mut before, from, to, source);
     }
 
     /// After the submission ran: copies the bytes its shaders wrote back
@@ -192,12 +249,12 @@ impl Shadow {
         let mut written = 0;
         let (from, to) = self.inside(address, len);
         let start = self.start as usize;
-        if let Some((taken, before)) = &*snapshot
-            && *taken <= from
-            && to <= taken + before.len()
-            && from < to
+        if from < to
+            && let Some((taken, before)) = snapshot
+                .iter()
+                .find(|(taken, bytes)| *taken <= from && to <= taken + bytes.len())
         {
-            let before = &before[from - taken..to - taken];
+            let before = &before[from - *taken..to - *taken];
             // By 64 KiB piece: the copy compared with its bytes before the
             // submission, title memory read only where the GPU wrote.
             const PIECE: usize = 64 << 10;
@@ -251,10 +308,10 @@ impl Shadow {
         // submission runs at a time), and the snapshot with the last range.
         let mut pending = self.pending.lock().unwrap_or_else(|e| e.into_inner());
         pending.retain(|&r| r != (address, address + len));
-        if pending.is_empty()
-            && let Some((_, bytes)) = snapshot.take()
-        {
-            give_back(bytes);
+        if pending.is_empty() {
+            for (_, bytes) in snapshot.drain(..) {
+                give_back(bytes);
+            }
         }
         written
     }
@@ -299,9 +356,22 @@ impl Shadow {
     /// [`Shadow::update`] of `[from, to)` (inside the buffer) where no
     /// shader writes.
     fn update_free(&self, from: usize, to: usize) -> usize {
-        if self.watched.load(Ordering::Relaxed) != NOT_WATCHED {
-            if let Some((now, written)) = crate::watch::writes(from, to, true) {
-                self.watched.store(1, Ordering::Relaxed);
+        use crate::watch::Kind;
+        let mode = self.watched.load(Ordering::Relaxed);
+        if mode != NOT_WATCHED {
+            let known = match mode {
+                WATCHED => Some(Kind::Watched),
+                GUARDED => Some(Kind::Guarded),
+                _ => None,
+            };
+            if let Some((kind, (now, written))) = crate::watch::writes_kind(from, to, known) {
+                let next = match kind {
+                    Kind::Watched => WATCHED,
+                    Kind::Guarded => GUARDED,
+                };
+                if next != mode {
+                    self.watched.store(next, Ordering::Relaxed);
+                }
                 let copied = self.copy_stale(from, to, now, &written);
                 #[cfg(feature = "diagnostics")]
                 {
@@ -496,4 +566,41 @@ pub(crate) fn near(va: u64) -> String {
         ));
     }
     text
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{COALESCE_GAP, record_snapshot};
+
+    #[test]
+    fn snapshots_keep_disjoint_ranges_and_preserve_prior_bytes_on_merge() {
+        let mut source = vec![0x11u8; COALESCE_GAP * 4];
+        source[10..20].fill(0x22);
+        source[COALESCE_GAP * 3..COALESCE_GAP * 3 + 16].fill(0x33);
+
+        let mut segments = Vec::new();
+        record_snapshot(&mut segments, 10, 20, &source);
+        record_snapshot(&mut segments, COALESCE_GAP * 3, COALESCE_GAP * 3 + 16, &source);
+        assert_eq!(segments.len(), 2);
+        assert_eq!(segments[0].0, 10);
+        assert_eq!(segments[1].0, COALESCE_GAP * 3);
+
+        // Mutate source inside the first snapshot; merging a contiguous extension
+        // must keep the original pre-write bytes (0x22) for [10, 20).
+        source[10..20].fill(0x99);
+        source[20..30].fill(0x44);
+        record_snapshot(&mut segments, 15, 30, &source);
+        assert_eq!(segments.len(), 2);
+        assert_eq!(segments[0].0, 10);
+        assert_eq!(&segments[0].1[..10], &[0x22; 10]);
+        assert_eq!(&segments[0].1[10..20], &[0x44; 10]);
+
+        // Bridging both segments merges them into one contiguous snapshot.
+        record_snapshot(&mut segments, 25, COALESCE_GAP * 3 + 4, &source);
+        assert_eq!(segments.len(), 1);
+        assert_eq!(segments[0].0, 10);
+        assert_eq!(segments[0].1.len(), COALESCE_GAP * 3 + 16 - 10);
+        assert_eq!(&segments[0].1[..10], &[0x22; 10]);
+        assert_eq!(&segments[0].1[segments[0].1.len() - 16..], &[0x33; 16]);
+    }
 }
