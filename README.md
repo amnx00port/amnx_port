@@ -101,6 +101,19 @@ victory config
 Logging: `VICTORY_LOG=victory_loader=trace,info` (a release build logs
 info and above).
 
+## Experimental memory option
+
+Set `VICTORY_TRIM_IDLE_SHADERS=1` before launch to periodically remove
+shader-cache entries that are no longer referenced by any pipeline or
+worker. A sweep runs after every 256 new shader-cache entries, not on cache
+hits. Live shader objects are retained; the disk shader cache is unchanged.
+
+This is opt-in: the default keeps shader objects for the entire run.
+Revisiting an evicted shader can require additional cache reads or
+translation (including previously failed translations). The option reduces
+retained CPU-side shader data when idle entries exist; it does not cap
+overall memory use or GPU VRAM, and no title-level savings are established.
+
 ## Debugging
 
 A release build has no debugging aids. Build them in with
