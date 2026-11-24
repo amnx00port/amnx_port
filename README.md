@@ -131,6 +131,38 @@ cargo build --profile diag -p victory --features diagnostics   # target\diag\vic
 Every build appends crashes and host GPU failures to `crashes.log` in the
 title's data folder.
 
+### Tracing a streaming stop
+
+To trace a read from the DirectStorage queue API to worker completion,
+run the diagnostics build with its request trace on in PowerShell.
+
+```powershell
+$env:VICTORY_LOG = "info,victory_dstorage=trace"
+$env:VICTORY_DSTORAGE_CALLER_SIZE = "46586"
+.\target\diag\victory.exe run $exe --execute 2> "$env:TEMP\victory-streaming.log"
+```
+
+Set `$exe` to the title executable. Follow `request_id` from the enqueue
+call to the worker, even for identical reads on one queue. The enqueue rows
+record the caller's sizes and whether the queue accepted the request. The optional caller-size filter adds the
+submitting thread's module-relative stack to enqueue rows with that input,
+intermediate or destination size. A worker adds its sequence number, zlib flag
+and BCPack mode when it starts the read.
+The matching file-read event reports the source path, offset and bytes
+actually read. Completion reports the bytes produced, which can be less
+than the destination capacity. On failure the trace includes the HRESULT.
+A zlib failure also reports the decoder status and output capacity.
+
+For [#1063](https://github.com/Marvisak/VIctory/issues/1063), inspect the
+events around the breakpoint for sizes 65536 and 46586. A short file
+read, `HasMoreOutput` from zlib, and a successful short output are different
+outcomes. Record which occurred, the matching sizes, and their time relative
+to the breakpoint. If other enqueues appear but none carries these sizes,
+report that as well. A decision inside the title before enqueue is outside
+the trace. The caller stack shows who submitted the request. Identifying
+the original allocator of a title descriptor requires independent
+evidence. For sharing, a few matching rows with local paths redacted suffice.
+
 ## License
 
 GPL-3.0-or-later. See [LICENSE](LICENSE).

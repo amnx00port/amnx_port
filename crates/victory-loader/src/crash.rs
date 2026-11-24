@@ -586,7 +586,8 @@ pub fn locate(address: usize) -> String {
     module_of(address).unwrap_or_else(|| format!("{address:#x}"))
 }
 
-fn module_of(address: usize) -> Option<String> {
+/// Loaded module name and relative offset, if the address belongs to a module.
+pub fn module_of(address: usize) -> Option<String> {
     let mut module: HMODULE = std::ptr::null_mut();
     // SAFETY: looks up the module containing `address`; no reference taken.
     let found = unsafe {
