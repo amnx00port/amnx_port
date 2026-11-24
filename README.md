@@ -93,10 +93,21 @@ victory census [paths...] [--missing] [--strict]
 victory lib-exports <import.lib> [--list]
 victory shader-info [paths...] [--verbose] [--disasm]
 victory translate [paths...] [--validate] [--pipelines] [--list] [--jobs N]
+                  [--shader-hash HASH[,HASH...]]
 victory run <exe> [--execute] [--unimplemented trap|zero] [--strict]
             [--console series-x|series-s] [-- <title arguments>]
 victory config
 ```
+
+To replay a shader named in a runtime pipeline diagnostic, pass its
+16-digit hash, for example `victory translate path/to/archive --shader-hash
+0123456789abcdef --list`. The scan hashes raw containers and unpacked SGD5
+records over the DXBC header's declared length and runs the translator only
+for matches. Add `--validate` or
+`--pipelines` to check the emitted shaders on the host. Repeat the option or
+separate hashes with commas to check several from the same run. The report
+shows the file and offset for each match. Missing hashes give a nonzero exit
+after the report. Translation refusals are tallied as in a full scan.
 
 Logging: `VICTORY_LOG=victory_loader=trace,info` (a release build logs
 info and above).

@@ -1,7 +1,7 @@
 //! The offline batch: every shader found goes through the translator, and
 //! what it cannot handle yet is tallied (decision 0003).
 
-use std::collections::{BTreeMap, HashSet};
+use std::collections::{BTreeMap, BTreeSet, HashSet};
 use std::path::{Path, PathBuf};
 use std::sync::Mutex;
 use std::sync::atomic::{AtomicUsize, Ordering};
@@ -21,6 +21,8 @@ use crate::shader::{MAX_FILE, Source, sources};
 struct Tally {
     containers: usize,
     duplicates: usize,
+    /// One source location per requested runtime hash found.
+    matched: BTreeMap<u64, String>,
     programs: usize,
     translated: usize,
     instructions: usize,
@@ -93,6 +95,7 @@ impl Tally {
     fn merge(&mut self, other: Tally) {
         self.containers += other.containers;
         self.duplicates += other.duplicates;
+        self.matched.extend(other.matched);
         self.programs += other.programs;
         self.translated += other.translated;
         self.instructions += other.instructions;
@@ -152,13 +155,27 @@ struct Checks {
     host: Option<(Host, emit::HostShader)>,
 }
 
+/// Pipeline diagnostics print the first eight bytes of BLAKE3 in byte order.
+pub fn parse_hash(s: &str) -> Result<u64, &'static str> {
+    if s.len() != 16 || !s.bytes().all(|b| b.is_ascii_hexdigit()) {
+        return Err("expected 16 hexadecimal digits from a runtime shader hash");
+    }
+    u64::from_str_radix(s, 16).map_err(|_| "invalid runtime shader hash")
+}
+
 pub fn run(
     paths: Vec<PathBuf>,
     validate: bool,
     pipelines: bool,
     list: bool,
     jobs: Option<usize>,
+    shader_hashes: Vec<u64>,
 ) -> Result<()> {
+    let requested: BTreeSet<_> = shader_hashes.into_iter().collect();
+    anyhow::ensure!(
+        requested.is_empty() || jobs != Some(0),
+        "select at least one worker to replay requested shader hashes"
+    );
     let paths = crate::default_paths(paths)?;
     let dll = validate.then(Validator::default_path).flatten();
     if validate {
@@ -213,7 +230,7 @@ pub fn run(
                                 .flatten(),
                         };
                         while let Some(job) = jobs.get(next.fetch_add(1, Ordering::Relaxed)) {
-                            translate(job, entry.path(), &seen, &mut t, &mut checks);
+                            translate(job, entry.path(), &seen, &requested, &mut t, &mut checks);
                         }
                         lock(&total).merge(t);
                     });
@@ -222,6 +239,9 @@ pub fn run(
         }
     }
     let t = total.into_inner().unwrap_or_else(|e| e.into_inner());
+    for (id, label) in &t.matched {
+        println!("matched      {id:016x} {label}");
+    }
     println!(
         "containers   {} ({} duplicates skipped)",
         t.containers, t.duplicates
@@ -298,6 +318,16 @@ pub fn run(
     for (reason, (n, example)) in failed {
         println!("  {n:>7}  {reason}  (e.g. {example})");
     }
+    let missing: Vec<_> = requested
+        .iter()
+        .filter(|id| !t.matched.contains_key(id))
+        .map(|id| format!("{id:016x}"))
+        .collect();
+    anyhow::ensure!(
+        missing.is_empty(),
+        "shader hashes not found in readable containers: {}",
+        missing.join(", ")
+    );
     Ok(())
 }
 
@@ -305,24 +335,54 @@ fn translate(
     source: &Source,
     path: &Path,
     seen: &Mutex<HashSet<blake3::Hash>>,
+    requested: &BTreeSet<u64>,
     t: &mut Tally,
     checks: &mut Checks,
 ) {
-    let example = || format!("{}{}", path.display(), source.label());
+    let location = || format!("{}{}", path.display(), source.label());
     let Some(bytes) = source.bytes() else {
-        return t.fail("corrupt record".into(), example);
+        if requested.is_empty() {
+            t.fail("corrupt record".into(), location);
+        }
+        return;
+    };
+    let container = Container::parse(&bytes).ok();
+    let selected = if requested.is_empty() {
+        None
+    } else {
+        // A raw source can include following archive data and an unpacked
+        // record can have padding. Hash just the declared bytecode span.
+        let Some(c) = &container else { return };
+        let hash = blake3::hash(&bytes[..c.size]);
+        let id = u64::from_be_bytes(hash.as_bytes()[..8].try_into().expect("8 bytes"));
+        if !requested.contains(&id) {
+            return;
+        }
+        Some((id, hash))
+    };
+    let example = || match selected {
+        Some((id, _)) => format!("{} hash={id:016x}", location()),
+        None => location(),
     };
     t.containers += 1;
-    let Ok(container) = Container::parse(&bytes) else {
-        return t.fail("no DXIL part (SM5 or older)".into(), example);
-    };
-    let Some(dxil) = container.part(FourCC::DXIL).map(|p| p.data) else {
-        return t.fail("no DXIL part (SM5 or older)".into(), example);
-    };
-    if !lock(seen).insert(blake3::hash(dxil)) {
+    let dxil = container
+        .as_ref()
+        .and_then(|c| c.part(FourCC::DXIL))
+        .map(|p| p.data);
+    // Distinct selected containers can share DXIL but differ in stage I/O.
+    let key = selected
+        .map(|(_, hash)| hash)
+        .or_else(|| dxil.map(blake3::hash));
+    if key.is_some_and(|h| !lock(seen).insert(h)) {
         t.duplicates += 1;
         return;
     }
+    if let Some((id, _)) = selected {
+        t.matched.entry(id).or_insert_with(location);
+    }
+    let (Some(container), Some(dxil)) = (container, dxil) else {
+        return t.fail("no DXIL part (SM5 or older)".into(), example);
+    };
     let programs = match native_programs(dxil) {
         Ok(p) => p,
         Err(e) => return t.fail(e.to_string(), example),
