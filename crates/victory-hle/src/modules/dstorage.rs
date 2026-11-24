@@ -821,10 +821,10 @@ fn execute(request: &Request) -> Result<(), HRESULT> {
     let source = read_source(request).map_err(|hr| fail(hr, "reading the source"))?;
     // The console's order: zlib first, then BCPack.
     let source = if bc != 0 && options & ZLIB != 0 {
-        let mut packed = vec![0; request.intermediate_size as usize];
-        let n = inflate(&source, &mut packed).map_err(|hr| fail(hr, "zlib"))?;
-        packed.truncate(n);
-        Cow::Owned(packed)
+        Cow::Owned(
+            inflate_intermediate(&source, request.intermediate_size as usize)
+                .map_err(|hr| fail(hr, "zlib"))?,
+        )
     } else {
         source
     };
@@ -848,10 +848,19 @@ fn execute(request: &Request) -> Result<(), HRESULT> {
 /// nothing says that is required.
 fn inflate(source: &[u8], out: &mut [u8]) -> Result<usize, HRESULT> {
     miniz_oxide::inflate::decompress_slice_iter_to_slice(out, std::iter::once(source), true, false)
-        .map_err(|status| {
-            tracing::debug!(?status, "dstorage: zlib stream");
-            INVALID_DATA
-        })
+        .map_err(inflate_error)
+}
+
+/// The BCPack intermediate may be shorter than its limit. Grow its
+/// storage as bytes arrive instead of reserving the entire limit up front.
+fn inflate_intermediate(source: &[u8], limit: usize) -> Result<Vec<u8>, HRESULT> {
+    miniz_oxide::inflate::decompress_to_vec_zlib_with_limit(source, limit)
+        .map_err(|error| inflate_error(error.status))
+}
+
+fn inflate_error(status: miniz_oxide::inflate::TINFLStatus) -> HRESULT {
+    tracing::debug!(?status, "dstorage: zlib stream");
+    INVALID_DATA
 }
 
 /// The BCPack format's constant tables, parsed once for the process. If
@@ -1350,6 +1359,25 @@ mod tests {
         assert_eq!(results(), (E_PENDING, E_PENDING));
         l.finish(&jobs[1], Err(INVALID_DATA));
         assert_eq!(results(), (INVALID_DATA, S_OK));
+    }
+
+    #[test]
+    fn zlib_intermediate_grows_with_output_and_respects_its_limit() {
+        let data = [0x69; 2048];
+        let mut encoded = miniz_oxide::deflate::compress_to_vec_zlib(&data, 6);
+        let limit = 64 << 20;
+        let decoded = inflate_intermediate(&encoded, limit).unwrap();
+        assert_eq!(decoded, data);
+        assert!(decoded.capacity() < limit);
+        assert_eq!(inflate_intermediate(&encoded, data.len()).unwrap(), data);
+        assert_eq!(
+            inflate_intermediate(&encoded, data.len() - 1),
+            Err(INVALID_DATA)
+        );
+
+        // The checksum is still checked, even with room left over.
+        *encoded.last_mut().unwrap() ^= 1;
+        assert_eq!(inflate_intermediate(&encoded, limit), Err(INVALID_DATA));
     }
 
     #[test]
