@@ -31,3 +31,31 @@ jobs:
       # Includes xtask's repository_passes_policy, the asset-policy check.
       - name: Tests
         run: cargo test --workspace --locked
+
+  # The crates that carry no Windows dependency are the title's data formats,
+  # PE parsing, the pipeline and the loader; they are where most contributions
+  # that need no game files and no GPU happen. Building them on Linux keeps
+  # them host-independent, so that work does not require a Windows machine,
+  # and catches a `cfg(windows)` item used from ungated code before it reaches
+  # anyone who cannot compile it.
+  #
+  # Deliberately not the whole workspace yet: victory-gpu and victory-shader
+  # compile and pass their tests here but still warn in this configuration,
+  # and victory-hle needs its module tree gated. Widen this list as those
+  # are fixed.
+  linux:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    env:
+      HOST_INDEPENDENT: >-
+        -p victory-core -p victory-pe -p victory-formats
+        -p victory-pipeline -p victory-game -p victory-loader
+    steps:
+      - uses: actions/checkout@v5
+      # The version and components pinned in rust-toolchain.toml.
+      - run: rustup toolchain install
+      - uses: Swatinem/rust-cache@v2
+      - name: Clippy
+        run: cargo clippy $HOST_INDEPENDENT --all-targets --locked -- -D warnings
+      - name: Tests
+        run: cargo test $HOST_INDEPENDENT --locked
