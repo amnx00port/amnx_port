@@ -925,6 +925,19 @@ impl HostList {
         }
     }
 
+    /// The current state established by this list. A texture the list has
+    /// never used can arrive in a different state at submission.
+    pub(crate) fn tracked_texture_state(
+        &self,
+        copy: &std::sync::Arc<crate::resource::HostTexture>,
+    ) -> Option<u32> {
+        self.states
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .get(&(std::sync::Arc::as_ptr(copy) as usize))
+            .map(|&(_, last, _)| last)
+    }
+
     /// At submission: the list that moves each texture this list uses from
     /// its real state to the one the list starts with; the textures' real
     /// states become those the list ends with.

@@ -675,6 +675,154 @@ pub(crate) struct Rect {
     bottom: i32,
 }
 
+#[repr(C)]
+#[derive(Clone, Copy)]
+struct DiscardRegion {
+    num_rects: u32,
+    rects: *const Rect,
+    first_subresource: u32,
+    num_subresources: u32,
+}
+
+#[cfg(windows)]
+const _: () = {
+    use windows::Win32::Foundation::RECT;
+    use windows::Win32::Graphics::Direct3D12::D3D12_DISCARD_REGION;
+    assert!(size_of::<DiscardRegion>() == size_of::<D3D12_DISCARD_REGION>());
+    assert!(align_of::<DiscardRegion>() == align_of::<D3D12_DISCARD_REGION>());
+    assert!(size_of::<Rect>() == size_of::<RECT>());
+    assert!(align_of::<Rect>() == align_of::<RECT>());
+};
+
+/// A non-null, aligned rectangle pointer must cover `num_rects` rectangles.
+#[cfg(any(windows, test))]
+unsafe fn valid_discard_region(
+    region: Option<&DiscardRegion>,
+    dimension: u32,
+    mip_levels: u16,
+    depth_or_array_size: u16,
+    planes: u8,
+    extent: [u64; 2],
+) -> bool {
+    const TEXTURE_2D: u32 = 3;
+    const TEXTURE_3D: u32 = 4;
+    let Some(region) = region else { return true };
+    let mips = u64::from(mip_levels.max(1));
+    let slices = if dimension == TEXTURE_3D {
+        1
+    } else {
+        u64::from(depth_or_array_size.max(1))
+    };
+    let first = u64::from(region.first_subresource);
+    let count = u64::from(region.num_subresources);
+    if count == 0 || first + count > mips * slices * u64::from(planes) {
+        return false;
+    }
+    if region.num_rects == 0 {
+        return true;
+    }
+    let rects = region.num_rects as usize;
+    // Rectangles apply to 2D subresources of the same dimensions. In a
+    // contiguous range with multiple mips, adjacent subresources differ.
+    if dimension != TEXTURE_2D
+        || (mips > 1 && count > 1)
+        || region.rects.is_null()
+        || !region.rects.is_aligned()
+        || rects > isize::MAX as usize / size_of::<Rect>()
+    {
+        return false;
+    }
+    let [width, height] =
+        extent.map(|size| size.checked_shr((first % mips) as u32).unwrap_or(0).max(1));
+    // SAFETY: the caller supplies the array, and its pointer and size were checked.
+    unsafe { std::slice::from_raw_parts(region.rects, rects) }
+        .iter()
+        .all(|r| {
+            r.left >= 0
+                && r.top >= 0
+                && r.left < r.right
+                && r.top < r.bottom
+                && r.right as u64 <= width
+                && r.bottom as u64 <= height
+        })
+}
+
+#[cfg(any(windows, test))]
+fn discard_state_allowed(state: u32, flags: u32) -> bool {
+    let required_flag = match state {
+        0x4 => 0x1,  // RENDER_TARGET
+        0x10 => 0x2, // DEPTH_WRITE / ALLOW_DEPTH_STENCIL
+        0x8 => 0x4,  // UNORDERED_ACCESS
+        _ => return false,
+    };
+    flags & required_flag != 0
+}
+
+extern "system" fn discard_resource(this: This, resource: This, region: *const DiscardRegion) {
+    #[cfg(windows)]
+    {
+        use windows::Win32::Graphics::Direct3D12::*;
+        let (Some(list), Some(copy)) = (host_list(this), crate::resource::host_copy(resource))
+        else {
+            return;
+        };
+        let Some(state) = list.tracked_texture_state(&copy) else {
+            return;
+        };
+        // SAFETY: a live host texture.
+        let desc = unsafe { copy.texture.GetDesc() };
+        if !discard_state_allowed(state, desc.Flags.0 as u32) || !region.is_aligned() {
+            return;
+        }
+        // SAFETY: the title passes a discard region or null.
+        let region = unsafe { region.as_ref() };
+        if let Some(region) = region {
+            let Some(host) = crate::host::host() else {
+                return;
+            };
+            let mut format = D3D12_FEATURE_DATA_FORMAT_INFO {
+                Format: desc.Format,
+                PlaneCount: 0,
+            };
+            // SAFETY: the feature data matches the requested query.
+            if unsafe {
+                host.device.CheckFeatureSupport(
+                    D3D12_FEATURE_FORMAT_INFO,
+                    (&raw mut format).cast(),
+                    size_of::<D3D12_FEATURE_DATA_FORMAT_INFO>() as u32,
+                )
+            }
+            .is_err()
+            {
+                return;
+            }
+            // SAFETY: the title supplies the rectangles described by the region.
+            if !unsafe {
+                valid_discard_region(
+                    Some(region),
+                    desc.Dimension.0 as u32,
+                    desc.MipLevels,
+                    desc.DepthOrArraySize,
+                    format.PlaneCount,
+                    [desc.Width, u64::from(desc.Height)],
+                )
+            } {
+                return;
+            }
+        }
+        #[cfg(feature = "diagnostics")]
+        list.note_op(|| format!("discard resource {resource:?}"));
+        // SAFETY: the list holds the texture in a compatible state. The
+        // checked region and its rectangles have the host layout.
+        unsafe {
+            list.list
+                .DiscardResource(&copy.texture, region.map(|r| std::ptr::from_ref(r).cast()))
+        };
+    }
+    #[cfg(not(windows))]
+    let _ = (this, resource, region);
+}
+
 extern "system" fn clear_rtv(
     this: This,
     handle: u64,
@@ -1284,7 +1432,7 @@ fn defer_write(this: This, address: u64, what: Written, bytes: usize) {
 /// layout): IUnknown 3, object 4, device child 1, list 1, graphics list 96
 /// (59 as on PC, then console ones), then versions 1-6 (6 + 1 + 1 + 11 + 3
 /// + 13): 140 slots.
-const METHODS: [(usize, *const ()); 52] = [
+const METHODS: [(usize, *const ()); 53] = [
     (0, list_query as *const ()),
     (2, list_release as *const ()),
     (7, object::parent_device as *const ()),      // 0x38
@@ -1325,6 +1473,7 @@ const METHODS: [(usize, *const ()); 52] = [
     (50, state::targets as *const ()),            // 0x190
     (51, clear_dsv as *const ()),                 // 0x198
     (52, clear_rtv as *const ()),                 // 0x1a0
+    (55, discard_resource as *const ()),          // 0x1b8
     (59, execute_indirect as *const ()),          // 0x1d8 indirect
     (60, copy_memory as *const ()),               // 0x1e0
     (68, ignored_state as *const ()),             // 0x220 depth bounds
@@ -1404,6 +1553,287 @@ static NEWER_LIST_FUNCTIONS: Table<160> = Table(list_table(true));
 mod tests {
     use super::*;
     use crate::object::slot;
+
+    #[test]
+    fn discard_resource_slot_is_stable() {
+        assert_eq!(LIST_FUNCTIONS.0[55], discard_resource as *const ());
+        assert_eq!(NEWER_LIST_FUNCTIONS.0[55], discard_resource as *const ());
+    }
+
+    #[test]
+    fn discard_region_validation() {
+        let rect = Rect {
+            left: 1,
+            top: 1,
+            right: 4,
+            bottom: 4,
+        };
+        let valid = DiscardRegion {
+            num_rects: 1,
+            rects: &rect,
+            first_subresource: 1,
+            num_subresources: 1,
+        };
+        let whole_subresource = DiscardRegion {
+            num_rects: 0,
+            rects: std::ptr::null(),
+            ..valid
+        };
+        let check = |region: Option<&DiscardRegion>, dimension, mips, slices, planes| {
+            // SAFETY: each non-null rectangle pointer names one live rectangle.
+            unsafe { valid_discard_region(region, dimension, mips, slices, planes, [8, 8]) }
+        };
+        assert!(check(None, 3, 2, 3, 1));
+        assert!(check(Some(&valid), 3, 2, 3, 1));
+        assert!(!check(Some(&valid), 2, 2, 3, 1)); // 1D subresources
+        assert!(!check(Some(&valid), 4, 2, 3, 1)); // 3D subresources
+        assert!(check(Some(&whole_subresource), 4, 2, 3, 1));
+        assert!(check(Some(&whole_subresource), 3, 1, 1, 2)); // stencil plane
+        assert!(!check(Some(&whole_subresource), 3, 1, 1, 1));
+
+        for (first, count) in [(5, 2), (6, 1), (u32::MAX, 2), (1, u32::MAX), (1, 0)] {
+            let bad_range = DiscardRegion {
+                first_subresource: first,
+                num_subresources: count,
+                ..whole_subresource
+            };
+            assert!(!check(Some(&bad_range), 3, 2, 3, 1));
+        }
+        let last_slice = DiscardRegion {
+            first_subresource: 5,
+            ..whole_subresource
+        };
+        assert!(check(Some(&last_slice), 3, 2, 3, 1));
+        assert!(!check(Some(&last_slice), 4, 2, 3, 1)); // depth is not an array size
+
+        let null_rects = DiscardRegion {
+            rects: std::ptr::null(),
+            ..valid
+        };
+        assert!(!check(Some(&null_rects), 3, 2, 3, 1));
+        let different_mips = DiscardRegion {
+            num_subresources: 2,
+            ..valid
+        };
+        assert!(!check(Some(&different_mips), 3, 2, 3, 1));
+        assert!(check(Some(&different_mips), 3, 1, 3, 1));
+        for right in [0, 1, 5] {
+            let rect = Rect { right, ..rect };
+            let bad_rect = DiscardRegion {
+                rects: &rect,
+                ..valid
+            };
+            assert!(!check(Some(&bad_rect), 3, 2, 3, 1));
+        }
+    }
+
+    #[test]
+    fn discard_requires_matching_state_and_flags() {
+        for (state, flag) in [(0x4, 1), (0x10, 2), (0x8, 4)] {
+            assert!(discard_state_allowed(state, flag));
+            assert!(discard_state_allowed(state, flag | 0x20)); // simultaneous access
+            assert!(!discard_state_allowed(state, 0x7 ^ flag));
+            assert!(!discard_state_allowed(state | 0x80, flag));
+        }
+        for state in [0, 0x400, 0x80] {
+            assert!(!discard_state_allowed(state, 0x7));
+        }
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn discard_resource_executes_on_guest_queue() {
+        use windows::Win32::Graphics::Direct3D12::*;
+        use windows::Win32::Graphics::Dxgi::Common::*;
+        use windows::Win32::Graphics::Dxgi::{
+            CreateDXGIFactory2, DXGI_CREATE_FACTORY_FLAGS, IDXGIAdapter1, IDXGIFactory4,
+        };
+
+        let Some(host) = crate::host::host() else {
+            eprintln!("skipped live discard: no host D3D12 device");
+            return;
+        };
+        // SAFETY: plain DXGI queries for the device the guest queue uses.
+        unsafe {
+            let factory: IDXGIFactory4 = CreateDXGIFactory2(DXGI_CREATE_FACTORY_FLAGS(0)).unwrap();
+            let adapter: IDXGIAdapter1 = factory
+                .EnumAdapterByLuid(host.device.GetAdapterLuid())
+                .unwrap();
+            let desc = adapter.GetDesc1().unwrap();
+            let name = String::from_utf16_lossy(&desc.Description);
+            eprintln!("live discard adapter: {}", name.trim_end_matches('\0'));
+        }
+
+        let null = std::ptr::null();
+        let heap = D3D12_HEAP_PROPERTIES {
+            Type: D3D12_HEAP_TYPE_DEFAULT,
+            ..Default::default()
+        };
+        let resource_iid = guid(
+            0x696442be,
+            0xa72e,
+            0x4059,
+            [0xbc, 0x79, 0x5b, 0x5c, 0x98, 0x04, 0x0f, 0xad],
+        );
+        let make_resource = |desc: D3D12_RESOURCE_DESC| {
+            let mut resource = null;
+            assert_eq!(
+                crate::resource::create_committed(
+                    null,
+                    (&raw const heap).cast(),
+                    0,
+                    (&raw const desc).cast(),
+                    0,
+                    null.cast(),
+                    &resource_iid,
+                    &mut resource,
+                ),
+                S_OK
+            );
+            resource
+        };
+        let make_texture = |format, flags| {
+            let resource = make_resource(D3D12_RESOURCE_DESC {
+                Dimension: D3D12_RESOURCE_DIMENSION_TEXTURE2D,
+                Width: 8,
+                Height: 8,
+                DepthOrArraySize: 1,
+                MipLevels: 1,
+                Format: format,
+                SampleDesc: DXGI_SAMPLE_DESC {
+                    Count: 1,
+                    Quality: 0,
+                },
+                Flags: flags,
+                ..Default::default()
+            });
+            assert!(
+                crate::resource::host_resource(resource).is_some(),
+                "missing host texture for {format:?}"
+            );
+            resource
+        };
+        let rt = make_texture(
+            DXGI_FORMAT_R8G8B8A8_UNORM,
+            D3D12_RESOURCE_FLAG_ALLOW_RENDER_TARGET,
+        );
+        let ds = make_texture(
+            DXGI_FORMAT_D24_UNORM_S8_UINT,
+            D3D12_RESOURCE_FLAG_ALLOW_DEPTH_STENCIL,
+        );
+        let uav = make_texture(
+            DXGI_FORMAT_R32_UINT,
+            D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS,
+        );
+        let srv = make_texture(DXGI_FORMAT_R8G8B8A8_UNORM, D3D12_RESOURCE_FLAG_NONE);
+        let buffer = make_resource(D3D12_RESOURCE_DESC {
+            Dimension: D3D12_RESOURCE_DIMENSION_BUFFER,
+            Width: 256,
+            Height: 1,
+            DepthOrArraySize: 1,
+            MipLevels: 1,
+            SampleDesc: DXGI_SAMPLE_DESC {
+                Count: 1,
+                Quality: 0,
+            },
+            Layout: D3D12_TEXTURE_LAYOUT_ROW_MAJOR,
+            ..Default::default()
+        });
+        assert!(crate::resource::buffer_bytes(buffer).is_some());
+
+        let (mut queue, mut allocator, mut list) = (null, null, null);
+        let queue_iid = guid(
+            0x0ec870a6,
+            0x5d7e,
+            0x4c22,
+            [0x8c, 0xfc, 0x5b, 0xaa, 0xe0, 0x76, 0x16, 0xed],
+        );
+        let queue_desc = [0_u32; 4];
+        assert_eq!(
+            crate::queue::create(null, queue_desc.as_ptr().cast(), &queue_iid, &mut queue),
+            S_OK
+        );
+        assert_eq!(
+            create_allocator(null, 0, &ALLOCATOR_IIDS[0], &mut allocator),
+            S_OK
+        );
+        assert_eq!(
+            create_list(null, 0, 0, allocator, null, &LIST_IIDS[1], &mut list),
+            S_OK
+        );
+        let host_list = host_list(list).unwrap();
+        let discard = slot::<extern "system" fn(This, This, *const DiscardRegion)>(list, 0x1b8);
+        discard(list, null, null.cast());
+        discard(list, buffer, null.cast());
+        ensure_state(
+            host_list,
+            srv,
+            D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE.0 as u32,
+        );
+        discard(list, srv, null.cast());
+        discard(list, rt, null.cast()); // no state established by this list yet
+
+        ensure_state(host_list, rt, D3D12_RESOURCE_STATE_RENDER_TARGET.0 as u32);
+        discard(list, rt, null.cast());
+        let rect = Rect {
+            left: 1,
+            top: 2,
+            right: 5,
+            bottom: 6,
+        };
+        discard(
+            list,
+            rt,
+            &DiscardRegion {
+                num_rects: 1,
+                rects: &rect,
+                first_subresource: 0,
+                num_subresources: 1,
+            },
+        );
+        let mut descriptor = [0_u64; 14];
+        let handle = descriptor.as_mut_ptr() as u64;
+        crate::descriptor::create_rtv(null, rt, std::ptr::null(), handle);
+        let clear =
+            slot::<extern "system" fn(This, u64, *const [f32; 4], u32, *const Rect)>(list, 0x1a0);
+        clear(list, handle, &[0.25, 0.5, 0.75, 1.0], 0, std::ptr::null());
+
+        ensure_state(host_list, ds, D3D12_RESOURCE_STATE_DEPTH_WRITE.0 as u32);
+        for first_subresource in [0, 1] {
+            discard(
+                list,
+                ds,
+                &DiscardRegion {
+                    num_rects: 0,
+                    rects: std::ptr::null(),
+                    first_subresource,
+                    num_subresources: 1,
+                },
+            );
+        }
+        ensure_state(
+            host_list,
+            uav,
+            D3D12_RESOURCE_STATE_UNORDERED_ACCESS.0 as u32,
+        );
+        discard(list, uav, null.cast());
+
+        assert_eq!(
+            slot::<extern "system" fn(This) -> HRESULT>(list, 0x48)(list),
+            S_OK
+        );
+        assert_eq!(host.log_messages(), None);
+        slot::<extern "system" fn(This, u32, *const This)>(queue, 0x50)(queue, 1, &list);
+        // SAFETY: the guest queue waits for submission and the device is live.
+        unsafe { host.device.GetDeviceRemovedReason().unwrap() };
+
+        for object in [list, allocator, queue, rt, ds, uav, srv, buffer] {
+            assert_eq!(
+                slot::<extern "system" fn(This) -> u32>(object, 0x10)(object),
+                0
+            );
+        }
+    }
 
     #[test]
     fn every_inline_command_falls_back_to_the_table() {
