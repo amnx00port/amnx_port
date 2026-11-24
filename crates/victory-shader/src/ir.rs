@@ -101,10 +101,16 @@ pub struct Inst {
     pub reads: Vec<(Reg, Value)>,
     /// Every register dword written, with the value it receives.
     pub writes: Vec<(Reg, Value)>,
+    #[cfg(test)]
+    pub(crate) name_override: Option<&'static str>,
 }
 
 impl Inst {
     pub fn name(&self) -> &'static str {
+        #[cfg(test)]
+        if let Some(name) = self.name_override {
+            return name;
+        }
         self.machine.name().unwrap_or("")
     }
 
@@ -192,6 +198,8 @@ pub fn build(code: &[u8], wave64: bool, vgprs: u16) -> Result<Program, ShaderErr
                 fields,
                 reads: unset(reads),
                 writes: unset(writes),
+                #[cfg(test)]
+                name_override: None,
             });
         }
     }
