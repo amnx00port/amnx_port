@@ -13,7 +13,7 @@
 use std::collections::{HashMap, VecDeque};
 use std::ffi::c_void;
 use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
-use std::sync::{Arc, Condvar, LazyLock, Mutex, MutexGuard};
+use std::sync::{Arc, Condvar, LazyLock, Mutex, MutexGuard, Weak};
 use std::time::Duration;
 
 use super::xgameruntime::{Guid, HRESULT, Interface, Methods, Object, S_OK, add_ref, missing};
@@ -192,10 +192,56 @@ impl Pool {
 
 /// A queue handle is `Arc::into_raw` of this; duplicating and closing a
 /// handle add and drop a reference.
+struct Waiter {
+    token: u64,
+    #[cfg(windows)]
+    stop_event: usize,
+    #[cfg(windows)]
+    thread: Option<std::thread::JoinHandle<()>>,
+}
+
+impl Waiter {
+    #[allow(unused_mut)]
+    fn stop(mut self) {
+        #[cfg(windows)]
+        {
+            use windows_sys::Win32::Foundation::{CloseHandle, HANDLE};
+            use windows_sys::Win32::System::Threading::SetEvent;
+            let stop = self.stop_event as HANDLE;
+            if !stop.is_null() {
+                // SAFETY: manual-reset stop event owned by this `Waiter`.
+                unsafe { SetEvent(stop) };
+            }
+            if let Some(handle) = self.thread.take()
+                && handle.thread().id() != std::thread::current().id()
+            {
+                let _ = handle.join();
+            }
+            if !stop.is_null() {
+                // SAFETY: thread has exited or is self-detaching after seeing stop.
+                unsafe { CloseHandle(stop) };
+            }
+        }
+    }
+}
+
 pub struct Queue {
     ports: [Arc<Port>; 2],
     monitors: Mutex<Vec<(u64, usize, usize)>>,
+    waiters: Mutex<Vec<Waiter>>,
     terminated: AtomicBool,
+    terminate_lock: Mutex<bool>,
+    terminate_wake: Condvar,
+}
+
+impl Drop for Queue {
+    fn drop(&mut self) {
+        *self.terminate_lock.get_mut().unwrap_or_else(|e| e.into_inner()) = true;
+        self.terminate_wake.notify_all();
+        for waiter in self.waiters.get_mut().unwrap_or_else(|e| e.into_inner()).drain(..) {
+            waiter.stop();
+        }
+    }
 }
 
 impl Queue {
@@ -203,7 +249,10 @@ impl Queue {
         Arc::new(Queue {
             ports,
             monitors: Mutex::default(),
+            waiters: Mutex::default(),
             terminated: AtomicBool::new(false),
+            terminate_lock: Mutex::new(false),
+            terminate_wake: Condvar::new(),
         })
     }
 
@@ -219,8 +268,23 @@ impl Queue {
         } else {
             let queue = self.clone();
             std::thread::spawn(move || {
-                std::thread::sleep(Duration::from_millis(delay_ms.into()));
-                queue.deliver(port, task);
+                let guard = lock(&queue.terminate_lock);
+                let (guard, _) = queue
+                    .terminate_wake
+                    .wait_timeout_while(
+                        guard,
+                        Duration::from_millis(delay_ms.into()),
+                        |&mut terminated| !terminated,
+                    )
+                    .unwrap_or_else(|e| e.into_inner());
+                let canceled = *guard || queue.terminated.load(Ordering::Acquire);
+                drop(guard);
+                if canceled {
+                    // Terminating a queue cancels its delayed callbacks (#132).
+                    task.run(true);
+                } else {
+                    queue.deliver(port, task);
+                }
             });
         }
         S_OK
@@ -381,6 +445,12 @@ pub fn XTaskQueueTerminate(
         return E_INVALIDARG;
     };
     queue.terminated.store(true, Ordering::Release);
+    *lock(&queue.terminate_lock) = true;
+    queue.terminate_wake.notify_all();
+    let waiters: Vec<Waiter> = lock(&queue.waiters).drain(..).collect();
+    for waiter in waiters {
+        waiter.stop();
+    }
     for port in &queue.ports {
         let pending: Vec<Task> = lock(&port.tasks).drain(..).collect();
         // Dispatches waiting on this queue end: nothing more will come.
@@ -421,6 +491,118 @@ pub fn XTaskQueueRegisterMonitor(
 pub fn XTaskQueueUnregisterMonitor(handle: *const Queue, token: u64) {
     if let Some(queue) = queue(handle) {
         lock(&queue.monitors).retain(|m| m.0 != token);
+    }
+}
+
+/// Registers a callback to be submitted to `port` whenever `wait_handle`
+/// becomes signaled (#888).
+pub fn XTaskQueueRegisterWaiter(
+    handle: *const Queue,
+    port: u32,
+    wait_handle: *mut c_void,
+    context: *mut c_void,
+    callback: Option<Callback>,
+    token: *mut u64,
+) -> HRESULT {
+    let (Some(queue), Some(callback)) = (queue(handle), callback) else {
+        return E_INVALIDARG;
+    };
+    if port > COMPLETION || wait_handle.is_null() || token.is_null() {
+        return E_INVALIDARG;
+    }
+    if queue.terminated.load(Ordering::Acquire) {
+        return E_ABORT;
+    }
+    let id = NEXT_TOKEN.fetch_add(1, Ordering::Relaxed);
+    #[cfg(windows)]
+    {
+        use windows_sys::Win32::Foundation::{
+            CloseHandle, DUPLICATE_SAME_ACCESS, DuplicateHandle, HANDLE, WAIT_OBJECT_0,
+        };
+        use windows_sys::Win32::System::Threading::{
+            CreateEventW, GetCurrentProcess, WaitForMultipleObjects,
+        };
+        let mut dup: HANDLE = std::ptr::null_mut();
+        // SAFETY: duplicates the caller's waitable handle within this process.
+        let ok = unsafe {
+            let me = GetCurrentProcess();
+            DuplicateHandle(
+                me,
+                wait_handle,
+                me,
+                &mut dup,
+                0,
+                0,
+                DUPLICATE_SAME_ACCESS,
+            )
+        };
+        if ok == 0 || dup.is_null() {
+            return E_INVALIDARG;
+        }
+        // SAFETY: manual-reset unsignaled event.
+        let stop_event = unsafe { CreateEventW(std::ptr::null(), 1, 0, std::ptr::null()) };
+        if stop_event.is_null() {
+            // SAFETY: duplicated above.
+            unsafe { CloseHandle(dup) };
+            return E_INVALIDARG;
+        }
+        let dup_addr = dup as usize;
+        let stop_addr = stop_event as usize;
+        let ctx_addr = context as usize;
+        let weak: Weak<Queue> = Arc::downgrade(&queue);
+        let thread = std::thread::spawn(move || {
+            let handles = [stop_addr as HANDLE, dup_addr as HANDLE];
+            loop {
+                // SAFETY: both handles are live until the loop exits (and
+                // `stop_event` stays live until after this thread is joined).
+                let res = unsafe { WaitForMultipleObjects(2, handles.as_ptr(), 0, INFINITE) };
+                if res != WAIT_OBJECT_0 + 1 {
+                    break;
+                }
+                let Some(q) = weak.upgrade() else {
+                    break;
+                };
+                if q.terminated.load(Ordering::Acquire) {
+                    break;
+                }
+                let hr = q.submit(port, 0, Task::new(ctx_addr as *mut c_void, callback));
+                if hr < 0 {
+                    break;
+                }
+            }
+            // SAFETY: owned duplicate handle.
+            unsafe { CloseHandle(dup_addr as HANDLE) };
+        });
+        lock(&queue.waiters).push(Waiter {
+            token: id,
+            stop_event: stop_addr,
+            thread: Some(thread),
+        });
+    }
+    #[cfg(not(windows))]
+    {
+        let _ = (context, callback);
+        lock(&queue.waiters).push(Waiter { token: id });
+    }
+    // SAFETY: checked non-null.
+    unsafe { token.write(id) };
+    S_OK
+}
+
+/// Unregisters a previously registered waiter and stops its watcher (#888).
+pub fn XTaskQueueUnregisterWaiter(handle: *const Queue, token: u64) {
+    let Some(queue) = queue(handle) else {
+        return;
+    };
+    let removed = {
+        let mut waiters = lock(&queue.waiters);
+        waiters
+            .iter()
+            .position(|w| w.token == token)
+            .map(|i| waiters.swap_remove(i))
+    };
+    if let Some(waiter) = removed {
+        waiter.stop();
     }
 }
 
@@ -956,6 +1138,20 @@ extern "system" fn m_submit_delayed(
 ) -> HRESULT {
     XTaskQueueSubmitDelayedCallback(q, port, delay, context, callback)
 }
+extern "system" fn m_register_waiter(
+    _: This,
+    q: *const Queue,
+    port: u32,
+    wait_handle: *mut c_void,
+    context: *mut c_void,
+    callback: Option<Callback>,
+    token: *mut u64,
+) -> HRESULT {
+    XTaskQueueRegisterWaiter(q, port, wait_handle, context, callback, token)
+}
+extern "system" fn m_unregister_waiter(_: This, q: *const Queue, token: u64) {
+    XTaskQueueUnregisterWaiter(q, token)
+}
 extern "system" fn m_terminate(
     _: This,
     q: *const Queue,
@@ -1008,8 +1204,8 @@ static VTABLE: Methods<31> = Methods([
     m_close as *const (),              // 0x88
     m_submit as *const (),             // 0x90
     m_submit_delayed as *const (),     // 0x98
-    missing::<20> as *const (),        // 0xa0 register a wait handle
-    missing::<21> as *const (),        // 0xa8 unregister it
+    m_register_waiter as *const (),    // 0xa0 register a wait handle (#888)
+    m_unregister_waiter as *const (),  // 0xa8 unregister it (#888)
     m_terminate as *const (),          // 0xb0
     m_register_monitor as *const (),   // 0xb8
     m_unregister_monitor as *const (), // 0xc0
@@ -1331,6 +1527,82 @@ mod tests {
         assert_eq!(
             XTaskQueueSubmitDelayedCallback(q, WORK, 0, flag, Some(note)),
             E_ABORT
+        );
+        XTaskQueueCloseHandle(q);
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn waiter_fires_callback_when_event_signaled_and_stops_on_unregister() {
+        use windows_sys::Win32::Foundation::CloseHandle;
+        use windows_sys::Win32::System::Threading::{CreateEventW, SetEvent};
+
+        static HITS: AtomicU32 = AtomicU32::new(0);
+        extern "system" fn on_wait(_: *mut c_void, canceled: bool) {
+            if !canceled {
+                HITS.fetch_add(1, Ordering::SeqCst);
+            }
+        }
+        let mut q = std::ptr::null();
+        assert_eq!(XTaskQueueCreate(0, 0, &mut q), S_OK);
+        // SAFETY: auto-reset unsignaled event.
+        let ev = unsafe { CreateEventW(std::ptr::null(), 0, 0, std::ptr::null()) };
+        assert!(!ev.is_null());
+        let mut token = 0u64;
+        type Reg = extern "system" fn(
+            This,
+            *const Queue,
+            u32,
+            *mut c_void,
+            *mut c_void,
+            Option<Callback>,
+            *mut u64,
+        ) -> HRESULT;
+        type Unreg = extern "system" fn(This, *const Queue, u64);
+        assert_eq!(
+            slot::<Reg>(0xa0)(&OBJECT, q, WORK, ev, std::ptr::null_mut(), Some(on_wait), &mut token),
+            S_OK
+        );
+        assert_ne!(token, 0);
+        // SAFETY: valid event.
+        unsafe { SetEvent(ev) };
+        assert!(XTaskQueueDispatch(q, WORK, 2_000));
+        assert_eq!(HITS.load(Ordering::SeqCst), 1);
+        slot::<Unreg>(0xa8)(&OBJECT, q, token);
+        // SAFETY: valid event.
+        unsafe {
+            SetEvent(ev);
+            CloseHandle(ev);
+        }
+        assert!(!XTaskQueueDispatch(q, WORK, 25));
+        XTaskQueueCloseHandle(q);
+    }
+
+    #[test]
+    fn terminating_queue_cancels_delayed_callbacks() {
+        static CANCELED: AtomicUsize = AtomicUsize::new(0);
+        extern "system" fn on_delayed(_: *mut c_void, canceled: bool) {
+            if canceled {
+                CANCELED.fetch_add(1, Ordering::SeqCst);
+            }
+        }
+        let mut q = std::ptr::null();
+        assert_eq!(XTaskQueueCreate(0, 0, &mut q), S_OK);
+        assert_eq!(
+            XTaskQueueSubmitDelayedCallback(q, WORK, 30_000, std::ptr::null_mut(), Some(on_delayed)),
+            S_OK
+        );
+        assert_eq!(XTaskQueueTerminate(q, false, std::ptr::null_mut(), None), S_OK);
+        let start = std::time::Instant::now();
+        while CANCELED.load(Ordering::SeqCst) == 0
+            && start.elapsed() < Duration::from_secs(2)
+        {
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        assert_eq!(
+            CANCELED.load(Ordering::SeqCst),
+            1,
+            "delayed callback must be canceled promptly on terminate"
         );
         XTaskQueueCloseHandle(q);
     }

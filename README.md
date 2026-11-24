@@ -62,28 +62,49 @@ cargo test --workspace                   # needs no game data
 cargo run -p victory -- config           # check your paths
 ```
 
-Run the title:
+Run or package the title on Windows:
 
 ```powershell
+# One-click portable Windows package (builds release victory.exe + launcher helper + runs doctor):
+.\scripts\build-windows.ps1 -GameDir "D:\Path\To\Your\XboxTitle"
+
+# Or build and run directly:
 cargo build --release -p victory
+target\release\victory.exe doctor                              # check GPU / SM 6.6 / Mesh Shaders
+target\release\victory.exe                                     # interactive Windows launcher menu
 target\release\victory.exe run <game dir>\<the title's exe> --execute
 ```
 
-The window caption shows the framerate. Saves, settings and `crashes.log`
-are kept under the data folder (default `%LOCALAPPDATA%\victory\data`), derived
-data under the cache folder.
+You can double-click `victory.exe` to open the interactive PC readiness &
+title launcher menu (press `S` to save your game folder to `victory.toml` and
+`K` for the full controls guide), or drag-and-drop a title `.exe` directly onto
+`victory.exe` in Windows Explorer.
 
-Input: XInput pads. With none connected the keyboard is a pad while the
-title's window has focus:
+On multi-GPU / hybrid laptops, VIctory automatically prefers the high-performance
+discrete GPU (`DXGI_GPU_PREFERENCE_HIGH_PERFORMANCE`). You can override the GPU
+with `VICTORY_ADAPTER=<index or name substring>` (for example `VICTORY_ADAPTER=RTX`).
 
-| Keys | Pad |
-|------|-----|
+The window caption shows live FPS, frame time, and draw counts. Press **`F11`**
+or **`Alt+Enter`** in-game to toggle borderless fullscreen. Saves, settings and
+`crashes.log` are kept under the data folder (default `%LOCALAPPDATA%\victory\data`),
+derived data under the cache folder.
+
+Input: XInput pads (up to 4 controllers, with Windows.Gaming.Input 4-motor
+impulse trigger rumble). With no physical pad connected, Keyboard + Mouse acts
+as a virtual gamepad while the title's window has focus:
+
+| Keys / Mouse | Pad |
+|--------------|-----|
 | W A S D / I J K L | left / right stick |
+| Right Click + Mouse (or `F9` toggle) | mouse camera look (right stick) |
 | arrows | D-pad |
-| Enter, Backspace, X, Y | A, B, X, Y |
-| Q / E, Z / C | shoulders, triggers |
-| F / H | stick clicks |
+| Enter or Space / Backspace or Left Ctrl | A / B |
+| X or R / Y | X / Y |
+| Q / E | LB / RB |
+| Z or Right Click / C or Left Click | LT / RT |
+| F or Left Shift / H or Middle Click | L3 / R3 |
 | Esc, Tab | Menu, View |
+| F11 / Alt+Enter | borderless fullscreen |
 
 ## Commands
 
@@ -96,6 +117,8 @@ victory translate [paths...] [--validate] [--pipelines] [--list] [--jobs N]
 victory run <exe> [--execute] [--unimplemented trap|zero] [--strict]
             [--console series-x|series-s] [-- <title arguments>]
 victory config
+victory doctor
+victory                                    # interactive Windows launcher menu
 ```
 
 Logging: `VICTORY_LOG=victory_loader=trace,info` (a release build logs

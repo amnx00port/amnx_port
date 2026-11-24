@@ -156,16 +156,19 @@ pub(crate) fn texture_layout(desc: &ResourceDesc) -> Option<texture::Texture> {
         l if l & !0xff == 0x100 => Swizzle(l & 0xff),
         _ => return None,
     };
-    texture::Texture::new(&TextureDesc {
-        dimension,
-        width: u32::try_from(desc.width).ok()?,
-        height: desc.height,
-        depth_or_array: u32::from(desc.depth_or_array_size),
-        mips: u32::from(desc.mip_levels),
-        format: desc.format,
-        samples: desc.sample_count.max(1),
-        swizzle,
-    })
+    texture::Texture::with_metadata(
+        &TextureDesc {
+            dimension,
+            width: u32::try_from(desc.width).ok()?,
+            height: desc.height,
+            depth_or_array: u32::from(desc.depth_or_array_size),
+            mips: u32::from(desc.mip_levels),
+            format: desc.format,
+            samples: desc.sample_count.max(1),
+            swizzle,
+        },
+        texture::MetadataFlags::from_d3d12_flags(desc.flags),
+    )
     .ok()
 }
 
@@ -273,6 +276,47 @@ pub(crate) fn family(format: u32) -> u32 {
     }
 }
 
+/// Whether DXGI format `format` is typeless and therefore cannot be bound
+/// directly to an SRV or UAV on D3D12 without resolving a typed format (#876).
+pub(crate) fn is_typeless(format: u32) -> bool {
+    matches!(
+        format,
+        1 | 5 | 9 | 15 | 19 | 23 | 27 | 33 | 39 | 44 | 48 | 53 | 60 | 70 | 73 | 76 | 79 | 82 | 90 | 92 | 94 | 97
+    )
+}
+
+/// Default concrete DXGI format for viewing a typeless host texture as an SRV
+/// (`unordered = false`) or UAV (`unordered = true`). Never returns a typeless
+/// format or a DSV-only format (`20`, `40`, `45`, `55`), and rejects depth/BC
+/// formats for UAVs (#876, #882).
+pub(crate) fn resolve_typeless_view(typeless: u32, unordered: bool) -> Option<u32> {
+    match typeless {
+        1 => Some(2),                  // R32G32B32A32_FLOAT
+        5 => Some(6),                  // R32G32B32_FLOAT
+        9 => Some(10),                 // R16G16B16A16_FLOAT
+        15 => Some(16),                // R32G32_FLOAT
+        19 if !unordered => Some(21),  // R32_FLOAT_X8X24_TYPELESS
+        23 => Some(24),                // R10G10B10A2_UNORM
+        27 => Some(28),                // R8G8B8A8_UNORM
+        33 => Some(34),                // R16G16_FLOAT
+        39 => Some(41),                // R32_FLOAT
+        44 if !unordered => Some(46),  // R24_UNORM_X8_TYPELESS
+        48 => Some(49),                // R8G8_UNORM
+        53 => Some(56),                // R16_UNORM
+        60 => Some(61),                // R8_UNORM
+        70 if !unordered => Some(71),  // BC1_UNORM
+        73 if !unordered => Some(74),  // BC2_UNORM
+        76 if !unordered => Some(77),  // BC3_UNORM
+        79 if !unordered => Some(80),  // BC4_UNORM
+        82 if !unordered => Some(83),  // BC5_UNORM
+        90 => Some(87),                // B8G8R8A8_UNORM
+        92 if !unordered => Some(88),  // B8G8R8X8_UNORM
+        94 if !unordered => Some(95),  // BC6H_UF16
+        97 if !unordered => Some(98),  // BC7_UNORM
+        _ => None,
+    }
+}
+
 /// sRGB formats and their linear twins.
 pub(crate) const SRGB: [(u32, u32); 3] = [(29, 28), (91, 87), (93, 88)];
 
@@ -316,11 +360,11 @@ fn mip_count(desc: &ResourceDesc) -> u32 {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) struct PlacedFootprint {
     pub(crate) offset: u64,
-    format: u32,
-    width: u32,
-    height: u32,
-    depth: u32,
-    row_pitch: u32,
+    pub(crate) format: u32,
+    pub(crate) width: u32,
+    pub(crate) height: u32,
+    pub(crate) depth: u32,
+    pub(crate) row_pitch: u32,
 }
 
 impl PlacedFootprint {
@@ -457,14 +501,22 @@ pub(crate) extern "system" fn allocation_info(
     count: u32,
     descs: *const ResourceDesc,
 ) -> *mut AllocationInfo {
-    let descs = if descs.is_null() {
-        &[][..]
+    let info = if count > 0 && descs.is_null() {
+        AllocationInfo {
+            size: u64::MAX,
+            alignment: 0,
+        }
+    } else if count == 0 {
+        place(std::iter::empty(), |_, _| ())
     } else {
-        // SAFETY: the title passes `count` descriptions.
-        unsafe { std::slice::from_raw_parts(descs, count as usize) }
+        // SAFETY: `count > 0` and `descs` is non-null; the title passes `count` descriptions.
+        let descs = unsafe { std::slice::from_raw_parts(descs, count as usize) };
+        place(descs.iter(), |_, _| ())
     };
-    // SAFETY: the caller passes room for the value.
-    unsafe { out.write(place(descs.iter(), |_, _| ())) };
+    // SAFETY: the caller passes room for the value (null tolerated defensively).
+    if let Some(slot) = unsafe { out.as_mut() } {
+        *slot = info;
+    }
     out
 }
 
@@ -495,32 +547,44 @@ pub(crate) extern "system" fn allocation_info2(
     descs: *const ResourceDesc1,
     each: *mut AllocationInfo1,
 ) -> *mut AllocationInfo {
-    let descs = if descs.is_null() {
-        &[][..]
-    } else {
-        // SAFETY: the title passes `count` descriptions.
-        unsafe { std::slice::from_raw_parts(descs, count as usize) }
-    };
-    let total = place(descs.iter().map(|d| &d.desc), |i, info| {
-        if !each.is_null() {
-            // SAFETY: the title passes room for `count` entries.
-            unsafe { each.add(i).write(info) };
+    let total = if count > 0 && descs.is_null() {
+        AllocationInfo {
+            size: u64::MAX,
+            alignment: 0,
         }
-    });
-    // SAFETY: the caller passes room for the value.
-    unsafe { out.write(total) };
+    } else if count == 0 {
+        place(std::iter::empty(), |_, _| ())
+    } else {
+        // SAFETY: `count > 0` and `descs` is non-null; the title passes `count` descriptions.
+        let descs = unsafe { std::slice::from_raw_parts(descs, count as usize) };
+        place(descs.iter().map(|d| &d.desc), |i, info| {
+            if !each.is_null() {
+                // SAFETY: the title passes room for `count` entries.
+                unsafe { each.add(i).write(info) };
+            }
+        })
+    };
+    // SAFETY: the caller passes room for the value (null tolerated defensively).
+    if let Some(slot) = unsafe { out.as_mut() } {
+        *slot = total;
+    }
     out
 }
 
 /// Resources placed one after another: the whole footprint, telling `each`
-/// where every resource goes. Unknown sizes give the documented `u64::MAX`.
+/// where every resource goes. Unknown sizes or overflow give the documented
+/// `u64::MAX`.
 fn place<'a>(
     descs: impl Iterator<Item = &'a ResourceDesc>,
     mut each: impl FnMut(usize, AllocationInfo1),
 ) -> AllocationInfo {
     let mut total = AllocationInfo {
         size: 0,
-        alignment: KIB_64,
+        alignment: 1,
+    };
+    let invalid = AllocationInfo {
+        size: u64::MAX,
+        alignment: 0,
     };
     for (i, desc) in descs.enumerate() {
         let Some(one) = footprint(desc) else {
@@ -533,13 +597,31 @@ fn place<'a>(
                     size: u64::MAX,
                 },
             );
-            return AllocationInfo {
-                size: u64::MAX,
-                alignment: 0,
-            };
+            return invalid;
         };
         tracing::debug!(?desc, ?one, "allocation info");
-        let offset = total.size.next_multiple_of(one.alignment);
+        let Some(offset) = total.size.checked_next_multiple_of(one.alignment) else {
+            each(
+                i,
+                AllocationInfo1 {
+                    offset: u64::MAX,
+                    alignment: 0,
+                    size: u64::MAX,
+                },
+            );
+            return invalid;
+        };
+        let Some(next_size) = offset.checked_add(one.size) else {
+            each(
+                i,
+                AllocationInfo1 {
+                    offset: u64::MAX,
+                    alignment: 0,
+                    size: u64::MAX,
+                },
+            );
+            return invalid;
+        };
         each(
             i,
             AllocationInfo1 {
@@ -548,7 +630,7 @@ fn place<'a>(
                 size: one.size,
             },
         );
-        total.size = offset + one.size;
+        total.size = next_size;
         total.alignment = total.alignment.max(one.alignment);
     }
     total
@@ -763,6 +845,16 @@ pub(crate) struct HostTexture {
     pub(crate) state: std::sync::atomic::AtomicU32,
 }
 
+#[cfg(windows)]
+impl Drop for HostTexture {
+    fn drop(&mut self) {
+        // Keep the underlying D3D12 resource alive across subsequent frames
+        // so directly-indexed or indirect GPU commands referencing its heap
+        // descriptor cannot page-fault on a freed streaming texture.
+        crate::host::retire_resource(self.texture.clone());
+    }
+}
+
 /// Moves the host texture to `wanted` (a host texture state); the host
 /// resource and the state it leaves, if that is a change.
 #[cfg(windows)]
@@ -834,37 +926,98 @@ fn host_texture(
     if d.flags & UNORDERED != 0 && SRGB.iter().any(|&(srgb, _)| srgb == d.format) {
         d.format = family(d.format);
     }
+    const RENDER_TARGET: u32 = 1;
     // The clear value names the format too: format, then color or depth
     // and stencil (5 words).
-    let clear_value = (!clear.is_null()).then(|| {
+    let mut clear_value = (!clear.is_null()).then(|| {
         // SAFETY: the title passes a whole clear value.
         let mut value = unsafe { clear.cast::<[u32; 5]>().read_unaligned() };
         value[0] = pc_format(value[0]);
         value
     });
+    // Packed 16-bit BGRA formats (`B5G6R5_UNORM` 85, `B5G5R5A1_UNORM` 86,
+    // `B4G4R4A4_UNORM` 115) have no UAV support and often no RTV support on
+    // PC D3D12 (e.g. Bink video surfaces, #797). Widen UAV-flagged ones (or
+    // any RTV/UAV creation that the driver refuses) to `R8G8B8A8_UNORM` (28)
+    // so both RTV and UAV views work natively.
+    let packed_16 = matches!(d.format, 85 | 86 | 115);
+    if packed_16 && d.flags & UNORDERED != 0 {
+        d.format = 28;
+        if let Some(cv) = clear_value.as_mut() {
+            cv[0] = 28;
+        }
+    }
     let heap = D3D12_HEAP_PROPERTIES {
         Type: D3D12_HEAP_TYPE_DEFAULT,
         ..Default::default()
     };
-    let mut texture: Option<ID3D12Resource> = None;
-    // SAFETY: the description has the host layout (checked size, same
-    // fields); the out pointer is ours.
-    let made = unsafe {
-        host.device.CreateCommittedResource(
-            &heap,
-            D3D12_HEAP_FLAG_NONE,
-            (&raw const d).cast(),
-            D3D12_RESOURCE_STATES(
-                crate::host::legal_for(d.flags, crate::host::texture_state(state)) as i32,
-            ),
-            // The same layout: format, then color or depth and stencil.
-            clear_value.as_ref().map(|v| std::ptr::from_ref(v).cast()),
-            &mut texture,
-        )
+    let try_create = |desc: &ResourceDesc,
+                      cv: Option<&[u32; 5]>|
+     -> windows::core::Result<ID3D12Resource> {
+        let mut texture: Option<ID3D12Resource> = None;
+        // SAFETY: the description has the host layout (checked size, same
+        // fields); the out pointer is ours.
+        unsafe {
+            host.device.CreateCommittedResource(
+                &heap,
+                D3D12_HEAP_FLAG_NONE,
+                std::ptr::from_ref(desc).cast(),
+                D3D12_RESOURCE_STATES(
+                    crate::host::legal_for(desc.flags, crate::host::texture_state(state)) as i32,
+                ),
+                // The same layout: format, then color or depth and stencil.
+                cv.map(|v| std::ptr::from_ref(v).cast()),
+                &mut texture,
+            )?;
+        }
+        texture.ok_or_else(windows::core::Error::empty)
     };
-    if let Err(e) = made {
-        tracing::warn!(error = %e, desc = ?d, "no host texture");
-    }
+    let texture = match try_create(&d, clear_value.as_ref()) {
+        Ok(t) => Some(t),
+        Err(e) if packed_16 && d.flags & (RENDER_TARGET | UNORDERED) != 0 => {
+            d.format = 28;
+            if let Some(cv) = clear_value.as_mut() {
+                cv[0] = 28;
+            }
+            match try_create(&d, clear_value.as_ref()) {
+                Ok(t) => {
+                    tracing::debug!(
+                        error = %e,
+                        "packed 16-bit texture widened to R8G8B8A8_UNORM for RTV/UAV support"
+                    );
+                    Some(t)
+                }
+                Err(e2) => {
+                    tracing::warn!(error = %e2, desc = ?d, "no host texture");
+                    None
+                }
+            }
+        }
+        Err(e) if d.flags & UNORDERED != 0 => {
+            // Retry without `ALLOW_UNORDERED_ACCESS` for formats the host
+            // driver refuses as UAVs (such as block-compressed formats) so
+            // SRV/RTV use still gets a host texture.
+            d.flags &= !UNORDERED;
+            match try_create(&d, clear_value.as_ref()) {
+                Ok(t) => {
+                    tracing::debug!(
+                        error = %e,
+                        format = d.format,
+                        "host texture created without ALLOW_UNORDERED_ACCESS"
+                    );
+                    Some(t)
+                }
+                Err(e2) => {
+                    tracing::warn!(error = %e2, desc = ?d, "no host texture");
+                    None
+                }
+            }
+        }
+        Err(e) => {
+            tracing::warn!(error = %e, desc = ?d, "no host texture");
+            None
+        }
+    };
     if let Some(t) = &texture {
         crate::host::name(t, || {
             format!("texture {}x{} f{} flags {:#x}", d.width, d.height, d.format, d.flags)
@@ -1148,17 +1301,34 @@ static PLACED_TEXTURES: std::sync::Mutex<std::collections::BTreeMap<(u64, [u32; 
     std::sync::Mutex::new(std::collections::BTreeMap::new());
 
 /// The resource for a texture placed at `address` with the resource
-/// description `desc` (as words), made on first use.
+/// description `desc` (as words), made on first use. When `unordered` is true,
+/// ensures the host texture carries `ALLOW_UNORDERED_ACCESS` and marks it
+/// host-written so UAV outputs are not overwritten by stale CPU staging (#921).
 #[cfg(windows)]
-pub(crate) fn texture_at(address: u64, desc: &[u32; 14]) -> Option<This> {
+pub(crate) fn texture_at(address: u64, desc: &[u32; 14], unordered: bool) -> Option<This> {
+    const ALLOW_UAV: u32 = 0x4;
     let mut map = PLACED_TEXTURES.lock().unwrap_or_else(|e| e.into_inner());
     if let Some(&r) = map.get(&(address, *desc)) {
-        return Some(r as This);
+        let this = r as This;
+        if !unordered {
+            return Some(this);
+        }
+        if let Some(t) = host_resource(this) {
+            // SAFETY: a live host texture.
+            let flags = unsafe { t.GetDesc() }.Flags.0 as u32;
+            if flags & ALLOW_UAV != 0 {
+                crate::texture::host_written(this);
+                return Some(this);
+            }
+        }
     }
     // SAFETY: 56 bytes in the description's layout.
-    let d = unsafe { desc.as_ptr().cast::<ResourceDesc>().read_unaligned() };
+    let mut d = unsafe { desc.as_ptr().cast::<ResourceDesc>().read_unaligned() };
     if d.dimension == BUFFER {
         return None;
+    }
+    if unordered {
+        d.flags |= ALLOW_UAV;
     }
     let mut out = std::ptr::null();
     let made = create_at_address(
@@ -1173,8 +1343,12 @@ pub(crate) fn texture_at(address: u64, desc: &[u32; 14]) -> Option<This> {
     if made != S_OK {
         return None;
     }
+    resource(out).host.as_ref()?;
+    if unordered {
+        crate::texture::host_written(out);
+    }
     map.insert((address, *desc), out as usize);
-    resource(out).host.is_some().then_some(out)
+    Some(out)
 }
 
 pub(crate) extern "system" fn create_placed(
@@ -1840,5 +2014,78 @@ mod tests {
         // The resource keeps the heap alive.
         assert_eq!(slot::<Release>(heap, 0x10)(heap), 1);
         assert_eq!(slot::<Release>(placed, 0x10)(placed), 0);
+    }
+
+    #[test]
+    fn allocation_info_handles_null_empty_alignment_and_overflow() {
+        let mut info = AllocationInfo {
+            size: 123,
+            alignment: 456,
+        };
+        // Non-zero count with null pointer returns documented invalid sentinel (#782).
+        allocation_info(&mut info, std::ptr::null(), 0, 1, std::ptr::null());
+        assert_eq!(
+            info,
+            AllocationInfo {
+                size: u64::MAX,
+                alignment: 0
+            }
+        );
+        // Zero count returns size 0, alignment 1.
+        allocation_info(&mut info, std::ptr::null(), 0, 0, std::ptr::null());
+        assert_eq!(
+            info,
+            AllocationInfo {
+                size: 0,
+                alignment: 1
+            }
+        );
+        // Two individually valid buffers whose sum overflows u64 return the invalid sentinel.
+        let half = (u64::MAX / 2) & !(KIB_64 - 1);
+        let huge = [buffer(half), buffer(half + 2 * KIB_64)];
+        allocation_info(&mut info, std::ptr::null(), 0, 2, huge.as_ptr());
+        assert_eq!(
+            info,
+            AllocationInfo {
+                size: u64::MAX,
+                alignment: 0
+            }
+        );
+        // `allocation_info2` handles null+nonzero the same way.
+        allocation_info2(
+            &mut info,
+            std::ptr::null(),
+            0,
+            2,
+            std::ptr::null(),
+            std::ptr::null_mut(),
+        );
+        assert_eq!(
+            info,
+            AllocationInfo {
+                size: u64::MAX,
+                alignment: 0
+            }
+        );
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn packed_16bit_rtv_uav_textures_widen_to_rgba8_on_host() {
+        if crate::host::host().is_none() {
+            return;
+        }
+        // Format 86 (B5G5R5A1_UNORM) with RTV|UAV (5) and format 115 (B4G4R4A4_UNORM) with RTV (1).
+        let mut d86 = texture(64, 64, 86, 1);
+        d86.flags = 5;
+        let t86 = host_texture(&d86, 0, std::ptr::null()).expect("format 86 RTV|UAV widened");
+        // SAFETY: live texture.
+        assert_eq!(unsafe { t86.GetDesc() }.Format.0, 28);
+
+        let mut d115 = texture(64, 64, 115, 1);
+        d115.flags = 1;
+        let t115 = host_texture(&d115, 0, std::ptr::null()).expect("format 115 RTV created");
+        // SAFETY: live texture.
+        assert!(matches!(unsafe { t115.GetDesc() }.Format.0, 28 | 115));
     }
 }

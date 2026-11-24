@@ -63,8 +63,9 @@ pub extern "system" fn GetModuleFileNameA(module: *mut c_void, out: *mut u8, siz
     let Some(path) = title_path(module) else {
         return host::get_module_file_name_a(module, out, size);
     };
+    let ansi = host::encode_ansi(&path);
     // SAFETY: the title passes a buffer of `size` bytes.
-    copy_truncated(path.as_bytes(), unsafe {
+    copy_truncated(&ansi, unsafe {
         std::slice::from_raw_parts_mut(out, size as usize)
     })
 }
@@ -397,6 +398,7 @@ mod host {
     use std::ffi::c_void;
 
     use windows_sys::Win32::Foundation::{FreeLibrary, SetLastError};
+    use windows_sys::Win32::Globalization::{CP_ACP, WideCharToMultiByte};
     use windows_sys::Win32::System::Diagnostics::Debug::RtlCaptureStackBackTrace;
     use windows_sys::Win32::System::LibraryLoader::{
         DisableThreadLibraryCalls, GetModuleFileNameA, GetModuleFileNameW, GetModuleHandleA,
@@ -432,6 +434,53 @@ mod host {
     pub(super) fn get_module_file_name_a(module: *mut c_void, out: *mut u8, size: u32) -> u32 {
         // SAFETY: see above.
         unsafe { GetModuleFileNameA(module, out, size) }
+    }
+
+    /// Encodes a Rust string using the host ANSI code page (`CP_ACP`),
+    /// matching Windows `*A` APIs like `GetModuleFileNameA`.
+    pub(super) fn encode_ansi(text: &str) -> Vec<u8> {
+        let wide: Vec<u16> = text.encode_utf16().collect();
+        let Ok(len) = i32::try_from(wide.len()) else {
+            return text.as_bytes().to_vec();
+        };
+        if len == 0 {
+            return Vec::new();
+        }
+        // SAFETY: `wide` has `len` valid UTF-16 code units; querying size first.
+        let need = unsafe {
+            WideCharToMultiByte(
+                CP_ACP,
+                0,
+                wide.as_ptr(),
+                len,
+                std::ptr::null_mut(),
+                0,
+                std::ptr::null(),
+                std::ptr::null_mut(),
+            )
+        };
+        if need <= 0 {
+            return text.as_bytes().to_vec();
+        }
+        let mut out = vec![0u8; need as usize];
+        // SAFETY: `out` has `need` writable bytes matching the query above.
+        let wrote = unsafe {
+            WideCharToMultiByte(
+                CP_ACP,
+                0,
+                wide.as_ptr(),
+                len,
+                out.as_mut_ptr(),
+                need,
+                std::ptr::null(),
+                std::ptr::null_mut(),
+            )
+        };
+        if wrote <= 0 {
+            return text.as_bytes().to_vec();
+        }
+        out.truncate(wrote as usize);
+        out
     }
 
     pub(super) fn set_last_error(code: u32) {
@@ -549,6 +598,10 @@ mod host {
 
     pub(super) fn get_module_file_name_a(_: *mut c_void, _: *mut u8, _: u32) -> u32 {
         0
+    }
+
+    pub(super) fn encode_ansi(text: &str) -> Vec<u8> {
+        text.as_bytes().to_vec()
     }
 
     pub(super) fn set_last_error(_: u32) {}

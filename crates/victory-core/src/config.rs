@@ -47,9 +47,20 @@ impl Config {
     /// Loads configuration from the environment and the config file.
     pub fn load() -> Result<Self> {
         let explicit = std::env::var_os("VICTORY_CONFIG").map(PathBuf::from);
-        let path = explicit
-            .clone()
-            .unwrap_or_else(|| PathBuf::from("victory.toml"));
+        let path = explicit.clone().unwrap_or_else(|| {
+            let cwd = PathBuf::from("victory.toml");
+            if cwd.is_file() {
+                cwd
+            } else if let Some(next_to_exe) = std::env::current_exe()
+                .ok()
+                .and_then(|p| p.parent().map(|d| d.join("victory.toml")))
+                && next_to_exe.is_file()
+            {
+                next_to_exe
+            } else {
+                cwd
+            }
+        });
         let file = if path.is_file() {
             let text = std::fs::read_to_string(&path)
                 .with_context(|| format!("reading {}", path.display()))?;

@@ -96,6 +96,10 @@ extern "system" fn close(_: This, _: Handle) {}
 extern "system" fn compare(_: This, a: Handle, b: Handle) -> i32 {
     i32::from(a != b)
 }
+/// One local offline user.
+extern "system" fn get_max_users(_: This, out: *mut u32) -> HRESULT {
+    put(out, 1)
+}
 
 /// The async provider for adding a user: done at once, the result is a
 /// handle.
@@ -267,7 +271,7 @@ extern "system" fn find_for_device(_: This, _device: *const c_void, _: *mut Hand
     USER_NOT_FOUND
 }
 
-// Unset slots (no title seen calls them): maximum users, gamer pictures,
+// Unset slots (no title seen calls them): gamer pictures,
 // the UTF-16 token calls, issue resolution.
 static VTABLE: Methods<35> = Methods([
     missing::<0> as *const (),             // 0x00 QueryInterface
@@ -276,7 +280,7 @@ static VTABLE: Methods<35> = Methods([
     duplicate as *const (),                // 0x18
     close as *const (),                    // 0x20
     compare as *const (),                  // 0x28
-    missing::<6> as *const (),             // 0x30 maximum users
+    get_max_users as *const (),            // 0x30 maximum users
     add_async as *const (),                // 0x38
     add_result as *const (),               // 0x40
     get_local_id as *const (),             // 0x48
@@ -421,5 +425,11 @@ mod tests {
             xasync::XAsyncGetStatus(&mut block, true),
             FAILED_TO_GET_TOKEN
         );
+
+        type GetMaxUsers = extern "system" fn(This, *mut u32) -> HRESULT;
+        let get_max = slot::<GetMaxUsers>(&OBJECT, 0x30);
+        let mut max_users = 0u32;
+        assert_eq!(get_max(this, &mut max_users), S_OK);
+        assert_eq!(max_users, 1);
     }
 }

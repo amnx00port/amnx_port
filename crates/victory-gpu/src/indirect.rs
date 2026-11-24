@@ -16,12 +16,15 @@
 //! dispatches, the budget) cut legitimate work beyond them; raise them if
 //! the title needs more.
 
+use std::sync::Arc;
+
 use windows::Win32::Graphics::Direct3D::Fxc::D3DCompile;
 use windows::Win32::Graphics::Direct3D::ID3DBlob;
 use windows::Win32::Graphics::Direct3D12::*;
 use windows::core::s;
 
-use crate::host::{HostList, host, transition};
+use crate::host::{HostList, host};
+use crate::shadow::Shadow;
 
 const SOURCE: &str = r#"
 #define RS "RootConstants(num32BitConstants=4, b0), UAV(u0), UAV(u1)"
@@ -60,9 +63,23 @@ void main(uint3 id : SV_DispatchThreadID) {
         cost = g.x * g.y * g.z * 128;
         args.Store3(at, g);
     }
-    uint before;
-    budget.InterlockedAdd(0, cost, before);
-    if (before >= BUDGET || before + cost > BUDGET) {
+    bool allowed = (cost == 0);
+    if (!allowed) {
+        uint cur = budget.Load(0);
+        [loop] while (true) {
+            if (cur >= BUDGET || cost > BUDGET - cur) {
+                break;
+            }
+            uint prev;
+            budget.InterlockedCompareExchange(0, cur, cur + cost, prev);
+            if (prev == cur) {
+                allowed = true;
+                break;
+            }
+            cur = prev;
+        }
+    }
+    if (!allowed) {
         // Draws keep their layout with no vertices; groups become zero.
         args.Store(at, 0);
     }
@@ -141,12 +158,13 @@ fn make() -> windows::core::Result<Clamp> {
 
 /// Records, in `list`, the clamp of `records` records of `kind` (PC
 /// argument numbering) `stride` bytes apart at host address `gpu` in
-/// `buffer`, and leaves the buffer ready to be read as arguments. Replaces
-/// the list's compute root signature and pipeline (callers bind theirs
-/// after). False if the clamp is not available.
+/// `args`, and leaves the buffer in `GENERIC_READ` ready to be read as
+/// indirect arguments (or vertex/index/shader data). Replaces the list's
+/// compute root signature and pipeline (callers bind theirs after). False
+/// if the clamp is not available.
 pub(crate) fn bound(
     list: &HostList,
-    buffer: &ID3D12Resource,
+    args: &Arc<Shadow>,
     gpu: u64,
     (kind, stride, records): (u32, u32, u32),
 ) -> bool {
@@ -156,6 +174,7 @@ pub(crate) fn bound(
     if !gpu.is_multiple_of(4) || !stride.is_multiple_of(4) {
         return false;
     }
+    list.ensure_buffer(args, D3D12_RESOURCE_STATE_UNORDERED_ACCESS.0 as u32);
     let l = &list.list;
     let constants = [kind, stride, records, 0];
     // SAFETY: an open list; our root signature, pipeline and a live buffer
@@ -169,29 +188,10 @@ pub(crate) fn bound(
         l.SetComputeRootUnorderedAccessView(1, gpu);
         l.SetComputeRootUnorderedAccessView(2, budget);
         l.Dispatch(records.div_ceil(64), 1, 1);
-        l.ResourceBarrier(&[
-            uav_barrier(),
-            transition(
-                buffer,
-                D3D12_RESOURCE_STATE_UNORDERED_ACCESS,
-                D3D12_RESOURCE_STATE_INDIRECT_ARGUMENT,
-            ),
-        ]);
+        l.ResourceBarrier(&[uav_barrier()]);
     }
+    list.ensure_buffer(args, D3D12_RESOURCE_STATE_GENERIC_READ.0 as u32);
     true
-}
-
-/// After the execution: the buffer back to unordered access, where the
-/// title's passes keep using it.
-pub(crate) fn done(list: &HostList, buffer: &ID3D12Resource) {
-    // SAFETY: an open list and a live buffer.
-    unsafe {
-        list.list.ResourceBarrier(&[transition(
-            buffer,
-            D3D12_RESOURCE_STATE_INDIRECT_ARGUMENT,
-            D3D12_RESOURCE_STATE_UNORDERED_ACCESS,
-        )])
-    };
 }
 
 fn uav_barrier() -> D3D12_RESOURCE_BARRIER {
@@ -213,5 +213,39 @@ mod tests {
             return; // no host GPU here
         }
         assert!(super::clamp().is_some());
+    }
+
+    /// Massive rejected indirect records must saturate the frame budget rather
+    /// than wrapping the 32-bit atomic counter and letting later records pass.
+    #[test]
+    fn budget_saturation_never_wraps_on_massive_rejected_records() {
+        let Some(host) = super::host() else {
+            return;
+        };
+        const RECORDS: usize = 256;
+        // Each record asks for 2^24 vertices * 4 instances = 2^26 vertex
+        // instances (half the 2^27 budget): 256 records total 2^34, wrapping
+        // u32 four times under naive InterlockedAdd, whereas saturating CAS
+        // admits exactly 2 records and zeroes the remaining 254.
+        let mut buf: Vec<[u32; 4]> = vec![[1 << 24, 4, 0, 0]; RECORDS];
+        let addr = buf.as_mut_ptr() as u64;
+        let byte_len = std::mem::size_of_val(buf.as_slice()) as u64;
+        let token = addr as usize;
+        crate::shadow::register(token, addr, byte_len);
+        let shadow = crate::shadow::find(addr, byte_len).expect("shadow buffer");
+        let list = host.new_list().expect("host list");
+        shadow.refresh(&list, addr, byte_len);
+        shadow.gpu_writes(&list, addr, byte_len);
+        let gpu = shadow.gpu(addr);
+        assert!(super::bound(&list, &shadow, gpu, (0, 16, RECORDS as u32)));
+        list.close();
+        host.execute(&[&list]);
+        crate::shadow::unregister(token, addr);
+
+        let survived = buf.iter().filter(|r| r[0] != 0).count();
+        assert_eq!(
+            survived, 2,
+            "saturating budget (2^27) must admit exactly two 2^26-vertex draws and reject the rest"
+        );
     }
 }

@@ -132,13 +132,19 @@ extern "system" fn execute(_: This, count: u32, lists: *const This) {
     }
 }
 
-/// The start of a present plane: frame token, then the plane's resources.
+/// `D3D12XBOX_PRESENT_PLANE_PARAMETERS` (0x48 bytes per plane in the Xbox
+/// GDK `PresentX` plane array, #211).
 #[repr(C)]
 pub(crate) struct Plane {
     token: u64,
     count: u32,
+    _pad0: u32,
     resources: *const This,
+    color_space: u32,
+    options: u32,
+    _tail: [u8; 0x28],
 }
+const _: () = assert!(size_of::<Plane>() == 0x48);
 /// Submission tagged with the frame it belongs to `(count, lists, frame
 /// token, flags)`; frames are paced elsewhere, so it runs as a plain one.
 extern "system" fn execute_x(this: This, count: u32, lists: *const This, _token: u64, _flags: u32) {
@@ -167,13 +173,20 @@ extern "system" fn signal(_: This, fence: This, value: u64) -> HRESULT {
 extern "system" fn wait(_: This, fence: This, _value: u64) -> HRESULT {
     if fence.is_null() { E_INVALIDARG } else { S_OK }
 }
-/// Ticks per second of GPU timestamps (see [`Written::GpuTimestamp`]).
+/// Ticks per second of GPU timestamps (real host queue frequency when running
+/// on host D3D12, falling back to [`TIMESTAMP_FREQUENCY`] when headless).
 extern "system" fn timestamp_frequency(_: This, out: *mut u64) -> HRESULT {
     if out.is_null() {
         return E_INVALIDARG;
     }
+    #[cfg(windows)]
+    let freq = crate::host::host()
+        .and_then(|h| h.timestamp_frequency())
+        .unwrap_or(TIMESTAMP_FREQUENCY);
+    #[cfg(not(windows))]
+    let freq = TIMESTAMP_FREQUENCY;
     // SAFETY: checked non-null.
-    unsafe { out.write(TIMESTAMP_FREQUENCY) };
+    unsafe { out.write(freq) };
     S_OK
 }
 const TIMESTAMP_FREQUENCY: u64 = 100_000_000;
@@ -209,6 +222,7 @@ impl Written {
                 at.cast::<u64>().write_unaligned(value);
             }
         }
+        std::sync::atomic::fence(std::sync::atomic::Ordering::Release);
     }
 }
 
@@ -277,24 +291,47 @@ extern "system" fn present(
     }
     #[cfg(windows)]
     if planes > 0
-        // SAFETY: the title passes `planes` plane descriptions.
-        && let Some(plane) = unsafe { plane_parameters.as_ref() }
-        && plane.count > 0
-        && !plane.resources.is_null()
-        // SAFETY: the plane lists `count` resources.
-        && let resource = unsafe { *plane.resources }
-        && let Some(texture) = crate::resource::host_resource(resource)
+        && !plane_parameters.is_null()
         && let Some(host) = crate::host::host()
     {
         const COPY_SOURCE: u32 = 0x800;
-        let state = crate::resource::host_transition(resource, COPY_SOURCE)
-            .map_or(COPY_SOURCE, |(_, before)| before);
-        let shown = host.present(texture, state, frame);
-        crate::resource::host_transition(resource, state);
-        #[cfg(feature = "diagnostics")]
-        blinks(frame, resource, state, shown);
-        #[cfg(not(feature = "diagnostics"))]
-        let _ = shown;
+        let count = (planes as usize).min(8);
+        let mut collected: Vec<(This, &windows::Win32::Graphics::Direct3D12::ID3D12Resource, u32)> =
+            Vec::with_capacity(count);
+        let mut prior_states: Vec<(This, u32)> = Vec::with_capacity(count);
+        for i in 0..count {
+            // SAFETY: the title passes `planes` `0x48`-byte plane parameters.
+            let plane = unsafe { &*plane_parameters.add(i) };
+            if plane.count == 0 || plane.resources.is_null() {
+                continue;
+            }
+            // SAFETY: the plane lists `count` resources.
+            let resource = unsafe { *plane.resources };
+            let Some(texture) = crate::resource::host_resource(resource) else {
+                continue;
+            };
+            let state = if let Some(&(_, s)) = prior_states.iter().find(|&&(r, _)| r == resource) {
+                s
+            } else {
+                let s = crate::resource::host_transition(resource, COPY_SOURCE)
+                    .map_or(COPY_SOURCE, |(_, before)| before);
+                prior_states.push((resource, s));
+                s
+            };
+            collected.push((resource, texture, state));
+        }
+        if !collected.is_empty() {
+            let active: Vec<(&windows::Win32::Graphics::Direct3D12::ID3D12Resource, u32)> =
+                collected.iter().map(|&(_, tex, st)| (tex, st)).collect();
+            let shown = host.present_planes(&active, frame);
+            for &(resource, state) in &prior_states {
+                crate::resource::host_transition(resource, state);
+            }
+            #[cfg(feature = "diagnostics")]
+            blinks(frame, collected[0].0, collected[0].2, shown);
+            #[cfg(not(feature = "diagnostics"))]
+            let _ = shown;
+        }
     }
     #[cfg(not(windows))]
     let _ = (planes, plane_parameters);

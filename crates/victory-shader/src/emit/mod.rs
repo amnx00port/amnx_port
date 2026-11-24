@@ -97,7 +97,7 @@ use crate::native::{HwStage, NativeProgram, RootType};
 use crate::{ShaderError, io, ir, resource, structure};
 
 pub use sampler::StaticSampler;
-pub use shader::{ROOT_CBV_SPACE, SAMPLER_SPACE, USER_DATA_SPACE};
+pub use shader::{CONST_VIEW_SPACE, ROOT_CBV_SPACE, SAMPLER_SPACE, USER_DATA_SPACE};
 
 /// The loop limit without an override: 2^20.
 pub const DEFAULT_LOOP_LIMIT: u32 = lower::LOOP_LIMIT;
@@ -137,6 +137,16 @@ fn parse_loop_limit(value: Option<&str>) -> u32 {
     }
 }
 
+/// A 64-bit GPU address passed in two adjacent 32-bit root constants
+/// `(slot, dword)` and `(slot, dword + 1)`, bound as a root descriptor at
+/// register `register` in [`CONST_VIEW_SPACE`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub struct ConstRootView {
+    pub slot: u8,
+    pub dword: u32,
+    pub register: u32,
+}
+
 /// A translated shader and what the host binds for it.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct HostShader {
@@ -156,6 +166,20 @@ pub struct HostShader {
     /// Root SRVs (raw buffers) the shader reads: `t<index>` in
     /// [`ROOT_CBV_SPACE`].
     pub root_srvs: Vec<u8>,
+    /// Root UAVs (raw buffers) the shader reads or writes: `u<index>` in
+    /// [`ROOT_CBV_SPACE`].
+    pub root_uavs: Vec<u8>,
+    /// Root CBVs carried in adjacent root-constant pairs: `b<register>` in
+    /// [`CONST_VIEW_SPACE`].
+    pub const_cbvs: Vec<ConstRootView>,
+    /// Root SRVs (raw buffers) carried in adjacent root-constant pairs:
+    /// `t<register>` in [`CONST_VIEW_SPACE`].
+    pub const_srvs: Vec<ConstRootView>,
+    /// Root UAVs (raw buffers) carried in adjacent root-constant pairs:
+    /// `u<register>` in [`CONST_VIEW_SPACE`].
+    pub const_uavs: Vec<ConstRootView>,
+    /// Declared DXIL compute `WaveSize`, if any (32 or 64).
+    pub wave_size: Option<u32>,
 }
 
 impl HostShader {
@@ -185,36 +209,54 @@ pub struct UserData {
     pub dword: u32,
 }
 
-/// Translates the vertex, pixel, compute or mesh program of a console
-/// shader container.
+/// Translates the vertex, pixel, compute, mesh or merged geometry program of
+/// a console shader container, assuming a 64-lane capable host GPU.
 pub fn translate(container: &[u8]) -> Result<HostShader, ShaderError> {
+    translate_for(container, 64)
+}
+
+/// Like [`translate`], tailored for a host GPU whose maximum supported wave
+/// width is `max_wave_size` (32 on 32-lane GPUs, 64 on RDNA/Intel GPUs).
+pub fn translate_for(container: &[u8], max_wave_size: u32) -> Result<HostShader, ShaderError> {
     let c = Container::parse(container)?;
     let dxil = c
         .part(FourCC::DXIL)
         .ok_or(ShaderError::Malformed("no DXIL part"))?;
-    let native = crate::native_programs(dxil.data)?
-        .into_iter()
+    let progs = crate::native_programs(dxil.data)?;
+    let native = progs
+        .iter()
         .find(|p| {
             matches!(
                 p.stage,
                 HwStage::Vs | HwStage::Ps | HwStage::Cs | HwStage::Ms
             )
         })
+        .or_else(|| {
+            // Fall back to merged geometry front-end/NGG stages (`Es`, `Ls`,
+            // `Gs`) when the container has no standalone `Vs`/`Ms` variant.
+            progs.iter().find(|p| {
+                matches!(
+                    (p.stage, &p.io),
+                    (HwStage::Es | HwStage::Ls, crate::native::StageIo::Vs { .. })
+                        | (HwStage::Gs, crate::native::StageIo::Ms(_))
+                )
+            })
+        })
         .ok_or(ShaderError::Unsupported {
             offset: 0,
-            what: "a container without a vertex, pixel, compute or mesh program",
+            what: "a container without a vertex, pixel, compute, mesh or merged geometry program",
         })?;
     let p = ir::build(&native.patched_code(), native.wave64, native.vgprs)?;
     // Structurisation first: tracing per-lane descriptors needs it (its
     // failure is reported after the earlier stages').
     let st = structure::structure(&p);
     let res = resource::track(&p, &native.layout, native.stage, st.as_ref().ok())?;
-    let io = io::raise(&p, &native)?;
+    let io = io::raise(&p, native)?;
     let st = st?;
-    emit(&c, &native, &p, &st, &io, &res)
+    emit_for(&c, native, &p, &st, &io, &res, max_wave_size)
 }
 
-/// Emits a program whose earlier stages already ran.
+/// Emits a program whose earlier stages already ran, assuming a 64-lane host.
 pub fn emit(
     c: &Container,
     native: &NativeProgram,
@@ -222,6 +264,19 @@ pub fn emit(
     st: &structure::Structured,
     io: &io::Io,
     res: &resource::Resources,
+) -> Result<HostShader, ShaderError> {
+    emit_for(c, native, p, st, io, res, 64)
+}
+
+/// Like [`emit`], tailored to a host GPU's maximum wave lane count.
+pub fn emit_for(
+    c: &Container,
+    native: &NativeProgram,
+    p: &ir::Program,
+    st: &structure::Structured,
+    io: &io::Io,
+    res: &resource::Resources,
+    max_wave_size: u32,
 ) -> Result<HostShader, ShaderError> {
     let sig = |fourcc| -> Result<Vec<container::SigElement>, ShaderError> {
         match c.part(fourcc) {
@@ -239,8 +294,9 @@ pub fn emit(
         e.interp = match (e.kind, e.comp) {
             (3, _) => 4,
             // Constant, as DXC declares it (the AMD compiler crashed on a
-            // front face without a mode).
-            (13, _) => 1,
+            // front face without a mode; SV_RenderTargetArrayIndex and
+            // SV_ViewportArrayIndex are likewise constant, #914).
+            (4 | 5 | 13, _) => 1,
             (0 | 6 | 7, 9) => 2,
             (0, _) => 1,
             _ => 0,
@@ -288,6 +344,7 @@ pub fn emit(
         outputs,
         prims,
         mesh_stride,
+        max_wave_size,
     })?;
     Ok(HostShader {
         stage: native.stage,
@@ -308,6 +365,11 @@ pub fn emit(
         samplers: l.samplers,
         root_cbvs: l.root_cbvs,
         root_srvs: l.root_srvs,
+        root_uavs: l.root_uavs,
+        const_cbvs: l.const_cbvs,
+        const_srvs: l.const_srvs,
+        const_uavs: l.const_uavs,
+        wave_size: l.wave_size,
     })
 }
 
@@ -565,6 +627,11 @@ mod tests {
             static_samplers: Vec::new(),
             root_cbvs: Vec::new(),
             root_srvs: Vec::new(),
+            root_uavs: Vec::new(),
+            const_cbvs: Vec::new(),
+            const_srvs: Vec::new(),
+            const_uavs: Vec::new(),
+            wave_size: None,
         };
         let file = |var: &str, stage| {
             std::env::var(var).ok().map(|p| super::HostShader {
@@ -575,6 +642,11 @@ mod tests {
                 static_samplers: Vec::new(),
                 root_cbvs: Vec::new(),
                 root_srvs: Vec::new(),
+                root_uavs: Vec::new(),
+                const_cbvs: Vec::new(),
+                const_srvs: Vec::new(),
+                const_uavs: Vec::new(),
+                wave_size: None,
             })
         };
         let ps = file("VICTORY_REF_PS", crate::HwStage::Ps).unwrap_or(ps);
@@ -745,5 +817,253 @@ mod tests {
         let io = crate::io::raise(&p, &native).unwrap();
         // Translated or refused with a reason; it must not panic.
         let _ = super::emit(&c, &native, &p, &st, &io, &res);
+    }
+
+    #[test]
+    fn pixel_readfirstlane_guards_helper_lanes_and_validates() {
+        // v_mov_b32 v0, 0x3f800000; v_readfirstlane_b32 s0, v0;
+        // v_mov_b32 v0, s0; exp mrt0 v0, v0, v0, v0 done; s_endpgm
+        let words = [
+            0x7E00_02FFu32,
+            0x3F80_0000,
+            0x7E00_0500, // v_readfirstlane_b32 s0, v0
+            0x7E00_0200, // v_mov_b32 v0, s0
+            0xF800_080F, // exp mrt0 en:0xf done
+            0x0000_0000, // v0, v0, v0, v0
+            0xBF81_0000, // s_endpgm
+        ];
+        let native = super::NativeProgram {
+            stage: super::HwStage::Ps,
+            wave64: false,
+            vgprs: 4,
+            layout: vec![],
+            used: vec![],
+            io: StageIo::Ps {
+                inputs: vec![],
+                input_addr: 0,
+                db_shader_control: 0,
+                patches: vec![],
+            },
+            code: words.iter().flat_map(|w| w.to_le_bytes()).collect(),
+        };
+        let osg1 = super::container::signature(
+            &[SigElement {
+                name: "SV_Target".into(),
+                index: 0,
+                kind: 16,
+                comp: 9,
+                interp: 0,
+                row: Some(0),
+                col: 0,
+                cols: 4,
+                usage: 0xF,
+                half: false,
+            }],
+            false,
+        );
+        let bytes = crate::dxbc::build(&[(super::FourCC::OSG1, &osg1)]);
+        let c = super::Container::parse(&bytes).unwrap();
+        let p = crate::ir::build(&native.patched_code(), native.wave64, native.vgprs).unwrap();
+        let st = crate::structure::structure(&p).unwrap();
+        let res = crate::resource::track(&p, &native.layout, native.stage, Some(&st)).unwrap();
+        let io = crate::io::raise(&p, &native).unwrap();
+        let out = super::emit(&c, &native, &p, &st, &io, &res).unwrap();
+        #[cfg(windows)]
+        if let Ok(mut v) = super::validator::Validator::load(
+            super::validator::Validator::default_path().as_deref(),
+        ) {
+            v.validate(&mut out.dxil.clone()).unwrap();
+        }
+    }
+
+    #[test]
+    fn image_store_partial_contiguous_dmasks_validate_and_reject_sparse() {
+        use crate::native::{ResourceType, RootParam, RootType, UsedResource};
+        let emit_store = |dmask: u8, d16: bool| {
+            let store_w0 = 0xF020_0008u32 | (u32::from(dmask) << 8);
+            let store_w1 = 4u32 | (1 << 16) | (u32::from(d16) << 31);
+            let words = [
+                0xBE81_0380u32, // s_mov_b32 s1, 0
+                0xF40C_0100,
+                0xFA00_0000, // s_load_dwordx8 s[4:11], s[0:1], null
+                0x7E00_0280, // v_mov_b32 v0, 0
+                0x7E02_0281, // v_mov_b32 v1, 1
+                0x7E04_0282, // v_mov_b32 v2, 2
+                0x7E06_0283, // v_mov_b32 v3, 3
+                0x7E08_0280, // v_mov_b32 v4, 0 (x)
+                0x7E0A_0280, // v_mov_b32 v5, 0 (y)
+                store_w0,
+                store_w1,
+                0xBF81_0000, // s_endpgm
+            ];
+            let native = super::NativeProgram {
+                stage: super::HwStage::Cs,
+                wave64: false,
+                vgprs: 8,
+                layout: vec![RootParam {
+                    root: RootType::Table,
+                    table_offset_dwords: 0,
+                    sgprs: 1,
+                    base_register: 0,
+                    user_data: 0,
+                    slot: 0,
+                }],
+                used: vec![UsedResource {
+                    kind: ResourceType::Uav,
+                    root: RootType::Table,
+                    table_offset_dwords: 0,
+                    lower_bound: 0,
+                    stride: 0,
+                    dwords: 8,
+                    user_data: 0,
+                    slot: 0,
+                }],
+                io: StageIo::Cs(ComputeIo {
+                    rsrc2: 0,
+                    threads: [1, 1, 1],
+                }),
+                code: words.iter().flat_map(|w| w.to_le_bytes()).collect(),
+            };
+            let bytes = crate::dxbc::build(&[]);
+            let c = super::Container::parse(&bytes).unwrap();
+            let p = crate::ir::build(&native.patched_code(), native.wave64, native.vgprs).unwrap();
+            let st = crate::structure::structure(&p).unwrap();
+            let res =
+                crate::resource::track(&p, &native.layout, native.stage, Some(&st)).unwrap();
+            let io = crate::io::raise(&p, &native).unwrap();
+            super::emit(&c, &native, &p, &st, &io, &res)
+        };
+
+        for (dmask, d16) in [
+            (0x0, false),
+            (0x1, false),
+            (0x3, false),
+            (0x7, false),
+            (0xF, false),
+            (0x1, true),
+            (0x3, true),
+            (0x7, true),
+        ] {
+            let out = emit_store(dmask, d16)
+                .unwrap_or_else(|e| panic!("dmask={dmask:#x} d16={d16}: {e}"));
+            #[cfg(windows)]
+            if let Ok(mut v) = super::validator::Validator::load(
+                super::validator::Validator::default_path().as_deref(),
+            ) {
+                v.validate(&mut out.dxil.clone())
+                    .unwrap_or_else(|e| panic!("dmask={dmask:#x} d16={d16} validation: {e}"));
+            }
+        }
+        assert!(
+            emit_store(0x5, false).is_err(),
+            "sparse dmask 0x5 must be rejected"
+        );
+    }
+
+    #[test]
+    fn vs_rt_and_viewport_array_index_and_shifted_clip_distance_validate() {
+        // v_mov_b32 v0..v4; exp pos0 v0..v0; exp pos1 v1,v1,v2,v1; exp pos2 v3,v3,v3,v3 done; s_endpgm
+        let words = [
+            0x7E00_02FFu32,
+            0x3F80_0000, // v0 = 1.0
+            0x7E02_0280, // v1 = 0
+            0x7E04_02FF,
+            0x0003_0002, // v2 = (vp=3 << 16) | rt=2
+            0x7E06_02FF,
+            0x3F00_0000, // v3 = 0.5 (clip distance)
+            0xF800_00CF, // exp pos0 (target=12) en:0xf
+            0x0000_0000, // v0, v0, v0, v0
+            0xF800_00D4, // exp pos1 (target=13) en:0x4 (z)
+            0x0102_0101, // v1, v1, v2, v1
+            0xF800_08E1, // exp pos2 (target=14) en:0x1 done
+            0x0303_0303, // v3, v3, v3, v3
+            0xBF81_0000, // s_endpgm
+        ];
+        let native = super::NativeProgram {
+            stage: super::HwStage::Vs,
+            wave64: false,
+            vgprs: 4,
+            layout: vec![],
+            used: vec![],
+            io: StageIo::Vs {
+                inputs: vec![],
+                outputs: vec![],
+            },
+            code: words.iter().flat_map(|w| w.to_le_bytes()).collect(),
+        };
+        let osg1 = super::container::signature(
+            &[
+                SigElement {
+                    name: "SV_Position".into(),
+                    index: 0,
+                    kind: 3,
+                    comp: 9,
+                    interp: 0,
+                    row: Some(0),
+                    col: 0,
+                    cols: 4,
+                    usage: 0xF,
+                    half: false,
+                },
+                SigElement {
+                    name: "SV_RenderTargetArrayIndex".into(),
+                    index: 0,
+                    kind: 4,
+                    comp: 5,
+                    interp: 0,
+                    row: Some(1),
+                    col: 0,
+                    cols: 1,
+                    usage: 1,
+                    half: false,
+                },
+                SigElement {
+                    name: "SV_ViewportArrayIndex".into(),
+                    index: 0,
+                    kind: 5,
+                    comp: 5,
+                    interp: 0,
+                    row: Some(2),
+                    col: 0,
+                    cols: 1,
+                    usage: 1,
+                    half: false,
+                },
+                SigElement {
+                    name: "SV_ClipDistance".into(),
+                    index: 0,
+                    kind: 6,
+                    comp: 9,
+                    interp: 0,
+                    row: Some(3),
+                    col: 0,
+                    cols: 1,
+                    usage: 1,
+                    half: false,
+                },
+            ],
+            false,
+        );
+        let bytes = crate::dxbc::build(&[(super::FourCC::OSG1, &osg1)]);
+        let c = super::Container::parse(&bytes).unwrap();
+        let p = crate::ir::build(&native.patched_code(), native.wave64, native.vgprs).unwrap();
+        let st = crate::structure::structure(&p).unwrap();
+        let res = crate::resource::track(&p, &native.layout, native.stage, Some(&st)).unwrap();
+        let io = crate::io::raise(&p, &native).unwrap();
+        let out = super::emit(&c, &native, &p, &st, &io, &res).unwrap();
+        let host = super::Container::parse(&out.dxil).unwrap();
+        let sfi0 = host.part(super::FourCC::SFI0).unwrap().data;
+        let features = u64::from_le_bytes(sfi0[..8].try_into().unwrap());
+        assert_ne!(
+            features & 0x2000,
+            0,
+            "SFI0 must declare ViewportAndRTArrayIndexFromAnyShaderFeedingRasterizer"
+        );
+        #[cfg(windows)]
+        if let Ok(mut v) = super::validator::Validator::load(
+            super::validator::Validator::default_path().as_deref(),
+        ) {
+            v.validate(&mut out.dxil.clone()).unwrap();
+        }
     }
 }

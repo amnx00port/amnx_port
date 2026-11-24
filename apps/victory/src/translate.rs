@@ -17,6 +17,21 @@ use victory_shader::{io, resource};
 
 use crate::shader::{MAX_FILE, Source, sources};
 
+/// Resolved `VICTORY_EMIT_DUMP` folder, refused if it points inside a VIctory
+/// source tree (enforcing `docs/asset-policy.md`).
+fn emit_dump_dir() -> Option<&'static Path> {
+    static DIR: std::sync::OnceLock<Option<PathBuf>> = std::sync::OnceLock::new();
+    DIR.get_or_init(|| {
+        let dir = PathBuf::from(std::env::var_os("VICTORY_EMIT_DUMP")?);
+        if let Err(e) = victory_core::ensure_outside_repo(&dir) {
+            eprintln!("refusing VICTORY_EMIT_DUMP: {e}");
+            return None;
+        }
+        Some(dir)
+    })
+    .as_deref()
+}
+
 #[derive(Default)]
 struct Tally {
     containers: usize,
@@ -426,14 +441,14 @@ fn check(
     }
     // `VICTORY_EMIT_DUMP` with `--list`: every emitted shader as a file.
     if t.list
-        && let Ok(dir) = std::env::var("VICTORY_EMIT_DUMP")
+        && let Some(dir) = emit_dump_dir()
     {
         let name: String = label()
             .chars()
             .map(|c| if c.is_ascii_alphanumeric() { c } else { '_' })
             .collect();
         let _ = std::fs::write(
-            format!("{dir}/{}.dxil", &name[name.len().saturating_sub(100)..]),
+            dir.join(format!("{}.dxil", &name[name.len().saturating_sub(100)..])),
             &shader.dxil,
         );
     }
@@ -470,22 +485,25 @@ fn check(
                 .find(|l| l.contains("error"))
                 .unwrap_or(text.lines().next().unwrap_or(""))
                 .to_owned();
-            if let Ok(dir) = std::env::var("VICTORY_EMIT_DUMP") {
+            if let Some(dir) = emit_dump_dir() {
                 let n = t
                     .failed
                     .get(&format!("validator: {first}"))
                     .map_or(0, |f| f.0);
                 if n < 3 {
-                    let name = format!(
-                        "{dir}/{}_{n}",
+                    let stem = format!(
+                        "{}_{n}",
                         first
                             .chars()
                             .filter(char::is_ascii_alphanumeric)
                             .take(40)
                             .collect::<String>()
                     );
-                    let _ = std::fs::write(format!("{name}.dxil"), &shader.dxil);
-                    let _ = std::fs::write(format!("{name}.txt"), format!("{}\n{text}", label()));
+                    let _ = std::fs::write(dir.join(format!("{stem}.dxil")), &shader.dxil);
+                    let _ = std::fs::write(
+                        dir.join(format!("{stem}.txt")),
+                        format!("{}\n{text}", label()),
+                    );
                 }
             }
             t.fail(format!("validator: {first}"), label);

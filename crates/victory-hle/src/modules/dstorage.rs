@@ -17,7 +17,7 @@
 #![allow(non_snake_case)]
 #![allow(clippy::not_unsafe_ptr_arg_deref)]
 
-use std::borrow::Cow;
+use std::cell::RefCell;
 use std::collections::{BTreeMap, BTreeSet, HashMap, VecDeque};
 use std::ffi::{CStr, c_char, c_void};
 use std::os::windows::fs::FileExt;
@@ -173,6 +173,7 @@ extern "system" fn create_status_array(
 /// The queue's description: as in 2020 (source type, capacity, priority,
 /// name), plus a field Grand Theft Auto VI sets to 1.
 #[repr(C)]
+#[derive(Clone, Copy)]
 struct QueueDesc {
     source_type: u64,
     capacity: u16,
@@ -204,6 +205,11 @@ extern "system" fn create_queue(
     let Some(scheduler) = scheduler() else {
         return E_OUTOFMEMORY;
     };
+    let owned_name = std::ffi::CString::new(name.as_str()).ok();
+    let mut stored_desc = *desc;
+    stored_desc.name = owned_name
+        .as_ref()
+        .map_or(std::ptr::null(), |s| s.as_ptr());
     let mut lanes = scheduler.lock();
     let id = lanes.next_id;
     lanes.next_id += 1;
@@ -212,7 +218,14 @@ extern "system" fn create_queue(
     drop(lanes);
     put(
         out,
-        Instance::create(Object::new("dstorage queue", &QUEUE_VTABLE), Queue { id }),
+        Instance::create(
+            Object::new("dstorage queue", &QUEUE_VTABLE),
+            Queue {
+                id,
+                desc: stored_desc,
+                _name: owned_name,
+            },
+        ),
     )
 }
 
@@ -305,9 +318,25 @@ static STATUS_VTABLE: Methods<5> = Methods([
 
 // Queues.
 
-/// A queue object: its lane in the scheduler.
+/// A queue object: its lane in the scheduler, plus the creation description
+/// (with an owned C string so `Query` always returns a valid `name` pointer).
 struct Queue {
     id: u64,
+    desc: QueueDesc,
+    _name: Option<std::ffi::CString>,
+}
+
+// SAFETY: `desc.name` points into `_name` (immutable heap CString) or is null.
+unsafe impl Send for Queue {}
+// SAFETY: as above.
+unsafe impl Sync for Queue {}
+
+#[repr(C)]
+#[derive(Clone, Copy)]
+struct QueueInfo {
+    desc: QueueDesc,
+    empty_slot_count: u32,
+    request_count_until_auto_submit: u32,
 }
 
 impl Drop for Queue {
@@ -784,6 +813,61 @@ extern "system" fn close(this: QueueRef) {
     close_lane(unsafe { &*this }.state.id);
 }
 
+/// Drops unsubmitted and queued-not-yet-started reads matching
+/// `(tag & mask) == value` without recording an error, flushes any newly
+/// unblocked statuses, and wakes capacity waiters (#889).
+extern "system" fn cancel_requests_with_tag(this: QueueRef, mask: u64, value: u64) {
+    // SAFETY: a queue we created and the title still holds.
+    let id = unsafe { &*this }.state.id;
+    let Some(scheduler) = scheduler() else {
+        return;
+    };
+    let mut lanes = scheduler.lock();
+    let Some(lane) = lanes.lanes.get_mut(&id).filter(|l| !l.closed) else {
+        return;
+    };
+    lane.unsubmitted.retain(|cmd| match cmd {
+        Command::Read(req) => (req.tag & mask) != value,
+        Command::Status(_) => true,
+    });
+    lane.reads.retain(|(_, req)| (req.tag & mask) != value);
+    lane.flush();
+    scheduler.finished.notify_all();
+}
+
+/// Fills `DSTORAGE_QUEUE_INFO` with the creation description and live slot
+/// counts (#889).
+extern "system" fn query_queue(this: QueueRef, info: *mut QueueInfo) {
+    if info.is_null() {
+        return;
+    }
+    // SAFETY: a queue we created and the title still holds.
+    let q = unsafe { &*this };
+    let (empty_slot_count, until_auto) = scheduler()
+        .map(|s| {
+            let lanes = s.lock();
+            match lanes.lanes.get(&q.state.id).filter(|l| !l.closed) {
+                Some(lane) => {
+                    let cap = lane.capacity.max(2);
+                    let empty = cap.saturating_sub(lane.entries() + 1) as u32;
+                    let half = (lane.capacity / 2).max(1);
+                    let until = half.saturating_sub(lane.unsubmitted.len()) as u32;
+                    (empty, until)
+                }
+                None => (0, 0),
+            }
+        })
+        .unwrap_or((0, 0));
+    // SAFETY: checked non-null; the title passes a writable `QueueInfo`.
+    unsafe {
+        info.write(QueueInfo {
+            desc: q.state.desc,
+            empty_slot_count,
+            request_count_until_auto_submit: until_auto,
+        });
+    }
+}
+
 /// Reads, inflates and/or unpacks, and writes one request.
 fn execute(request: &Request) -> Result<(), HRESULT> {
     let options = request.options;
@@ -814,26 +898,57 @@ fn execute(request: &Request) -> Result<(), HRESULT> {
             return Err(fail(E_INVALIDARG, "source larger than destination"));
         }
         let size = request.source_size as usize;
-        return into_destination(request, size, |out| read_into(request, out).map(|()| size))
-            .map_err(|hr| fail(hr, "copying"));
+        if options & PAGE_DESTINATION != 0 {
+            let offset = (request.page_offset & 0xffff) as usize;
+            // SAFETY: the title passes a page number per 64 KiB of destination,
+            // which holds at least `size` bytes from `offset`.
+            let pages = unsafe {
+                std::slice::from_raw_parts(
+                    request.destination.cast::<usize>(),
+                    (offset + size).div_ceil(PAGE),
+                )
+            };
+            // Stream directly into each contiguous physical-page run without
+            // allocating a staging copy or zero-filling multi-MiB buffers.
+            let ok = super::xmem::write_physical_with(pages, offset, size, |done, dst| {
+                read_into_at(request, done as u64, dst)
+            })
+            .map_err(|hr| fail(hr, "copying"))?;
+            return if ok {
+                Ok(())
+            } else {
+                Err(fail(E_INVALIDARG, "copying"))
+            };
+        }
+        return into_destination(request, size, |out| {
+            read_into_at(request, 0, out).map(|()| size)
+        })
+        .map_err(|hr| fail(hr, "copying"));
     }
     let tables = if bc != 0 { Some(bcpack_tables()?) } else { None };
-    let source = read_source(request).map_err(|hr| fail(hr, "reading the source"))?;
-    // The console's order: zlib first, then BCPack.
-    let source = if bc != 0 && options & ZLIB != 0 {
-        let mut packed = vec![0; request.intermediate_size as usize];
-        let n = inflate(&source, &mut packed).map_err(|hr| fail(hr, "zlib"))?;
-        packed.truncate(n);
-        Cow::Owned(packed)
-    } else {
-        source
-    };
-    into_destination(request, size, |out| match tables {
-        Some(tables) => bcpack::decode(bc, &source, out, tables)
-            .map(|()| out.len())
-            .map_err(|e| fail(INVALID_DATA, &e.to_string())),
-        None => inflate(&source, out).map_err(|hr| fail(hr, "zlib")),
-    })?;
+    with_source(request, |raw_source| {
+        // The console's order: zlib first, then BCPack.
+        if bc != 0 && options & ZLIB != 0 {
+            let inter_size = request.intermediate_size as usize;
+            with_scratch(&SCRATCH_INTER, inter_size, |packed| {
+                let n = inflate(raw_source, packed).map_err(|hr| fail(hr, "zlib"))?;
+                let packed = &packed[..n];
+                into_destination(request, size, |out| {
+                    bcpack::decode(bc, packed, out, tables.unwrap())
+                        .map(|()| out.len())
+                        .map_err(|e| fail(INVALID_DATA, &e.to_string()))
+                })
+            })
+        } else {
+            into_destination(request, size, |out| match tables {
+                Some(tables) => bcpack::decode(bc, raw_source, out, tables)
+                    .map(|()| out.len())
+                    .map_err(|e| fail(INVALID_DATA, &e.to_string())),
+                None => inflate(raw_source, out).map_err(|hr| fail(hr, "zlib")),
+            })
+        }
+    })
+    .map_err(|hr| fail(hr, "reading or decompressing the source"))?;
     tracing::trace!(
         options = format_args!("{options:#x}"),
         offset = request.offset,
@@ -894,28 +1009,70 @@ fn load_bcpack_tables() -> Result<Tables, String> {
     Tables::parse(&bytes).map_err(|e| e.to_string())
 }
 
-/// A compressed request's source: borrowed from memory, or read from the
-/// file.
-fn read_source(request: &Request) -> Result<Cow<'static, [u8]>, HRESULT> {
+/// Cap on per-worker reusable scratch buffer retention (16 MiB); larger
+/// one-off chunks are released back to the OS once completed.
+const MAX_SCRATCH_RETAIN: usize = 16 << 20;
+
+thread_local! {
+    static SCRATCH_SRC: RefCell<Vec<u8>> = const { RefCell::new(Vec::new()) };
+    static SCRATCH_INTER: RefCell<Vec<u8>> = const { RefCell::new(Vec::new()) };
+    static SCRATCH_DST: RefCell<Vec<u8>> = const { RefCell::new(Vec::new()) };
+}
+
+/// Lends a reusable per-worker `len`-byte buffer to `f`, avoiding per-request
+/// heap allocations and OS zero-page faults during bulk world streaming.
+fn with_scratch<R>(
+    slot: &'static std::thread::LocalKey<RefCell<Vec<u8>>>,
+    len: usize,
+    f: impl FnOnce(&mut [u8]) -> R,
+) -> R {
+    slot.with(|cell| {
+        let mut buf = cell.borrow_mut();
+        if buf.len() < len {
+            buf.resize(len, 0);
+        }
+        let result = f(&mut buf[..len]);
+        if buf.capacity() > MAX_SCRATCH_RETAIN {
+            buf.clear();
+            buf.shrink_to_fit();
+        }
+        result
+    })
+}
+
+/// Borrows a compressed request's source from memory or reads it from the file
+/// into the worker's reusable source scratch buffer.
+fn with_source<R>(
+    request: &Request,
+    f: impl FnOnce(&[u8]) -> Result<R, HRESULT>,
+) -> Result<R, HRESULT> {
     let size = request.source_size as usize;
     if request.options & MEMORY_SOURCE != 0 {
         // SAFETY: the title's source holds `size` bytes until completion.
         let bytes = unsafe { std::slice::from_raw_parts(request.source.cast(), size) };
-        return Ok(Cow::Borrowed(bytes));
+        return f(bytes);
     }
-    let mut bytes = vec![0; size];
-    read_into(request, &mut bytes)?;
-    Ok(Cow::Owned(bytes))
+    with_scratch(&SCRATCH_SRC, size, |buf| {
+        read_into_at(request, 0, buf)?;
+        f(buf)
+    })
 }
 
 /// Nanoseconds workers spent reading files, for the debug summary.
 static READING: AtomicU64 = AtomicU64::new(0);
 
-/// Fills `out` (the source size) from the request's file or memory.
-fn read_into(request: &Request, out: &mut [u8]) -> Result<(), HRESULT> {
+/// Fills `out` starting `rel_offset` bytes into the request's file or memory
+/// source.
+fn read_into_at(request: &Request, rel_offset: u64, out: &mut [u8]) -> Result<(), HRESULT> {
     if request.options & MEMORY_SOURCE != 0 {
-        // SAFETY: the title's source holds `out.len()` bytes until completion.
-        out.copy_from_slice(unsafe { std::slice::from_raw_parts(request.source.cast(), out.len()) });
+        // SAFETY: the title's source holds at least `rel_offset + out.len()` bytes until completion.
+        let src = unsafe {
+            std::slice::from_raw_parts(
+                request.source.cast::<u8>().wrapping_add(rel_offset as usize),
+                out.len(),
+            )
+        };
+        out.copy_from_slice(src);
         return Ok(());
     }
     // SAFETY: a file object we created; the title keeps it open.
@@ -924,11 +1081,12 @@ fn read_into(request: &Request, out: &mut [u8]) -> Result<(), HRESULT> {
         .file;
     let started = std::time::Instant::now();
     let mut done = 0;
+    let base = request.offset + rel_offset;
     let result = loop {
         if done == out.len() {
             break Ok(());
         }
-        match file.seek_read(&mut out[done..], request.offset + done as u64) {
+        match file.seek_read(&mut out[done..], base + done as u64) {
             Ok(0) => break Err(END_OF_FILE),
             Ok(n) => done += n,
             Err(error) => break Err(from_win32(&error)),
@@ -942,7 +1100,7 @@ fn read_into(request: &Request, out: &mut [u8]) -> Result<(), HRESULT> {
 /// many it produced. GPU-visible destinations are host memory like the
 /// rest (GPU address = CPU address), so an address is written in place;
 /// physical pages are too when they are consecutive pages of one
-/// allocation, and otherwise go through a buffer.
+/// allocation, and otherwise reuse the worker's scratch buffer.
 fn into_destination(
     request: &Request,
     len: usize,
@@ -971,13 +1129,14 @@ fn into_destination(
     if let Some(mut window) = super::xmem::page_window(pages, offset, len) {
         return fill(window.bytes()).map(drop);
     }
-    let mut data = vec![0; len];
-    let n = fill(&mut data)?;
-    if super::xmem::write_physical(pages, offset, &data[..n]) {
-        Ok(())
-    } else {
-        Err(E_INVALIDARG)
-    }
+    with_scratch(&SCRATCH_DST, len, |data| {
+        let n = fill(data)?;
+        if super::xmem::write_physical(pages, offset, &data[..n]) {
+            Ok(())
+        } else {
+            Err(E_INVALIDARG)
+        }
+    })
 }
 
 /// Slots by the 2020 order, which the argument shapes at Grand Theft Auto
@@ -986,15 +1145,15 @@ static QUEUE_VTABLE: Methods<12> = Methods([
     missing::<0> as *const (),
     add_ref_instance::<Queue> as *const (),
     release::<Queue> as *const (),
-    enqueue_request as *const (), // 0x18
-    enqueue_status as *const (),  // 0x20
-    missing::<5> as *const (),    // 0x28 (2020: fence signal)
-    submit as *const (),          // 0x30
-    missing::<7> as *const (),    // 0x38 (2020: cancel by tag)
-    close as *const (),           // 0x40
-    missing::<9> as *const (),    // 0x48 (2020: error event)
-    missing::<10> as *const (),   // 0x50 (2020: error record)
-    missing::<11> as *const (),   // 0x58 (2020: queue info)
+    enqueue_request as *const (),          // 0x18
+    enqueue_status as *const (),           // 0x20
+    missing::<5> as *const (),             // 0x28 (2020: fence signal)
+    submit as *const (),                   // 0x30
+    cancel_requests_with_tag as *const (), // 0x38 (2020: cancel by tag)
+    close as *const (),                    // 0x40
+    missing::<9> as *const (),             // 0x48 (2020: error event)
+    missing::<10> as *const (),            // 0x50 (2020: error record)
+    query_queue as *const (),              // 0x58 (2020: queue info)
 ]);
 
 pub(crate) fn module() -> HleModule {
@@ -1541,5 +1700,81 @@ mod tests {
         }
         assert_eq!(xmem::XMemFreePhysicalPages(3, a.as_ptr()), 1);
         assert_eq!(xmem::XMemFreePhysicalPages(1, b.as_ptr()), 1);
+    }
+
+    #[test]
+    fn cancel_requests_with_tag_and_query_track_queue_state() {
+        let create_queue: extern "system" fn(*mut c_void, *const QueueDesc, *const Guid, Out) -> HRESULT =
+            call(factory(), 0x50);
+        let desc = QueueDesc {
+            source_type: 1,
+            capacity: 16,
+            priority: 0,
+            name: c"cancel-test".as_ptr(),
+            unknown: 1,
+        };
+        let mut queue = std::ptr::null_mut();
+        assert_eq!(
+            create_queue(factory(), &desc, std::ptr::null(), &mut queue),
+            S_OK
+        );
+        let array = status_array(2);
+
+        // Query on empty queue (null pointer is tolerated).
+        let qfn: extern "system" fn(*mut c_void, *mut QueueInfo) = call(queue, 0x58);
+        qfn(queue, std::ptr::null_mut());
+        let mut info = std::mem::MaybeUninit::<QueueInfo>::zeroed();
+        qfn(queue, info.as_mut_ptr());
+        // SAFETY: written by `query_queue`.
+        let info = unsafe { info.assume_init() };
+        assert_eq!(info.desc.capacity, 16);
+        assert_eq!(text(info.desc.name), "cancel-test");
+        assert_eq!(info.empty_slot_count, 15);
+        assert_eq!(info.request_count_until_auto_submit, 8);
+
+        // Enqueue two tagged reads; cancel one before submit.
+        let src = [0x42u8; 16];
+        let mut dst_a = [0u8; 16];
+        let mut dst_b = [0u8; 16];
+        let mut r1 = request(
+            MEMORY_SOURCE,
+            dst_a.as_mut_ptr().cast(),
+            16,
+            src.as_ptr().cast(),
+            0,
+            16,
+        );
+        r1.tag = 0xAA01;
+        let mut r2 = request(
+            MEMORY_SOURCE,
+            dst_b.as_mut_ptr().cast(),
+            16,
+            src.as_ptr().cast(),
+            0,
+            16,
+        );
+        r2.tag = 0xBB02;
+        enqueue(queue, &r1);
+        enqueue(queue, &r2);
+        let cancel: extern "system" fn(*mut c_void, u64, u64) = call(queue, 0x38);
+        cancel(queue, 0xFF00, 0xAA00);
+        enqueue_status(queue, array, 0);
+        void(queue, 0x30); // submit
+        assert_eq!(wait(array, 0), S_OK);
+        assert_eq!(dst_a, [0u8; 16], "cancelled read must leave destination untouched");
+        assert_eq!(dst_b, src, "unmatched read must complete");
+
+        // Close sets empty_slot_count to 0 while keeping name valid.
+        void(queue, 0x40);
+        let mut closed = std::mem::MaybeUninit::<QueueInfo>::zeroed();
+        qfn(queue, closed.as_mut_ptr());
+        // SAFETY: written by `query_queue`.
+        let closed = unsafe { closed.assume_init() };
+        assert_eq!(closed.empty_slot_count, 0);
+        assert_eq!(text(closed.desc.name), "cancel-test");
+        let rel: extern "system" fn(*mut c_void) -> u32 = call(queue, 0x10);
+        assert_eq!(rel(queue), 0);
+        let rel_arr: extern "system" fn(*mut c_void) -> u32 = call(array, 0x10);
+        assert_eq!(rel_arr(array), 0);
     }
 }

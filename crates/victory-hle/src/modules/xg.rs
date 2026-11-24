@@ -13,7 +13,9 @@
 
 use std::sync::atomic::{AtomicU32, Ordering};
 
-use victory_formats::texture::{Dimension, Error, Layout, Swizzle, Texture, TextureDesc};
+use victory_formats::texture::{
+    Dimension, Error, Layout, MetadataFlags, Swizzle, Texture, TextureDesc,
+};
 
 use super::xasync::{E_INVALIDARG, E_NOTIMPL};
 use super::xgameruntime::{HRESULT, S_OK};
@@ -147,16 +149,19 @@ fn texture(desc: &ResourceDesc) -> Option<Texture> {
         l if l & !0xff == SWIZZLED => Swizzle(l & 0xff),
         _ => return None,
     };
-    let texture = Texture::new(&TextureDesc {
-        dimension,
-        width: u32::try_from(desc.width).ok()?,
-        height: desc.height,
-        depth_or_array: u32::from(desc.depth_or_array),
-        mips: u32::from(desc.mips),
-        format: desc.format,
-        samples: desc.samples.max(1),
-        swizzle,
-    })
+    let texture = Texture::with_metadata(
+        &TextureDesc {
+            dimension,
+            width: u32::try_from(desc.width).ok()?,
+            height: desc.height,
+            depth_or_array: u32::from(desc.depth_or_array),
+            mips: u32::from(desc.mips),
+            format: desc.format,
+            samples: desc.samples.max(1),
+            swizzle,
+        },
+        MetadataFlags::from_d3d12_flags(desc.flags),
+    )
     .ok()?;
     // The layout struct has room for 15 mips.
     (texture.planes[0].layout.mips.len() <= MIPS).then_some(texture)
@@ -193,7 +198,7 @@ pub struct MipOut {
 #[repr(C)]
 #[derive(Debug, Clone, Copy)]
 pub struct PlaneOut {
-    /// 1 data, 7 depth, 8 stencil (metadata planes are not made).
+    /// 1 data, 2 CMASK, 3 FMASK, 4 HTILE, 7 depth, 8 stencil, 9 DCC.
     pub usage: u32,
     pub size: u64,
     pub slice_size: u64,
@@ -303,7 +308,8 @@ extern "system" fn layout(this: This, out: *mut LayoutOut) -> HRESULT {
     out.size = c.texture.size;
     out.alignment = c.texture.alignment;
     out.mips = c.mips;
-    out.planes = c.texture.planes.len() as u32;
+    let total_planes = (c.texture.planes.len() + c.texture.metadata.len()).min(out.plane.len());
+    out.planes = total_planes as u32;
     out.dimension = c.desc.dimension;
     // The library calls a depth plane "depth" only beside stencil or
     // without mips.
@@ -327,16 +333,31 @@ extern "system" fn layout(this: This, out: *mut LayoutOut) -> HRESULT {
             *mip = mip_out(&c.desc, l, i);
         }
     }
+    let data_planes = c.texture.planes.len();
+    for (plane, m) in out.plane[data_planes..total_planes]
+        .iter_mut()
+        .zip(&c.texture.metadata)
+    {
+        plane.usage = m.kind.xg_usage();
+        plane.size = m.size;
+        plane.slice_size = m.slice_size;
+        plane.offset = m.offset;
+        plane.alignment = m.alignment;
+        plane.element_bytes = m.element_bytes;
+        plane.standard_mips = 1;
+        plane.tail_mips = 0;
+    }
     S_OK
 }
 
 /// The plane, its mip and array slice for a subresource index, and the
-/// tiled bytes and the linear bytes the copy touches.
+/// tiled offset/length and linear bytes the copy touches.
 struct CopyArgs<'a> {
     layout: &'a Layout,
     mip: u32,
     slice: u32,
-    tiled: usize,
+    tiled_offset: usize,
+    tiled_len: usize,
     linear: usize,
 }
 
@@ -347,18 +368,44 @@ fn copy_args(
     row: u32,
     depth: u32,
 ) -> Option<CopyArgs<'_>> {
+    if c.mips == 0 {
+        return None;
+    }
     let p = c.texture.planes.get(plane as usize)?;
     let l = &p.layout;
     let (mip, slice) = (subresource % c.mips, subresource / c.mips);
+    if slice >= l.slices {
+        return None;
+    }
     let m = l.mips.get(mip as usize)?;
-    let bytes = m.width as usize * l.desc.element_bytes as usize;
-    let depths = l.subresource_depth(mip) as usize;
-    let linear = (depths - 1) * depth as usize + (m.height as usize - 1) * row as usize + bytes;
+    let bytes = m.width.checked_mul(l.desc.element_bytes)?;
+    let depths = l.subresource_depth(mip);
+    let height = m.height;
+    if depths == 0 || height == 0 {
+        return None;
+    }
+    if height > 1 && row < bytes {
+        return None;
+    }
+    let row_span = height.checked_sub(1)?.checked_mul(row)?;
+    let slice_bytes = row_span.checked_add(bytes)?;
+    if depths > 1 && depth < slice_bytes {
+        return None;
+    }
+    let depth_span = (depths - 1).checked_mul(depth)?;
+    let linear = depth_span.checked_add(slice_bytes)? as usize;
+    let tiled_offset = usize::try_from(p.offset).ok()?;
+    let tiled_len = usize::try_from(l.size).ok()?;
+    let _ = tiled_offset.checked_add(tiled_len)?;
+    if tiled_len > isize::MAX as usize || linear > isize::MAX as usize {
+        return None;
+    }
     Some(CopyArgs {
         layout: l,
         mip,
         slice,
-        tiled: (p.offset + l.size) as usize,
+        tiled_offset,
+        tiled_len,
         linear,
     })
 }
@@ -388,11 +435,11 @@ extern "system" fn copy_into(
     if tiled.is_null() || linear.is_null() {
         return E_INVALIDARG;
     }
-    let offset = c.texture.planes[plane as usize].offset as usize;
-    // SAFETY: the title's memory holds the whole texture and its rows.
+    // SAFETY: checked non-null and bounded span; the title's memory holds the
+    // whole texture and its rows.
     let (tiled, linear) = unsafe {
         (
-            std::slice::from_raw_parts_mut(tiled.add(offset), a.tiled - offset),
+            std::slice::from_raw_parts_mut(tiled.add(a.tiled_offset), a.tiled_len),
             std::slice::from_raw_parts(linear, a.linear),
         )
     };
@@ -425,11 +472,11 @@ extern "system" fn copy_from(
     if tiled.is_null() || linear.is_null() {
         return E_INVALIDARG;
     }
-    let offset = c.texture.planes[plane as usize].offset as usize;
-    // SAFETY: the title's memory holds the whole texture and its rows.
+    // SAFETY: checked non-null and bounded span; the title's memory holds the
+    // whole texture and its rows.
     let (tiled, linear) = unsafe {
         (
-            std::slice::from_raw_parts(tiled.add(offset), a.tiled - offset),
+            std::slice::from_raw_parts(tiled.add(a.tiled_offset), a.tiled_len),
             std::slice::from_raw_parts_mut(linear, a.linear),
         )
     };
@@ -484,6 +531,14 @@ extern "system" fn tiling(
     if l.thick {
         return E_NOTIMPL;
     }
+    if l.block[0] == 0 || l.block[1] == 0 {
+        return E_FAIL;
+    }
+    // SAFETY: caller passes null or a valid `count` pointer; reject null
+    // `out` when the caller asks to write `*count > 0` entries.
+    if !count.is_null() && unsafe { *count } > 0 && out.is_null() {
+        return E_INVALIDARG;
+    }
     let standard = l.first_tail_mip;
     let tail = standard < c.mips;
     let tail_tiles = match standard {
@@ -492,8 +547,8 @@ extern "system" fn tiling(
         _ => 0,
     };
     let block = l.desc.block;
-    // SAFETY: each output is null or room for its value; `out` has room
-    // for `*count` entries.
+    // SAFETY: each output is null or room for its value; `out` is non-null
+    // whenever `*count > 0` (checked above).
     unsafe {
         if let Some(t) = tiles.as_mut() {
             *t = (l.size / TILE) as u32;
@@ -511,9 +566,15 @@ extern "system" fn tiling(
         }
         if let Some(n) = count.as_mut() {
             let slices = if tail { l.slices.min(2) } else { l.slices };
-            let wanted = (standard * slices).saturating_sub(first).min(*n);
+            let total = standard.saturating_mul(slices);
+            let wanted = total.saturating_sub(first).min(*n);
             for i in 0..wanted {
-                let (slice, mip) = ((first + i) / standard, (first + i) % standard);
+                let (Some(slice), Some(mip)) = (
+                    (first + i).checked_div(standard),
+                    (first + i).checked_rem(standard),
+                ) else {
+                    break;
+                };
                 let m = &l.mips[mip as usize];
                 let entry = if tail && slice > 0 {
                     SubresourceTiling {
@@ -776,5 +837,71 @@ mod tests {
         let bad = desc(256, 256, 1, 28, 0x103);
         assert_eq!(XGCreateTextureComputer(&bad, &mut c), E_INVALIDARG);
         assert!(module().exports.len() == 2);
+    }
+
+    #[test]
+    fn render_target_and_depth_layouts_report_metadata_planes() {
+        let mut rt_desc = desc(1920, 1080, 1, 28, 0);
+        rt_desc.flags = ALLOW_RENDER_TARGET;
+        let c = create(&rt_desc);
+        let mut l = std::mem::MaybeUninit::<LayoutOut>::zeroed();
+        assert_eq!(layout(c, l.as_mut_ptr()), S_OK);
+        // SAFETY: filled by `layout`.
+        let l = unsafe { l.assume_init() };
+        assert_eq!(l.planes, 2);
+        assert_eq!(l.plane[0].usage, 1); // data
+        assert_eq!(l.plane[1].usage, 9); // DCC
+        assert!(l.plane[1].offset >= l.plane[0].size);
+        assert!(l.plane[1].size > 0);
+        assert_eq!(release(c), 0);
+
+        let mut ds_desc = desc(1920, 1080, 1, 20, 0);
+        ds_desc.flags = ALLOW_DEPTH_STENCIL;
+        let c = create(&ds_desc);
+        let mut l = std::mem::MaybeUninit::<LayoutOut>::zeroed();
+        assert_eq!(layout(c, l.as_mut_ptr()), S_OK);
+        // SAFETY: filled by `layout`.
+        let l = unsafe { l.assume_init() };
+        assert_eq!(l.planes, 3);
+        assert_eq!(l.plane[0].usage, 7); // depth
+        assert_eq!(l.plane[1].usage, 8); // stencil
+        assert_eq!(l.plane[2].usage, 4); // HTILE
+        assert!(l.plane[2].offset >= l.plane[1].offset + l.plane[1].size);
+        assert_eq!(release(c), 0);
+    }
+
+    #[test]
+    fn tiling_and_copy_reject_null_out_and_out_of_range_subresources() {
+        let c = create(&desc(256, 256, 2, 28, 0x109));
+        let mut tiles = 0;
+        let mut n = 2;
+        assert_eq!(
+            tiling(
+                c,
+                &mut tiles,
+                std::ptr::null_mut(),
+                std::ptr::null_mut(),
+                &mut n,
+                0,
+                std::ptr::null_mut(),
+            ),
+            E_INVALIDARG
+        );
+        // Subresource index past `mips * slices` must be rejected cleanly.
+        let mut buf = [0u8; 64];
+        assert_eq!(
+            copy_into(c, buf.as_mut_ptr(), 0, 99, buf.as_ptr(), 256, 0),
+            E_INVALIDARG
+        );
+        assert_eq!(
+            copy_from(c, buf.as_mut_ptr(), 0, 99, 0, buf.as_ptr(), 256, 0),
+            E_INVALIDARG
+        );
+        // Overflowing pitch must fail instead of wrapping slice length.
+        assert_eq!(
+            copy_into(c, buf.as_mut_ptr(), 0, 0, buf.as_ptr(), u32::MAX, u32::MAX),
+            E_INVALIDARG
+        );
+        assert_eq!(release(c), 0);
     }
 }

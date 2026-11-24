@@ -253,11 +253,11 @@ fn simulate(insts: &[Inst], wave: u32, saved: Value) -> HashMap<Value, Shape> {
             let Some(k) = lo else {
                 return shapes(vec, uni, wave);
             };
-            exec = if name == "s_mov_b64" {
+            exec = (if name == "s_mov_b64" {
                 k
             } else {
                 exec & !0xFFFF_FFFF | k & 0xFFFF_FFFF
-            };
+            }) & all;
             continue;
         }
         if inst.write(Reg::S(EXEC + 1)).is_some() {
@@ -268,7 +268,7 @@ fn simulate(insts: &[Inst], wave: u32, saved: Value) -> HashMap<Value, Shape> {
             else {
                 return shapes(vec, uni, wave);
             };
-            exec = exec & 0xFFFF_FFFF | k << 32;
+            exec = (exec & 0xFFFF_FFFF | k << 32) & all;
             continue;
         }
         if let Fields::Sop { src, .. } = &inst.fields {
@@ -497,8 +497,11 @@ fn constant(inst: &Inst) -> Option<u64> {
     match *src.first()? {
         Operand::Const(c) => {
             let x = crate::resource::inline(c)?;
-            Some(if (x as i32) < 0 {
-                u64::MAX
+            // Inline integers (-16..-1, codes 193..=208) sign-extend to 64
+            // bits (e.g. -2 -> 0xFFFF_FFFF_FFFF_FFFE, not all-ones); other
+            // constants carry their 32-bit bit pattern zero-extended.
+            Some(if (193..=208).contains(&c) {
+                i64::from(x as i32) as u64
             } else {
                 u64::from(x)
             })
@@ -577,7 +580,8 @@ fn per_lane(lanes: &[Sym], all: u64) -> Option<Shape> {
         };
     }
     // Prefixes: lane l holds lanes 0..l (exclusive) or 0..=l (inclusive).
-    let mut found: Option<(Op, Value, Value, u32, bool)> = None;
+    let mut meta: Option<(Value, Value, u32, bool)> = None;
+    let mut found_op: Option<Op> = None;
     for (l, &s) in lanes.iter().enumerate() {
         let below = (1u64 << l) - 1;
         let (op, src, mask, ident, set) = match s {
@@ -596,19 +600,22 @@ fn per_lane(lanes: &[Sym], all: u64) -> Option<Shape> {
         if !inclusive && set != below {
             return None;
         }
-        let op = match (op, found) {
-            (Some(o), _) => o,
-            (None, Some(f)) => f.0,
-            (None, None) => continue,
-        };
-        let me = (op, src, mask, ident, inclusive);
-        match found {
-            None => found = Some(me),
-            Some(f) if f == me => {}
+        let m = (src, mask, ident, inclusive);
+        match meta {
+            None => meta = Some(m),
+            Some(prev) if prev == m => {}
             _ => return None,
         }
+        if let Some(o) = op {
+            match found_op {
+                None => found_op = Some(o),
+                Some(prev) if prev == o => {}
+                _ => return None,
+            }
+        }
     }
-    let (op, src, mask, ident, inclusive) = found?;
+    let (src, mask, ident, inclusive) = meta?;
+    let op = found_op?;
     if let Sym::K(k) = lanes[0]
         && (inclusive || k != ident)
     {
@@ -675,5 +682,15 @@ mod tests {
             per_lane(&vec![red(u64::MAX); 64], u64::MAX),
             Some(Shape::Active(Op::AddU, x, m, 0))
         );
+        // Mismatched `op: None` lane must not silently pass prefix validation.
+        let mut bad_prefix = inclusive.clone();
+        bad_prefix[0] = Sym::Red {
+            op: None,
+            src: Value(99),
+            mask: m,
+            ident: 0,
+            lanes: 1,
+        };
+        assert_eq!(per_lane(&bad_prefix, u64::MAX), None);
     }
 }

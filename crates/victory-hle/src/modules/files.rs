@@ -158,6 +158,38 @@ pub(crate) fn translate(path: &[u16]) -> Option<Vec<u16>> {
         out.push(0);
         return Some(out);
     }
+    let dot = u16::from(b'.');
+    let has_parent = tail
+        .split(|c| SEPARATORS.contains(c))
+        .any(|p| p == [dot, dot]);
+    if has_parent {
+        // Resolve `.` and `..` so `..` stops at the virtual drive's root (#182).
+        let backslash = u16::from(b'\\');
+        let mut out = prefix.to_vec();
+        out.extend_from_slice(root);
+        while out.last() == Some(&backslash) {
+            out.pop();
+        }
+        let mut parts: Vec<&[u16]> = Vec::new();
+        for part in tail.split(|c| SEPARATORS.contains(c)) {
+            match part {
+                [] => {}
+                [d] if *d == dot => {}
+                [d, e] if [*d, *e] == [dot; 2] => drop(parts.pop()),
+                _ => parts.push(part),
+            }
+        }
+        if parts.is_empty() {
+            out.push(backslash);
+        } else {
+            for part in parts {
+                out.push(backslash);
+                out.extend_from_slice(part);
+            }
+        }
+        out.push(0);
+        return Some(out);
+    }
     let mut out = prefix.to_vec();
     out.extend_from_slice(root);
     // `X:` and `X:name` are relative to the root.
@@ -801,6 +833,15 @@ mod tests {
         assert_eq!(
             verbatim(&w(r"\\server\share\")[..15], &w("/x/../../y")[..10]),
             w(r"\\?\UNC\server\share\y")[..22].to_vec()
+        );
+        // `..` stops at the virtual drive's root on short paths too (#182).
+        assert_eq!(
+            tr(r"G:\..\..\Windows\system.ini".into()),
+            Some(format!(r"{}\Windows\system.ini", package.path().display()))
+        );
+        assert_eq!(
+            tr(r"G:\sub\..\..".into()),
+            Some(format!(r"{}\", package.path().display()))
         );
     }
 

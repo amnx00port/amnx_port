@@ -20,6 +20,7 @@
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::sync::Mutex;
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 
 /// The unit tracked and copied: 64 KiB, the console's page (the kernel's
 /// 4 KiB pages fold into it). Finer units made the checks of the world's
@@ -115,6 +116,27 @@ static GUARDS: Mutex<Guards> = Mutex::new(Guards {
     clean: BTreeSet::new(),
 });
 
+/// Fast-path indicator: `true` iff `GUARDS.protected` is non-empty, allowing
+/// `writing()` (`kernel_will_write`) to skip acquiring the global `GUARDS`
+/// mutex when no physical-page blocks are guarded.
+static HAS_GUARDS: AtomicBool = AtomicBool::new(false);
+
+/// Monotonic generation bumped whenever physical-page pool memory is written
+/// or remapped by the runtime (DirectStorage page destinations, `xmem`
+/// mappings), letting `texture::Staging` skip redundant per-submission full
+/// `blake3` hashes of unchanged textures.
+static PHYSICAL_EPOCH: AtomicU64 = AtomicU64::new(1);
+
+/// Marks that physical-page title memory has been written or remapped.
+pub fn physical_memory_written() {
+    PHYSICAL_EPOCH.fetch_add(1, Ordering::Release);
+}
+
+/// Current physical-page write generation.
+pub(crate) fn physical_epoch() -> u64 {
+    PHYSICAL_EPOCH.load(Ordering::Acquire)
+}
+
 fn guards() -> std::sync::MutexGuard<'static, Guards> {
     GUARDS.lock().unwrap_or_else(|e| e.into_inner())
 }
@@ -174,6 +196,9 @@ fn protect(g: &mut Guards, from: usize, to: usize) {
     let note = |g: &mut Guards, from: usize, to: usize| {
         g.protected.extend(from..to);
         g.clean.extend(from..to);
+        if from < to {
+            HAS_GUARDS.store(true, Ordering::Release);
+        }
     };
     if set(from, to) {
         note(g, from, to);
@@ -187,22 +212,59 @@ fn protect(g: &mut Guards, from: usize, to: usize) {
 }
 
 /// Gives write access back to the guarded blocks of `[start, end)` and
-/// notes them written; true if any was guarded.
+/// notes them written; true if any was guarded. Contiguous runs of guarded
+/// blocks are coalesced into a single `VirtualProtect` call to avoid
+/// per-64 KiB TLB shootdowns during bulk DirectStorage / kernel writes.
 fn open(g: &mut Guards, start: usize, end: usize) -> bool {
     use windows_sys::Win32::System::Memory::{PAGE_READWRITE, VirtualProtect};
+    if g.protected.is_empty() || start >= end {
+        return false;
+    }
     let blocks: Vec<usize> = g
         .protected
         .range(start / BLOCK..end.div_ceil(BLOCK))
         .copied()
         .collect();
+    if blocks.is_empty() {
+        return false;
+    }
     for &block in &blocks {
         g.protected.remove(&block);
         g.clean.remove(&block);
-        let mut old = 0;
-        // SAFETY: a block we made read-only.
-        unsafe { VirtualProtect((block * BLOCK) as *const _, BLOCK, PAGE_READWRITE, &mut old) };
     }
-    !blocks.is_empty()
+    if g.protected.is_empty() {
+        HAS_GUARDS.store(false, Ordering::Release);
+    }
+    let mut i = 0;
+    while i < blocks.len() {
+        let run_start = blocks[i];
+        let mut run_end = run_start + 1;
+        while i + 1 < blocks.len() && blocks[i + 1] == run_end {
+            i += 1;
+            run_end += 1;
+        }
+        let mut old = 0;
+        // SAFETY: contiguous blocks we made read-only.
+        let ok = unsafe {
+            VirtualProtect(
+                (run_start * BLOCK) as *const _,
+                (run_end - run_start) * BLOCK,
+                PAGE_READWRITE,
+                &mut old,
+            ) != 0
+        };
+        if !ok {
+            // Fall back block by block if the run spans separate views.
+            for block in run_start..run_end {
+                // SAFETY: a block we made read-only.
+                unsafe {
+                    VirtualProtect((block * BLOCK) as *const _, BLOCK, PAGE_READWRITE, &mut old)
+                };
+            }
+        }
+        i += 1;
+    }
+    true
 }
 
 /// Before our own write into title memory `[at, at + len)` through the
@@ -210,6 +272,9 @@ fn open(g: &mut Guards, start: usize, end: usize) -> bool {
 /// The runtime calls it (as `kernel_will_write`) before the title's kernel
 /// reads into its own memory.
 pub fn writing(at: usize, len: usize) {
+    if len == 0 || !HAS_GUARDS.load(Ordering::Acquire) {
+        return;
+    }
     // The length is the title's (`fread`'s size times count, saturated).
     open(&mut guards(), at, at.saturating_add(len));
 }
@@ -217,6 +282,10 @@ pub fn writing(at: usize, len: usize) {
 /// The runtime mapped or unmapped title memory `[at, at + len)`: what it
 /// shows is new and read-write, so it is no longer guarded.
 pub fn title_memory_remapped(at: usize, len: usize) {
+    physical_memory_written();
+    if len == 0 || !HAS_GUARDS.load(Ordering::Acquire) {
+        return;
+    }
     let mut g = guards();
     let blocks: Vec<usize> = g
         .protected
@@ -226,6 +295,9 @@ pub fn title_memory_remapped(at: usize, len: usize) {
     for block in blocks {
         g.protected.remove(&block);
         g.clean.remove(&block);
+    }
+    if g.protected.is_empty() {
+        HAS_GUARDS.store(false, Ordering::Release);
     }
 }
 

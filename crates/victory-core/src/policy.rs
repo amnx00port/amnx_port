@@ -65,7 +65,7 @@ pub fn ensure_outside_repo(path: &Path) -> Result<(), PolicyError> {
 /// Canonicalizes the longest existing prefix of `path` and re-appends the
 /// rest, so that paths which do not exist yet can still be compared.
 fn resolve(path: &Path) -> Result<PathBuf, PolicyError> {
-    let absolute = if path.is_absolute() {
+    let absolute = normalize(&if path.is_absolute() {
         path.to_path_buf()
     } else {
         std::env::current_dir()
@@ -74,7 +74,7 @@ fn resolve(path: &Path) -> Result<PathBuf, PolicyError> {
                 source,
             })?
             .join(path)
-    };
+    });
 
     let mut existing = absolute.as_path();
     let mut rest = Vec::new();
@@ -103,16 +103,35 @@ fn resolve(path: &Path) -> Result<PathBuf, PolicyError> {
     }
 }
 
-/// Removes `.` and resolves `..` lexically (only used on the non-existing tail).
+/// Removes `.` and resolves `..` lexically, including under Windows `\\?\`
+/// verbatim prefixes where `Path::components` yields `.`/`..` as `Normal`
+/// components. Never pops past a root or prefix component.
 fn normalize(path: &Path) -> PathBuf {
     let mut out = PathBuf::new();
+    let mut depth = 0usize;
     for component in path.components() {
         match component {
             Component::CurDir => {}
+            Component::Normal(s) if s == "." => {}
             Component::ParentDir => {
-                out.pop();
+                if depth > 0 {
+                    out.pop();
+                    depth -= 1;
+                }
             }
-            c => out.push(c),
+            Component::Normal(s) if s == ".." => {
+                if depth > 0 {
+                    out.pop();
+                    depth -= 1;
+                }
+            }
+            Component::Prefix(_) | Component::RootDir => {
+                out.push(component);
+            }
+            Component::Normal(s) => {
+                out.push(s);
+                depth += 1;
+            }
         }
     }
     out
@@ -142,6 +161,28 @@ mod tests {
             .join("not-yet-created")
             .join("out");
         assert!(ensure_outside_repo(&path).is_err());
+    }
+
+    #[test]
+    fn handles_trailing_dot_and_dotdot_and_verbatim_dotdot() {
+        let tmp = tempfile::tempdir().unwrap();
+        let trailing_parent = tmp.path().join("nonexistent").join("sub").join("..");
+        ensure_outside_repo(&trailing_parent).unwrap();
+        let trailing_cur = tmp.path().join("nonexistent").join(".");
+        ensure_outside_repo(&trailing_cur).unwrap();
+
+        let root = compiled_workspace_root();
+        let back_in = root.join("nonexistent").join("..");
+        assert!(matches!(
+            ensure_outside_repo(&back_in),
+            Err(PolicyError::InsideRepo { .. })
+        ));
+
+        // Lexical `..` folding under Windows verbatim prefixes (`\\?\...`).
+        let verbatim = Path::new(r"\\?\C:\repo\crates\..\cache\.");
+        assert_eq!(normalize(verbatim), Path::new(r"\\?\C:\repo\cache"));
+        let at_root = Path::new(r"\\?\C:\..\..\outside");
+        assert_eq!(normalize(at_root), Path::new(r"\\?\C:\outside"));
     }
 
     #[test]

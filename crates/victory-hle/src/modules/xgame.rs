@@ -6,7 +6,7 @@
 use std::ffi::{CStr, c_char, c_void};
 
 use super::xgameruntime::{
-    Guid, HRESULT, Interface, Methods, Object, S_OK, add_ref, missing, put, text, token,
+    Guid, HRESULT, Interface, Methods, Object, S_OK, add_ref, put, text, token,
 };
 use crate::runtime;
 
@@ -158,8 +158,51 @@ extern "system" fn write_event(
     S_OK
 }
 
+const IID_IUNKNOWN: Guid = Guid::new(
+    0x0000_0000,
+    0x0000,
+    0x0000,
+    [0xc0, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x46],
+);
+const E_POINTER: HRESULT = 0x8000_4003_u32 as i32;
+const E_NOINTERFACE: HRESULT = 0x8000_4002_u32 as i32;
+
+extern "system" fn query_interface(
+    this: This,
+    iid: *const Guid,
+    out: *mut *const Object,
+) -> HRESULT {
+    if out.is_null() {
+        return E_POINTER;
+    }
+    // SAFETY: checked non-null; COM requires zeroing `*out` on error.
+    unsafe { out.write(std::ptr::null()) };
+    // SAFETY: title passes an IID pointer (null tolerated).
+    let Some(&want) = (unsafe { iid.as_ref() }) else {
+        return E_POINTER;
+    };
+    let own = if std::ptr::eq(this, &TITLE_OBJECT) {
+        Some(TITLE_IID)
+    } else if std::ptr::eq(this, &FEATURES_OBJECT) {
+        Some(FEATURES)
+    } else if std::ptr::eq(this, &INVITES_OBJECT) {
+        Some(INVITES)
+    } else if std::ptr::eq(this, &EVENTS_OBJECT) {
+        Some(EVENTS)
+    } else {
+        None
+    };
+    if want == IID_IUNKNOWN || own == Some(want) {
+        // SAFETY: checked non-null.
+        unsafe { out.write(this) };
+        S_OK
+    } else {
+        E_NOINTERFACE
+    }
+}
+
 static TITLE_VTABLE: Methods<5> = Methods([
-    missing::<0> as *const (),
+    query_interface as *const (),
     add_ref as *const (),
     add_ref as *const (),
     title_id as *const (),        // 0x18
@@ -167,14 +210,14 @@ static TITLE_VTABLE: Methods<5> = Methods([
 ]);
 
 static FEATURES_VTABLE: Methods<4> = Methods([
-    missing::<0> as *const (),
+    query_interface as *const (),
     add_ref as *const (),
     add_ref as *const (),
     is_feature_available as *const (), // 0x18
 ]);
 
 static INVITES_VTABLE: Methods<5> = Methods([
-    missing::<0> as *const (),
+    query_interface as *const (),
     add_ref as *const (),
     add_ref as *const (),
     register as *const (),   // 0x18
@@ -182,7 +225,7 @@ static INVITES_VTABLE: Methods<5> = Methods([
 ]);
 
 static EVENTS_VTABLE: Methods<4> = Methods([
-    missing::<0> as *const (),
+    query_interface as *const (),
     add_ref as *const (),
     add_ref as *const (),
     write_event as *const (), // 0x18
@@ -237,5 +280,32 @@ mod tests {
             token,
             true
         ));
+    }
+
+    #[test]
+    fn query_interface_answers_iunknown_and_own_iid() {
+        type Qi = extern "system" fn(This, *const Guid, *mut *const Object) -> HRESULT;
+        for (obj, own) in [
+            (&TITLE_OBJECT, TITLE_IID),
+            (&FEATURES_OBJECT, FEATURES),
+            (&INVITES_OBJECT, INVITES),
+            (&EVENTS_OBJECT, EVENTS),
+        ] {
+            let qi = method::<Qi>(obj, 0x00);
+            let mut out = std::ptr::null();
+            assert_eq!(qi(obj, &IID_IUNKNOWN, &mut out), S_OK);
+            assert!(std::ptr::eq(out, obj));
+            out = std::ptr::null();
+            assert_eq!(qi(obj, &own, &mut out), S_OK);
+            assert!(std::ptr::eq(out, obj));
+            // Wrong IID clears *out and returns E_NOINTERFACE.
+            assert_eq!(qi(obj, &TITLE_PROVIDER, &mut out), E_NOINTERFACE);
+            assert!(out.is_null());
+            // Null out or null iid returns E_POINTER.
+            assert_eq!(qi(obj, &own, std::ptr::null_mut()), E_POINTER);
+            out = obj;
+            assert_eq!(qi(obj, std::ptr::null(), &mut out), E_POINTER);
+            assert!(out.is_null());
+        }
     }
 }

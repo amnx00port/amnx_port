@@ -222,7 +222,14 @@ impl Tables {
                     bits: [r.u8(), r.u8()],
                     ..Default::default()
                 };
-                for v in ix.ix.as_flattened_mut() {
+                // Bytes 52..54 hold a second width word before the 16 set-0
+                // indices at bytes 54..86; bytes 86..116 hold 15 set-1 i16s
+                // (all zero in shipped tables, where `bits[1]` is 0).
+                let _extra_widths = r.u16();
+                for v in &mut ix.ix[0] {
+                    *v = r.u16() as i16;
+                }
+                for v in &mut ix.ix[1][..15] {
                     *v = r.u16() as i16;
                 }
                 (ep, ix)
@@ -249,10 +256,71 @@ impl Tables {
     }
 }
 
+/// Reusable scratch history for [`decode_with`], avoiding per-call heap
+/// allocations across repeated BCPack decodes.
+#[derive(Default)]
+pub struct Workspace {
+    plain: Vec<Plain>,
+    bc6: Vec<(Bc6Ep, Bc6Ix)>,
+    bc7: Vec<(Bc7Ep, Bc7Ix)>,
+}
+
+impl Workspace {
+    /// Creates an empty workspace; format history ring buffers are allocated
+    /// lazily on first use and reused across subsequent calls.
+    pub const fn new() -> Self {
+        Self {
+            plain: Vec::new(),
+            bc6: Vec::new(),
+            bc7: Vec::new(),
+        }
+    }
+
+    fn plain_history(&mut self) -> &mut [Plain] {
+        if self.plain.len() < HISTORY {
+            self.plain.resize(HISTORY, Plain::default());
+        }
+        &mut self.plain[..HISTORY]
+    }
+
+    fn bc6_history(&mut self) -> &mut [(Bc6Ep, Bc6Ix)] {
+        if self.bc6.len() < HISTORY {
+            self.bc6.resize(HISTORY, (Bc6Ep::default(), Bc6Ix::default()));
+        }
+        &mut self.bc6[..HISTORY]
+    }
+
+    fn bc7_history(&mut self) -> &mut [(Bc7Ep, Bc7Ix)] {
+        if self.bc7.len() < HISTORY {
+            self.bc7.resize(HISTORY, (Bc7Ep::default(), Bc7Ix::default()));
+        }
+        &mut self.bc7[..HISTORY]
+    }
+}
+
 /// Unpacks `src` (BC number `bc`, 1 and 3-7) into `dst`, whose length gives
 /// the block count. The stream carries no size: bytes after the last one the
 /// lanes need are ignored, a stream that runs out is an error.
+///
+/// Reuses a thread-local [`Workspace`] and streams block records on the stack,
+/// avoiding per-call heap allocations.
 pub fn decode(bc: u8, src: &[u8], dst: &mut [u8], tables: &Tables) -> Result<(), Error> {
+    thread_local! {
+        static WORKSPACE: std::cell::RefCell<Workspace> = const {
+            std::cell::RefCell::new(Workspace::new())
+        };
+    }
+    WORKSPACE.with(|ws| decode_with(bc, src, dst, tables, &mut ws.borrow_mut()))
+}
+
+/// Unpacks `src` into `dst` using the caller-provided reusable [`Workspace`].
+pub fn decode_with(
+    bc: u8,
+    src: &[u8],
+    dst: &mut [u8],
+    tables: &Tables,
+    ws: &mut Workspace,
+) -> Result<(), Error> {
     let block = match bc {
         1 | 4 => 8,
         3 | 5 | 6 | 7 => 16,
@@ -270,20 +338,108 @@ pub fn decode(bc: u8, src: &[u8], dst: &mut [u8], tables: &Tables) -> Result<(),
         6 => (&[3, 3, 7, 7, 7, 4, 4, 4, 5, 5, 5, 7, 7, 7, 7, 4], 2),
         _ => (&[3, 3, 7, 7, 7, 7, 7, 6, 6, 4, 5, 7, 7, 7, 7, 4], 2),
     };
-    let stride = widths.len() * per;
-    let mut records = vec![0u8; blocks * stride];
     let mut next = src.iter().copied();
-    lanes(tables, widths, per, blocks, |_| next.next(), &mut records)?;
-    let records = records.chunks_exact(stride);
-    let out = dst.chunks_exact_mut(block);
     let t = tables;
     match bc {
-        1 => plain(records, out, &t.bc1, &BC1, |s| bc1_residual(t, s), bc1_pack),
-        3 => plain(records, out, &t.bc3, &BC3, |s| bc3_residual(t, s), bc3_pack),
-        4 => plain(records, out, &t.bc4, &BC4, |s| bc4_residual(t, s), bc4_pack),
-        5 => plain(records, out, &t.bc5, &BC5, |s| bc5_residual(t, s), bc5_pack),
-        6 => bc6(records, out, &t.bc6),
-        _ => bc7(records, out, t),
+        1 => {
+            let history = ws.plain_history();
+            let zero = Plain::default();
+            lanes_stream(tables, widths, per, blocks, |_| next.next(), |i, s| {
+                plain_block(
+                    i,
+                    s,
+                    &mut dst[i * block..(i + 1) * block],
+                    history,
+                    &t.bc1,
+                    &zero,
+                    &BC1,
+                    |s| bc1_residual(t, s),
+                    bc1_pack,
+                );
+                Ok(())
+            })
+        }
+        3 => {
+            let history = ws.plain_history();
+            let zero = Plain::default();
+            lanes_stream(tables, widths, per, blocks, |_| next.next(), |i, s| {
+                plain_block(
+                    i,
+                    s,
+                    &mut dst[i * block..(i + 1) * block],
+                    history,
+                    &t.bc3,
+                    &zero,
+                    &BC3,
+                    |s| bc3_residual(t, s),
+                    bc3_pack,
+                );
+                Ok(())
+            })
+        }
+        4 => {
+            let history = ws.plain_history();
+            let zero = Plain::default();
+            lanes_stream(tables, widths, per, blocks, |_| next.next(), |i, s| {
+                plain_block(
+                    i,
+                    s,
+                    &mut dst[i * block..(i + 1) * block],
+                    history,
+                    &t.bc4,
+                    &zero,
+                    &BC4,
+                    |s| bc4_residual(t, s),
+                    bc4_pack,
+                );
+                Ok(())
+            })
+        }
+        5 => {
+            let history = ws.plain_history();
+            let zero = Plain::default();
+            lanes_stream(tables, widths, per, blocks, |_| next.next(), |i, s| {
+                plain_block(
+                    i,
+                    s,
+                    &mut dst[i * block..(i + 1) * block],
+                    history,
+                    &t.bc5,
+                    &zero,
+                    &BC5,
+                    |s| bc5_residual(t, s),
+                    bc5_pack,
+                );
+                Ok(())
+            })
+        }
+        6 => {
+            let history = ws.bc6_history();
+            let zero = (
+                Bc6Ep::default(),
+                Bc6Ix {
+                    mode: 11,
+                    ..Default::default()
+                },
+            );
+            lanes_stream(tables, widths, per, blocks, |_| next.next(), |i, s| {
+                bc6_block(
+                    i,
+                    s,
+                    &mut dst[i * block..(i + 1) * block],
+                    history,
+                    &t.bc6,
+                    &zero,
+                )
+            })
+        }
+        _ => {
+            let history = ws.bc7_history();
+            let zero = (Bc7Ep::default(), Bc7Ix::default());
+            lanes_stream(tables, widths, per, blocks, |_| next.next(), |i, s| {
+                bc7_block(i, s, &mut dst[i * block..(i + 1) * block], history, t, &zero)
+            })
+        }
     }
 }
 
@@ -396,20 +552,21 @@ fn bucket_of(t: &Tables, model: u8, slot: u32) -> usize {
     b
 }
 
-/// Decodes `per` symbols per block on every lane into `records` (one record
-/// of `widths.len() * per` symbols per block), taking input from `fetch`
-/// (given the lane that takes the byte) in the order of the schedule: each
-/// round the lanes step in order and take at most 8 bytes between them.
+/// Decodes `per` symbols per block on every lane and streams each completed
+/// block record (`widths.len() * per <= 32` bytes) to `emit` on the stack,
+/// taking input from `fetch` (given the lane that takes the byte) in the
+/// order of the schedule: each round the lanes step in order and take at most
+/// 8 bytes between them.
 // shortcut: one lane step at a time (BC1 roughly 30-60 MB/s, BC7 15-20 MB/s
 // on one core); if texture streaming needs more, run the schedule only to
 // split the input per lane and decode the lanes apart.
-fn lanes(
+fn lanes_stream(
     t: &Tables,
     widths: &[u8],
     per: usize,
     blocks: usize,
     mut fetch: impl FnMut(usize) -> Option<u8>,
-    records: &mut [u8],
+    mut emit: impl FnMut(usize, &[u8]) -> Result<(), Error>,
 ) -> Result<(), Error> {
     let mut lanes = [Lane::default(); 16];
     let lanes = &mut lanes[..widths.len()];
@@ -418,12 +575,12 @@ fn lanes(
         lane.need = true;
     }
     let stride = widths.len() * per;
+    let mut record = [0u8; 32];
     let full = (1u32 << widths.len()) - 1;
     let (mut pos, mut done, mut idle) = (0, 0u32, 0);
-    // Where symbol `pos` of lane 0 goes; lane j's is `per * j` further on.
-    let mut at = 0;
     while pos < blocks * per {
         let (mut taken, mut moved) = (0, false);
+        let sub = pos % per;
         for (j, lane) in lanes.iter_mut().enumerate() {
             let bit = 1 << j;
             let before = taken;
@@ -442,18 +599,16 @@ fn lanes(
             if !lane.stalled
                 && let Some(sym) = lane.out.take()
             {
-                records[at + j * per] = sym;
+                record[j * per + sub] = sym;
                 done |= bit;
                 moved = true;
             }
         }
         if done == full {
+            if sub + 1 == per {
+                emit(pos / per, &record[..stride])?;
+            }
             pos += 1;
-            at += if pos.is_multiple_of(per) {
-                stride - per + 1
-            } else {
-                1
-            };
             done = 0;
             moved = true;
         }
@@ -464,6 +619,22 @@ fn lanes(
         }
     }
     Ok(())
+}
+
+#[cfg(test)]
+fn lanes(
+    t: &Tables,
+    widths: &[u8],
+    per: usize,
+    blocks: usize,
+    fetch: impl FnMut(usize) -> Option<u8>,
+    records: &mut [u8],
+) -> Result<(), Error> {
+    let stride = widths.len() * per;
+    lanes_stream(t, widths, per, blocks, fetch, |i, rec| {
+        records[i * stride..(i + 1) * stride].copy_from_slice(rec);
+        Ok(())
+    })
 }
 
 // Blocks.
@@ -523,31 +694,30 @@ const BC3: Widths = widths([5, 6, 5, 5, 6, 5, 8, 8], 16, 16, true);
 const BC4: Widths = widths([8, 8, 0, 0, 0, 0, 0, 0], 16, 0, false);
 const BC5: Widths = widths([8, 8, 8, 8, 0, 0, 0, 0], 32, 0, true);
 
-fn plain<'a>(
-    records: impl Iterator<Item = &'a [u8]>,
-    out: impl Iterator<Item = &'a mut [u8]>,
+#[allow(clippy::too_many_arguments)]
+fn plain_block(
+    i: usize,
+    s: &[u8],
+    block: &mut [u8],
+    history: &mut [Plain],
     dictionary: &[Plain],
+    zero: &Plain,
     w: &Widths,
     residual: impl Fn(&[u8]) -> Plain,
     pack: fn(&Plain, &mut [u8]),
-) -> Result<(), Error> {
-    let mut history = vec![Plain::default(); HISTORY];
-    let zero = Plain::default();
-    for (i, (s, block)) in records.zip(out).enumerate() {
-        let (ep_ref, ix_ref) = references(s, w.paired);
-        let ep_ref = &pick(i, ep_ref, &history, dictionary, &zero).ep;
-        let ix_ref = &pick(i, ix_ref, &history, dictionary, &zero).ix;
-        let mut v = residual(s);
-        for ((v, r), bits) in v.ep.iter_mut().zip(ep_ref).zip(w.ep) {
-            *v = v.wrapping_add(*r) & ((1u16 << bits) - 1) as u8;
-        }
-        for ((v, r), bits) in v.ix.iter_mut().zip(ix_ref).zip(w.ix) {
-            *v = v.wrapping_add(*r) & ((1u8 << bits) - 1);
-        }
-        history[i % HISTORY] = v;
-        pack(&v, block);
+) {
+    let (ep_ref, ix_ref) = references(s, w.paired);
+    let ep_ref = &pick(i, ep_ref, history, dictionary, zero).ep;
+    let ix_ref = &pick(i, ix_ref, history, dictionary, zero).ix;
+    let mut v = residual(s);
+    for ((v, r), bits) in v.ep.iter_mut().zip(ep_ref).zip(w.ep) {
+        *v = v.wrapping_add(*r) & ((1u16 << bits) - 1) as u8;
     }
-    Ok(())
+    for ((v, r), bits) in v.ix.iter_mut().zip(ix_ref).zip(w.ix) {
+        *v = v.wrapping_add(*r) & ((1u8 << bits) - 1);
+    }
+    history[i % HISTORY] = v;
+    pack(&v, block);
 }
 
 /// 2-bit index residuals: one symbol per 2x2 quad.
@@ -754,93 +924,91 @@ fn bc7_precision(ctrl: u16) -> [u8; 4] {
     p
 }
 
-fn bc7<'a>(
-    records: impl Iterator<Item = &'a [u8]>,
-    out: impl Iterator<Item = &'a mut [u8]>,
+fn bc7_block(
+    i: usize,
+    s: &[u8],
+    block: &mut [u8],
+    history: &mut [(Bc7Ep, Bc7Ix)],
     t: &Tables,
+    zero: &(Bc7Ep, Bc7Ix),
 ) -> Result<(), Error> {
-    let mut history = vec![(Bc7Ep::default(), Bc7Ix::default()); HISTORY];
-    let zero = (Bc7Ep::default(), Bc7Ix::default());
-    for (i, (s, block)) in records.zip(out).enumerate() {
-        let (ep_ref, ix_ref) = references(s, true);
-        let ctrl = t.ctrl7[usize::from(s[31] & 15) << 5 | usize::from(s[30] & 31)];
-        if ctrl == 0 {
-            return Err(Error("unused BC7 control code"));
+    let (ep_ref, ix_ref) = references(s, true);
+    let ctrl = t.ctrl7[usize::from(s[31] & 15) << 5 | usize::from(s[30] & 31)];
+    if ctrl == 0 {
+        return Err(Error("unused BC7 control code"));
+    }
+    let mode = usize::from(ctrl & 7);
+    let subsets = usize::from((ctrl & 0xff) >> 6);
+    let prec = bc7_precision(ctrl);
+    let three = subsets == 3;
+    let or0 = |v: u8| if three { 0 } else { v };
+    let if3 = |v: u8| if three { v } else { 0 };
+    let stored = [
+        [s[4], s[5], s[6], s[7], s[8], s[9], or0(s[10]), or0(s[11])],
+        [
+            s[12],
+            s[13],
+            s[14],
+            s[15],
+            s[16],
+            s[17],
+            or0(s[18]),
+            or0(s[19]),
+        ],
+        [
+            s[20],
+            s[21],
+            if3(s[10]),
+            if3(s[11]),
+            if3(s[18]),
+            if3(s[19]),
+            0,
+            0,
+        ],
+    ];
+    let r = &pick(i, ep_ref, history, &t.bc7, zero).0;
+    let mut ep = Bc7Ep {
+        ctrl,
+        ..Default::default()
+    };
+    // Rows the reference lacks build on its first row.
+    let common = subsets.min(usize::from((r.ctrl & 0xff) >> 6));
+    let columns = if prec[3] > 0 { 8 } else { 6 };
+    for c in 0..columns {
+        let p = prec[c / 2];
+        if p == 0 {
+            continue;
         }
-        let mode = usize::from(ctrl & 7);
-        let subsets = usize::from((ctrl & 0xff) >> 6);
-        let prec = bc7_precision(ctrl);
-        let three = subsets == 3;
-        let or0 = |v: u8| if three { 0 } else { v };
-        let if3 = |v: u8| if three { v } else { 0 };
-        let stored = [
-            [s[4], s[5], s[6], s[7], s[8], s[9], or0(s[10]), or0(s[11])],
-            [
-                s[12],
-                s[13],
-                s[14],
-                s[15],
-                s[16],
-                s[17],
-                or0(s[18]),
-                or0(s[19]),
-            ],
-            [
-                s[20],
-                s[21],
-                if3(s[10]),
-                if3(s[11]),
-                if3(s[18]),
-                if3(s[19]),
-                0,
-                0,
-            ],
-        ];
-        let r = &pick(i, ep_ref, &history, &t.bc7, &zero).0;
-        let mut ep = Bc7Ep {
-            ctrl,
-            ..Default::default()
-        };
-        // Rows the reference lacks build on its first row.
-        let common = subsets.min(usize::from((r.ctrl & 0xff) >> 6));
-        let columns = if prec[3] > 0 { 8 } else { 6 };
-        for c in 0..columns {
-            let p = prec[c / 2];
-            if p == 0 {
-                continue;
-            }
-            let mask = 0xffffu16 << (16 - p);
-            for (row, st) in stored.iter().enumerate().take(subsets) {
-                let v = st[c];
-                let residual =
-                    (u16::from(v >> 1) ^ (v & 1).wrapping_neg() as i8 as u16) << (16 - p);
-                let base = r.rows[if row < common { row } else { 0 }][c] & mask;
-                ep.rows[row][c] = base.wrapping_add(residual);
-            }
+        let mask = 0xffffu16 << (16 - p);
+        for (row, st) in stored.iter().enumerate().take(subsets) {
+            let v = st[c];
+            let residual = (u16::from(v >> 1) ^ (v & 1).wrapping_neg() as i8 as u16) << (16 - p);
+            let base = r.rows[if row < common { row } else { 0 }][c] & mask;
+            ep.rows[row][c] = base.wrapping_add(residual);
         }
-        let bits = BC7_INDEX[mode];
-        let rx = &pick(i, ix_ref, &history, &t.bc7, &zero).1;
-        let mut ix = Bc7Ix {
-            bits,
-            ..Default::default()
-        };
-        for (set, offsets) in [[22, 24, 26, 28], [12, 14, 16, 20]].into_iter().enumerate() {
-            if bits[set] == 0 {
-                continue;
-            }
-            for (k, o) in offsets.into_iter().enumerate() {
-                for (b, &byte) in s[o..o + 2].iter().enumerate() {
-                    let pair = nibbles(byte, k < 3);
-                    for (h, &v) in pair.iter().enumerate() {
-                        let p = 4 * k + 2 * b + h;
-                        ix.ix[set][p] = add_index(v, bits[set], rx.ix[set][p], rx.bits[set]);
-                    }
+    }
+    let bits = BC7_INDEX[mode];
+    let rx = &pick(i, ix_ref, history, &t.bc7, zero).1;
+    let mut ix = Bc7Ix {
+        bits,
+        ..Default::default()
+    };
+    for (set, offsets) in [[22, 24, 26, 28], [12, 14, 16, 20]].into_iter().enumerate() {
+        if bits[set] == 0 {
+            continue;
+        }
+        for (k, o) in offsets.into_iter().enumerate() {
+            for (b, &byte) in s[o..o + 2].iter().enumerate() {
+                let pair = nibbles(byte, k < 3);
+                for (h, &v) in pair.iter().enumerate() {
+                    let p = 4 * k + 2 * b + h;
+                    ix.ix[set][p] = add_index(v, bits[set], rx.ix[set][p], rx.bits[set]);
                 }
             }
         }
-        history[i % HISTORY] = (ep, ix);
-        bc7_pack(&ep, &ix, prec, block);
     }
+    history[i % HISTORY] = (ep, ix);
+    bc7_pack(&ep, &ix, prec, block);
     Ok(())
 }
 
@@ -1054,107 +1222,100 @@ fn bc6_index_bits(mode: u8) -> u8 {
     }
 }
 
-fn bc6<'a>(
-    records: impl Iterator<Item = &'a [u8]>,
-    out: impl Iterator<Item = &'a mut [u8]>,
+fn bc6_block(
+    i: usize,
+    s: &[u8],
+    block: &mut [u8],
+    history: &mut [(Bc6Ep, Bc6Ix)],
     dictionary: &[(Bc6Ep, Bc6Ix)],
+    zero: &(Bc6Ep, Bc6Ix),
 ) -> Result<(), Error> {
-    let mut history = vec![(Bc6Ep::default(), Bc6Ix::default()); HISTORY];
-    let zero = (
-        Bc6Ep::default(),
-        Bc6Ix {
-            mode: 11,
-            ..Default::default()
-        },
-    );
     let z = |v: u16| (v >> 1) ^ (v & 1).wrapping_neg();
     let wide = |a: u8, b: u8| {
         (0..8).fold(0u16, |acc, k| {
             acc | u16::from(a >> k & 1) << (2 * k) | u16::from(b >> k & 1) << (2 * k + 1)
         })
     };
-    for (i, (s, block)) in records.zip(out).enumerate() {
-        let (ep_ref, ix_ref) = references(s, true);
-        let mode = s[30].wrapping_add(1);
-        if !(1..=14).contains(&mode) {
-            return Err(Error("BC6H mode out of range"));
-        }
-        let two = mode < 11;
-        let shift = BC6_BITS[usize::from(mode)].map(|b| 16 - u32::from(b));
-        let e0 = [wide(s[4], s[5]), wide(s[6], s[7]), wide(s[8], s[9])].map(z);
-        let e1 = [wide(s[10], s[11]), wide(s[12], s[13]), wide(s[14], s[15])].map(z);
-        let (e2, e3) = if two {
-            (
-                [s[16], s[18], s[20]].map(|v| z(v.into())),
-                [s[17], s[19], s[21]].map(|v| z(v.into())),
-            )
-        } else {
-            (e0, e1)
-        };
-        let r = &pick(i, ep_ref, &history, dictionary, &zero).0;
-        let mut ep = Bc6Ep::default();
-        // Endpoint 0 at the base precision, the others per channel; the
-        // reference is cut by the mask after the sum.
-        let mask = |sh: u32| 0xffffu16 << sh;
-        for ((e, &r), res) in ep.e[0].iter_mut().zip(&r.e[0]).zip(e0) {
-            *e = r.wrapping_add(res << shift[0]) & mask(shift[0]);
-        }
-        for (k, res) in [e1, e2, e3]
-            .iter()
-            .enumerate()
-            .take(if two { 3 } else { 1 })
-        {
-            for c in 0..3 {
-                ep.e[k + 1][c] =
-                    r.e[k + 1][c].wrapping_add(res[c] << shift[1 + c]) & mask(shift[1 + c]);
-            }
-        }
-        if !two {
-            for c in 0..3 {
-                ep.e[2][c] = (ep.e[0][c] >> shift[0]) << shift[1];
-            }
-            ep.e[3] = ep.e[1];
-        }
-        let rx = &pick(i, ix_ref, &history, dictionary, &zero).1;
-        let bits = bc6_index_bits(mode);
-        let mut ix = Bc6Ix {
-            mode,
-            ..Default::default()
-        };
-        for k in 0..8 {
-            for (h, v) in nibbles(s[22 + k], k < 6).into_iter().enumerate() {
-                let p = 2 * k + h;
-                ix.ix[p] = add_index(v, bits, rx.ix[p], bc6_index_bits(rx.mode));
-            }
-        }
-        history[i % HISTORY] = (ep, ix);
-        // Fields: the working value has its top bit flipped.
-        let field = |k: usize, c: usize| {
-            let sh = if k == 0 { shift[0] } else { shift[1 + c] };
-            u64::from((ep.e[k][c] ^ 0x8000) >> sh)
-        };
-        let mut w = Bits::default();
-        let (code, n) = BC6_CODE[usize::from(mode)];
-        w.put(code, n);
-        let part = s[31] & 31;
-        for run in BC6_LAYOUT[usize::from(mode)] {
-            if run.ch == 3 {
-                w.put(part.into(), 5);
-            } else {
-                w.put(
-                    field(run.ep.into(), run.ch.into()) >> run.first,
-                    run.len.into(),
-                );
-            }
-        }
-        let anchor = if two { ANCHOR2[usize::from(part)] } else { 0 };
-        for (p, &v) in ix.ix.iter().enumerate() {
-            let short = p == 0 || p == usize::from(anchor);
-            let v = (v as u16).wrapping_add(1 << (bits - 1));
-            w.put(v.into(), u32::from(bits) - u32::from(short));
-        }
-        block.copy_from_slice(&w.v.to_le_bytes());
+    let (ep_ref, ix_ref) = references(s, true);
+    let mode = s[30].wrapping_add(1);
+    if !(1..=14).contains(&mode) {
+        return Err(Error("BC6H mode out of range"));
     }
+    let two = mode < 11;
+    let shift = BC6_BITS[usize::from(mode)].map(|b| 16 - u32::from(b));
+    let e0 = [wide(s[4], s[5]), wide(s[6], s[7]), wide(s[8], s[9])].map(z);
+    let e1 = [wide(s[10], s[11]), wide(s[12], s[13]), wide(s[14], s[15])].map(z);
+    let (e2, e3) = if two {
+        (
+            [s[16], s[18], s[20]].map(|v| z(v.into())),
+            [s[17], s[19], s[21]].map(|v| z(v.into())),
+        )
+    } else {
+        (e0, e1)
+    };
+    let r = &pick(i, ep_ref, history, dictionary, zero).0;
+    let mut ep = Bc6Ep::default();
+    // Endpoint 0 at the base precision, the others per channel; the
+    // reference is cut by the mask after the sum.
+    let mask = |sh: u32| 0xffffu16 << sh;
+    for ((e, &r), res) in ep.e[0].iter_mut().zip(&r.e[0]).zip(e0) {
+        *e = r.wrapping_add(res << shift[0]) & mask(shift[0]);
+    }
+    for (k, res) in [e1, e2, e3]
+        .iter()
+        .enumerate()
+        .take(if two { 3 } else { 1 })
+    {
+        for c in 0..3 {
+            ep.e[k + 1][c] =
+                r.e[k + 1][c].wrapping_add(res[c] << shift[1 + c]) & mask(shift[1 + c]);
+        }
+    }
+    if !two {
+        for c in 0..3 {
+            ep.e[2][c] = (ep.e[0][c] >> shift[0]) << shift[1];
+        }
+        ep.e[3] = ep.e[1];
+    }
+    let rx = &pick(i, ix_ref, history, dictionary, zero).1;
+    let bits = bc6_index_bits(mode);
+    let mut ix = Bc6Ix {
+        mode,
+        ..Default::default()
+    };
+    for k in 0..8 {
+        for (h, v) in nibbles(s[22 + k], k < 6).into_iter().enumerate() {
+            let p = 2 * k + h;
+            ix.ix[p] = add_index(v, bits, rx.ix[p], bc6_index_bits(rx.mode));
+        }
+    }
+    history[i % HISTORY] = (ep, ix);
+    // Fields: the working value has its top bit flipped.
+    let field = |k: usize, c: usize| {
+        let sh = if k == 0 { shift[0] } else { shift[1 + c] };
+        u64::from((ep.e[k][c] ^ 0x8000) >> sh)
+    };
+    let mut w = Bits::default();
+    let (code, n) = BC6_CODE[usize::from(mode)];
+    w.put(code, n);
+    let part = s[31] & 31;
+    for run in BC6_LAYOUT[usize::from(mode)] {
+        if run.ch == 3 {
+            w.put(part.into(), 5);
+        } else {
+            w.put(
+                field(run.ep.into(), run.ch.into()) >> run.first,
+                run.len.into(),
+            );
+        }
+    }
+    let anchor = if two { ANCHOR2[usize::from(part)] } else { 0 };
+    for (p, &v) in ix.ix.iter().enumerate() {
+        let short = p == 0 || p == usize::from(anchor);
+        let v = (v as u16).wrapping_add(1 << (bits - 1));
+        w.put(v.into(), u32::from(bits) - u32::from(short));
+    }
+    block.copy_from_slice(&w.v.to_le_bytes());
     Ok(())
 }
 
@@ -1364,6 +1525,21 @@ mod tests {
         let mut no_tiling = tables();
         no_tiling[0] = 1;
         assert!(Tables::parse(&no_tiling).is_err());
+    }
+
+    #[test]
+    fn bc7_dictionary_indices_start_after_width_word() {
+        let t = Tables::builtin().unwrap();
+        // Entry 0: anchor index 0 is 1 (not the width word 2 at byte 52).
+        assert_eq!(t.bc7[0].1.bits, [4, 0]);
+        assert_eq!(t.bc7[0].1.ix[0][0], 1);
+        assert_eq!(t.bc7[0].1.ix[0][1], 0);
+        // Entry 1: width 3, anchor 1, then 0s and -1s.
+        assert_eq!(t.bc7[1].1.bits, [3, 0]);
+        assert_eq!(t.bc7[1].1.ix[0][0], 1);
+        assert_eq!(t.bc7[1].1.ix[0][15], 1);
+        // Set 1 is empty in all shipped entries.
+        assert!(t.bc7.iter().all(|(_, ix)| ix.ix[1] == [0; 16]));
     }
 
     #[test]
@@ -1589,5 +1765,15 @@ mod tests {
             n += 1;
         }
         assert!(n > 0);
+    }
+
+    #[test]
+    fn workspace_decode_matches_and_reuses_across_calls() {
+        let t = Tables::parse(&tables()).unwrap();
+        let mut ws = Workspace::new();
+        let mut dst = [0u8; 8];
+        assert!(decode_with(1, &[], &mut dst, &t, &mut ws).is_err());
+        assert!(decode_with(2, &[0; 32], &mut dst, &t, &mut ws).is_err());
+        assert!(decode_with(1, &[0; 32], &mut [0u8; 7], &t, &mut ws).is_err());
     }
 }

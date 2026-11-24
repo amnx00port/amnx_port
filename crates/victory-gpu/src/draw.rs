@@ -8,6 +8,7 @@
 //! stencil reference, topology, targets) is set on the host list as the
 //! title sets it.
 
+use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 
 use victory_shader::{ResourceType, RootType, UsedResource};
@@ -74,19 +75,8 @@ pub(crate) struct State {
     /// Tables made afresh in this list: (table, what it holds) → first
     /// dynamic slot.
     fresh_tables: std::collections::HashMap<(u64, u64), u32>,
-    /// The dynamic slots the list holds: title heap, first, count; given
-    /// back when the list is reset or released.
-    dynamic: Vec<(usize, u32, u32)>,
     /// A fresh table of the stage being bound could not be made.
     table_failed: bool,
-}
-
-impl Drop for State {
-    fn drop(&mut self) {
-        for &(heap, first, n) in &self.dynamic {
-            crate::descriptor::release_dynamic(heap, first, n);
-        }
-    }
 }
 
 /// Draws recorded on the host GPU since the last frame line.
@@ -131,19 +121,53 @@ pub(crate) fn dispatched() -> u64 {
     DISPATCHED.load(Ordering::Relaxed)
 }
 
+#[derive(Clone, Copy)]
+enum RootViewKind {
+    Cbv,
+    Srv,
+    Uav,
+}
+
+const BUFFER_READ: u32 = D3D12_RESOURCE_STATE_GENERIC_READ.0 as u32;
+const BUFFER_UAV: u32 = D3D12_RESOURCE_STATE_UNORDERED_ACCESS.0 as u32;
+
 /// The host address of a root view: its buffer's host copy, or for a
 /// constant buffer not 256-byte aligned there (the console needs 16) a
 /// copy in upload memory.
 /// shortcut: a root view has no size; constant buffers are taken as 64 KiB,
 /// other views as 1 MiB (both cut at their buffer's end).
-fn root_view(list: &HostList, address: u64, srv: bool) -> Option<u64> {
-    let shadow = crate::shadow::find(address, 1)?;
-    let len = shadow
-        .left(address)
-        .min(if srv { 1 << 20 } else { 1 << 16 });
+/// Maximum reach refreshed for a root SRV binding (32 MiB so mesh/geometry
+/// shaders indexing megabytes past a root SRV do not fault, #951).
+const ROOT_SRV_REACH: u64 = 32 << 20;
+
+fn root_view(
+    list: &HostList,
+    address: u64,
+    kind: RootViewKind,
+    uav_buffers: &mut Vec<usize>,
+) -> Option<u64> {
+    let shadow = match kind {
+        RootViewKind::Srv => crate::shadow::find_wide(address, ROOT_SRV_REACH)?,
+        RootViewKind::Cbv | RootViewKind::Uav => crate::shadow::find(address, 1)?,
+    };
+    let len = shadow.left(address).min(match kind {
+        RootViewKind::Cbv => 1 << 16,
+        RootViewKind::Srv => ROOT_SRV_REACH,
+        RootViewKind::Uav => 1 << 20,
+    });
     let gpu = shadow.gpu(address);
-    if srv || gpu % 256 == 0 {
+    if !matches!(kind, RootViewKind::Cbv) || gpu.is_multiple_of(256) {
         shadow.refresh(list, address, len);
+        let key = Arc::as_ptr(&shadow) as usize;
+        if matches!(kind, RootViewKind::Uav) {
+            shadow.gpu_writes(list, address, len);
+            if !uav_buffers.contains(&key) {
+                uav_buffers.push(key);
+            }
+            list.ensure_buffer(&shadow, BUFFER_UAV);
+        } else if !uav_buffers.contains(&key) {
+            list.ensure_buffer(&shadow, BUFFER_READ);
+        }
         return Some(gpu);
     }
     let (gpu, to) = list.scratch(len)?;
@@ -170,6 +194,21 @@ impl State {
     pub(crate) fn reset(&mut self, pipeline: This) {
         *self = State::default();
         self.pipeline = pipeline as usize;
+    }
+
+    /// Resets all command-list state to defaults while preserving any dynamic
+    /// table cache already allocated on this open host list (`ClearState`, #848).
+    pub(crate) fn clear(&mut self, list: &HostList, pipeline: This) {
+        let fresh_tables = std::mem::take(&mut self.fresh_tables);
+        *self = State::default();
+        self.fresh_tables = fresh_tables;
+        self.pipeline = pipeline as usize;
+        // SAFETY: an open list; passing `None` resets host state (PSO, root
+        // signatures, descriptor heaps, targets, viewports, scissors, topology,
+        // stencil ref, blend factor, predication) to defaults. Our `host_*`
+        // caches are now zeroed so the next draw rebinds `self.pipeline` and
+        // any newly set heaps/roots.
+        unsafe { list.list.ClearState(None::<&ID3D12PipelineState>) };
     }
 
     /// The title's topology; console-only ones become host lists (see
@@ -296,9 +335,51 @@ impl State {
         };
     }
 
+    /// The host byte length of a bound root view for `slot` (0 if unset or
+    /// outside shadow memory), matching [`root_view`]'s 64 KiB CBV / 1 MiB
+    /// SRV/UAV cap so shaders never read or write past the host mapping.
+    fn root_view_bytes(
+        &self,
+        stage: &crate::pipeline::host::Stage,
+        compute: bool,
+        slot: u8,
+    ) -> u32 {
+        let Some(Root::View(address)) = self.roots_ref(compute).get(usize::from(slot)) else {
+            return 0;
+        };
+        let is_cbv = stage.root_cbvs.iter().any(|&(s, _)| s == slot);
+        let is_srv = stage.root_srvs.iter().any(|&(s, _)| s == slot);
+        let Some(shadow) = (if is_srv {
+            crate::shadow::find_wide(*address, ROOT_SRV_REACH)
+        } else {
+            crate::shadow::find(*address, 1)
+        }) else {
+            return 0;
+        };
+        let cap = if is_cbv {
+            1u64 << 16
+        } else if is_srv {
+            ROOT_SRV_REACH
+        } else {
+            1u64 << 20
+        };
+        shadow.left(*address).min(cap) as u32
+    }
+
     /// The user-data value of a root argument, as translated shaders read
-    /// it: a table's byte offset in its heap, a constant's value.
-    fn user_value(&self, compute: bool, slot: u8, root: RootType, dword: u32) -> u32 {
+    /// it: a table's byte offset in its heap, a constant's value, or a root
+    /// view's bound byte size.
+    fn user_value(
+        &self,
+        stage: &crate::pipeline::host::Stage,
+        compute: bool,
+        slot: u8,
+        root: RootType,
+        dword: u32,
+    ) -> u32 {
+        if root == RootType::Descriptor {
+            return self.root_view_bytes(stage, compute, slot);
+        }
         match (self.roots_ref(compute).get(usize::from(slot)), root) {
             (Some(Root::Table(handle)), RootType::Table) => match self.heap_of(*handle) {
                 Some(heap) => (handle - heap.start) as u32,
@@ -352,9 +433,9 @@ impl State {
             once!(mesh, "a draw or mesh dispatch with another kind of pipeline");
             return false;
         }
-        if !self.bind(list, p, false) {
+        let Some(uav_buffers) = self.bind(list, p, false) else {
             return false;
-        }
+        };
         let l = &list.list;
         // Vertex buffers the input layout reads.
         let mut views = [D3D12_VERTEX_BUFFER_VIEW::default(); 32];
@@ -371,6 +452,9 @@ impl State {
                 continue;
             };
             shadow.refresh(list, v.address, u64::from(v.size));
+            if !uav_buffers.contains(&(Arc::as_ptr(&shadow) as usize)) {
+                list.ensure_buffer(&shadow, BUFFER_READ);
+            }
             *view = D3D12_VERTEX_BUFFER_VIEW {
                 BufferLocation: shadow.gpu(v.address),
                 SizeInBytes: v.size,
@@ -389,6 +473,9 @@ impl State {
                 return false;
             };
             shadow.refresh(list, v.address, u64::from(v.size));
+            if !uav_buffers.contains(&(Arc::as_ptr(&shadow) as usize)) {
+                list.ensure_buffer(&shadow, BUFFER_READ);
+            }
             let view = D3D12_INDEX_BUFFER_VIEW {
                 BufferLocation: shadow.gpu(v.address),
                 SizeInBytes: v.size,
@@ -411,11 +498,41 @@ impl State {
     /// A descriptor a shader reads through a table: its host slot made if
     /// it changed, constant data copied, textures made readable.
     /// What draws and dispatches share: heaps, our root signature, the
+    /// Ensures the shader-visible host view heap for `view_heap` is currently
+    /// bound on `list` (required by `ClearUnorderedAccessView*`), keeping
+    /// `host_heaps` and `host_roots` in sync for subsequent draws/dispatches.
+    pub(crate) fn ensure_view_heap(&mut self, list: &HostList, view_heap: usize) {
+        let wanted = if self.heaps[0] == view_heap {
+            self.heaps
+        } else {
+            [view_heap, self.heaps[1]]
+        };
+        if self.host_heaps == wanted {
+            return;
+        }
+        let heaps: Vec<Option<ID3D12DescriptorHeap>> = wanted
+            .iter()
+            .filter(|&&h| h != 0)
+            .filter_map(|&h| crate::descriptor::heap(h as This).host())
+            .map(|h| Some(h.heap.clone()))
+            .collect();
+        if heaps.is_empty() {
+            return;
+        }
+        heaps.iter().flatten().for_each(|h| list.keep(h));
+        // SAFETY: an open list and shader-visible heaps.
+        unsafe { list.list.SetDescriptorHeaps(&heaps) };
+        self.host_heaps = wanted;
+        self.host_roots = [0; 2];
+    }
+
     /// pipeline, and per stage the user data, root views and the
-    /// descriptors its tables hold.
-    /// False if the draw or dispatch must not run: a table it reads could
-    /// not be made.
-    fn bind(&mut self, list: &HostList, p: &HostPipeline, compute: bool) -> bool {
+    /// descriptors its tables hold. Returns `Some(uav_buffers)` with
+    /// shadow-buffer pointers bound as UAVs by this operation so callers do
+    /// not transition them away from `UNORDERED_ACCESS`, or `None` if a
+    /// required fresh table could not be made and the draw/dispatch must drop.
+    fn bind(&mut self, list: &HostList, p: &HostPipeline, compute: bool) -> Option<Vec<usize>> {
+        let mut uav_buffers = Vec::new();
         let l = &list.list;
         // Heaps first: a root signature with directly indexed heaps must be
         // set after them.
@@ -459,7 +576,7 @@ impl State {
         for stage in &p.stages {
             let t = stage.translated();
             self.table_failed = false;
-            let made = self.tables(list, &t.used, compute);
+            let made = self.tables(list, &t.used, compute, &mut uav_buffers);
             if self.table_failed {
                 static DROPPED_TABLES: AtomicU64 = AtomicU64::new(0);
                 let n = DROPPED_TABLES.fetch_add(1, Ordering::Relaxed) + 1;
@@ -469,9 +586,13 @@ impl State {
                         "a draw or dispatch dropped: no dynamic slots for its tables"
                     );
                 }
-                return false;
+                return None;
             }
-            if let Some((param, dwords)) = stage.user_data {
+            if let Some(binding) = stage.user_data {
+                let dwords = match binding {
+                    crate::pipeline::host::UserDataBinding::Constants { dwords, .. }
+                    | crate::pipeline::host::UserDataBinding::RootCbv { dwords, .. } => dwords,
+                };
                 let mut values = vec![0u32; dwords as usize];
                 for u in &t.host.user_data {
                     let fresh = made
@@ -479,41 +600,149 @@ impl State {
                         .find(|m| m.0 == u.slot && u.root == RootType::Table);
                     values[u.index as usize] = match fresh {
                         Some(&(_, offset)) => offset,
-                        None => self.user_value(compute, u.slot, u.root, u.dword),
+                        None => self.user_value(stage, compute, u.slot, u.root, u.dword),
                     };
                 }
-                // SAFETY: an open list; `values` covers the parameter.
-                unsafe {
-                    if compute {
-                        l.SetComputeRoot32BitConstants(param, dwords, values.as_ptr().cast(), 0);
-                    } else {
-                        l.SetGraphicsRoot32BitConstants(param, dwords, values.as_ptr().cast(), 0);
+                match binding {
+                    crate::pipeline::host::UserDataBinding::Constants { param, dwords } => {
+                        // SAFETY: an open list; `values` covers the parameter.
+                        unsafe {
+                            if compute {
+                                l.SetComputeRoot32BitConstants(
+                                    param,
+                                    dwords,
+                                    values.as_ptr().cast(),
+                                    0,
+                                );
+                            } else {
+                                l.SetGraphicsRoot32BitConstants(
+                                    param,
+                                    dwords,
+                                    values.as_ptr().cast(),
+                                    0,
+                                );
+                            }
+                        }
+                    }
+                    crate::pipeline::host::UserDataBinding::RootCbv { param, dwords } => {
+                        let byte_len = (dwords as usize) * 4;
+                        let padded = u64::from(dwords * 4).next_multiple_of(256);
+                        if let Some((gpu, to)) = list.scratch(padded) {
+                            // SAFETY: `to` points to `padded >= byte_len` writable bytes of
+                            // the list's upload ring; `values` is `byte_len` valid bytes.
+                            unsafe {
+                                std::ptr::copy_nonoverlapping(
+                                    values.as_ptr().cast::<u8>(),
+                                    to,
+                                    byte_len,
+                                );
+                                if compute {
+                                    l.SetComputeRootConstantBufferView(param, gpu);
+                                } else {
+                                    l.SetGraphicsRootConstantBufferView(param, gpu);
+                                }
+                            }
+                        } else {
+                            once!(param, "no scratch upload memory for spilled user-data CBV");
+                        }
                     }
                 }
             }
-            for (views, srv) in [(&stage.root_cbvs, false), (&stage.root_srvs, true)] {
+            for (views, kind) in [
+                (&stage.root_cbvs, RootViewKind::Cbv),
+                (&stage.root_srvs, RootViewKind::Srv),
+                (&stage.root_uavs, RootViewKind::Uav),
+            ] {
                 for &(slot, param) in views {
                     let Some(Root::View(address)) = self.roots_ref(compute).get(usize::from(slot))
                     else {
                         once!(slot, "a shader reads a root view the title did not set");
                         continue;
                     };
-                    let Some(gpu) = root_view(list, *address, srv) else {
+                    let Some(gpu) = root_view(list, *address, kind, &mut uav_buffers) else {
                         continue;
                     };
                     // SAFETY: an open list; the address is in live memory.
                     unsafe {
-                        match (compute, srv) {
-                            (false, false) => l.SetGraphicsRootConstantBufferView(param, gpu),
-                            (false, true) => l.SetGraphicsRootShaderResourceView(param, gpu),
-                            (true, false) => l.SetComputeRootConstantBufferView(param, gpu),
-                            (true, true) => l.SetComputeRootShaderResourceView(param, gpu),
+                        match (compute, kind) {
+                            (false, RootViewKind::Cbv) => {
+                                l.SetGraphicsRootConstantBufferView(param, gpu)
+                            }
+                            (false, RootViewKind::Srv) => {
+                                l.SetGraphicsRootShaderResourceView(param, gpu)
+                            }
+                            (false, RootViewKind::Uav) => {
+                                l.SetGraphicsRootUnorderedAccessView(param, gpu)
+                            }
+                            (true, RootViewKind::Cbv) => {
+                                l.SetComputeRootConstantBufferView(param, gpu)
+                            }
+                            (true, RootViewKind::Srv) => {
+                                l.SetComputeRootShaderResourceView(param, gpu)
+                            }
+                            (true, RootViewKind::Uav) => {
+                                l.SetComputeRootUnorderedAccessView(param, gpu)
+                            }
+                        }
+                    }
+                }
+            }
+            for (views, kind) in [
+                (&stage.const_cbvs, RootViewKind::Cbv),
+                (&stage.const_srvs, RootViewKind::Srv),
+                (&stage.const_uavs, RootViewKind::Uav),
+            ] {
+                for &(slot, dword, param) in views {
+                    let Some(Root::Constants(c)) = self.roots_ref(compute).get(usize::from(slot))
+                    else {
+                        once!(
+                            slot,
+                            "a shader reads a constant-pair root view the title did not set"
+                        );
+                        continue;
+                    };
+                    let (Some(&lo), Some(&hi)) = (
+                        c.get(dword as usize),
+                        c.get((dword as usize).saturating_add(1)),
+                    ) else {
+                        once!(
+                            slot,
+                            dword,
+                            "a constant-pair root view reads past the set root constants"
+                        );
+                        continue;
+                    };
+                    let address = u64::from(lo) | (u64::from(hi) << 32);
+                    let Some(gpu) = root_view(list, address, kind, &mut uav_buffers) else {
+                        continue;
+                    };
+                    // SAFETY: an open list; the address is in live memory.
+                    unsafe {
+                        match (compute, kind) {
+                            (false, RootViewKind::Cbv) => {
+                                l.SetGraphicsRootConstantBufferView(param, gpu)
+                            }
+                            (false, RootViewKind::Srv) => {
+                                l.SetGraphicsRootShaderResourceView(param, gpu)
+                            }
+                            (false, RootViewKind::Uav) => {
+                                l.SetGraphicsRootUnorderedAccessView(param, gpu)
+                            }
+                            (true, RootViewKind::Cbv) => {
+                                l.SetComputeRootConstantBufferView(param, gpu)
+                            }
+                            (true, RootViewKind::Srv) => {
+                                l.SetComputeRootShaderResourceView(param, gpu)
+                            }
+                            (true, RootViewKind::Uav) => {
+                                l.SetComputeRootUnorderedAccessView(param, gpu)
+                            }
                         }
                     }
                 }
             }
         }
-        true
+        Some(uav_buffers)
     }
 
     /// Runs a dispatch on the host.
@@ -538,7 +767,7 @@ impl State {
             once!("a dispatch with a graphics pipeline");
             return;
         }
-        if !self.bind(list, p, true) {
+        if self.bind(list, p, true).is_none() {
             DROPPED.fetch_add(1, Ordering::Relaxed);
             return;
         }
@@ -567,14 +796,19 @@ impl State {
             let t = stage.translated();
             let _ = write!(text, " | {}:", stage.shader.hash);
             for u in &t.host.user_data {
-                let v = self.user_value(compute, u.slot, u.root, u.dword);
+                let v = self.user_value(stage, compute, u.slot, u.root, u.dword);
                 let _ = write!(text, " u{}={v:#x}", u.index);
                 let index = if u.root == RootType::Table { v / 32 } else { v };
                 if let Some(slot) = views.and_then(|h| h.describe_slot(index)) {
                     let _ = write!(text, " [heap {index}: {slot}]");
                 }
             }
-            for &(slot, _) in stage.root_cbvs.iter().chain(&stage.root_srvs) {
+            for &(slot, _) in stage
+                .root_cbvs
+                .iter()
+                .chain(&stage.root_srvs)
+                .chain(&stage.root_uavs)
+            {
                 if let Some(Root::View(address)) = self.roots_ref(compute).get(usize::from(slot)) {
                     let host = crate::shadow::find(*address, 1)
                         .map(|s| (s.gpu(*address), s.left(*address)));
@@ -618,7 +852,13 @@ impl State {
         }
     }
 
-    fn table_entry(&self, list: &HostList, u: &UsedResource, compute: bool) {
+    fn table_entry(
+        &self,
+        list: &HostList,
+        u: &UsedResource,
+        compute: bool,
+        uav_buffers: &mut Vec<usize>,
+    ) {
         let Some(Root::Table(table)) = self.roots_ref(compute).get(usize::from(u.slot)) else {
             return;
         };
@@ -629,33 +869,47 @@ impl State {
         let (Some(host), Some(index)) = (heap.host(), heap.index(handle)) else {
             return;
         };
-        if let Some(view) = host.mirror(index, handle, true) {
-            readable(list, u, &view);
+        if let Some(view) = host.mirror_for(index, handle, true, u.kind, u.dwords) {
+            readable(list, u, &view, uav_buffers);
         }
     }
 
-    /// The descriptors a shader reads through tables. Tables holding a
-    /// constant buffer are made afresh for the draw in dynamic slots, with
-    /// the constant data copied to upload memory when the list is
-    /// submitted: the host wants constant buffers 256-byte aligned, the
-    /// console only 16. Returns those tables' new byte offsets by root
-    /// parameter; the other tables' slots are made from the title's.
+    /// Whether a `View::Constant(address, size)` can be mirrored directly in
+    /// place inside the title's own host descriptor heap slot (256-byte host
+    /// GPU address alignment and padded size within its `Shadow` buffer),
+    /// avoiding dynamic slot allocation and scratch upload copies (#840).
+    fn can_mirror_cbv_in_place(address: u64, size: u32) -> bool {
+        if size == 0 {
+            return false;
+        }
+        let Some(padded) = size.checked_next_multiple_of(256) else {
+            return false;
+        };
+        let Some(shadow) = crate::shadow::find(address, u64::from(size)) else {
+            return false;
+        };
+        shadow.gpu(address).is_multiple_of(256) && shadow.left(address) >= u64::from(padded)
+    }
+
+    /// The descriptors a shader reads through tables. Constant-buffer tables
+    /// whose views are 256-byte aligned and fit inside their host shadow buffer
+    /// are mirrored directly in place (#840). Tables that hold unaligned or
+    /// unshadowed constant buffers (the console requires only 16-byte alignment),
+    /// CBV descriptor arrays, or entries reaching past a capped host heap are
+    /// made afresh in dynamic slots, with unaligned constant data copied to
+    /// upload memory on submission.
     ///
-    /// Within a list, the same table holding the same descriptors is made
-    /// once: its constant data is copied at submission either way, and the
-    /// big tables the world binds would otherwise take hundreds of slots per
-    /// draw, wrapping the dynamic slots onto lists not yet submitted.
-    fn tables(&mut self, list: &HostList, used: &[UsedResource], compute: bool) -> Vec<(u8, u32)> {
+    /// Within a list, the same fresh table holding the same descriptors is made
+    /// once so dynamic slots do not wrap onto lists still in flight.
+    fn tables(
+        &mut self,
+        list: &HostList,
+        used: &[UsedResource],
+        compute: bool,
+        uav_buffers: &mut Vec<usize>,
+    ) -> Vec<(u8, u32)> {
         let tables = |u: &&UsedResource| u.root == RootType::Table;
-        let mut fresh: Vec<u8> = used
-            .iter()
-            .filter(tables)
-            .filter(|u| u.kind == ResourceType::Cbv)
-            .map(|u| u.slot)
-            .collect();
-        // Tables reaching past a host heap smaller than the title's (the
-        // host's limit, 1,000,000 views on NVIDIA) are made afresh too: the
-        // title's slots there have no host slot of their own.
+        let mut fresh: Vec<u8> = Vec::new();
         for u in used.iter().filter(tables) {
             if fresh.contains(&u.slot) {
                 continue;
@@ -663,25 +917,47 @@ impl State {
             let Some(&Root::Table(table)) = self.roots_ref(compute).get(usize::from(u.slot)) else {
                 continue;
             };
-            let end = table + u64::from(u.table_offset_dwords) * 4;
+            let handle = table + u64::from(u.table_offset_dwords) * 4;
             let Some(heap) = self.heap_of(table) else {
                 continue;
             };
-            let (Some(host), Some(index)) = (heap.host(), heap.index(end)) else {
+            let (Some(host), Some(index)) = (heap.host(), heap.index(handle)) else {
                 continue;
             };
             if index >= host.count() {
                 fresh.push(u.slot);
+                continue;
+            }
+            if u.kind == ResourceType::Cbv {
+                let needs_fresh = u.stride > 0
+                    || match crate::descriptor::view(handle) {
+                        Some(View::Constant(address, size)) => {
+                            !Self::can_mirror_cbv_in_place(address, size)
+                        }
+                        Some(_) => true,
+                        None => false,
+                    };
+                if needs_fresh {
+                    fresh.push(u.slot);
+                }
             }
         }
         fresh.sort_unstable();
         fresh.dedup();
         for u in used.iter().filter(tables) {
             if !fresh.contains(&u.slot) {
-                self.table_entry(list, u, compute);
+                self.table_entry(list, u, compute, uav_buffers);
             }
         }
+        struct Reserved<'a> {
+            host: &'a crate::descriptor::host::HostHeap,
+            heap_ptr: usize,
+            key: (u64, u64),
+            first: u32,
+            n: u32,
+        }
         let mut made = Vec::new();
+        let mut reserved: Vec<Reserved<'_>> = Vec::new();
         for slot in fresh {
             let Some(&Root::Table(table)) = self.roots_ref(compute).get(usize::from(slot)) else {
                 continue;
@@ -697,53 +973,80 @@ impl State {
             let Some(host) = heap.host() else {
                 continue;
             };
-            let n = entries
-                .iter()
-                .map(|u| u.table_offset_dwords / 8 + 1)
-                .max()
-                .unwrap_or(1);
-            // The table and what its entries hold (record words).
+            let (base, n) = fresh_table_span(&entries, host.count());
+            // The table slice and what its entries hold (record words).
             let key = {
                 use std::hash::{Hash, Hasher};
                 let mut h = std::collections::hash_map::DefaultHasher::new();
-                for k in 0..n {
-                    let at = table + u64::from(k) * 32;
+                base.hash(&mut h);
+                n.hash(&mut h);
+                for offset in 0..n {
+                    let at = table + u64::from(base + offset) * 32;
                     // SAFETY: a descriptor slot in title memory.
                     unsafe { (at as *const [u32; 3]).read_unaligned() }.hash(&mut h);
                 }
                 (table, h.finish())
             };
-            if let Some(&first) = self.fresh_tables.get(&key) {
+            if let Some(&table_base) = self.fresh_tables.get(&key) {
                 for u in entries.iter().filter(|u| u.kind != ResourceType::Cbv) {
                     let handle = table + u64::from(u.table_offset_dwords) * 4;
                     if let Some(view) = crate::descriptor::view(handle) {
-                        readable(list, u, &view);
+                        readable(list, u, &view, uav_buffers);
                     }
                 }
-                made.push((slot, first * 32));
+                made.push((slot, table_base * 32));
                 continue;
             }
-            let Some(first) = host.dynamic(n) else {
+            let heap_ptr = std::ptr::from_ref(heap) as usize;
+            let Some(first) = host
+                .dynamic(n)
+                .or_else(|| {
+                    let reclaimed = crate::host::reclaim_dynamic_slots(heap_ptr);
+                    if reclaimed > 0 {
+                        tracing::debug!(
+                            reclaimed,
+                            needed = n,
+                            "reclaimed dynamic descriptor slots from executed lists"
+                        );
+                        host.dynamic(n)
+                    } else {
+                        None
+                    }
+                })
+                .or_else(|| host.recycle_dynamic(n))
+            else {
                 // Without its fresh table the shader would read the title's
                 // slots, which for constant buffer tables hold no constant
-                // view: a texture or null descriptor read as a buffer gives
-                // a wild address on AMD and the device is removed (#59).
-                // The draw or dispatch is dropped instead.
+                // view: roll back slots reserved by this draw and drop (#59, #911).
                 self.table_failed = true;
-                continue;
+                static ONCE: std::sync::Once = std::sync::Once::new();
+                ONCE.call_once(|| {
+                    tracing::warn!(n, "no free dynamic descriptor slots: a table is not made")
+                });
+                break;
             };
-            self.fresh_tables.insert(key, first);
-            self.dynamic
-                .push((std::ptr::from_ref(heap) as usize, first, n));
-            // The whole range: a shader may index past the entries its
-            // used-resource list names (descriptor arrays).
-            for k in 0..n {
-                let index = first + k;
+            // `first >= host.count() >= base`, so `first - base` never underflows
+            // and shifting the shader's base back by `base` lands `base + offset`
+            // directly on dynamic slot `first + offset`.
+            let table_base = first - base;
+            self.fresh_tables.insert(key, table_base);
+            reserved.push(Reserved {
+                host,
+                heap_ptr,
+                key,
+                first,
+                n,
+            });
+            // The whole range from the first used entry to the last: a shader may
+            // index across intermediate entries (descriptor arrays).
+            for offset in 0..n {
+                let k = base + offset;
+                let index = first + offset;
                 let used = entries.iter().find(|u| u.table_offset_dwords / 8 == k);
                 match crate::descriptor::view(table + u64::from(k) * 32) {
                     Some(View::Constant(address, size)) => {
                         let Some((gpu, to)) = list.scratch(u64::from(size)) else {
-                            host.make_null(index);
+                            host.make_null_for(index, ResourceType::Cbv, 4);
                             continue;
                         };
                         list.defer_fill(to, address as *const u8, size as usize);
@@ -752,18 +1055,31 @@ impl State {
                     Some(view) => {
                         host.make_at(index, &view);
                         if let Some(u) = used {
-                            readable(list, u, &view);
+                            readable(list, u, &view, uav_buffers);
                         }
                     }
                     None => {
-                        host.make_null(index);
-                        if used.is_some() {
+                        if let Some(u) = used {
+                            host.make_null_for(index, u.kind, u.dwords);
                             once!(slot, "a table entry without a view");
+                        } else {
+                            host.make_null(index);
                         }
                     }
                 }
             }
-            made.push((slot, first * 32));
+            made.push((slot, table_base * 32));
+        }
+        if self.table_failed {
+            for r in reserved {
+                self.fresh_tables.remove(&r.key);
+                r.host.release(r.first, r.n);
+            }
+            made.clear();
+        } else {
+            for r in reserved {
+                list.record_dynamic(r.heap_ptr, r.first, r.n);
+            }
         }
         made
     }
@@ -887,20 +1203,20 @@ impl State {
                 continue;
             }
             let v = self.vertex[slot as usize];
-            let stride = u64::from(v.stride);
-            let from = v.address + u64::from(first) * stride;
-            if v.address == 0
-                || stride == 0
-                || u64::from(first + count) * stride > u64::from(v.size)
-                || crate::shadow::find(from, rects * 3 * stride).is_none()
-            {
+            let Some((from, src_bytes, dst_bytes)) =
+                rect_vertex_range(v.address, v.size, v.stride, first, count)
+            else {
+                once!(slot, "rectangle vertices outside their buffer");
+                return false;
+            };
+            if crate::shadow::find(from, src_bytes).is_none() {
                 once!(slot, "rectangle vertices outside their buffer");
                 return false;
             }
-            let Some((gpu, to)) = list.scratch(rects * 6 * stride) else {
+            let Some((gpu, to)) = list.scratch(u64::from(dst_bytes)) else {
                 return false;
             };
-            let (from, to, stride) = (from as usize, to as usize, stride as usize);
+            let (from, to, stride) = (from as usize, to as usize, v.stride as usize);
             let n = rects as usize;
             list.defer_host(move || {
                 // SAFETY: the vertices lie in a title buffer (checked when
@@ -915,7 +1231,7 @@ impl State {
             });
             let view = D3D12_VERTEX_BUFFER_VIEW {
                 BufferLocation: gpu,
-                SizeInBytes: (rects * 6 * stride as u64) as u32,
+                SizeInBytes: dst_bytes,
                 StrideInBytes: v.stride,
             };
             // SAFETY: an open list; the view names live scratch memory.
@@ -1011,10 +1327,14 @@ impl State {
         if let Some((s, at)) = &counter {
             s.refresh(list, *at, 4);
         }
-        // Bounded first: the clamp binds a compute pipeline of its own.
-        if !crate::indirect::bound(list, &args.buffer, args.gpu(arguments), (kind, stride, max)) {
+        // Bounded first: the clamp binds a compute pipeline of its own, and
+        // leaves `args` in `GENERIC_READ`.
+        if !crate::indirect::bound(list, &args, args.gpu(arguments), (kind, stride, max)) {
             why("not bounded (no clamp, or arguments not 4-byte aligned)");
             return false;
+        }
+        if let Some((s, _)) = &counter {
+            list.ensure_buffer(s, BUFFER_READ);
         }
         self.host_pipeline = 0;
         self.host_roots[1] = 0;
@@ -1022,19 +1342,25 @@ impl State {
             DRAW | INDEXED => self.topology != RECTANGLES && self.prepare(list, kind == INDEXED),
             MESH => self.prepare_for(list, false, true),
             DISPATCH => match crate::pipeline::host_pipeline(self.pipeline as This) {
-                Some(p) if p.compute => self.bind(list, p, true),
+                Some(p) if p.compute => self.bind(list, p, true).is_some(),
                 _ => false,
             },
             _ => false,
         };
         if !ran {
-            crate::indirect::done(list, &args.buffer);
             #[cfg(feature = "diagnostics")]
             match crate::pipeline::host_pipeline(self.pipeline as This) {
                 None => crate::pipeline::note_drop(self.pipeline as This),
                 Some(p) => why(&format!("prepare failed (compute {}, mesh {})", p.compute, p.mesh)),
             }
             return false;
+        }
+        // Ensure indirect argument and count buffers stay in `GENERIC_READ`
+        // (includes `INDIRECT_ARGUMENT`) even if `bind` touched the same
+        // backing shadow buffer.
+        list.ensure_buffer(&args, BUFFER_READ);
+        if let Some((s, _)) = &counter {
+            list.ensure_buffer(s, BUFFER_READ);
         }
         #[cfg(feature = "diagnostics")]
         list.note_op(|| {
@@ -1052,7 +1378,6 @@ impl State {
                 counter.as_ref().map_or(0, |(s, at)| s.offset(*at)),
             )
         };
-        crate::indirect::done(list, &args.buffer);
         if kind == DISPATCH {
             DISPATCHED.fetch_add(1, Ordering::Relaxed);
         } else {
@@ -1101,8 +1426,8 @@ fn host_signature(kind: u32, stride: u32) -> Option<ID3D12CommandSignature> {
 }
 
 /// Gets what a shader reads or writes through a view ready: buffer data
-/// copied, textures moved to the state they need.
-fn readable(list: &HostList, u: &UsedResource, view: &View) {
+/// copied, textures and buffers moved to the state they need.
+fn readable(list: &HostList, u: &UsedResource, view: &View, uav_buffers: &mut Vec<usize>) {
     const SHADER_RESOURCE: u32 = 0x40 | 0x80;
     const UNORDERED_ACCESS: u32 = 0x8;
     let placed = crate::descriptor::host::placed_texture(view);
@@ -1114,8 +1439,15 @@ fn readable(list: &HostList, u: &UsedResource, view: &View) {
         && let Some(shadow) = crate::shadow::find(address, len)
     {
         shadow.refresh(list, address, len);
+        let key = Arc::as_ptr(&shadow) as usize;
         if u.kind == ResourceType::Uav {
             shadow.gpu_writes(list, address, len);
+            if !uav_buffers.contains(&key) {
+                uav_buffers.push(key);
+            }
+            list.ensure_buffer(&shadow, BUFFER_UAV);
+        } else if !uav_buffers.contains(&key) {
+            list.ensure_buffer(&shadow, BUFFER_READ);
         }
     }
     match (view, u.kind) {
@@ -1140,6 +1472,7 @@ fn readable(list: &HostList, u: &UsedResource, view: &View) {
             }
         }
         (View::Unordered(resource, _, _), ResourceType::Uav) => {
+            crate::texture::host_written(*resource as This);
             #[cfg(feature = "diagnostics")]
             crate::capture::note_target(*resource as This);
             crate::list::ensure_state(list, *resource as This, UNORDERED_ACCESS);
@@ -1177,12 +1510,21 @@ fn describe(view: Option<&View>) -> String {
             u64::from(d[10]) | u64::from(d[11]) << 32
         ),
         // The first four values, as a colour rectangle's constants are.
-        Some(View::Constant(address, size))
-            if *size >= 16 && crate::texture::committed(*address as *const u8, 16) =>
-        {
-            // SAFETY: 16 committed bytes of title memory.
-            let v = unsafe { (*address as *const [f32; 4]).read_unaligned() };
-            format!("Constant({address:#x}, {size}) {v:?}")
+        // Read via `host::read_into` (kernel-checked) to avoid TOCTOU races
+        // against unmapping/guard pages (#913).
+        Some(View::Constant(address, size)) if *size >= 16 => {
+            let mut bytes = [0u8; 16];
+            if crate::host::read_into(*address as *const u8, &mut bytes) {
+                let v = [
+                    f32::from_le_bytes([bytes[0], bytes[1], bytes[2], bytes[3]]),
+                    f32::from_le_bytes([bytes[4], bytes[5], bytes[6], bytes[7]]),
+                    f32::from_le_bytes([bytes[8], bytes[9], bytes[10], bytes[11]]),
+                    f32::from_le_bytes([bytes[12], bytes[13], bytes[14], bytes[15]]),
+                ];
+                format!("Constant({address:#x}, {size}) {v:?}")
+            } else {
+                format!("Constant({address:#x}, {size})")
+            }
         }
         Some(v) => format!("{v:?}").chars().take(60).collect(),
     }
@@ -1214,4 +1556,109 @@ pub(crate) fn blend_factor(list: &HostList, factor: Option<&[f32; 4]>) {
 pub(crate) fn stencil_ref(list: &HostList, reference: u32) {
     // SAFETY: an open list.
     unsafe { list.list.OMSetStencilRef(reference) };
+}
+
+pub(crate) fn depth_bounds(list: &HostList, min: f32, max: f32) {
+    if crate::host::host().is_some_and(crate::host::Host::depth_bounds)
+        && let Ok(l1) = list.list.cast::<ID3D12GraphicsCommandList1>()
+    {
+        // SAFETY: an open list on a host supporting depth bounds.
+        unsafe { l1.OMSetDepthBounds(min, max) };
+    }
+}
+
+/// Computes `(base, count)` for a fresh dynamic table covering `entries`,
+/// trimming leading unused descriptor slots so tables starting deep in a
+/// descriptor table do not waste dynamic heap slots (#747). `max_trim` is
+/// `host.count()`, ensuring `first - base` never underflows.
+fn fresh_table_span(entries: &[&UsedResource], max_trim: u32) -> (u32, u32) {
+    let mut start = u32::MAX;
+    let mut end = 0u32;
+    for u in entries {
+        let entry = u.table_offset_dwords / 8;
+        start = start.min(entry);
+        end = end.max(entry + 1);
+    }
+    if start == u32::MAX {
+        return (0, 1);
+    }
+    let base = start.min(max_trim);
+    (base, end - base)
+}
+
+/// Validates and computes `(from_address, src_bytes, dst_bytes)` for expanding
+/// `count / 3` console rectangles starting at vertex `first` into triangles.
+fn rect_vertex_range(
+    address: u64,
+    size: u32,
+    stride: u32,
+    first: u32,
+    count: u32,
+) -> Option<(u64, u64, u32)> {
+    if address == 0 || stride == 0 {
+        return None;
+    }
+    let stride = u64::from(stride);
+    let end_vertex = u64::from(first).checked_add(u64::from(count))?;
+    if end_vertex.checked_mul(stride)? > u64::from(size) {
+        return None;
+    }
+    let from = address.checked_add(u64::from(first).checked_mul(stride)?)?;
+    let rects = u64::from(count / 3);
+    let src_bytes = rects.checked_mul(3)?.checked_mul(stride)?;
+    let dst_bytes = u32::try_from(rects.checked_mul(6)?.checked_mul(stride)?).ok()?;
+    Some((from, src_bytes, dst_bytes))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{fresh_table_span, rect_vertex_range};
+    use victory_shader::{ResourceType, RootType, UsedResource};
+
+    fn used_table_entry(offset_dwords: u32) -> UsedResource {
+        UsedResource {
+            root: RootType::Table,
+            slot: 0,
+            user_data: 0,
+            table_offset_dwords: offset_dwords,
+            kind: ResourceType::Cbv,
+            dwords: 4,
+            stride: 0,
+            lower_bound: 0,
+        }
+    }
+
+    #[test]
+    fn fresh_table_span_trims_leading_unused_entries() {
+        // Empty entry list falls back to 1 slot at base 0.
+        assert_eq!(fresh_table_span(&[], 1000), (0, 1));
+
+        // Single entry deep in the table allocates 1 slot instead of 101.
+        let deep = used_table_entry(100 * 8);
+        assert_eq!(fresh_table_span(&[&deep], 737_856), (100, 1));
+
+        // Multiple entries span [min..=max] inclusively.
+        let a = used_table_entry(40 * 8);
+        let b = used_table_entry(45 * 8 + 4);
+        assert_eq!(fresh_table_span(&[&a, &b], 737_856), (40, 6));
+
+        // `base` is clamped to `max_trim` (`host.count()`) so `first - base`
+        // can never underflow even on a tiny heap.
+        let huge = used_table_entry(500 * 8);
+        assert_eq!(fresh_table_span(&[&huge], 128), (128, 373));
+    }
+
+    #[test]
+    fn rect_vertex_range_rejects_overflow_and_out_of_bounds() {
+        assert_eq!(rect_vertex_range(0x1000, 96, 16, 0, 6), Some((0x1000, 96, 192)));
+        assert_eq!(rect_vertex_range(0x1000, 96, 16, 3, 3), Some((0x1030, 48, 96)));
+        // `first + count` wraps u32 if not widened to u64.
+        assert_eq!(rect_vertex_range(0x1000, u32::MAX, 16, u32::MAX - 2, 3), None);
+        // Zero address or stride or past buffer size.
+        assert_eq!(rect_vertex_range(0, 96, 16, 0, 3), None);
+        assert_eq!(rect_vertex_range(0x1000, 96, 0, 0, 3), None);
+        assert_eq!(rect_vertex_range(0x1000, 47, 16, 0, 3), None);
+        // Expanded triangle buffer would exceed u32 `SizeInBytes`.
+        assert_eq!(rect_vertex_range(0x1000, u32::MAX, 16, 0, (1 << 28) - 1), None);
+    }
 }

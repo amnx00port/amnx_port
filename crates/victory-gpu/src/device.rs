@@ -233,6 +233,20 @@ extern "system" fn node_count(_: This) -> u32 {
     1
 }
 
+/// `ID3D12Device::GetDeviceRemovedReason` (slot 37 / `0x128`): forwards the
+/// host D3D12 device's removal status instead of returning `E_NOTIMPL` (#900).
+extern "system" fn device_removed_reason(_: This) -> HRESULT {
+    #[cfg(windows)]
+    if let Some(host) = crate::host::host() {
+        // SAFETY: live host device.
+        return match unsafe { host.device.GetDeviceRemovedReason() } {
+            Ok(()) => S_OK,
+            Err(e) => e.code().0,
+        };
+    }
+    S_OK
+}
+
 /// Feature query 2: the highest of the requested feature levels we support.
 #[repr(C)]
 struct FeatureLevels {
@@ -378,6 +392,7 @@ static FUNCTIONS: Table<160> = {
     f[28] = resource::create_heap as *const (); // 0xe0
     f[29] = resource::create_placed as *const (); // 0xe8
     f[36] = fence::create as *const (); // 0x120
+    f[37] = device_removed_reason as *const (); // 0x128
     f[38] = resource::copyable_footprints as *const (); // 0x130
     f[39] = query::create as *const (); // 0x138
     f[41] = signature::create as *const (); // 0x148
@@ -528,5 +543,12 @@ mod tests {
         assert_eq!(query(&levels, 0x18), (S_OK, 0xc100));
         assert_eq!(query(&levels, 0x10).0, E_INVALIDARG);
         assert_eq!(query(&levels[4..], 0x18).0, UNSUPPORTED);
+    }
+
+    #[test]
+    fn a_healthy_device_reports_no_removal() {
+        let device = device();
+        let reason = slot::<extern "system" fn(This) -> HRESULT>(device, 0x128);
+        assert_eq!(reason(device), S_OK);
     }
 }

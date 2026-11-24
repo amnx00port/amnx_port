@@ -57,13 +57,58 @@ pub const INTERFACES: &[Interface] = &[
 
 type This = *const Object;
 
-/// 2: disabled. We present in SDR, so the title must render SDR.
-// shortcut: HDR output is not done (see the presentation items in
-// `TODO.md`); report enabled, with the host display's luminance, once the
-// swap chain can present HDR.
-extern "system" fn try_enable_hdr(_: This, preference: u32, _info: *mut c_void) -> u32 {
-    tracing::info!(preference, "HDR mode: disabled (SDR presentation)");
-    2
+/// `XDisplayHdrModeInfo` filled when HDR10 output is enabled.
+#[repr(C)]
+#[derive(Debug, Clone, Copy, PartialEq)]
+struct HdrModeInfo {
+    min_tone_map_luminance: f32,
+    max_tone_map_luminance: f32,
+    max_full_frame_tone_map_luminance: f32,
+    game_os_max_luminance: f32,
+}
+
+/// Evaluates whether HDR10 output should be enabled for `preference`
+/// (`0 = PreferHdr`, `1 = PreferRefreshRate`, `2 = Disabled`) given host
+/// display capability `hdr`. Returns `1` (Enabled) or `2` (Disabled) and
+/// optionally fills `HdrModeInfo`.
+fn resolve_hdr_mode(preference: u32, hdr: victory_gpu::HdrInfo) -> (u32, Option<HdrModeInfo>) {
+    // Preference 2 explicitly requests SDR; otherwise enable HDR10 whenever
+    // the host display reports HDR10 support (or `VICTORY_HDR=1`).
+    if preference == 2 || !hdr.supported {
+        return (2, None);
+    }
+    let info = HdrModeInfo {
+        min_tone_map_luminance: hdr.min_nits,
+        max_tone_map_luminance: hdr.max_nits,
+        max_full_frame_tone_map_luminance: hdr.max_full_frame_nits,
+        game_os_max_luminance: hdr.max_nits.clamp(200.0, 1000.0),
+    };
+    (1, Some(info))
+}
+
+/// `XDisplayTryEnableHdrMode(preference, out info) -> XDisplayHdrModeResult`:
+/// returns `1` (Enabled) when the host display supports HDR10 (filling
+/// luminance info for the title's tone mapper) and `2` (Disabled) on SDR
+/// displays.
+extern "system" fn try_enable_hdr(_: This, preference: u32, info: *mut c_void) -> u32 {
+    let hdr = victory_gpu::hdr_info();
+    let (result, mode_info) = resolve_hdr_mode(preference, hdr);
+    if let Some(mode_info) = mode_info {
+        if !info.is_null() {
+            // SAFETY: caller passed a valid `XDisplayHdrModeInfo` out pointer.
+            unsafe { info.cast::<HdrModeInfo>().write(mode_info) };
+        }
+        tracing::info!(
+            preference,
+            min_nits = mode_info.min_tone_map_luminance,
+            max_nits = mode_info.max_tone_map_luminance,
+            max_full_frame_nits = mode_info.max_full_frame_tone_map_luminance,
+            "HDR mode: enabled (HDR10 presentation)"
+        );
+    } else {
+        tracing::info!(preference, "HDR mode: disabled (SDR presentation)");
+    }
+    result
 }
 
 /// Nothing launches URIs for the title: no store, browser or console app
@@ -73,10 +118,16 @@ extern "system" fn launch_uri(_: This, _user: *const c_void, uri: *const c_char)
     NOT_SUPPORTED
 }
 
+/// Sentinel handle handed out when the host OS rejects `PowerSetRequest`
+/// with `ERROR_NOT_SUPPORTED` (RDP, headless runners, restricted power plans).
+#[cfg(windows)]
+const NOOP_DEFERRAL: *mut c_void = std::ptr::dangling_mut();
+
 /// A deferral keeps the host display on, as on the console, through a
 /// power request; the handle is that request.
 #[cfg(windows)]
 extern "system" fn acquire_deferral(_: This, out: *mut *mut c_void) -> HRESULT {
+    use windows_sys::Win32::Foundation::{CloseHandle, ERROR_NOT_SUPPORTED, GetLastError};
     use windows_sys::Win32::System::Power::{
         PowerCreateRequest, PowerRequestDisplayRequired, PowerSetRequest,
     };
@@ -99,10 +150,15 @@ extern "system" fn acquire_deferral(_: This, out: *mut *mut c_void) -> HRESULT {
     }
     // SAFETY: the request we just created.
     if unsafe { PowerSetRequest(request, PowerRequestDisplayRequired) } == 0 {
-        let hr = last_error();
+        // SAFETY: no preconditions.
+        let code = unsafe { GetLastError() };
         // SAFETY: as above; not handed out.
-        unsafe { windows_sys::Win32::Foundation::CloseHandle(request) };
-        return hr;
+        unsafe { CloseHandle(request) };
+        if code == ERROR_NOT_SUPPORTED {
+            tracing::debug!("PowerSetRequest returned ERROR_NOT_SUPPORTED; using no-op deferral");
+            return put(out, NOOP_DEFERRAL);
+        }
+        return (0x8007_0000 | (code & 0xffff)) as i32;
     }
     put(out, request)
 }
@@ -111,7 +167,7 @@ extern "system" fn acquire_deferral(_: This, out: *mut *mut c_void) -> HRESULT {
 extern "system" fn close_deferral(_: This, handle: *mut c_void) {
     use windows_sys::Win32::Foundation::CloseHandle;
     use windows_sys::Win32::System::Power::{PowerClearRequest, PowerRequestDisplayRequired};
-    if !handle.is_null() {
+    if !handle.is_null() && handle != NOOP_DEFERRAL {
         // SAFETY: a request from `acquire_deferral`.
         unsafe {
             PowerClearRequest(handle, PowerRequestDisplayRequired);
@@ -170,6 +226,34 @@ static CAPTURE_VTABLE: Methods<6> = Methods([
     take_screenshot as *const (), // 0x28
 ]);
 
+#[cfg(test)]
+mod hdr_tests {
+    use super::*;
+
+    #[test]
+    fn resolve_hdr_mode_enables_hdr10_with_luminance_info() {
+        let sdr = victory_gpu::HdrInfo::default();
+        assert_eq!(resolve_hdr_mode(0, sdr), (2, None));
+
+        let hdr = victory_gpu::HdrInfo {
+            supported: true,
+            min_nits: 0.005,
+            max_nits: 1000.0,
+            max_full_frame_nits: 450.0,
+        };
+        let (res, info) = resolve_hdr_mode(0, hdr);
+        assert_eq!(res, 1);
+        let info = info.expect("HDR mode info populated");
+        assert_eq!(info.min_tone_map_luminance, 0.005);
+        assert_eq!(info.max_tone_map_luminance, 1000.0);
+        assert_eq!(info.max_full_frame_tone_map_luminance, 450.0);
+        assert_eq!(info.game_os_max_luminance, 1000.0);
+
+        // Explicit SDR preference disables HDR even on an HDR display.
+        assert_eq!(resolve_hdr_mode(2, hdr), (2, None));
+    }
+}
+
 #[cfg(all(test, windows))]
 mod tests {
     use super::*;
@@ -178,8 +262,19 @@ mod tests {
     #[test]
     fn sdr_and_display_deferrals() {
         type Hdr = extern "system" fn(This, u32, *mut c_void) -> u32;
+        let expected = if victory_gpu::hdr_info().supported { 1 } else { 2 };
+        let mut info = HdrModeInfo {
+            min_tone_map_luminance: 0.0,
+            max_tone_map_luminance: 0.0,
+            max_full_frame_tone_map_luminance: 0.0,
+            game_os_max_luminance: 0.0,
+        };
         assert_eq!(
-            method::<Hdr>(&HDR_OBJECT, 0x20)(&HDR_OBJECT, 0, std::ptr::null_mut()),
+            method::<Hdr>(&HDR_OBJECT, 0x20)(&HDR_OBJECT, 0, (&raw mut info).cast()),
+            expected
+        );
+        assert_eq!(
+            method::<Hdr>(&HDR_OBJECT, 0x20)(&HDR_OBJECT, 2, std::ptr::null_mut()),
             2
         );
         type Acquire = extern "system" fn(This, *mut *mut c_void) -> HRESULT;

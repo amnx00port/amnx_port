@@ -218,10 +218,25 @@ fn name_info_flags(sa: *const u8, len: i32, host_wanted: bool, flags: i32) -> Op
     }
 }
 
+/// True when `addr` is one of Winsock's documented zero-address forms that
+/// disconnect a connectionless socket rather than reaching the network (#891):
+/// an all-zero `sockaddr`, `AF_INET` `0.0.0.0`, or `AF_INET6` `::`.
+fn zero_address(addr: *const u8, len: i32) -> bool {
+    if addr.is_null() || len < 16 {
+        return false;
+    }
+    if let Some(sa) = socket_addr(addr, len) {
+        return sa.ip().is_unspecified();
+    }
+    // SAFETY: `addr` is non-null and holds `len` bytes per Winsock ABI.
+    let bytes = unsafe { std::slice::from_raw_parts(addr, len as usize) };
+    bytes.iter().all(|&b| b == 0)
+}
+
 // Connects.
 
 pub extern "system" fn connect(s: Socket, name: *const u8, len: i32) -> i32 {
-    if !reachable("network connect blocked", name, len) {
+    if !zero_address(name, len) && !reachable("network connect blocked", name, len) {
         return SOCKET_ERROR;
     }
     host!("ws2_32.dll", "connect": extern "system" fn(Socket, *const u8, i32) -> i32)(s, name, len)
@@ -236,7 +251,7 @@ pub extern "system" fn WSAConnect(
     sqos: *const c_void,
     gqos: *const c_void,
 ) -> i32 {
-    if !reachable("network connect blocked", name, len) {
+    if !zero_address(name, len) && !reachable("network connect blocked", name, len) {
         return SOCKET_ERROR;
     }
     host!("ws2_32.dll", "WSAConnect": extern "system" fn(Socket, *const u8, i32, *const c_void, *mut c_void, *const c_void, *const c_void) -> i32)(
@@ -1065,5 +1080,27 @@ mod tests {
             }
             assert!(present, "{dll} lacks {}", e.name);
         }
+    }
+
+    #[test]
+    fn zero_address_recognises_disconnect_forms() {
+        let all_zero = [0u8; 16];
+        assert!(zero_address(all_zero.as_ptr(), 16));
+        assert!(!zero_address(all_zero.as_ptr(), 8));
+        assert!(!zero_address(std::ptr::null(), 16));
+        // AF_INET 0.0.0.0
+        let mut v4 = [0u8; 16];
+        v4[..2].copy_from_slice(&2u16.to_ne_bytes());
+        assert!(zero_address(v4.as_ptr(), 16));
+        // AF_INET 127.0.0.1 is NOT a zero address
+        v4[4..8].copy_from_slice(&[127, 0, 0, 1]);
+        assert!(!zero_address(v4.as_ptr(), 16));
+        // AF_INET6 ::
+        let mut v6 = [0u8; 28];
+        v6[..2].copy_from_slice(&23u16.to_ne_bytes());
+        assert!(zero_address(v6.as_ptr(), 28));
+        // AF_INET6 ::1 is NOT a zero address
+        v6[23] = 1;
+        assert!(!zero_address(v6.as_ptr(), 28));
     }
 }

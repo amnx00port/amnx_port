@@ -963,6 +963,20 @@ impl<'a> Lanes<'a> {
                     };
                     self.scc_lane.insert(scc, m);
                 }
+                // `s_bcnt1` of a mask: its SCC is "some lane is set" per lane (#878).
+                let bcnt = if self.p.wave64 {
+                    "s_bcnt1_i32_b64"
+                } else {
+                    "s_bcnt1_i32_b32"
+                };
+                if takes_mask
+                    && name == bcnt
+                    && let Some(scc) = inst.write(Reg::Scc)
+                    && let [a] = &src[..]
+                    && let Some((m, _)) = self.operand(inst, a)
+                {
+                    self.scc_lane.insert(scc, m);
+                }
             }
             Fields::Valu(v) => {
                 let exec = self.exec(inst);

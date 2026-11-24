@@ -15,6 +15,175 @@ use crate::dxbc::{Container, FourCC};
 
 pub struct Host {
     pub device: ID3D12Device,
+    pub software: bool,
+}
+
+/// Summary of the Windows host GPU's DirectX 12 capabilities for VIctory (#910).
+#[derive(Debug, Clone)]
+pub struct AdapterReport {
+    pub name: String,
+    pub software: bool,
+    pub vram_mb: u64,
+    pub shader_model_6_6: bool,
+    pub highest_shader_model: u32,
+    pub mesh_shaders: bool,
+    pub wave_ops: bool,
+    pub wave_lanes_min: u32,
+    pub wave_lanes_max: u32,
+    pub resource_binding_tier: u32,
+}
+
+/// Selects a D3D12 adapter and creates a device: WARP when `warp` is true,
+/// `VICTORY_ADAPTER` (index or name substring) when set, otherwise the
+/// high-performance GPU via `IDXGIFactory6` (avoiding picking an iGPU on
+/// hybrid Windows laptops, #208 / #1132), falling back to the default adapter.
+unsafe fn create_device(factory: &IDXGIFactory4, warp: bool) -> Result<ID3D12Device, String> {
+    let mut device: Option<ID3D12Device> = None;
+    // SAFETY: caller upholds DXGI/D3D12 safety; all out pointers are valid.
+    unsafe {
+        if warp {
+            let adapter: IDXGIAdapter = factory.EnumWarpAdapter().map_err(err)?;
+            D3D12CreateDevice(&adapter, D3D_FEATURE_LEVEL_12_0, &mut device).map_err(err)?;
+            return device.ok_or_else(|| "no Direct3D 12 device".to_owned());
+        }
+        if let Ok(sel) = std::env::var("VICTORY_ADAPTER") {
+            let sel = sel.trim();
+            if !sel.is_empty() {
+                if let Ok(idx) = sel.parse::<u32>() {
+                    if let Ok(adapter) = factory.EnumAdapters1(idx)
+                        && D3D12CreateDevice(&adapter, D3D_FEATURE_LEVEL_12_0, &mut device).is_ok()
+                        && let Some(d) = device.take()
+                    {
+                        return Ok(d);
+                    }
+                } else {
+                    let needle = sel.to_ascii_lowercase();
+                    let mut i = 0u32;
+                    while let Ok(adapter) = factory.EnumAdapters1(i) {
+                        i += 1;
+                        if let Ok(desc) = adapter.GetDesc1() {
+                            let end = desc
+                                .Description
+                                .iter()
+                                .position(|&c| c == 0)
+                                .unwrap_or(desc.Description.len());
+                            let name = String::from_utf16_lossy(&desc.Description[..end]);
+                            if name.to_ascii_lowercase().contains(&needle)
+                                && D3D12CreateDevice(&adapter, D3D_FEATURE_LEVEL_12_0, &mut device)
+                                    .is_ok()
+                                && let Some(d) = device.take()
+                            {
+                                return Ok(d);
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        if let Ok(f6) = factory.cast::<IDXGIFactory6>()
+            && let Ok(adapter) =
+                f6.EnumAdapterByGpuPreference::<IDXGIAdapter>(0, DXGI_GPU_PREFERENCE_HIGH_PERFORMANCE)
+            && D3D12CreateDevice(&adapter, D3D_FEATURE_LEVEL_12_0, &mut device).is_ok()
+            && let Some(d) = device.take()
+        {
+            return Ok(d);
+        }
+        D3D12CreateDevice(None, D3D_FEATURE_LEVEL_12_0, &mut device).map_err(err)?;
+        device.ok_or_else(|| "no Direct3D 12 device".to_owned())
+    }
+}
+
+/// Probes the preferred D3D12 adapter (or WARP when `VICTORY_WARP=1`) and
+/// returns its GPU/shader capability report without failing if SM 6.6 is
+/// absent (#910).
+pub fn probe_host() -> Result<AdapterReport, String> {
+    let warp = std::env::var("VICTORY_WARP").is_ok_and(|v| v == "1");
+    // SAFETY: plain D3D12/DXGI calls with valid out pointers.
+    unsafe {
+        let factory: IDXGIFactory4 =
+            CreateDXGIFactory2(DXGI_CREATE_FACTORY_FLAGS(0)).map_err(err)?;
+        let device = create_device(&factory, warp)?;
+        let desc = factory
+            .EnumAdapterByLuid::<IDXGIAdapter1>(device.GetAdapterLuid())
+            .and_then(|a| a.GetDesc1())
+            .ok();
+        let (name, software, vram_mb) = match desc {
+            Some(d) => {
+                let end = d
+                    .Description
+                    .iter()
+                    .position(|&c| c == 0)
+                    .unwrap_or(d.Description.len());
+                let name = String::from_utf16_lossy(&d.Description[..end]);
+                let sw = warp
+                    || (d.Flags & DXGI_ADAPTER_FLAG_SOFTWARE.0 as u32 != 0)
+                    || (d.VendorId == 0x1414 && d.DeviceId == 0x008C);
+                (name, sw, (d.DedicatedVideoMemory as u64) >> 20)
+            }
+            None => ("Unknown D3D12 Adapter".to_owned(), warp, 0),
+        };
+        let mut sm = D3D12_FEATURE_DATA_SHADER_MODEL {
+            HighestShaderModel: D3D_SHADER_MODEL_6_6,
+        };
+        let sm_ok = device
+            .CheckFeatureSupport(
+                D3D12_FEATURE_SHADER_MODEL,
+                (&raw mut sm).cast(),
+                size_of_val(&sm) as u32,
+            )
+            .is_ok();
+        let highest_shader_model = if sm_ok {
+            sm.HighestShaderModel.0 as u32
+        } else {
+            0
+        };
+        let shader_model_6_6 = sm_ok && sm.HighestShaderModel.0 >= D3D_SHADER_MODEL_6_6.0;
+
+        let mut opt = D3D12_FEATURE_DATA_D3D12_OPTIONS::default();
+        let opt_ok = device
+            .CheckFeatureSupport(
+                D3D12_FEATURE_D3D12_OPTIONS,
+                (&raw mut opt).cast(),
+                size_of_val(&opt) as u32,
+            )
+            .is_ok();
+        let resource_binding_tier = if opt_ok {
+            opt.ResourceBindingTier.0 as u32
+        } else {
+            0
+        };
+
+        let mut opt1 = D3D12_FEATURE_DATA_D3D12_OPTIONS1::default();
+        let opt1_ok = device
+            .CheckFeatureSupport(
+                D3D12_FEATURE_D3D12_OPTIONS1,
+                (&raw mut opt1).cast(),
+                size_of_val(&opt1) as u32,
+            )
+            .is_ok();
+
+        let mut opt7 = D3D12_FEATURE_DATA_D3D12_OPTIONS7::default();
+        let opt7_ok = device
+            .CheckFeatureSupport(
+                D3D12_FEATURE_D3D12_OPTIONS7,
+                (&raw mut opt7).cast(),
+                size_of_val(&opt7) as u32,
+            )
+            .is_ok();
+
+        Ok(AdapterReport {
+            name,
+            software,
+            vram_mb,
+            shader_model_6_6,
+            highest_shader_model,
+            mesh_shaders: opt7_ok && opt7.MeshShaderTier != D3D12_MESH_SHADER_TIER_NOT_SUPPORTED,
+            wave_ops: opt1_ok && opt1.WaveOps.as_bool(),
+            wave_lanes_min: if opt1_ok { opt1.WaveLaneCountMin } else { 0 },
+            wave_lanes_max: if opt1_ok { opt1.WaveLaneCountMax } else { 0 },
+            resource_binding_tier,
+        })
+    }
 }
 
 /// What the stage declares that a pipeline must match.
@@ -63,21 +232,23 @@ fn err(e: windows::core::Error) -> String {
 }
 
 impl Host {
-    /// The default adapter, or WARP with `warp` (or `VICTORY_WARP=1`).
+    /// The preferred high-performance adapter (or `VICTORY_ADAPTER`), or WARP
+    /// with `warp` (or `VICTORY_WARP=1`).
     pub fn new(warp: bool) -> Result<Self, String> {
         let warp = warp || std::env::var("VICTORY_WARP").is_ok_and(|v| v == "1");
         // SAFETY: plain D3D12/DXGI calls with valid out pointers.
         unsafe {
-            let mut device: Option<ID3D12Device> = None;
-            if warp {
-                let factory: IDXGIFactory4 =
-                    CreateDXGIFactory2(DXGI_CREATE_FACTORY_FLAGS(0)).map_err(err)?;
-                let adapter: IDXGIAdapter = factory.EnumWarpAdapter().map_err(err)?;
-                D3D12CreateDevice(&adapter, D3D_FEATURE_LEVEL_12_0, &mut device).map_err(err)?;
-            } else {
-                D3D12CreateDevice(None, D3D_FEATURE_LEVEL_12_0, &mut device).map_err(err)?;
-            }
-            let device = device.ok_or("no device")?;
+            let factory: IDXGIFactory4 =
+                CreateDXGIFactory2(DXGI_CREATE_FACTORY_FLAGS(0)).map_err(err)?;
+            let device = create_device(&factory, warp)?;
+            let software = warp
+                || factory
+                    .EnumAdapterByLuid::<IDXGIAdapter1>(device.GetAdapterLuid())
+                    .and_then(|a| a.GetDesc1())
+                    .is_ok_and(|d| {
+                        d.Flags & DXGI_ADAPTER_FLAG_SOFTWARE.0 as u32 != 0
+                            || (d.VendorId == 0x1414 && d.DeviceId == 0x008C)
+                    });
             let mut sm = D3D12_FEATURE_DATA_SHADER_MODEL {
                 HighestShaderModel: D3D_SHADER_MODEL_6_6,
             };
@@ -94,7 +265,7 @@ impl Host {
                     sm.HighestShaderModel.0
                 ));
             }
-            Ok(Host { device })
+            Ok(Host { device, software })
         }
     }
 
@@ -132,26 +303,56 @@ impl Host {
                 ShaderVisibility: vis,
             })
             .collect();
-        let mut views: Vec<(u8, bool)> = stages
+        let mut views: Vec<(u8, u8)> = stages
             .iter()
             .flat_map(|(s, _)| {
-                let cbvs = s.root_cbvs.iter().map(|&r| (r, false));
-                cbvs.chain(s.root_srvs.iter().map(|&r| (r, true)))
+                let cbvs = s.root_cbvs.iter().map(|&r| (r, 0u8));
+                let srvs = s.root_srvs.iter().map(|&r| (r, 1u8));
+                let uavs = s.root_uavs.iter().map(|&r| (r, 2u8));
+                cbvs.chain(srvs).chain(uavs)
             })
             .collect();
         views.sort_unstable();
         views.dedup();
-        for (slot, srv) in views {
+        for (slot, kind) in views {
             params.push(D3D12_ROOT_PARAMETER1 {
-                ParameterType: if srv {
-                    D3D12_ROOT_PARAMETER_TYPE_SRV
-                } else {
-                    D3D12_ROOT_PARAMETER_TYPE_CBV
+                ParameterType: match kind {
+                    0 => D3D12_ROOT_PARAMETER_TYPE_CBV,
+                    1 => D3D12_ROOT_PARAMETER_TYPE_SRV,
+                    _ => D3D12_ROOT_PARAMETER_TYPE_UAV,
                 },
                 Anonymous: D3D12_ROOT_PARAMETER1_0 {
                     Descriptor: D3D12_ROOT_DESCRIPTOR1 {
                         ShaderRegister: u32::from(slot),
                         RegisterSpace: super::ROOT_CBV_SPACE,
+                        Flags: D3D12_ROOT_DESCRIPTOR_FLAG_NONE,
+                    },
+                },
+                ShaderVisibility: D3D12_SHADER_VISIBILITY_ALL,
+            });
+        }
+        let mut const_views: Vec<(u32, u8)> = stages
+            .iter()
+            .flat_map(|(s, _)| {
+                let cbvs = s.const_cbvs.iter().map(|r| (r.register, 0u8));
+                let srvs = s.const_srvs.iter().map(|r| (r.register, 1u8));
+                let uavs = s.const_uavs.iter().map(|r| (r.register, 2u8));
+                cbvs.chain(srvs).chain(uavs)
+            })
+            .collect();
+        const_views.sort_unstable();
+        const_views.dedup();
+        for (reg, kind) in const_views {
+            params.push(D3D12_ROOT_PARAMETER1 {
+                ParameterType: match kind {
+                    0 => D3D12_ROOT_PARAMETER_TYPE_CBV,
+                    1 => D3D12_ROOT_PARAMETER_TYPE_SRV,
+                    _ => D3D12_ROOT_PARAMETER_TYPE_UAV,
+                },
+                Anonymous: D3D12_ROOT_PARAMETER1_0 {
+                    Descriptor: D3D12_ROOT_DESCRIPTOR1 {
+                        ShaderRegister: reg,
+                        RegisterSpace: super::CONST_VIEW_SPACE,
                         Flags: D3D12_ROOT_DESCRIPTOR_FLAG_NONE,
                     },
                 },
@@ -528,6 +729,11 @@ fn stub(pixel: bool, outputs: Vec<SigElement>) -> HostShader {
         static_samplers: Vec::new(),
         root_cbvs: Vec::new(),
         root_srvs: Vec::new(),
+        root_uavs: Vec::new(),
+        const_cbvs: Vec::new(),
+        const_srvs: Vec::new(),
+        const_uavs: Vec::new(),
+        wave_size: None,
     }
 }
 

@@ -180,6 +180,7 @@ impl Bits<'_> {
         if n == 0 {
             return 0;
         }
+        let n = n.min(32);
         let v = self.peek32() >> (32 - n);
         self.pos += n as usize;
         v
@@ -190,6 +191,10 @@ impl Bits<'_> {
     }
 
     fn signed(&mut self, n: u32) -> i32 {
+        if n == 0 {
+            return 0;
+        }
+        let n = n.min(32);
         ((self.read(n) << (32 - n)) as i32) >> (32 - n)
     }
 
@@ -279,6 +284,37 @@ fn log2(v: usize) -> u32 {
 
 // The inverse transform.
 
+/// Cached pre- and post-rotation `(sin, cos)` tables for an `n`-point half-IMDCT (#172).
+struct ImdctTables {
+    pre: Vec<(f64, f64)>,
+    post: Vec<(f64, f64)>,
+}
+
+impl ImdctTables {
+    fn build(n: usize) -> Self {
+        let m = n / 2;
+        let pre = (0..m)
+            .map(|k| (-std::f64::consts::PI * k as f64 / n as f64).sin_cos())
+            .collect();
+        let post = (0..m)
+            .map(|k| (-std::f64::consts::PI * (4 * k + 1) as f64 / (4 * n) as f64).sin_cos())
+            .collect();
+        Self { pre, post }
+    }
+}
+
+fn imdct_tables(n: usize) -> Option<&'static ImdctTables> {
+    use std::sync::OnceLock;
+    // XMA subframe sizes are powers of two in 64..=2048 (6 slots).
+    static CACHE: [OnceLock<ImdctTables>; 6] = [const { OnceLock::new() }; 6];
+    if n.is_power_of_two() && (64..=2048).contains(&n) {
+        let idx = (n.trailing_zeros() - 6) as usize;
+        Some(CACHE[idx].get_or_init(|| ImdctTables::build(n)))
+    } else {
+        None
+    }
+}
+
 /// Half-length inverse MDCT as FFmpeg defines it (`av_tx` MDCT, inverse):
 /// `n` coefficients to the middle `n` samples of the 2n-sample window,
 /// negated and scaled by `scale`. Computed as a DCT-IV through an
@@ -288,6 +324,21 @@ fn imdct_half(input: &[f32], out: &mut [f32], scale: f32) {
     let m = n / 2;
     let mut re = vec![0f64; m];
     let mut im = vec![0f64; m];
+    if let Some(tables) = imdct_tables(n) {
+        for k in 0..m {
+            let (a, b) = (input[2 * k] as f64, input[n - 1 - 2 * k] as f64);
+            let (s, c) = tables.pre[k];
+            (re[k], im[k]) = (a * c - b * s, a * s + b * c);
+        }
+        fft(&mut re, &mut im);
+        for k in 0..m {
+            let (s, c) = tables.post[k];
+            let (wr, wi) = (re[k] * c - im[k] * s, re[k] * s + im[k] * c);
+            out[n - 1 - 2 * k] = (wr as f32) * scale;
+            out[2 * k] = -(wi as f32) * scale;
+        }
+        return;
+    }
     for k in 0..m {
         let (a, b) = (input[2 * k] as f64, input[n - 1 - 2 * k] as f64);
         let (s, c) = (-std::f64::consts::PI * k as f64 / n as f64).sin_cos();
@@ -1243,5 +1294,23 @@ mod tests {
             );
             assert!(errors == 0 && snr > 40.0);
         }
+    }
+
+    #[test]
+    fn bits_read_and_signed_handle_zero_and_wide_widths() {
+        let data = [0xFFu8, 0x00, 0xAB, 0xCD, 0x12, 0x34];
+        let mut b = Bits {
+            data: &data,
+            pos: 0,
+            end: data.len() * 8,
+        };
+        assert_eq!(b.read(0), 0);
+        assert_eq!(b.signed(0), 0);
+        assert_eq!(b.consumed(), 0);
+        assert_eq!(b.signed(32), 0xFF00_ABCD_u32 as i32);
+        assert_eq!(b.consumed(), 32);
+        // Oversized widths clamp cleanly to 32 without shift overflow (#907).
+        assert_eq!(b.read(40), 0x1234_0000);
+        assert_eq!(b.signed(64), 0);
     }
 }

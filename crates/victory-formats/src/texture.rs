@@ -594,9 +594,62 @@ impl Layout {
         row_pitch: usize,
         depth_pitch: usize,
     ) -> Result<(), Error> {
-        self.walk(tiled.len(), mip, slice, linear.len(), row_pitch, depth_pitch, |t, l, len| {
-            linear[l..][..len].copy_from_slice(&tiled[t..][..len]);
-        })
+        let plan = self.copy_plan(tiled.len(), mip, slice, linear.len(), row_pitch, depth_pitch)?;
+        plan.detile(self, tiled, linear);
+        Ok(())
+    }
+
+    /// Exact `[start, end)` byte range in tiled memory touched by one
+    /// subresource (`mip`, `slice`), for partial detiling of dirty pages (#915).
+    pub fn extents(&self, mip: u32, slice: u32) -> Result<(u64, u64), Error> {
+        let m = self.mips.get(mip as usize).ok_or(Error::Invalid)?;
+        let depth = m.depth;
+        let first = if self.desc.dimension == Dimension::Tex3d {
+            if slice != 0 {
+                return Err(Error::Invalid);
+            }
+            0
+        } else {
+            slice
+        };
+        if first >= self.slices {
+            return Err(Error::Invalid);
+        }
+        if !self.addressable() {
+            return Err(Error::Unsupported);
+        }
+        let n = u64::from(self.desc.element_bytes);
+        let bytes = u64::from(m.width) * n;
+        let mut lo = u64::MAX;
+        let mut hi = 0u64;
+        if self.desc.swizzle == Swizzle::LINEAR {
+            let tiled_pitch = u64::from(m.pitch) * n;
+            for z in 0..depth {
+                let (s, _) = self.split(first + z);
+                let base = u64::from(s) * self.slice_size + m.offset;
+                let end = base + u64::from(m.height.saturating_sub(1)) * tiled_pitch + bytes;
+                lo = lo.min(base);
+                hi = hi.max(end);
+            }
+        } else {
+            let mut min_col = u64::MAX;
+            let mut max_col = 0u64;
+            for x in 0..m.width {
+                let col = self.column(m, x);
+                min_col = min_col.min(col);
+                max_col = max_col.max(col + n);
+            }
+            for z in 0..depth {
+                let (s, inner) = self.split(first + z);
+                let base = u64::from(s) * self.slice_size + m.offset;
+                for y in 0..m.height {
+                    let row = base + self.row(m, y, inner);
+                    lo = lo.min(row + min_col);
+                    hi = hi.max(row + max_col);
+                }
+            }
+        }
+        Ok((lo, hi))
     }
 
     /// The reverse of [`Layout::detile`]: linear rows into tiled memory.
@@ -609,14 +662,13 @@ impl Layout {
         row_pitch: usize,
         depth_pitch: usize,
     ) -> Result<(), Error> {
-        self.walk(tiled.len(), mip, slice, linear.len(), row_pitch, depth_pitch, |t, l, len| {
-            tiled[t..][..len].copy_from_slice(&linear[l..][..len]);
-        })
+        let plan = self.copy_plan(tiled.len(), mip, slice, linear.len(), row_pitch, depth_pitch)?;
+        plan.tile(self, tiled, linear);
+        Ok(())
     }
 
-    /// Visits contiguous runs as (tiled byte offset, linear byte offset, length).
-    #[allow(clippy::too_many_arguments)]
-    fn walk(
+    /// Validates dimensions and precomputes per-row contiguous byte runs.
+    fn copy_plan(
         &self,
         tiled_len: usize,
         mip: u32,
@@ -624,8 +676,7 @@ impl Layout {
         linear_len: usize,
         row_pitch: usize,
         depth_pitch: usize,
-        mut copy: impl FnMut(usize, usize, usize),
-    ) -> Result<(), Error> {
+    ) -> Result<CopyPlan, Error> {
         let m = self.mips.get(mip as usize).ok_or(Error::Invalid)?;
         let depth = m.depth;
         let first = if self.desc.dimension == Dimension::Tex3d {
@@ -671,23 +722,159 @@ impl Layout {
             }
             runs.push((first_tiled, first_linear, bytes - first_linear));
         }
-        for z in 0..depth {
-            let (s, inner) = self.split(first + z);
-            let base = u64::from(s) * self.slice_size + m.offset;
-            for y in 0..m.height {
-                let linear_row = z as usize * depth_pitch + y as usize * row_pitch;
-                if linear {
-                    let tiled_row = base + u64::from(y) * u64::from(m.pitch) * n as u64;
-                    copy(tiled_row as usize, linear_row, bytes);
+        let uniform_run = runs
+            .first()
+            .map(|r| r.2)
+            .filter(|&len| runs.iter().all(|r| r.2 == len));
+        Ok(CopyPlan {
+            mip: mip as usize,
+            first,
+            depth,
+            bytes,
+            row_pitch,
+            depth_pitch,
+            linear,
+            runs,
+            uniform_run,
+        })
+    }
+}
+
+struct CopyPlan {
+    mip: usize,
+    first: u32,
+    depth: u32,
+    bytes: usize,
+    row_pitch: usize,
+    depth_pitch: usize,
+    linear: bool,
+    runs: Vec<(usize, usize, usize)>,
+    uniform_run: Option<usize>,
+}
+
+impl CopyPlan {
+    fn detile(&self, layout: &Layout, tiled: &[u8], linear: &mut [u8]) {
+        let m = &layout.mips[self.mip];
+        let n = layout.desc.element_bytes as usize;
+        let tiled_pitch = m.pitch as usize * n;
+        for z in 0..self.depth {
+            let (s, inner) = layout.split(self.first + z);
+            let base = u64::from(s) * layout.slice_size + m.offset;
+            let linear_slice = z as usize * self.depth_pitch;
+            if self.linear {
+                if self.row_pitch == self.bytes && tiled_pitch == self.bytes {
+                    let len = m.height as usize * self.bytes;
+                    linear[linear_slice..][..len].copy_from_slice(&tiled[base as usize..][..len]);
                 } else {
-                    let tiled_row = (base + self.row(m, y, inner)) as usize;
-                    for &(tiled, linear, len) in &runs {
-                        copy(tiled_row + tiled, linear_row + linear, len);
+                    for y in 0..m.height {
+                        let tiled_row = base as usize + y as usize * tiled_pitch;
+                        let linear_row = linear_slice + y as usize * self.row_pitch;
+                        linear[linear_row..][..self.bytes]
+                            .copy_from_slice(&tiled[tiled_row..][..self.bytes]);
+                    }
+                }
+                continue;
+            }
+            match self.uniform_run {
+                Some(4) => self.detile_fixed::<4>(layout, m, base, inner, linear_slice, tiled, linear),
+                Some(8) => self.detile_fixed::<8>(layout, m, base, inner, linear_slice, tiled, linear),
+                Some(16) => self.detile_fixed::<16>(layout, m, base, inner, linear_slice, tiled, linear),
+                Some(32) => self.detile_fixed::<32>(layout, m, base, inner, linear_slice, tiled, linear),
+                Some(64) => self.detile_fixed::<64>(layout, m, base, inner, linear_slice, tiled, linear),
+                _ => {
+                    for y in 0..m.height {
+                        let tiled_row = (base + layout.row(m, y, inner)) as usize;
+                        let linear_row = linear_slice + y as usize * self.row_pitch;
+                        for &(t, l, len) in &self.runs {
+                            linear[linear_row + l..][..len]
+                                .copy_from_slice(&tiled[tiled_row + t..][..len]);
+                        }
                     }
                 }
             }
         }
-        Ok(())
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn detile_fixed<const N: usize>(
+        &self,
+        layout: &Layout,
+        m: &Mip,
+        base: u64,
+        inner: u32,
+        linear_slice: usize,
+        tiled: &[u8],
+        linear: &mut [u8],
+    ) {
+        for y in 0..m.height {
+            let tiled_row = (base + layout.row(m, y, inner)) as usize;
+            let linear_row = linear_slice + y as usize * self.row_pitch;
+            for &(t, l, _) in &self.runs {
+                linear[linear_row + l..][..N].copy_from_slice(&tiled[tiled_row + t..][..N]);
+            }
+        }
+    }
+
+    fn tile(&self, layout: &Layout, tiled: &mut [u8], linear: &[u8]) {
+        let m = &layout.mips[self.mip];
+        let n = layout.desc.element_bytes as usize;
+        let tiled_pitch = m.pitch as usize * n;
+        for z in 0..self.depth {
+            let (s, inner) = layout.split(self.first + z);
+            let base = u64::from(s) * layout.slice_size + m.offset;
+            let linear_slice = z as usize * self.depth_pitch;
+            if self.linear {
+                if self.row_pitch == self.bytes && tiled_pitch == self.bytes {
+                    let len = m.height as usize * self.bytes;
+                    tiled[base as usize..][..len].copy_from_slice(&linear[linear_slice..][..len]);
+                } else {
+                    for y in 0..m.height {
+                        let tiled_row = base as usize + y as usize * tiled_pitch;
+                        let linear_row = linear_slice + y as usize * self.row_pitch;
+                        tiled[tiled_row..][..self.bytes]
+                            .copy_from_slice(&linear[linear_row..][..self.bytes]);
+                    }
+                }
+                continue;
+            }
+            match self.uniform_run {
+                Some(4) => self.tile_fixed::<4>(layout, m, base, inner, linear_slice, tiled, linear),
+                Some(8) => self.tile_fixed::<8>(layout, m, base, inner, linear_slice, tiled, linear),
+                Some(16) => self.tile_fixed::<16>(layout, m, base, inner, linear_slice, tiled, linear),
+                Some(32) => self.tile_fixed::<32>(layout, m, base, inner, linear_slice, tiled, linear),
+                Some(64) => self.tile_fixed::<64>(layout, m, base, inner, linear_slice, tiled, linear),
+                _ => {
+                    for y in 0..m.height {
+                        let tiled_row = (base + layout.row(m, y, inner)) as usize;
+                        let linear_row = linear_slice + y as usize * self.row_pitch;
+                        for &(t, l, len) in &self.runs {
+                            tiled[tiled_row + t..][..len]
+                                .copy_from_slice(&linear[linear_row + l..][..len]);
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn tile_fixed<const N: usize>(
+        &self,
+        layout: &Layout,
+        m: &Mip,
+        base: u64,
+        inner: u32,
+        linear_slice: usize,
+        tiled: &mut [u8],
+        linear: &[u8],
+    ) {
+        for y in 0..m.height {
+            let tiled_row = (base + layout.row(m, y, inner)) as usize;
+            let linear_row = linear_slice + y as usize * self.row_pitch;
+            for &(t, l, _) in &self.runs {
+                tiled[tiled_row + t..][..N].copy_from_slice(&linear[linear_row + l..][..N]);
+            }
+        }
     }
 }
 
@@ -752,23 +939,107 @@ pub struct Plane {
     pub layout: Layout,
 }
 
-/// Every data plane of a texture (depth, then stencil), placed one after
-/// the other.
-///
-/// shortcut: no compression metadata planes (HTILE, CMASK, FMASK, DCC);
-/// the console adds them to render targets and depth buffers unless the
-/// description denies them, so those are smaller here than on the console.
-/// The host GPU renders them, so nothing reads that memory; add the planes
-/// if a title sizes a pool from console sizes and runs out.
+/// Hardware compression/acceleration metadata plane kind on GFX10.3/RDNA2.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum MetadataKind {
+    /// Color mask for MSAA fast-clear / compression (`XG_PLANE_USAGE_COLOR_MASK = 2`).
+    Cmask,
+    /// Fragment mask mapping MSAA sample indices (`XG_PLANE_USAGE_FRAGMENT_MASK = 3`).
+    Fmask,
+    /// Hierarchical depth/stencil tile metadata (`XG_PLANE_USAGE_HTILE = 4`).
+    Htile,
+    /// Delta color compression metadata (`XG_PLANE_USAGE_DELTA_COLOR_COMPRESSION = 9`).
+    Dcc,
+}
+
+impl MetadataKind {
+    /// Xbox `XG_PLANE_USAGE` discriminant for `xg_xs.dll` (`LayoutOut`).
+    pub const fn xg_usage(self) -> u32 {
+        match self {
+            MetadataKind::Cmask => 2,
+            MetadataKind::Fmask => 3,
+            MetadataKind::Htile => 4,
+            MetadataKind::Dcc => 9,
+        }
+    }
+}
+
+/// Optional metadata plane placed after a texture's data planes (HTILE, DCC,
+/// CMASK, FMASK).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct MetadataPlane {
+    pub kind: MetadataKind,
+    /// Byte offset from the start of the texture allocation.
+    pub offset: u64,
+    /// Total byte size across all slices.
+    pub size: u64,
+    /// Bytes per array slice.
+    pub slice_size: u64,
+    /// Hardware alignment requirement in bytes.
+    pub alignment: u64,
+    /// Logical metadata element width in bytes.
+    pub element_bytes: u32,
+}
+
+/// Flags controlling which GFX10.3 compression metadata planes are generated
+/// for render targets and depth/stencil buffers.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct MetadataFlags {
+    pub render_target: bool,
+    pub depth_stencil: bool,
+    pub deny_compression: bool,
+}
+
+impl MetadataFlags {
+    pub const NONE: Self = Self {
+        render_target: false,
+        depth_stencil: false,
+        deny_compression: false,
+    };
+
+    /// Decodes D3D12.X `D3D12_RESOURCE_FLAGS` into metadata plane eligibility.
+    /// Bit 0 (`0x1`) = `ALLOW_RENDER_TARGET`, bit 1 (`0x2`) = `ALLOW_DEPTH_STENCIL`,
+    /// bit 30 (`0x4000_0000`) = `D3D12XBOX_RESOURCE_FLAG_DENY_COMPRESSION_DATA`.
+    pub const fn from_d3d12_flags(flags: u32) -> Self {
+        const ALLOW_RT: u32 = 0x1;
+        const ALLOW_DS: u32 = 0x2;
+        const DENY_COMPRESSION: u32 = 0x4000_0000;
+        Self {
+            render_target: flags & ALLOW_RT != 0,
+            depth_stencil: flags & ALLOW_DS != 0,
+            deny_compression: flags & DENY_COMPRESSION != 0,
+        }
+    }
+}
+
+/// Every data plane of a texture (color/depth, plus optional stencil) followed
+/// by any GFX10.3 compression metadata planes (HTILE, DCC, CMASK, FMASK) when
+/// requested via [`Texture::with_metadata`].
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Texture {
     pub planes: Vec<Plane>,
+    pub metadata: Vec<MetadataPlane>,
     pub size: u64,
     pub alignment: u64,
 }
 
+/// GFX10.3 metadata surface alignment for a given swizzle mode: 64 KiB for
+/// 64 KiB macro-tiled modes, 4 KiB for 4 KiB modes, 256 B otherwise.
+fn metadata_alignment(swizzle: Swizzle) -> u64 {
+    match swizzle.0 {
+        0 => 256,
+        1..=3 => 256,
+        4..=7 | 20..=22 => 4096,
+        _ => 65_536,
+    }
+}
+
 impl Texture {
     pub fn new(desc: &TextureDesc) -> Result<Texture, Error> {
+        Self::with_metadata(desc, MetadataFlags::NONE)
+    }
+
+    pub fn with_metadata(desc: &TextureDesc, meta_flags: MetadataFlags) -> Result<Texture, Error> {
         let f = format(desc.format).ok_or(Error::Invalid)?;
         let depth3d = if desc.dimension == Dimension::Tex3d {
             desc.depth_or_array
@@ -779,6 +1050,7 @@ impl Texture {
             0 => 32 - desc.width.max(desc.height).max(depth3d).max(1).leading_zeros(),
             n => n,
         };
+        let samples = desc.samples.max(1);
         let plane = |bytes| Desc {
             dimension: desc.dimension,
             width: desc.width,
@@ -787,7 +1059,7 @@ impl Texture {
             mips,
             element_bytes: bytes,
             block: f.block,
-            samples: desc.samples.max(1),
+            samples,
             swizzle: desc.swizzle,
         };
         let mut planes = vec![Plane {
@@ -804,11 +1076,126 @@ impl Texture {
                 layout,
             });
         }
-        let last = &planes[planes.len() - 1];
-        let size = last.offset + last.layout.size;
-        let alignment = planes.iter().map(|p| p.layout.alignment).max().unwrap_or(1);
+
+        let mut cursor = {
+            let last = &planes[planes.len() - 1];
+            last.offset + last.layout.size
+        };
+        let mut alignment = planes.iter().map(|p| p.layout.alignment).max().unwrap_or(1);
+        let mut metadata = Vec::new();
+
+        // Hardware compression metadata applies to tiled 2D surfaces (not
+        // linear row-major or 1D/block-compressed surfaces) when not denied.
+        let tiled_2d = desc.dimension == Dimension::Tex2d
+            && desc.swizzle != Swizzle::LINEAR
+            && f.block == 1
+            && !meta_flags.deny_compression;
+        if tiled_2d {
+            let slices = u64::from(desc.depth_or_array.max(1));
+            let surf_align = metadata_alignment(desc.swizzle);
+            let push_meta = |metadata: &mut Vec<MetadataPlane>,
+                             cursor: &mut u64,
+                             alignment: &mut u64,
+                             kind: MetadataKind,
+                             slice_size: u64,
+                             align: u64,
+                             element_bytes: u32| {
+                let offset = (*cursor).next_multiple_of(align);
+                let total = (slice_size * slices).next_multiple_of(align);
+                metadata.push(MetadataPlane {
+                    kind,
+                    offset,
+                    size: total,
+                    slice_size,
+                    alignment: align,
+                    element_bytes,
+                });
+                *cursor = offset + total;
+                *alignment = (*alignment).max(align);
+            };
+
+            if meta_flags.depth_stencil {
+                // GFX10.3 HTILE: 1 u32 (4 bytes) per 8x8 pixel block, padded
+                // to 64x64 meta-block granularity and 2048/4096 B slice align.
+                let meta_w = u64::from(desc.width.div_ceil(8).next_multiple_of(8));
+                let meta_h = u64::from(desc.height.div_ceil(8).next_multiple_of(8));
+                let slice_align = if surf_align >= 65_536 { 4096 } else { 2048 };
+                let slice_size = (meta_w * meta_h * 4).max(slice_align).next_multiple_of(slice_align);
+                push_meta(
+                    &mut metadata,
+                    &mut cursor,
+                    &mut alignment,
+                    MetadataKind::Htile,
+                    slice_size,
+                    surf_align,
+                    4,
+                );
+            } else if meta_flags.render_target {
+                if samples > 1 {
+                    // CMASK: 4 bits per 8x8 tile for MSAA fast-clear / compression.
+                    let cm_w = u64::from(desc.width.div_ceil(8).next_multiple_of(16));
+                    let cm_h = u64::from(desc.height.div_ceil(8).next_multiple_of(16));
+                    let cm_slice = (cm_w * cm_h / 2).max(256).next_multiple_of(256);
+                    push_meta(
+                        &mut metadata,
+                        &mut cursor,
+                        &mut alignment,
+                        MetadataKind::Cmask,
+                        cm_slice,
+                        surf_align,
+                        1,
+                    );
+                    // FMASK: per-pixel sample-pointer map (1 B for 2x/4x, 4 B for 8x).
+                    let fmask_bpe = if samples <= 4 { 1u32 } else { 4u32 };
+                    let fmask_slice = if let Ok(fl) = Layout::new(&Desc {
+                        dimension: Dimension::Tex2d,
+                        width: desc.width,
+                        height: desc.height,
+                        depth: 1,
+                        mips: 1,
+                        element_bytes: fmask_bpe,
+                        block: 1,
+                        samples: 1,
+                        swizzle: desc.swizzle,
+                    }) {
+                        fl.slice_size
+                    } else {
+                        (u64::from(desc.width) * u64::from(desc.height) * u64::from(fmask_bpe))
+                            .next_multiple_of(surf_align)
+                    };
+                    push_meta(
+                        &mut metadata,
+                        &mut cursor,
+                        &mut alignment,
+                        MetadataKind::Fmask,
+                        fmask_slice,
+                        surf_align,
+                        fmask_bpe,
+                    );
+                }
+                // DCC: 1 metadata byte per 256 bytes of tiled color surface.
+                let color_slice = planes[0].layout.slice_size;
+                let dcc_slice_align = if surf_align >= 65_536 { 4096 } else { 256 };
+                let dcc_slice = color_slice
+                    .div_ceil(256)
+                    .max(dcc_slice_align)
+                    .next_multiple_of(dcc_slice_align);
+                push_meta(
+                    &mut metadata,
+                    &mut cursor,
+                    &mut alignment,
+                    MetadataKind::Dcc,
+                    dcc_slice,
+                    surf_align,
+                    1,
+                );
+            }
+        }
+
+        let size = cursor;
         Ok(Texture {
             planes,
+            metadata,
             size,
             alignment,
         })
@@ -1062,5 +1449,126 @@ mod tests {
             Err(Error::TooSmall)
         );
         assert_eq!(l.offset(0, 64, 0, 0), Err(Error::Invalid));
+    }
+
+    #[test]
+    fn extents_cover_exact_subresource_bytes() {
+        let mut d = desc(64, 64, 2, 4, Swizzle::SW_64KB_S);
+        d.mips = 4;
+        let l = Layout::new(&d).unwrap();
+        for slice in 0..d.depth {
+            for mip in 0..d.mips {
+                let (lo, hi) = l.extents(mip, slice).unwrap();
+                assert!(lo < hi && hi <= l.size);
+                let m = &l.mips[mip as usize];
+                let mut min_off = u64::MAX;
+                let mut max_off = 0u64;
+                for y in 0..m.height {
+                    for x in 0..m.width {
+                        let off = l.offset(mip, x, y, slice).unwrap();
+                        min_off = min_off.min(off);
+                        max_off = max_off.max(off + u64::from(d.element_bytes));
+                    }
+                }
+                assert_eq!((lo, hi), (min_off, max_off));
+            }
+        }
+    }
+
+    #[test]
+    fn fast_path_tile_and_detile_match_point_offsets() {
+        for (w, h, bpp, swizzle) in [
+            (64, 32, 4, Swizzle::LINEAR),
+            (37, 19, 4, Swizzle::LINEAR),
+            (64, 64, 1, Swizzle::SW_64KB_S),
+            (64, 64, 4, Swizzle::SW_64KB_S),
+            (64, 64, 8, Swizzle::SW_64KB_D),
+            (32, 32, 16, Swizzle::SW_64KB_S),
+            (37, 29, 4, Swizzle::SW_4KB_S),
+        ] {
+            let layout = Layout::new(&desc(w, h, 1, bpp, swizzle)).unwrap();
+            let row_bytes = (w * bpp) as usize;
+            let row_pitch = if swizzle == Swizzle::LINEAR && w == 64 {
+                row_bytes
+            } else {
+                row_bytes + 16
+            };
+            let mut src = vec![0u8; h as usize * row_pitch];
+            for y in 0..h {
+                for x in 0..w {
+                    for k in 0..bpp {
+                        src[y as usize * row_pitch + (x * bpp + k) as usize] =
+                            ((x * 13 + y * 37 + k * 7) & 0xff) as u8;
+                    }
+                }
+            }
+            let mut tiled = vec![0u8; layout.size as usize];
+            layout.tile(&mut tiled, 0, 0, &src, row_pitch, 0).unwrap();
+            for y in 0..h {
+                for x in 0..w {
+                    let off = layout.offset(0, x, y, 0).unwrap() as usize;
+                    let lin = y as usize * row_pitch + (x * bpp) as usize;
+                    assert_eq!(&tiled[off..off + bpp as usize], &src[lin..lin + bpp as usize]);
+                }
+            }
+            let mut out = vec![0u8; src.len()];
+            layout.detile(&tiled, 0, 0, &mut out, row_pitch, 0).unwrap();
+            for y in 0..h as usize {
+                let a = y * row_pitch;
+                assert_eq!(&out[a..a + row_bytes], &src[a..a + row_bytes]);
+            }
+        }
+    }
+
+    #[test]
+    fn render_target_and_depth_metadata_planes_are_laid_out_and_aligned() {
+        let base = TextureDesc {
+            dimension: Dimension::Tex2d,
+            width: 1920,
+            height: 1080,
+            depth_or_array: 1,
+            mips: 1,
+            format: 28, // R8G8B8A8_UNORM
+            samples: 1,
+            swizzle: Swizzle::SW_64KB_R_X,
+        };
+        let plain = Texture::new(&base).unwrap();
+        assert!(plain.metadata.is_empty());
+
+        // Single-sample render target gets a 64 KiB-aligned DCC plane.
+        let rt = Texture::with_metadata(&base, MetadataFlags::from_d3d12_flags(0x1)).unwrap();
+        assert_eq!(rt.planes.len(), 1);
+        assert_eq!(rt.metadata.len(), 1);
+        assert_eq!(rt.metadata[0].kind, MetadataKind::Dcc);
+        assert_eq!(rt.metadata[0].offset % 65_536, 0);
+        assert!(rt.size > plain.size);
+
+        // Deny-compression bit suppresses DCC.
+        let denied =
+            Texture::with_metadata(&base, MetadataFlags::from_d3d12_flags(0x4000_0001)).unwrap();
+        assert!(denied.metadata.is_empty());
+        assert_eq!(denied.size, plain.size);
+
+        // MSAA 4x render target gets CMASK, FMASK, and DCC.
+        let msaa_desc = TextureDesc { samples: 4, ..base };
+        let msaa = Texture::with_metadata(&msaa_desc, MetadataFlags::from_d3d12_flags(0x1)).unwrap();
+        assert_eq!(
+            msaa.metadata.iter().map(|m| m.kind).collect::<Vec<_>>(),
+            vec![MetadataKind::Cmask, MetadataKind::Fmask, MetadataKind::Dcc]
+        );
+
+        // Depth+stencil target (D32_FLOAT_S8X24_UINT = 20) gets depth + stencil + HTILE.
+        let ds_desc = TextureDesc {
+            format: 20,
+            swizzle: Swizzle::SW_64KB_Z_X,
+            ..base
+        };
+        let ds = Texture::with_metadata(&ds_desc, MetadataFlags::from_d3d12_flags(0x2)).unwrap();
+        assert_eq!(ds.planes.len(), 2);
+        assert_eq!(ds.metadata.len(), 1);
+        assert_eq!(ds.metadata[0].kind, MetadataKind::Htile);
+        assert_eq!(ds.metadata[0].element_bytes, 4);
+        assert_eq!(ds.metadata[0].offset % 65_536, 0);
+        assert!(ds.metadata[0].size >= 65_536);
     }
 }

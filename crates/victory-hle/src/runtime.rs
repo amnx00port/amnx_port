@@ -95,7 +95,13 @@ impl Title {
                 .find(|(p, _)| p == path)
                 .map(|(_, text)| text.as_str())
         };
-        let id = get("Game/TitleId").and_then(|v| u32::from_str_radix(v, 16).ok());
+        let id = get("Game/TitleId").and_then(|v| {
+            let hex = v
+                .strip_prefix("0x")
+                .or_else(|| v.strip_prefix("0X"))
+                .unwrap_or(v);
+            u32::from_str_radix(hex, 16).ok()
+        });
         let storage_mb = get("Game/PersistentLocalStorage/SizeMB").and_then(|v| v.parse().ok());
         Title {
             id: id.unwrap_or(0),
@@ -148,10 +154,20 @@ fn elements(text: &str) -> Vec<(String, String)> {
             .next()
             .unwrap_or("");
         path.push(name);
-        let body = rest[..rest.find('<').unwrap_or(rest.len())].trim();
-        let body = [("&lt;", "<"), ("&gt;", ">"), ("&quot;", "\""), ("&apos;", "'"), ("&amp;", "&")]
+        let body = if closed {
+            String::new()
+        } else {
+            let raw = rest[..rest.find('<').unwrap_or(rest.len())].trim();
+            [
+                ("&lt;", "<"),
+                ("&gt;", ">"),
+                ("&quot;", "\""),
+                ("&apos;", "'"),
+                ("&amp;", "&"),
+            ]
             .iter()
-            .fold(body.to_owned(), |b, (entity, c)| b.replace(entity, c));
+            .fold(raw.to_owned(), |b, (entity, c)| b.replace(entity, c))
+        };
         out.push((path.join("/"), body));
         if closed {
             path.pop();
@@ -222,5 +238,22 @@ mod tests {
         assert_eq!((t.id, t.storage_bytes), (0x639A_A8DD, 1024 << 20));
         assert_eq!(t.store_id, "9&C");
         assert_eq!(Title::from_manifest("").storage_bytes, 0);
+    }
+
+    #[test]
+    fn title_id_allows_0x_prefix_and_self_closing_tags_have_no_body() {
+        let text = "<Game><TitleId/>ignored<Identity Name=\"x\"/>trailing\
+                    <StoreId>S1</StoreId></Game>";
+        let t = Title::from_manifest(text);
+        assert_eq!(t.id, 0);
+        assert_eq!(t.store_id, "S1");
+        let els = elements(text);
+        assert!(els.iter().any(|(p, b)| p == "Game/TitleId" && b.is_empty()));
+        assert!(els.iter().any(|(p, b)| p == "Game/Identity" && b.is_empty()));
+
+        let hex_lower = "<Game><TitleId>0x639aa8dd</TitleId></Game>";
+        assert_eq!(Title::from_manifest(hex_lower).id, 0x639A_A8DD);
+        let hex_upper = "<Game><TitleId>0X1234ABCD</TitleId></Game>";
+        assert_eq!(Title::from_manifest(hex_upper).id, 0x1234_ABCD);
     }
 }

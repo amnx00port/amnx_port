@@ -455,11 +455,143 @@ pub extern "system" fn MFCreateSourceResolver(out: *mut *mut Resolver) -> HRESUL
     S_OK
 }
 
+/// Enforces the local-file URL rule on `mfplat!MFCreateFile`.
+pub extern "system" fn MFCreateFile(
+    access_mode: u32,
+    open_mode: u32,
+    flags: u32,
+    url: *const u16,
+    out: *mut Unknown,
+) -> HRESULT {
+    let url = match checked(url) {
+        Ok(u) => u,
+        Err(hr) => return hr,
+    };
+    static HOST_FN: OnceLock<Option<usize>> = OnceLock::new();
+    let Some(f) = *HOST_FN.get_or_init(|| crate::host::function("mfplat.dll", "MFCreateFile"))
+    else {
+        return UNSUPPORTED_SCHEME;
+    };
+    // SAFETY: matches host `MFCreateFile` signature.
+    let f: extern "system" fn(u32, u32, u32, *const u16, *mut Unknown) -> HRESULT =
+        unsafe { std::mem::transmute(f) };
+    f(access_mode, open_mode, flags, url.as_ptr(), out)
+}
+
+/// Enforces the local-file URL rule on `mfplat!MFBeginCreateFile`.
+#[allow(clippy::too_many_arguments)]
+pub extern "system" fn MFBeginCreateFile(
+    access_mode: u32,
+    open_mode: u32,
+    flags: u32,
+    url: *const u16,
+    callback: Unknown,
+    state: Unknown,
+    cancel_cookie: *mut Unknown,
+) -> HRESULT {
+    let url = match checked(url) {
+        Ok(u) => u,
+        Err(hr) => return hr,
+    };
+    static HOST_FN: OnceLock<Option<usize>> = OnceLock::new();
+    let Some(f) =
+        *HOST_FN.get_or_init(|| crate::host::function("mfplat.dll", "MFBeginCreateFile"))
+    else {
+        return UNSUPPORTED_SCHEME;
+    };
+    type BeginCreateFileFn = extern "system" fn(
+        u32,
+        u32,
+        u32,
+        *const u16,
+        Unknown,
+        Unknown,
+        *mut Unknown,
+    ) -> HRESULT;
+    // SAFETY: matches host `MFBeginCreateFile` signature.
+    let f: BeginCreateFileFn = unsafe { std::mem::transmute(f) };
+    f(
+        access_mode,
+        open_mode,
+        flags,
+        url.as_ptr(),
+        callback,
+        state,
+        cancel_cookie,
+    )
+}
+
+/// Enforces the local-file URL rule on `mfreadwrite!MFCreateSourceReaderFromURL`.
+pub extern "system" fn MFCreateSourceReaderFromURL(
+    url: *const u16,
+    attrs: Unknown,
+    out: *mut Unknown,
+) -> HRESULT {
+    let url = match checked(url) {
+        Ok(u) => u,
+        Err(hr) => return hr,
+    };
+    static HOST_FN: OnceLock<Option<usize>> = OnceLock::new();
+    let Some(f) = *HOST_FN.get_or_init(|| {
+        crate::host::function("mfreadwrite.dll", "MFCreateSourceReaderFromURL")
+    }) else {
+        return UNSUPPORTED_SCHEME;
+    };
+    // SAFETY: matches host `MFCreateSourceReaderFromURL` signature.
+    let f: extern "system" fn(*const u16, Unknown, *mut Unknown) -> HRESULT =
+        unsafe { std::mem::transmute(f) };
+    f(url.as_ptr(), attrs, out)
+}
+
+/// Enforces the local-file URL rule on `mfreadwrite!MFCreateSinkWriterFromURL`.
+/// A null URL is permitted by Media Foundation when `byte_stream` is supplied.
+pub extern "system" fn MFCreateSinkWriterFromURL(
+    url: *const u16,
+    byte_stream: Unknown,
+    attrs: Unknown,
+    out: *mut Unknown,
+) -> HRESULT {
+    let owned = if url.is_null() && !byte_stream.is_null() {
+        None
+    } else {
+        match checked(url) {
+            Ok(u) => Some(u),
+            Err(hr) => return hr,
+        }
+    };
+    static HOST_FN: OnceLock<Option<usize>> = OnceLock::new();
+    let Some(f) = *HOST_FN.get_or_init(|| {
+        crate::host::function("mfreadwrite.dll", "MFCreateSinkWriterFromURL")
+    }) else {
+        return UNSUPPORTED_SCHEME;
+    };
+    // SAFETY: matches host `MFCreateSinkWriterFromURL` signature.
+    let f: extern "system" fn(*const u16, Unknown, Unknown, *mut Unknown) -> HRESULT =
+        unsafe { std::mem::transmute(f) };
+    let ptr = owned.as_ref().map_or(std::ptr::null(), |u| u.as_ptr());
+    f(ptr, byte_stream, attrs, out)
+}
+
 pub(crate) fn module() -> HleModule {
     HleModule {
         name: "media",
         dlls: &["mfplat.dll"],
-        exports: vec![hle_export!(MFCreateSourceResolver)],
+        exports: vec![
+            hle_export!(MFCreateSourceResolver),
+            hle_export!(MFCreateFile),
+            hle_export!(MFBeginCreateFile),
+        ],
+    }
+}
+
+pub(crate) fn readwrite_module() -> HleModule {
+    HleModule {
+        name: "media_readwrite",
+        dlls: &["mfreadwrite.dll"],
+        exports: vec![
+            hle_export!(MFCreateSourceReaderFromURL),
+            hle_export!(MFCreateSinkWriterFromURL),
+        ],
     }
 }
 
@@ -527,5 +659,55 @@ mod tests {
     fn interface_ids_are_the_resolvers() {
         assert_eq!(&IID_IUNKNOWN[8..], &[0xC0, 0, 0, 0, 0, 0, 0, 0x46]);
         assert_eq!(&IID_RESOLVER[..4], &[0x2D, 0xA3, 0xE5, 0xFB]);
+    }
+
+    #[test]
+    fn direct_url_exports_refuse_network_urls() {
+        let mut url = wide("https://example.com/movie.mp4");
+        url.push(0);
+        let mut out = std::ptr::null_mut();
+        assert_eq!(
+            MFCreateSourceReaderFromURL(url.as_ptr(), std::ptr::null_mut(), &mut out),
+            UNSUPPORTED_SCHEME
+        );
+        assert_eq!(
+            MFCreateSinkWriterFromURL(
+                url.as_ptr(),
+                std::ptr::null_mut(),
+                std::ptr::null_mut(),
+                &mut out,
+            ),
+            UNSUPPORTED_SCHEME
+        );
+        assert_eq!(
+            MFCreateFile(0, 0, 0, url.as_ptr(), &mut out),
+            UNSUPPORTED_SCHEME
+        );
+        assert_eq!(
+            MFBeginCreateFile(
+                0,
+                0,
+                0,
+                url.as_ptr(),
+                std::ptr::null_mut(),
+                std::ptr::null_mut(),
+                &mut out,
+            ),
+            UNSUPPORTED_SCHEME
+        );
+        assert!(module().exports.iter().any(|e| e.name == "MFCreateFile"));
+        assert!(module().exports.iter().any(|e| e.name == "MFBeginCreateFile"));
+        assert!(
+            readwrite_module()
+                .exports
+                .iter()
+                .any(|e| e.name == "MFCreateSourceReaderFromURL")
+        );
+        assert!(
+            readwrite_module()
+                .exports
+                .iter()
+                .any(|e| e.name == "MFCreateSinkWriterFromURL")
+        );
     }
 }

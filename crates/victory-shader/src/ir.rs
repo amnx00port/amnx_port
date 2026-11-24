@@ -593,11 +593,19 @@ fn liveness(blocks: &[Block], order: &[usize]) -> (Vec<RegSet>, Vec<RegSet>) {
 /// arguments are all one value (or the phi itself) are replaced by it.
 fn remove_trivial_phis(blocks: &mut [Block], values: u32) {
     let mut replaced: Vec<Value> = (0..values).map(Value).collect();
-    let find = |replaced: &[Value], mut v: Value| {
-        while replaced[v.0 as usize] != v {
-            v = replaced[v.0 as usize];
+    let find = |replaced: &mut [Value], v: Value| {
+        let mut root = v;
+        while replaced[root.0 as usize] != root {
+            root = replaced[root.0 as usize];
         }
-        v
+        // Path compression avoids quadratic traversal on reverse-order phi chains (#950).
+        let mut cur = v;
+        while replaced[cur.0 as usize] != root {
+            let next = replaced[cur.0 as usize];
+            replaced[cur.0 as usize] = root;
+            cur = next;
+        }
+        root
     };
     let mut changed = true;
     while changed {
@@ -606,7 +614,7 @@ fn remove_trivial_phis(blocks: &mut [Block], values: u32) {
             block.phis.retain(|phi| {
                 let mut only = None;
                 for &a in &phi.args {
-                    let a = find(&replaced, a);
+                    let a = find(&mut replaced, a);
                     if a == phi.value || Some(a) == only {
                         continue;
                     }
@@ -625,12 +633,12 @@ fn remove_trivial_phis(blocks: &mut [Block], values: u32) {
     for block in blocks {
         for phi in &mut block.phis {
             for a in &mut phi.args {
-                *a = find(&replaced, *a);
+                *a = find(&mut replaced, *a);
             }
         }
         for inst in &mut block.insts {
             for (_, v) in &mut inst.reads {
-                *v = find(&replaced, *v);
+                *v = find(&mut replaced, *v);
             }
         }
     }
@@ -1223,5 +1231,34 @@ mod tests {
         assert_eq!(vgprs(&movrels.reads), [4, 5, 0]);
         assert_eq!(movrels.read(Reg::V(4)), movreld.write(Reg::V(4)));
         assert!(build(&code, false, 4).is_err(), "v4 is past 4 VGPRs");
+    }
+
+    #[test]
+    fn remove_trivial_phis_compresses_deep_chain() {
+        // Chain of 64 trivial phis in reverse order so each points to the next.
+        let n = 64u32;
+        let machine = gfx10::decode(&S_ENDPGM.to_le_bytes()).unwrap().pop().unwrap();
+        let mut blocks = vec![Block {
+            offset: 0,
+            preds: vec![0, 0],
+            phis: (1..=n)
+                .rev()
+                .map(|k| Phi {
+                    reg: Reg::V(0),
+                    value: Value(k),
+                    args: vec![Value(k - 1), Value(k)],
+                })
+                .collect(),
+            insts: vec![Inst {
+                machine,
+                fields: Fields::Sopp { imm: 0 },
+                reads: vec![(Reg::V(0), Value(n))],
+                writes: vec![],
+            }],
+            exit: Exit::End,
+        }];
+        remove_trivial_phis(&mut blocks, n + 1);
+        assert!(blocks[0].phis.is_empty());
+        assert_eq!(blocks[0].insts[0].reads[0].1, Value(0));
     }
 }

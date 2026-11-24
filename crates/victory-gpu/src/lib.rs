@@ -52,7 +52,25 @@ mod texture;
 #[cfg(windows)]
 mod watch;
 
+/// Host display HDR capability and luminance bounds (in nits), queried from
+/// DXGI (`IDXGIOutput6`) and surfaced to `victory-hle` (`XDisplayTryEnableHdrMode`).
+#[derive(Debug, Clone, Copy, Default, PartialEq)]
+pub struct HdrInfo {
+    pub supported: bool,
+    pub min_nits: f32,
+    pub max_nits: f32,
+    pub max_full_frame_nits: f32,
+}
+
 #[cfg(windows)]
-pub use host::on_failure;
+pub use host::{hdr_info, on_failure};
 #[cfg(windows)]
-pub use watch::{title_memory_remapped, writing as kernel_will_write};
+pub use watch::{physical_memory_written, title_memory_remapped, writing as kernel_will_write};
+
+#[cfg(not(windows))]
+pub fn physical_memory_written() {}
+
+#[cfg(not(windows))]
+pub fn hdr_info() -> HdrInfo {
+    HdrInfo::default()
+}

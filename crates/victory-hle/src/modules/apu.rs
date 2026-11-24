@@ -181,7 +181,13 @@ pub extern "system" fn XApuConnect(
     }
     let event = if input.options & RESULT_EVENT != 0 {
         // SAFETY: plain auto-reset event, no name.
-        unsafe { CreateEventW(std::ptr::null(), 0, 0, std::ptr::null()) }
+        let ev = unsafe { CreateEventW(std::ptr::null(), 0, 0, std::ptr::null()) };
+        if ev.is_null() {
+            // SAFETY: just allocated with `layout`.
+            unsafe { std::alloc::dealloc(memory, layout) };
+            return E_OUTOFMEMORY;
+        }
+        ev
     } else {
         std::ptr::null_mut()
     };
@@ -340,14 +346,26 @@ fn process(decoder: &mut OpusDecoder, options: u32, command: &Process, result: &
         .min(command.frame_count as usize)
         .min(output_length as usize / (4 * channels));
     let kept = &pcm[first * channels..(first + frames) * channels];
-    // SAFETY: the title's output buffer holds `output_length` bytes.
-    let out = unsafe { std::slice::from_raw_parts_mut(output.cast::<f32>(), frames * channels) };
     if options & DEINTERLEAVED_OUTPUT != 0 && channels == 2 {
         for (i, frame) in kept.as_chunks::<2>().0.iter().enumerate() {
-            (out[i], out[frames + i]) = (frame[0], frame[1]);
+            // SAFETY: the title's output buffer holds at least
+            // `frames * channels * 4` bytes; `write_unaligned` avoids UB when
+            // `output` is not 4-byte aligned.
+            unsafe {
+                output.add(i * 4).cast::<f32>().write_unaligned(frame[0]);
+                output
+                    .add((frames + i) * 4)
+                    .cast::<f32>()
+                    .write_unaligned(frame[1]);
+            }
         }
-    } else {
-        out.copy_from_slice(kept);
+    } else if !kept.is_empty() {
+        // SAFETY: `kept` is valid for `kept.len() * 4` bytes and `output`
+        // holds at least `frames * channels * 4` writable bytes; bytewise
+        // copy requires only 1-byte alignment.
+        unsafe {
+            std::ptr::copy_nonoverlapping(kept.as_ptr().cast::<u8>(), output, kept.len() * 4);
+        }
     }
     result.frames = frames as u32;
     result.output_length = (frames * channels * 4) as u32;
@@ -519,6 +537,174 @@ mod tests {
         // SAFETY: written above.
         let error = unsafe { result.assume_init() }.error;
         assert_eq!(error, INVALID_STREAM);
+        assert_eq!(XApuDisconnect(handle), S_OK);
+    }
+
+    #[test]
+    fn opus_deinterleaved_mono_trim_reset_and_bad_packet() {
+        let input = ConnectInput {
+            process: DECODE_OPUS,
+            streams: 4,
+            commands_per_stream: 4,
+            memory: 0x4_0000,
+            frames_per_output: 0,
+            options: DEINTERLEAVED_OUTPUT,
+        };
+        let mut output = ConnectOutput {
+            memory: std::ptr::null_mut(),
+            result_event: std::ptr::null_mut(),
+        };
+        let mut handle = std::ptr::null_mut();
+        assert_eq!(XApuConnect(&input, &mut output, &mut handle), S_OK);
+        let base = output.memory.cast::<u8>();
+
+        // Activate stereo stream 0 and mono stream 1.
+        for (stream, channels) in [(0, 2u32), (1, 1u32)] {
+            let activate = Activate {
+                id: id(ACTIVATE, stream),
+                channels,
+                init_length: 0,
+                init: std::ptr::null(),
+                start_pitch: 1.0,
+                processing_length: 0,
+                processing: std::ptr::null_mut(),
+            };
+            assert_eq!(
+                XApuEnqueueCommand(handle, (&raw const activate).cast(), std::ptr::null_mut()),
+                S_OK
+            );
+            let mut res = std::mem::MaybeUninit::<ApuResult>::zeroed();
+            assert_eq!(XApuDequeueResult(handle, res.as_mut_ptr()), S_OK);
+            // SAFETY: initialized by dequeue.
+            let err = unsafe { res.assume_init() }.error;
+            assert_eq!(err, S_OK);
+        }
+
+        // Encode left-only stereo signal and verify deinterleaved planar output
+        // places energy in plane 0 and keeps plane 1 quiet.
+        let mut stereo = vec![0f32; 960 * 2];
+        for i in 0..960 {
+            stereo[i * 2] = (i as f32 * 440.0 * std::f32::consts::TAU / 48_000.0).sin() * 0.6;
+        }
+        let mut enc_st = OpusEncoder::new(48_000, 2, Application::Audio).unwrap();
+        let mut pkt = [0u8; 1500];
+        // Prime encoder/decoder with two frames so Opus lookahead has settled.
+        let mut n = 0;
+        for _ in 0..2 {
+            n = enc_st.encode(&stereo, 960, &mut pkt).unwrap();
+            // SAFETY: inside connection memory.
+            unsafe { std::ptr::copy_nonoverlapping(pkt.as_ptr(), base, n) };
+            let proc = Process {
+                id: id(PROCESS, 0),
+                pitch_ramp: 0.0,
+                target_pitch: 1.0,
+                first_frame: 120,
+                frame_count: 480,
+                input_length: n as u32,
+                input: base,
+                output_length: 480 * 8,
+                output: base.wrapping_add(0x4000),
+            };
+            assert_eq!(
+                XApuEnqueueCommand(handle, (&raw const proc).cast(), std::ptr::null_mut()),
+                S_OK
+            );
+            let mut res = std::mem::MaybeUninit::<ApuResult>::zeroed();
+            assert_eq!(XApuDequeueResult(handle, res.as_mut_ptr()), S_OK);
+            // SAFETY: initialized by dequeue.
+            let r = unsafe { res.assume_init() };
+            assert_eq!((r.error, r.frames, r.output_length), (S_OK, 480, 480 * 8));
+        }
+        let _ = n;
+        // SAFETY: planar output has 480 left floats followed by 480 right floats.
+        let out_f = unsafe {
+            std::slice::from_raw_parts(base.wrapping_add(0x4000).cast::<f32>(), 960)
+        };
+        let left_e: f32 = out_f[..480].iter().map(|s| s * s).sum();
+        let right_e: f32 = out_f[480..].iter().map(|s| s * s).sum();
+        assert!(left_e > 1.0 && left_e > right_e * 10.0, "left={left_e}, right={right_e}");
+
+        // Mono decode + RESET + corrupt packet handling.
+        let mono: Vec<f32> = (0..960)
+            .map(|i| (i as f32 * 660.0 * std::f32::consts::TAU / 48_000.0).sin() * 0.5)
+            .collect();
+        let mut enc_m = OpusEncoder::new(48_000, 1, Application::Audio).unwrap();
+        let mn = enc_m.encode(&mono, 960, &mut pkt).unwrap();
+        // SAFETY: inside connection memory.
+        unsafe { std::ptr::copy_nonoverlapping(pkt.as_ptr(), base, mn) };
+        let proc_m = Process {
+            id: id(PROCESS, 1),
+            pitch_ramp: 0.0,
+            target_pitch: 1.0,
+            first_frame: 0,
+            frame_count: 960,
+            input_length: mn as u32,
+            input: base,
+            output_length: 960 * 4,
+            output: base.wrapping_add(0x8000),
+        };
+        assert_eq!(
+            XApuEnqueueCommand(handle, (&raw const proc_m).cast(), std::ptr::null_mut()),
+            S_OK
+        );
+        let reset = id(RESET, 1);
+        assert_eq!(
+            XApuEnqueueCommand(handle, (&raw const reset).cast(), std::ptr::null_mut()),
+            S_OK
+        );
+        let mut res = std::mem::MaybeUninit::<ApuResult>::zeroed();
+        assert_eq!(XApuDequeueResult(handle, res.as_mut_ptr()), S_OK);
+        // SAFETY: initialized by dequeue.
+        let rm = unsafe { res.assume_init() };
+        assert_eq!((rm.error, rm.frames, rm.output_length), (S_OK, 960, 960 * 4));
+        assert_eq!(XApuDequeueResult(handle, res.as_mut_ptr()), S_OK);
+        // SAFETY: initialized by dequeue.
+        let reset_err = unsafe { res.assume_init() }.error;
+        assert_eq!(reset_err, S_OK);
+
+        // Unaligned (offset +1) output buffers must decode cleanly without UB
+        // for both deinterleaved stereo and interleaved mono output.
+        let unaligned_stereo = Process {
+            id: id(PROCESS, 0),
+            pitch_ramp: 0.0,
+            target_pitch: 1.0,
+            first_frame: 0,
+            frame_count: 16,
+            input_length: n as u32,
+            input: base,
+            output_length: 16 * 8,
+            output: base.wrapping_add(0xC001),
+        };
+        assert_eq!(
+            XApuEnqueueCommand(handle, (&raw const unaligned_stereo).cast(), std::ptr::null_mut()),
+            S_OK
+        );
+        let mut res = std::mem::MaybeUninit::<ApuResult>::zeroed();
+        assert_eq!(XApuDequeueResult(handle, res.as_mut_ptr()), S_OK);
+        // SAFETY: initialized by dequeue.
+        let ru = unsafe { res.assume_init() };
+        assert_eq!((ru.error, ru.frames, ru.output_length), (S_OK, 16, 16 * 8));
+
+        let unaligned_mono = Process {
+            id: id(PROCESS, 1),
+            pitch_ramp: 0.0,
+            target_pitch: 1.0,
+            first_frame: 0,
+            frame_count: 16,
+            input_length: mn as u32,
+            input: base,
+            output_length: 16 * 4,
+            output: base.wrapping_add(0xC203),
+        };
+        assert_eq!(
+            XApuEnqueueCommand(handle, (&raw const unaligned_mono).cast(), std::ptr::null_mut()),
+            S_OK
+        );
+        assert_eq!(XApuDequeueResult(handle, res.as_mut_ptr()), S_OK);
+        // SAFETY: initialized by dequeue.
+        let rum = unsafe { res.assume_init() };
+        assert_eq!((rum.error, rum.frames, rum.output_length), (S_OK, 16, 16 * 4));
+
         assert_eq!(XApuDisconnect(handle), S_OK);
     }
 }

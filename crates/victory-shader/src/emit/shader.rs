@@ -9,19 +9,28 @@ use super::container::{self, Binding, Psv, SigElement};
 pub const USER_DATA_SPACE: u32 = 0;
 /// Where immediate samplers are bound: `s<n>` in this space.
 pub const SAMPLER_SPACE: u32 = 0;
-/// Where root CBVs and SRVs are bound: `b<root parameter index>` and
-/// `t<root parameter index>` in this space.
+/// Where root CBVs, SRVs and UAVs are bound: `b<root parameter index>`,
+/// `t<root parameter index>` and `u<root parameter index>` in this space.
 pub const ROOT_CBV_SPACE: u32 = 1;
+/// Where 64-bit GPU addresses carried in adjacent root-constant pairs
+/// (`RootType::Constants`, `(slot, dword)` + `(slot, dword + 1)`) are bound
+/// as host root CBVs/SRVs/UAVs: `b<reg>` / `t<reg>` / `u<reg>` in space 2.
+pub const CONST_VIEW_SPACE: u32 = 2;
 
 /// `ShaderFlags` bits (metadata) and their `SFI0` feature bits.
 pub(crate) mod flags {
     pub const RAW_BUFFERS: u64 = 1 << 4;
+    pub const VIEWPORT_RT_INDEX: u64 = 1 << 9;
     pub const STENCIL_REF: u64 = 1 << 11;
     pub const TYPED_UAV_LOADS: u64 = 1 << 13;
+    pub const USE_64_UAVS: u64 = 1 << 15;
+    pub const UAVS_AT_EVERY_STAGE: u64 = 1 << 16;
     pub const WAVE_OPS: u64 = 1 << 19;
     pub const INT64: u64 = 1 << 20;
+    pub const ATOMIC_INT64_ON_TYPED_RESOURCE: u64 = 1 << 27;
     pub const RESOURCE_HEAP: u64 = 1 << 30;
     pub const SAMPLER_HEAP: u64 = 1 << 31;
+    pub const ATOMIC_INT64_ON_HEAP_RESOURCE: u64 = 1 << 32;
 }
 
 pub(crate) struct Types {
@@ -65,6 +74,17 @@ pub(crate) struct Shader {
     pub root_cbvs: Vec<(u8, V)>,
     /// Root SRVs (raw buffers) read, likewise.
     pub root_srvs: Vec<(u8, V)>,
+    /// Root UAVs (raw buffers) read or written, likewise.
+    pub root_uavs: Vec<(u8, V)>,
+    /// Root CBVs backed by adjacent 32-bit root-constant pairs `(slot, dword)`,
+    /// bound sequentially at `b<reg>` in [`CONST_VIEW_SPACE`].
+    pub const_cbvs: Vec<(u8, u32, u32, V)>,
+    /// Root SRVs (raw buffers) backed by root-constant pairs, at `t<reg>` in
+    /// [`CONST_VIEW_SPACE`].
+    pub const_srvs: Vec<(u8, u32, u32, V)>,
+    /// Root UAVs (raw buffers) backed by root-constant pairs, at `u<reg>` in
+    /// [`CONST_VIEW_SPACE`].
+    pub const_uavs: Vec<(u8, u32, u32, V)>,
     pub flags: u64,
     /// Heap handles made with a non-uniform index.
     pub nonuniform_handles: u32,
@@ -120,6 +140,10 @@ impl Shader {
             cmp_samplers: 0,
             root_cbvs: Vec::new(),
             root_srvs: Vec::new(),
+            root_uavs: Vec::new(),
+            const_cbvs: Vec::new(),
+            const_srvs: Vec::new(),
+            const_uavs: Vec::new(),
             flags: 0,
             nonuniform_handles: 0,
             threads: None,
@@ -236,6 +260,119 @@ impl Shader {
         h
     }
 
+    /// The handle of the root UAV (a raw buffer) of root parameter `slot`.
+    pub fn root_uav_handle(&mut self, slot: u8) -> V {
+        if let Some(&(_, h)) = self.root_uavs.iter().find(|r| r.0 == slot) {
+            return h;
+        }
+        let r = self.m.i32(u32::from(slot));
+        let bind = [r, r, self.m.i32(ROOT_CBV_SPACE), self.m.i8(1)];
+        let bind = self.m.aggregate(self.t.bind, &bind);
+        let f = self.m.bool(false);
+        let block = self.entry;
+        let h = self.op(
+            block,
+            "createHandleFromBinding",
+            Attr::ReadNone,
+            self.t.handle,
+            217,
+            &[bind, r, f],
+        );
+        let h = self.annotate(block, h, 11 | 0x1000, 0);
+        self.flags |= flags::RAW_BUFFERS;
+        self.root_uavs.push((slot, h));
+        h
+    }
+
+    /// Root CBV handle for a 64-bit GPU address carried in root-constant pair
+    /// `(slot, dword)` and `(slot, dword + 1)`, bound in [`CONST_VIEW_SPACE`].
+    pub fn const_cbv_handle(&mut self, slot: u8, dword: u32) -> V {
+        if let Some(&(_, _, _, h)) = self
+            .const_cbvs
+            .iter()
+            .find(|&&(s, d, _, _)| s == slot && d == dword)
+        {
+            return h;
+        }
+        let reg = self.const_cbvs.len() as u32;
+        let r = self.m.i32(reg);
+        let bind = [r, r, self.m.i32(CONST_VIEW_SPACE), self.m.i8(2)];
+        let bind = self.m.aggregate(self.t.bind, &bind);
+        let f = self.m.bool(false);
+        let block = self.entry;
+        let h = self.op(
+            block,
+            "createHandleFromBinding",
+            Attr::ReadNone,
+            self.t.handle,
+            217,
+            &[bind, r, f],
+        );
+        let h = self.annotate(block, h, 13, 65536);
+        self.const_cbvs.push((slot, dword, reg, h));
+        h
+    }
+
+    /// Root SRV (raw buffer) handle for a 64-bit GPU address in root-constant
+    /// pair `(slot, dword)` / `(slot, dword + 1)`, bound in [`CONST_VIEW_SPACE`].
+    pub fn const_srv_handle(&mut self, slot: u8, dword: u32) -> V {
+        if let Some(&(_, _, _, h)) = self
+            .const_srvs
+            .iter()
+            .find(|&&(s, d, _, _)| s == slot && d == dword)
+        {
+            return h;
+        }
+        let reg = self.const_srvs.len() as u32;
+        let r = self.m.i32(reg);
+        let bind = [r, r, self.m.i32(CONST_VIEW_SPACE), self.m.i8(0)];
+        let bind = self.m.aggregate(self.t.bind, &bind);
+        let f = self.m.bool(false);
+        let block = self.entry;
+        let h = self.op(
+            block,
+            "createHandleFromBinding",
+            Attr::ReadNone,
+            self.t.handle,
+            217,
+            &[bind, r, f],
+        );
+        let h = self.annotate(block, h, 11, 0);
+        self.flags |= flags::RAW_BUFFERS;
+        self.const_srvs.push((slot, dword, reg, h));
+        h
+    }
+
+    /// Root UAV (raw buffer) handle for a 64-bit GPU address in root-constant
+    /// pair `(slot, dword)` / `(slot, dword + 1)`, bound in [`CONST_VIEW_SPACE`].
+    pub fn const_uav_handle(&mut self, slot: u8, dword: u32) -> V {
+        if let Some(&(_, _, _, h)) = self
+            .const_uavs
+            .iter()
+            .find(|&&(s, d, _, _)| s == slot && d == dword)
+        {
+            return h;
+        }
+        let reg = self.const_uavs.len() as u32;
+        let r = self.m.i32(reg);
+        let bind = [r, r, self.m.i32(CONST_VIEW_SPACE), self.m.i8(1)];
+        let bind = self.m.aggregate(self.t.bind, &bind);
+        let f = self.m.bool(false);
+        let block = self.entry;
+        let h = self.op(
+            block,
+            "createHandleFromBinding",
+            Attr::ReadNone,
+            self.t.handle,
+            217,
+            &[bind, r, f],
+        );
+        let h = self.annotate(block, h, 11 | 0x1000, 0);
+        self.flags |= flags::RAW_BUFFERS;
+        self.const_uavs.push((slot, dword, reg, h));
+        h
+    }
+
     /// The handle of immediate sampler `n` (a comparison sampler when its
     /// bit in `cmp_samplers` is set).
     pub fn sampler_handle(&mut self, block: usize, n: u32) -> V {
@@ -318,6 +455,10 @@ impl Shader {
             || self.samplers > 0
             || !self.root_cbvs.is_empty()
             || !self.root_srvs.is_empty()
+            || !self.root_uavs.is_empty()
+            || !self.const_cbvs.is_empty()
+            || !self.const_srvs.is_empty()
+            || !self.const_uavs.is_empty()
         {
             let empty = self.m.md_str("");
             let mut cbvs = None;
@@ -368,20 +509,39 @@ impl Shader {
                     dxil_kind: 13,
                 });
             }
+            for (_, _, reg, _) in self.const_cbvs.clone() {
+                let ops = vec![
+                    Some(i32c(&mut self, cbv_list.len() as u32)),
+                    Some(self.m.md_value(u)),
+                    Some(empty),
+                    Some(i32c(&mut self, CONST_VIEW_SPACE)),
+                    Some(i32c(&mut self, reg)),
+                    Some(i32c(&mut self, 1)),
+                    Some(i32c(&mut self, 65536)),
+                    None,
+                ];
+                cbv_list.push(Some(self.m.md_node(ops)));
+                bindings.push(Binding {
+                    kind: 2,
+                    space: CONST_VIEW_SPACE,
+                    register: reg,
+                    dxil_kind: 13,
+                });
+            }
             if !cbv_list.is_empty() {
                 cbvs = Some(self.m.md_node(cbv_list));
             }
             let mut srvs = None;
-            if !self.root_srvs.is_empty() {
+            if !self.root_srvs.is_empty() || !self.const_srvs.is_empty() {
                 let ty = self
                     .m
                     .named_struct("struct.ByteAddressBuffer", vec![self.t.i32]);
                 let p = self.m.ptr(ty);
                 let u = self.m.undef(p);
                 let mut list = Vec::new();
-                for (n, (slot, _)) in self.root_srvs.clone().into_iter().enumerate() {
+                for (slot, _) in self.root_srvs.clone() {
                     let ops = vec![
-                        Some(i32c(&mut self, n as u32)),
+                        Some(i32c(&mut self, list.len() as u32)),
                         Some(self.m.md_value(u)),
                         Some(empty),
                         Some(i32c(&mut self, ROOT_CBV_SPACE)),
@@ -399,7 +559,83 @@ impl Shader {
                         dxil_kind: 11,
                     });
                 }
+                for (_, _, reg, _) in self.const_srvs.clone() {
+                    let ops = vec![
+                        Some(i32c(&mut self, list.len() as u32)),
+                        Some(self.m.md_value(u)),
+                        Some(empty),
+                        Some(i32c(&mut self, CONST_VIEW_SPACE)),
+                        Some(i32c(&mut self, reg)),
+                        Some(i32c(&mut self, 1)),
+                        Some(i32c(&mut self, 11)),
+                        Some(i32c(&mut self, 0)),
+                        None,
+                    ];
+                    list.push(Some(self.m.md_node(ops)));
+                    bindings.push(Binding {
+                        kind: 4,
+                        space: CONST_VIEW_SPACE,
+                        register: reg,
+                        dxil_kind: 11,
+                    });
+                }
                 srvs = Some(self.m.md_node(list));
+            }
+            let mut uavs = None;
+            if !self.root_uavs.is_empty() || !self.const_uavs.is_empty() {
+                let ty = self
+                    .m
+                    .named_struct("struct.RWByteAddressBuffer", vec![self.t.i32]);
+                let p = self.m.ptr(ty);
+                let u = self.m.undef(p);
+                let f = self.m.bool(false);
+                let no = self.m.md_value(f);
+                let mut list = Vec::new();
+                for (slot, _) in self.root_uavs.clone() {
+                    let ops = vec![
+                        Some(i32c(&mut self, list.len() as u32)),
+                        Some(self.m.md_value(u)),
+                        Some(empty),
+                        Some(i32c(&mut self, ROOT_CBV_SPACE)),
+                        Some(i32c(&mut self, u32::from(slot))),
+                        Some(i32c(&mut self, 1)),
+                        Some(i32c(&mut self, 11)),
+                        Some(no),
+                        Some(no),
+                        Some(no),
+                        None,
+                    ];
+                    list.push(Some(self.m.md_node(ops)));
+                    bindings.push(Binding {
+                        kind: 7,
+                        space: ROOT_CBV_SPACE,
+                        register: u32::from(slot),
+                        dxil_kind: 11,
+                    });
+                }
+                for (_, _, reg, _) in self.const_uavs.clone() {
+                    let ops = vec![
+                        Some(i32c(&mut self, list.len() as u32)),
+                        Some(self.m.md_value(u)),
+                        Some(empty),
+                        Some(i32c(&mut self, CONST_VIEW_SPACE)),
+                        Some(i32c(&mut self, reg)),
+                        Some(i32c(&mut self, 1)),
+                        Some(i32c(&mut self, 11)),
+                        Some(no),
+                        Some(no),
+                        Some(no),
+                        None,
+                    ];
+                    list.push(Some(self.m.md_node(ops)));
+                    bindings.push(Binding {
+                        kind: 7,
+                        space: CONST_VIEW_SPACE,
+                        register: reg,
+                        dxil_kind: 11,
+                    });
+                }
+                uavs = Some(self.m.md_node(list));
             }
             let mut samplers = None;
             if self.samplers > 0 {
@@ -430,12 +666,13 @@ impl Shader {
                 }
                 samplers = Some(self.m.md_node(list));
             }
-            resources = Some(self.m.md_node(vec![srvs, None, cbvs, samplers]));
-            // PSV0 lists them as the module does: CBVs, samplers, SRVs.
+            resources = Some(self.m.md_node(vec![srvs, uavs, cbvs, samplers]));
+            // PSV0 lists them as the module does: CBVs, samplers, SRVs, UAVs.
             bindings.sort_by_key(|b| match b.kind {
                 2 => 0,
                 1 => 1,
-                _ => 2,
+                3..=5 => 2,
+                _ => 3,
             });
         }
         if let Some(r) = resources {
@@ -443,6 +680,12 @@ impl Shader {
         }
 
         let graphics = self.threads.is_none() || self.mesh.is_some();
+        if !self.root_uavs.is_empty() && graphics && !self.pixel {
+            self.flags |= flags::UAVS_AT_EVERY_STAGE;
+        }
+        if self.root_uavs.len() > 8 {
+            self.flags |= flags::USE_64_UAVS;
+        }
         if graphics {
             // shortcut: every output is declared to depend on every input; the
             // exact sets need a dependence pass. Drivers read this state.
@@ -566,11 +809,20 @@ impl Shader {
         dxil.extend(&bitcode);
 
         let mut features = 0u64;
+        if self.flags & flags::UAVS_AT_EVERY_STAGE != 0 {
+            features |= 0x4;
+        }
+        if self.flags & flags::USE_64_UAVS != 0 {
+            features |= 0x8;
+        }
         if self.flags & flags::STENCIL_REF != 0 {
             features |= 0x200;
         }
         if self.flags & flags::TYPED_UAV_LOADS != 0 {
             features |= 0x800;
+        }
+        if self.flags & flags::VIEWPORT_RT_INDEX != 0 {
+            features |= 0x2000;
         }
         if self.flags & flags::WAVE_OPS != 0 {
             features |= 0x4000;
@@ -578,11 +830,17 @@ impl Shader {
         if self.flags & flags::INT64 != 0 {
             features |= 0x8000;
         }
+        if self.flags & flags::ATOMIC_INT64_ON_TYPED_RESOURCE != 0 {
+            features |= 0x40_0000;
+        }
         if self.flags & flags::RESOURCE_HEAP != 0 {
             features |= 0x200_0000;
         }
         if self.flags & flags::SAMPLER_HEAP != 0 {
             features |= 0x400_0000;
+        }
+        if self.flags & flags::ATOMIC_INT64_ON_HEAP_RESOURCE != 0 {
+            features |= 0x1000_0000;
         }
         let sfi0 = features.to_le_bytes();
         let isg1 = container::signature(&self.inputs, true);

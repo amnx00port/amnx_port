@@ -143,9 +143,59 @@ fn fit_into(area: &RECT, width: i32, height: i32) -> (i32, i32) {
         f64::from(ah) / f64::from(height),
     );
     (
-        (f64::from(width) * scale) as i32,
-        (f64::from(height) * scale) as i32,
+        ((f64::from(width) * scale) as i32).max(1),
+        ((f64::from(height) * scale) as i32).max(1),
     )
+}
+
+/// Saved windowed style and rectangle while the title window is toggled into
+/// borderless fullscreen via F11 or Alt+Enter.
+static FULLSCREEN_STATE: Mutex<Option<(usize, i32, RECT)>> = Mutex::new(None);
+
+fn toggle_fullscreen(hwnd: HWND) {
+    let mut guard = FULLSCREEN_STATE.lock().unwrap_or_else(|e| e.into_inner());
+    let key = hwnd as usize;
+    // SAFETY: valid top-level window handle on its owning thread.
+    unsafe {
+        if let Some((saved_hwnd, style, rect)) = *guard
+            && saved_hwnd == key
+        {
+            *guard = None;
+            wm::SetWindowLongW(hwnd, wm::GWL_STYLE, style);
+            wm::SetWindowPos(
+                hwnd,
+                wm::HWND_NOTOPMOST,
+                rect.left,
+                rect.top,
+                (rect.right - rect.left).max(1),
+                (rect.bottom - rect.top).max(1),
+                wm::SWP_FRAMECHANGED | wm::SWP_NOOWNERZORDER,
+            );
+            return;
+        }
+        let style = wm::GetWindowLongW(hwnd, wm::GWL_STYLE);
+        let mut rect = RECT::default();
+        if wm::GetWindowRect(hwnd, &mut rect) == 0 {
+            return;
+        }
+        let sw = wm::GetSystemMetrics(wm::SM_CXSCREEN).max(1);
+        let sh = wm::GetSystemMetrics(wm::SM_CYSCREEN).max(1);
+        *guard = Some((key, style, rect));
+        wm::SetWindowLongW(
+            hwnd,
+            wm::GWL_STYLE,
+            style & !(wm::WS_OVERLAPPEDWINDOW as i32),
+        );
+        wm::SetWindowPos(
+            hwnd,
+            wm::HWND_TOP,
+            0,
+            0,
+            sw,
+            sh,
+            wm::SWP_FRAMECHANGED | wm::SWP_NOOWNERZORDER,
+        );
+    }
 }
 
 /// Puts our procedure in front of the title's.
@@ -168,6 +218,17 @@ extern "system" fn window_proc(
     wparam: WPARAM,
     lparam: LPARAM,
 ) -> LRESULT {
+    const VK_F11: usize = 0x7A;
+    const VK_RETURN: usize = 0x0D;
+    let repeat = (lparam & (1 << 30)) != 0;
+    let alt = (lparam & (1 << 29)) != 0;
+    if !repeat
+        && ((message == wm::WM_KEYDOWN && wparam == VK_F11)
+            || (message == wm::WM_SYSKEYDOWN && wparam == VK_RETURN && alt))
+    {
+        toggle_fullscreen(hwnd);
+        return 0;
+    }
     // A user close (close button, Alt+F4, window or taskbar menu); a
     // console title never sees one, nor a WM_CLOSE from it.
     if message == wm::WM_SYSCOMMAND && wparam & 0xFFF0 == wm::SC_CLOSE as usize {
@@ -434,5 +495,19 @@ mod tests {
         }
         let seen = COMMANDS.with(|c| c.borrow().clone());
         assert_eq!(seen, [wm::SC_MINIMIZE as usize]);
+    }
+
+    #[test]
+    fn fit_into_keeps_extreme_aspect_ratios_positive() {
+        let area = RECT {
+            left: 0,
+            top: 0,
+            right: 1920,
+            bottom: 1080,
+        };
+        let (w, h) = fit_into(&area, 10_000, 1);
+        assert!(w >= 1 && h >= 1, "got {w}x{h}");
+        let (w2, h2) = fit_into(&area, 1, 10_000);
+        assert!(w2 >= 1 && h2 >= 1, "got {w2}x{h2}");
     }
 }

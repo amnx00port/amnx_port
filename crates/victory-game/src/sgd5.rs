@@ -48,20 +48,25 @@ pub fn records(file: &[u8]) -> impl Iterator<Item = Record<'_>> {
 
 fn record(file: &[u8], at: usize) -> Option<Record<'_>> {
     let u32_at = |o: usize| {
-        file.get(o..o + 4)
+        let end = o.checked_add(4)?;
+        file.get(o..end)
             .map(|b| u32::from_le_bytes(b.try_into().expect("4 bytes")) as usize)
     };
     let n = u32_at(at.checked_sub(4)?)?;
-    let unpacked_size = u32_at(at + 8)?;
-    if u32_at(at + 4)? != n || n < 12 || unpacked_size > MAX_UNPACKED {
+    let unpacked_size = u32_at(at.checked_add(8)?)?;
+    if u32_at(at.checked_add(4)?)? != n || n < 12 || unpacked_size > MAX_UNPACKED {
         return None;
     }
     let nul = at.checked_sub(6)?;
+    let start = at.checked_add(12)?;
+    let end = at.checked_add(n)?;
     Some(Record {
         offset: at,
-        name: (file[nul] == 0).then(|| name_before(file, nul)).flatten(),
-        kind: file[at - 5],
-        packed: file.get(at + 12..at + n)?,
+        name: (file.get(nul).copied() == Some(0))
+            .then(|| name_before(file, nul))
+            .flatten(),
+        kind: *file.get(at.checked_sub(5)?)?,
+        packed: file.get(start..end)?,
         unpacked_size,
     })
 }
@@ -132,5 +137,19 @@ mod tests {
         file[27] = 0xFF; // first packed byte: reserved block type
         let r = records(&file).next().unwrap();
         assert_eq!(r.unpack(), None);
+    }
+
+    #[test]
+    fn truncated_and_overflowing_markers_do_not_panic() {
+        // Marker at offset 0 (no prefix bytes).
+        assert_eq!(records(&MARKER).count(), 0);
+        // Marker at end of buffer with huge claimed length (`u32::MAX`).
+        let mut bad = vec![0, 0, 0xff, 0xff, 0xff, 0xff];
+        bad.extend_from_slice(&MARKER);
+        bad.extend_from_slice(&u32::MAX.to_le_bytes());
+        bad.extend_from_slice(&16u32.to_le_bytes());
+        assert_eq!(records(&bad).count(), 0);
+        // Direct call at `usize::MAX - 2` must return None without overflow (#905).
+        assert!(record(&bad, usize::MAX - 2).is_none());
     }
 }

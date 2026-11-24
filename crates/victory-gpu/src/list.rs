@@ -416,7 +416,8 @@ fn buffer_range(buffer: This, offset: u64, len: u64) -> Option<*mut u8> {
     Some(unsafe { data.add(offset as usize) })
 }
 
-/// Buffer to buffer: both are host memory, copied at submission.
+/// Buffer to buffer: host memory copied at submission, or GPU-to-GPU when an
+/// earlier tracked GPU write in this list covers the source range (#785).
 extern "system" fn copy_buffer_region(
     this: This,
     dst: This,
@@ -430,6 +431,25 @@ extern "system" fn copy_buffer_region(
         && let Some(to) = buffer_range(dst, dst_offset, len)
         && let Some(from) = buffer_range(src, src_offset, len)
     {
+        if let Some(src_shadow) = list.latest_gpu_write_shadow(from as usize, len as usize)
+            && let Some(dst_shadow) = crate::shadow::find(to as u64, len)
+        {
+            dst_shadow.refresh(list, to as u64, len);
+            list.ensure_buffer(&src_shadow, COPY_SOURCE);
+            list.ensure_buffer(&dst_shadow, COPY_DEST);
+            // SAFETY: an open list; both shadow buffers cover the ranges.
+            unsafe {
+                list.list.CopyBufferRegion(
+                    &dst_shadow.buffer,
+                    dst_shadow.offset(to as u64),
+                    &src_shadow.buffer,
+                    src_shadow.offset(from as u64),
+                    len,
+                );
+            }
+            dst_shadow.gpu_writes(list, to as u64, len);
+            return;
+        }
         list.defer_copy(to, from, len as usize);
     }
     #[cfg(not(windows))]
@@ -516,26 +536,73 @@ extern "system" fn copy_texture_region(
         #[cfg(feature = "diagnostics")]
         let mut read = None;
         if src.kind == FOOTPRINT {
+            const PLACEMENT_ALIGN: u64 = 512;
             let (Some(host), Some(bytes)) = (crate::host::host(), src.footprint.bytes()) else {
                 return;
             };
             let Some(data) = buffer_range(src.resource, src.footprint.offset, bytes) else {
                 return;
             };
-            let Some((buffer, staging)) = list.upload(host, bytes) else {
-                return;
-            };
-            // The list owns this mapped D3D12 upload buffer. Wine can report
-            // its address as MEM_FREE, so use the host-upload path.
-            list.defer_fill(staging, data, bytes as usize);
-            from.resource = buffer.as_raw().cast_const().cast();
-            from.footprint.offset = 0;
-            #[cfg(feature = "diagnostics")]
-            {
-                // SAFETY: a live buffer.
-                read = Some((unsafe { buffer.GetGPUVirtualAddress() }, bytes));
+            if let Some(shadow) = list.latest_gpu_write_shadow(data as usize, bytes as usize) {
+                use windows::Win32::Graphics::Direct3D12::{
+                    D3D12_RESOURCE_STATE_COPY_DEST, D3D12_RESOURCE_STATE_COPY_SOURCE,
+                };
+                // A tracked same-list GPU write covers this footprint: read
+                // directly from the host shadow buffer instead of snapshotting
+                // stale CPU bytes, rebasing unaligned offsets via a GPU copy (#785).
+                let src_offset = shadow.offset(data as u64);
+                list.ensure_buffer(&shadow, COPY_SOURCE);
+                let src_buf = if src_offset.is_multiple_of(PLACEMENT_ALIGN) {
+                    from.resource = shadow.buffer.as_raw().cast_const().cast();
+                    from.footprint.offset = src_offset;
+                    list.keep(&shadow.buffer);
+                    shadow.buffer.clone()
+                } else {
+                    let Some(rebased) =
+                        host.default_buffer(bytes, D3D12_RESOURCE_STATE_COPY_DEST)
+                    else {
+                        return;
+                    };
+                    // SAFETY: an open list; both buffers cover `bytes` at the given offsets.
+                    unsafe {
+                        list.list
+                            .CopyBufferRegion(&rebased, 0, &shadow.buffer, src_offset, bytes);
+                        list.list.ResourceBarrier(&[crate::host::transition(
+                            &rebased,
+                            D3D12_RESOURCE_STATE_COPY_DEST,
+                            D3D12_RESOURCE_STATE_COPY_SOURCE,
+                        )]);
+                    }
+                    list.keep(&rebased);
+                    from.resource = rebased.as_raw().cast_const().cast();
+                    from.footprint.offset = 0;
+                    rebased
+                };
+                #[cfg(feature = "diagnostics")]
+                {
+                    // SAFETY: a live buffer.
+                    read = Some((
+                        unsafe { src_buf.GetGPUVirtualAddress() } + from.footprint.offset,
+                        bytes,
+                    ));
+                }
+                _upload = src_buf;
+            } else {
+                let Some((buffer, staging)) = list.upload(host, bytes) else {
+                    return;
+                };
+                // The list owns this mapped D3D12 upload buffer. Wine can report
+                // its address as MEM_FREE, so use the host-upload path.
+                list.defer_fill(staging, data, bytes as usize);
+                from.resource = buffer.as_raw().cast_const().cast();
+                from.footprint.offset = 0;
+                #[cfg(feature = "diagnostics")]
+                {
+                    // SAFETY: a live buffer.
+                    read = Some((unsafe { buffer.GetGPUVirtualAddress() }, bytes));
+                }
+                _upload = buffer;
             }
-            _upload = buffer;
         } else {
             let Some(texture) = crate::resource::host_resource(src.resource) else {
                 return;
@@ -638,7 +705,11 @@ extern "system" fn resolve(
         unsafe {
             let (a, b) = (to.GetDesc(), from.GetDesc());
             let format = DXGI_FORMAT(format as i32);
-            if (a.Width, a.Height) == (b.Width, b.Height) {
+            let dst_mip = dst_sub % u32::from(a.MipLevels.max(1));
+            let src_mip = src_sub % u32::from(b.MipLevels.max(1));
+            let (aw, ah) = ((a.Width >> dst_mip).max(1), (a.Height >> dst_mip).max(1));
+            let (bw, bh) = ((b.Width >> src_mip).max(1), (b.Height >> src_mip).max(1));
+            if (aw, ah) == (bw, bh) {
                 list.list
                     .ResolveSubresource(to, dst_sub, from, src_sub, format);
             } else if let Ok(list1) = list.list.cast::<ID3D12GraphicsCommandList1>() {
@@ -646,8 +717,8 @@ extern "system" fn resolve(
                 let rect = RECT {
                     left: 0,
                     top: 0,
-                    right: a.Width.min(b.Width) as i32,
-                    bottom: a.Height.min(b.Height) as i32,
+                    right: aw.min(bw) as i32,
+                    bottom: ah.min(bh) as i32,
                 };
                 list1.ResolveSubresourceRegion(
                     to,
@@ -762,6 +833,156 @@ extern "system" fn clear_dsv(
     let _ = (this, handle, flags, depth, stencil, count, rects);
 }
 
+#[cfg(windows)]
+fn prepare_texture_uav_clear(
+    list: &crate::host::HostList,
+    state: &mut crate::draw::State,
+    gpu_handle: u64,
+    cpu_handle: u64,
+    resource: This,
+    has_rects: bool,
+) -> Option<(
+    windows::Win32::Graphics::Direct3D12::D3D12_GPU_DESCRIPTOR_HANDLE,
+    windows::Win32::Graphics::Direct3D12::D3D12_CPU_DESCRIPTOR_HANDLE,
+    &'static windows::Win32::Graphics::Direct3D12::ID3D12Resource,
+)> {
+    const UNORDERED_ACCESS: u32 = 0x8;
+    let host = crate::host::host()?;
+    let crate::descriptor::View::Unordered(view_resource, _counter, raw_desc) =
+        crate::descriptor::view(cpu_handle).or_else(|| crate::descriptor::view(gpu_handle))?
+    else {
+        return None;
+    };
+    let resource_ptr = if !resource.is_null() {
+        resource
+    } else {
+        view_resource as This
+    };
+    let texture = crate::resource::host_resource(resource_ptr)?;
+    let desc = crate::descriptor::host::texture_uav_desc(resource_ptr, texture, raw_desc.as_ref())?;
+    let (heap, index) = crate::descriptor::shader_slot(gpu_handle)?;
+    let host_heap = heap.host()?;
+    let heap_ptr = std::ptr::from_ref(heap) as usize;
+    let slot = if index < host_heap.count() {
+        index
+    } else {
+        let slot = host_heap.dynamic(1).or_else(|| {
+            crate::host::reclaim_dynamic_slots(heap_ptr);
+            host_heap.dynamic(1)
+        })?;
+        list.record_dynamic(heap_ptr, slot, 1);
+        slot
+    };
+    host_heap.uav_at(slot, texture, desc.as_ref());
+    let gpu_desc = host_heap.gpu(slot);
+    let cpu_desc = host.uav_cpu(texture, desc.as_ref());
+    state.ensure_view_heap(list, heap_ptr);
+    if has_rects && crate::texture::title_written(texture) {
+        crate::texture::upload(list, resource_ptr, texture);
+    }
+    ensure_state(list, resource_ptr, UNORDERED_ACCESS);
+    crate::texture::host_written(resource_ptr);
+    Some((gpu_desc, cpu_desc, texture))
+}
+
+/// `ClearUnorderedAccessViewUint(gpu_handle, cpu_handle, resource, values, count, rects)`
+/// for resource-backed textures (#771).
+#[allow(clippy::too_many_arguments)] // the D3D12 method's own arguments
+extern "system" fn clear_uav_uint(
+    this: This,
+    gpu_handle: u64,
+    cpu_handle: u64,
+    resource: This,
+    values: *const [u32; 4],
+    count: u32,
+    rects: *const Rect,
+) {
+    #[cfg(windows)]
+    {
+        // SAFETY: the title passes four u32 values (null is tolerated).
+        let Some(values) = (unsafe { values.as_ref() }) else {
+            return;
+        };
+        let rects = if count > 0 && !rects.is_null() {
+            // SAFETY: the title passes `count` rectangles laid out as `RECT`.
+            unsafe { std::slice::from_raw_parts(rects.cast(), count as usize) }
+        } else {
+            &[]
+        };
+        with_state(this, |list, state| {
+            let Some((gpu_desc, cpu_desc, texture)) = prepare_texture_uav_clear(
+                list,
+                state,
+                gpu_handle,
+                cpu_handle,
+                resource,
+                !rects.is_empty(),
+            ) else {
+                return;
+            };
+            #[cfg(feature = "diagnostics")]
+            list.note_op(|| format!("clear uav uint {resource:?} {values:?} rects {}", rects.len()));
+            // SAFETY: an open list, matching shader-visible and CPU-only UAV
+            // descriptors, and a live texture in UNORDERED_ACCESS state.
+            unsafe {
+                list.list
+                    .ClearUnorderedAccessViewUint(gpu_desc, cpu_desc, texture, values, rects);
+            }
+        });
+    }
+    #[cfg(not(windows))]
+    let _ = (this, gpu_handle, cpu_handle, resource, values, count, rects);
+}
+
+/// `ClearUnorderedAccessViewFloat(gpu_handle, cpu_handle, resource, values, count, rects)`
+/// for resource-backed textures (#771).
+#[allow(clippy::too_many_arguments)] // the D3D12 method's own arguments
+extern "system" fn clear_uav_float(
+    this: This,
+    gpu_handle: u64,
+    cpu_handle: u64,
+    resource: This,
+    values: *const [f32; 4],
+    count: u32,
+    rects: *const Rect,
+) {
+    #[cfg(windows)]
+    {
+        // SAFETY: the title passes four f32 values (null is tolerated).
+        let Some(values) = (unsafe { values.as_ref() }) else {
+            return;
+        };
+        let rects = if count > 0 && !rects.is_null() {
+            // SAFETY: the title passes `count` rectangles laid out as `RECT`.
+            unsafe { std::slice::from_raw_parts(rects.cast(), count as usize) }
+        } else {
+            &[]
+        };
+        with_state(this, |list, state| {
+            let Some((gpu_desc, cpu_desc, texture)) = prepare_texture_uav_clear(
+                list,
+                state,
+                gpu_handle,
+                cpu_handle,
+                resource,
+                !rects.is_empty(),
+            ) else {
+                return;
+            };
+            #[cfg(feature = "diagnostics")]
+            list.note_op(|| format!("clear uav float {resource:?} {values:?} rects {}", rects.len()));
+            // SAFETY: an open list, matching shader-visible and CPU-only UAV
+            // descriptors, and a live texture in UNORDERED_ACCESS state.
+            unsafe {
+                list.list
+                    .ClearUnorderedAccessViewFloat(gpu_desc, cpu_desc, texture, values, rects);
+            }
+        });
+    }
+    #[cfg(not(windows))]
+    let _ = (this, gpu_handle, cpu_handle, resource, values, count, rects);
+}
+
 /// `CopyMemoryToMemoryX(destination, source, size, flags)`: GPU addresses
 /// are title memory, copied at submission like buffer copies (if mapped).
 extern "system" fn copy_memory(this: This, dst: u64, src: u64, len: u64, _flags: u32) {
@@ -801,33 +1022,107 @@ extern "system" fn dispatch_x(this: This, x: u32, y: u32, z: u32, _flags: u32) {
     }
 }
 
-/// `BeginQuery`/`EndQuery(heap, type, index)`: queries are answered when
-/// resolved.
-extern "system" fn query_mark(_: This, _heap: This, _kind: u32, _index: u32) {}
+/// `BeginQuery(heap, type, index)`: forwards to the host `ID3D12QueryHeap`
+/// when available.
+extern "system" fn begin_query(this: This, heap: This, kind: u32, index: u32) {
+    #[cfg(windows)]
+    if let Some(list) = host_list(this)
+        && let Some((host_heap, count)) = crate::query::host_heap(heap)
+        && let Some((host_kind, _)) = crate::query::query_type_info(kind)
+        && index < count
+    {
+        use windows::Win32::Graphics::Direct3D12::D3D12_QUERY_TYPE;
+        // SAFETY: open host command list and live query heap with in-bounds index.
+        unsafe {
+            list.list
+                .BeginQuery(&host_heap, D3D12_QUERY_TYPE(host_kind), index)
+        };
+        list.keep(&host_heap);
+    }
+    #[cfg(not(windows))]
+    let _ = (this, heap, kind, index);
+}
 
-/// `ResolveQueryData(heap, type, first, count, buffer, offset)`: writes
-/// each query's result into the buffer once the list has run. Timestamps
-/// (type 2) are the GPU clock then; occlusion counts (0) say a million
-/// samples passed and binary occlusion (1) visible, so nothing is culled
-/// by a query.
-/// shortcut: no query runs on the host GPU; results are plausible values,
-/// not measured ones (time spans come out as the submission's length).
+/// `EndQuery(heap, type, index)`: forwards to the host `ID3D12QueryHeap`
+/// when available.
+extern "system" fn end_query(this: This, heap: This, kind: u32, index: u32) {
+    #[cfg(windows)]
+    if let Some(list) = host_list(this)
+        && let Some((host_heap, count)) = crate::query::host_heap(heap)
+        && let Some((host_kind, _)) = crate::query::query_type_info(kind)
+        && index < count
+    {
+        use windows::Win32::Graphics::Direct3D12::D3D12_QUERY_TYPE;
+        // SAFETY: open host command list and live query heap with in-bounds index.
+        unsafe {
+            list.list
+                .EndQuery(&host_heap, D3D12_QUERY_TYPE(host_kind), index)
+        };
+        list.keep(&host_heap);
+    }
+    #[cfg(not(windows))]
+    let _ = (this, heap, kind, index);
+}
+
+/// `ResolveQueryData(heap, type, first, count, buffer, offset)`: resolves real
+/// GPU query results from the host `ID3D12QueryHeap` into a readback buffer
+/// and copies them into title memory once the submission completes, falling
+/// back to plausible synthetic values when headless or for unsupported query
+/// types.
 extern "system" fn resolve_queries(
     this: This,
-    _heap: This,
+    heap: This,
     kind: u32,
-    _first: u32,
+    first: u32,
     count: u32,
     buffer: This,
     offset: u64,
 ) {
+    let Some((data, size)) = crate::resource::buffer_bytes(buffer) else {
+        return;
+    };
+    if count == 0 {
+        return;
+    }
+    #[cfg(windows)]
+    if let Some(list) = host_list(this)
+        && let Some(host) = crate::host::host()
+        && let Some((host_heap, heap_count)) = crate::query::host_heap(heap)
+        && let Some((host_kind, stride)) = crate::query::query_type_info(kind)
+        && first.checked_add(count).is_some_and(|end| end <= heap_count)
+        && let Some(total) = u64::from(count).checked_mul(stride)
+        && offset.checked_add(total).is_some_and(|end| end <= size)
+        && let Some((rb_buf, rb_ptr)) = host.readback_buffer(total)
+    {
+        use windows::Win32::Graphics::Direct3D12::D3D12_QUERY_TYPE;
+        // SAFETY: open list, live query heap, and readback buffer large enough for `total` bytes.
+        unsafe {
+            list.list.ResolveQueryData(
+                &host_heap,
+                D3D12_QUERY_TYPE(host_kind),
+                first,
+                count,
+                &rb_buf,
+                0,
+            );
+        }
+        list.keep(&host_heap);
+        list.keep(&rb_buf);
+        let dst = data as usize + offset as usize;
+        let src = rb_ptr as usize;
+        let len = total as usize;
+        list.defer_after(move || {
+            crate::watch::writing(dst, len);
+            crate::host::write_mapped(dst as *mut u8, src as *const u8, len);
+        });
+        return;
+    }
+    #[cfg(not(windows))]
+    let _ = (heap, first);
     const OCCLUSION: u32 = 0;
     const BINARY: u32 = 1;
     const TIMESTAMP: u32 = 2;
     const PIPELINE_STATISTICS: u32 = 3;
-    let Some((data, size)) = crate::resource::buffer_bytes(buffer) else {
-        return;
-    };
     let (what, bytes) = match kind {
         OCCLUSION => (Written::Value(1 << 20), 8),
         BINARY => (Written::Value(1), 8),
@@ -882,26 +1177,324 @@ extern "system" fn reset_x(this: This, allocator: This, pipeline: This, _flags: 
 
 /// Newer lists' 0x4a0 `(size, alignment) -> pointer`: memory the list
 /// owns until it is reset, which the CPU writes and the GPU reads at the
-/// same address; null on failure. Grand Theft Auto VI's BVH builder puts
-/// its instance descriptions there (and wrote through our old
-/// `E_NOTIMPL` as a pointer).
+/// List-owned upload memory: `size` zeroed bytes aligned to `alignment` (a
+/// power of two, or `0` for the default 16-byte alignment), kept alive until
+/// the list is reset; null on invalid alignment, overflow, or OOM (#837).
 extern "system" fn allocate_upload(this: This, size: u64, alignment: u64) -> *mut u8 {
-    let align = usize::try_from(alignment).unwrap_or(0).max(16);
+    if this.is_null() {
+        return std::ptr::null_mut();
+    }
+    let align = if alignment == 0 {
+        16usize
+    } else {
+        let Ok(raw) = usize::try_from(alignment) else {
+            return std::ptr::null_mut();
+        };
+        if !raw.is_power_of_two() {
+            return std::ptr::null_mut();
+        }
+        raw.max(16)
+    };
     let Some(len) = usize::try_from(size).ok().and_then(|s| s.checked_add(align)) else {
         return std::ptr::null_mut();
     };
-    if this.is_null() || !align.is_power_of_two() {
+    let mut block = Vec::new();
+    if block.try_reserve_exact(len).is_err() {
         return std::ptr::null_mut();
     }
-    let mut block = vec![0u8; len];
+    block.resize(len, 0);
     let start = block.as_mut_ptr();
-    // SAFETY: the offset is below `align`, so `size` bytes fit after it.
-    let at = unsafe { start.add(start.align_offset(align)) };
+    let offset = start.align_offset(align);
+    if offset >= align {
+        return std::ptr::null_mut();
+    }
+    // SAFETY: `offset < align`, so `size` bytes remain inside `block`.
+    let at = unsafe { start.add(offset) };
     // SAFETY: the title passes one of our lists.
     let uploads = unsafe { &(*this.cast::<List>()).uploads };
     // Moving the vector keeps its heap block where it is.
     uploads.lock().unwrap_or_else(|e| e.into_inner()).push(block);
     at
+}
+
+/// `ID3D12GraphicsCommandList::ClearState(pPipelineState)` (slot 11 / 0x58, #848).
+extern "system" fn clear_state(this: This, pipeline: This) {
+    if !pipeline.is_null() {
+        crate::pipeline::bound(pipeline);
+    }
+    #[cfg(windows)]
+    with_state(this, |list, state| {
+        #[cfg(feature = "diagnostics")]
+        list.note_op(|| format!("clear state {pipeline:?}"));
+        state.clear(list, pipeline);
+    });
+    #[cfg(not(windows))]
+    let _ = (this, pipeline);
+}
+
+/// ABI-compatible layout of `D3D12_DISCARD_REGION`.
+#[cfg(windows)]
+#[repr(C)]
+#[derive(Clone, Copy)]
+struct DiscardRegion {
+    num_rects: u32,
+    rects: *const windows::Win32::Foundation::RECT,
+    first_subresource: u32,
+    num_subresources: u32,
+}
+
+#[cfg(windows)]
+const _: () = {
+    use windows::Win32::Graphics::Direct3D12::D3D12_DISCARD_REGION;
+    assert!(size_of::<DiscardRegion>() == size_of::<D3D12_DISCARD_REGION>());
+    assert!(align_of::<DiscardRegion>() == align_of::<D3D12_DISCARD_REGION>());
+};
+
+/// Validates a `DiscardRegion` against a host texture description (#835).
+#[cfg(windows)]
+fn valid_discard_region(
+    desc: &windows::Win32::Graphics::Direct3D12::D3D12_RESOURCE_DESC,
+    planes: u32,
+    region: &DiscardRegion,
+) -> bool {
+    use windows::Win32::Graphics::Direct3D12::{
+        D3D12_RESOURCE_DIMENSION_TEXTURE2D, D3D12_RESOURCE_DIMENSION_TEXTURE3D,
+    };
+    if region.num_rects > 0 && region.rects.is_null() {
+        return false;
+    }
+    let mips = u32::from(desc.MipLevels).max(1);
+    let array = if desc.Dimension == D3D12_RESOURCE_DIMENSION_TEXTURE3D {
+        1
+    } else {
+        u32::from(desc.DepthOrArraySize).max(1)
+    };
+    let Some(total) = mips
+        .checked_mul(array)
+        .and_then(|n| n.checked_mul(planes.max(1)))
+    else {
+        return false;
+    };
+    if region.num_subresources > 0 {
+        let Some(end) = region.first_subresource.checked_add(region.num_subresources) else {
+            return false;
+        };
+        if end > total {
+            return false;
+        }
+    }
+    if region.num_rects > 0 {
+        if desc.Dimension != D3D12_RESOURCE_DIMENSION_TEXTURE2D {
+            return false;
+        }
+        // D3D12 requires all subresources in a rect-based discard to share the
+        // same mip level (so rect extents match).
+        if region.num_subresources > 1 && mips > 1 {
+            let mip0 = region.first_subresource % mips;
+            for s in region.first_subresource + 1..region.first_subresource + region.num_subresources {
+                if s % mips != mip0 {
+                    return false;
+                }
+            }
+        }
+        // SAFETY: `region.num_rects > 0` and `region.rects` is non-null.
+        let rects = unsafe { std::slice::from_raw_parts(region.rects, region.num_rects as usize) };
+        if rects.iter().any(|r| r.left > r.right || r.top > r.bottom) {
+            return false;
+        }
+    }
+    true
+}
+
+/// Whether `state` is a D3D12-legal discard state matching `flags` (#835).
+#[cfg(windows)]
+fn discard_state_legal(state: u32, flags: u32) -> bool {
+    const RENDER_TARGET: u32 = 0x4;
+    const UNORDERED_ACCESS: u32 = 0x8;
+    const DEPTH_WRITE: u32 = 0x10;
+    const FLAG_RT: u32 = 1;
+    const FLAG_DS: u32 = 2;
+    const FLAG_UAV: u32 = 4;
+    (state == RENDER_TARGET && flags & FLAG_RT != 0)
+        || (state == UNORDERED_ACCESS && flags & FLAG_UAV != 0)
+        || (state == DEPTH_WRITE && flags & FLAG_DS != 0)
+}
+
+/// `ID3D12GraphicsCommandList::DiscardResource(pResource, pRegion)` (slot 55 / 0x1b8, #835).
+extern "system" fn discard_resource(this: This, resource: This, region: *const std::ffi::c_void) {
+    #[cfg(windows)]
+    {
+        use windows::Win32::Graphics::Direct3D12::{
+            D3D12_DISCARD_REGION, D3D12_FEATURE_DATA_FORMAT_INFO, D3D12_FEATURE_FORMAT_INFO,
+        };
+        let (Some(list), Some(host), Some(texture)) = (
+            host_list(this),
+            crate::host::host(),
+            crate::resource::host_resource(resource),
+        ) else {
+            return;
+        };
+        let Some(state) = list.tracked_texture_state(resource) else {
+            return;
+        };
+        // SAFETY: a live host texture.
+        let desc = unsafe { texture.GetDesc() };
+        if !discard_state_legal(state, desc.Flags.0 as u32) {
+            return;
+        }
+        let region_ptr = if region.is_null() {
+            None
+        } else {
+            // SAFETY: caller passes a `D3D12_DISCARD_REGION` pointer.
+            let r = unsafe { &*region.cast::<DiscardRegion>() };
+            let mut fmt_info = D3D12_FEATURE_DATA_FORMAT_INFO {
+                Format: desc.Format,
+                PlaneCount: 0,
+            };
+            // SAFETY: plain device capability query.
+            let _ = unsafe {
+                host.device.CheckFeatureSupport(
+                    D3D12_FEATURE_FORMAT_INFO,
+                    std::ptr::from_mut(&mut fmt_info).cast(),
+                    size_of::<D3D12_FEATURE_DATA_FORMAT_INFO>() as u32,
+                )
+            };
+            if !valid_discard_region(&desc, u32::from(fmt_info.PlaneCount).max(1), r) {
+                return;
+            }
+            Some(region.cast::<D3D12_DISCARD_REGION>())
+        };
+        list.keep(texture);
+        #[cfg(feature = "diagnostics")]
+        list.note_op(|| format!("discard resource {resource:?}"));
+        // SAFETY: open list, live texture in verified discard-legal state, validated region.
+        unsafe { list.list.DiscardResource(texture, region_ptr) };
+    }
+    #[cfg(not(windows))]
+    let _ = (this, resource, region);
+}
+
+/// `ID3D12GraphicsCommandList::SetPredication(pBuffer, AlignedBufferOffset, Operation)` (slot 31 / 0xf8, #859).
+extern "system" fn set_predication(this: This, buffer: This, offset: u64, operation: u32) {
+    #[cfg(windows)]
+    {
+        use windows::Win32::Graphics::Direct3D12::{
+            D3D12_PREDICATION_OP, D3D12_PREDICATION_OP_EQUAL_ZERO, D3D12_RESOURCE_STATE_PREDICATION,
+            ID3D12Resource,
+        };
+        let Some(list) = host_list(this) else {
+            return;
+        };
+        if buffer.is_null() {
+            #[cfg(feature = "diagnostics")]
+            list.note_op(|| "set predication off".to_string());
+            // SAFETY: open list; null disables predication.
+            unsafe {
+                list.list
+                    .SetPredication(None::<&ID3D12Resource>, 0, D3D12_PREDICATION_OP_EQUAL_ZERO);
+            }
+            return;
+        }
+        if operation > 1 || !offset.is_multiple_of(8) {
+            return;
+        }
+        let Some((data, size)) = crate::resource::buffer_bytes(buffer) else {
+            return;
+        };
+        if offset.checked_add(8).is_none_or(|end| end > size) {
+            return;
+        }
+        let addr = data as u64 + offset;
+        let op = D3D12_PREDICATION_OP(operation as i32);
+        if let Some(shadow) = list.latest_gpu_write_shadow(addr as usize, 8) {
+            let off = shadow.offset(addr);
+            if !off.is_multiple_of(8) {
+                return;
+            }
+            list.ensure_buffer(&shadow, D3D12_RESOURCE_STATE_PREDICATION.0 as u32);
+            list.keep(&shadow.buffer);
+            #[cfg(feature = "diagnostics")]
+            list.note_op(|| format!("set predication {buffer:?}+{offset:#x} op {operation} (gpu)"));
+            // SAFETY: open list, live shadow buffer in PREDICATION state, 8-byte aligned offset.
+            unsafe { list.list.SetPredication(&shadow.buffer, off, op) };
+        } else if let Some(shadow) = crate::shadow::find(addr, 8) {
+            let off = shadow.offset(addr);
+            if !off.is_multiple_of(8) {
+                return;
+            }
+            shadow.refresh(list, addr, 8);
+            list.ensure_buffer(&shadow, D3D12_RESOURCE_STATE_PREDICATION.0 as u32);
+            list.keep(&shadow.buffer);
+            #[cfg(feature = "diagnostics")]
+            list.note_op(|| format!("set predication {buffer:?}+{offset:#x} op {operation}"));
+            // SAFETY: open list, live shadow buffer in PREDICATION state, 8-byte aligned offset.
+            unsafe { list.list.SetPredication(&shadow.buffer, off, op) };
+        } else if let Some(host) = crate::host::host()
+            && let Some((upload, ptr)) = list.upload(host, 8)
+        {
+            list.defer_fill(ptr, addr as *const u8, 8);
+            #[cfg(feature = "diagnostics")]
+            list.note_op(|| format!("set predication {buffer:?}+{offset:#x} op {operation} (upload)"));
+            // SAFETY: open list, list-owned upload buffer (GENERIC_READ includes PREDICATION).
+            unsafe { list.list.SetPredication(&upload, 0, op) };
+        }
+    }
+    #[cfg(not(windows))]
+    let _ = (this, buffer, offset, operation);
+}
+
+/// `ID3D12GraphicsCommandList::SetMarker(Metadata, pData, Size)` (slot 56 / 0x1c0, #859).
+extern "system" fn set_marker(this: This, metadata: u32, data: *const std::ffi::c_void, size: u32) {
+    #[cfg(windows)]
+    if let Some(list) = host_list(this) {
+        let (ptr, len) = if data.is_null() || size == 0 {
+            (None, 0)
+        } else {
+            (Some(data), size)
+        };
+        #[cfg(feature = "diagnostics")]
+        list.note_op(|| format!("set marker meta={metadata} size={len}"));
+        // SAFETY: open list; null/zero payload normalized.
+        unsafe { list.list.SetMarker(metadata, ptr, len) };
+    }
+    #[cfg(not(windows))]
+    let _ = (this, metadata, data, size);
+}
+
+/// `ID3D12GraphicsCommandList::BeginEvent(Metadata, pData, Size)` (slot 57 / 0x1c8, #859).
+extern "system" fn begin_event(
+    this: This,
+    metadata: u32,
+    data: *const std::ffi::c_void,
+    size: u32,
+) {
+    #[cfg(windows)]
+    if let Some(list) = host_list(this) {
+        let (ptr, len) = if data.is_null() || size == 0 {
+            (None, 0)
+        } else {
+            (Some(data), size)
+        };
+        #[cfg(feature = "diagnostics")]
+        list.note_op(|| format!("begin event meta={metadata} size={len}"));
+        // SAFETY: open list; null/zero payload normalized.
+        unsafe { list.list.BeginEvent(metadata, ptr, len) };
+    }
+    #[cfg(not(windows))]
+    let _ = (this, metadata, data, size);
+}
+
+/// `ID3D12GraphicsCommandList::EndEvent()` (slot 58 / 0x1d0, #859).
+extern "system" fn end_event(this: This) {
+    #[cfg(windows)]
+    if let Some(list) = host_list(this) {
+        #[cfg(feature = "diagnostics")]
+        list.note_op(|| "end event".to_string());
+        // SAFETY: open list.
+        unsafe { list.list.EndEvent() };
+    }
+    #[cfg(not(windows))]
+    let _ = this;
 }
 
 /// Draw state the host has no use for (root signatures: ours come with
@@ -953,6 +1546,11 @@ mod state {
     pub(super) extern "system" fn stencil_ref(this: This, reference: u32) {
         if let Some(list) = host_list(this) {
             crate::draw::stencil_ref(list, reference);
+        }
+    }
+    pub(super) extern "system" fn depth_bounds(this: This, min: f32, max: f32) {
+        if let Some(list) = host_list(this) {
+            crate::draw::depth_bounds(list, min, max);
         }
     }
     pub(super) extern "system" fn heaps(this: This, count: u32, heaps: *const This) {
@@ -1022,6 +1620,32 @@ mod state {
             }
         });
     }
+    /// Collects and validates render target handles for `OMSetRenderTargets`:
+    /// caps at D3D12's 8 simultaneous targets and guards null / zero / overflow (#796).
+    pub(super) fn collect_target_handles(
+        count: u32,
+        handles: *const u64,
+        one_range: i32,
+    ) -> Vec<u64> {
+        const MAX_RENDER_TARGETS: u32 = 8;
+        let count = count.min(MAX_RENDER_TARGETS);
+        if count == 0 || handles.is_null() {
+            Vec::new()
+        } else if one_range != 0 {
+            // SAFETY: `count > 0` and `handles` is non-null.
+            let first = unsafe { *handles };
+            if first == 0 {
+                Vec::new()
+            } else {
+                (0..u64::from(count))
+                    .map_while(|i| first.checked_add(128 * i))
+                    .collect()
+            }
+        } else {
+            items(handles, count).to_vec()
+        }
+    }
+
     /// `(count, handles, one range, depth)`: with one range, the handles
     /// follow the first at the render target view size (128 bytes).
     pub(super) extern "system" fn targets(
@@ -1031,13 +1655,7 @@ mod state {
         one_range: i32,
         depth: *const u64,
     ) {
-        let handles: Vec<u64> = if one_range != 0 && !handles.is_null() {
-            // SAFETY: the title passes the first handle.
-            let first = unsafe { *handles };
-            (0..u64::from(count)).map(|i| first + 128 * i).collect()
-        } else {
-            items(handles, count).to_vec()
-        };
+        let handles = collect_target_handles(count, handles, one_range);
         // SAFETY: the title passes a handle or null.
         let depth = unsafe { depth.as_ref() }.copied().unwrap_or(0);
         with_state(this, |list, s| s.set_targets(list, &handles, depth));
@@ -1114,6 +1732,7 @@ mod state {
     pub(super) use super::ignored_state as compute_constants;
     pub(super) use super::ignored_state as compute_table;
     pub(super) use super::ignored_state as compute_view;
+    pub(super) use super::ignored_state as depth_bounds;
     pub(super) use super::ignored_state as graphics_constant;
     pub(super) use super::ignored_state as graphics_constants;
     pub(super) use super::ignored_state as graphics_table;
@@ -1224,29 +1843,121 @@ pub(crate) fn take_counts() -> (u64, u64) {
     (DRAWS.swap(0, Relaxed), DISPATCHES.swap(0, Relaxed))
 }
 
-/// A GPU wait for a memory value `(address, comparison, reference, ...)`.
-/// Lists run one after another and to completion, so a value another queue
-/// or the CPU has to write first cannot be waited for; nothing to do.
-extern "system" fn wait_value(_: This, _address: u64, _comparison: u32, _reference: u64) {}
+/// A GPU wait for a 64-bit memory value `(address, comparison, reference)`:
+/// recorded on the list and awaited at submission time before the list's
+/// host work runs, so cross-queue and CPU producers can satisfy it first.
+extern "system" fn wait_value(this: This, address: u64, comparison: u32, reference: u64) {
+    if address == 0 {
+        return;
+    }
+    #[cfg(windows)]
+    if let Some(list) = host_list(this) {
+        list.defer_wait(address, comparison, reference);
+    }
+    #[cfg(not(windows))]
+    let _ = (this, address, comparison, reference);
+}
 
-/// The enhanced barriers `(group count, groups)`: buffer, texture and
-/// global barriers with layouts instead of states. Every host use of a
-/// title texture (clears, copies) moves its host copy to the state it needs
-/// first, so only their ordering matters: one barrier on every shader
-/// write (the title's buffer barriers order compute passes).
-extern "system" fn barrier_groups(this: This, count: u32, _groups: *const u8) {
+#[cfg(windows)]
+#[repr(C)]
+struct BarrierGroup {
+    kind: u32,
+    count: u32,
+    barriers: *const std::ffi::c_void,
+}
+
+#[cfg(windows)]
+#[repr(C)]
+struct TextureBarrier {
+    sync_before: u32,
+    sync_after: u32,
+    access_before: u32,
+    access_after: u32,
+    layout_before: i32,
+    layout_after: i32,
+    resource: This,
+    subresources: [u32; 6],
+    flags: u32,
+}
+
+/// Maps an enhanced-barrier `D3D12_BARRIER_LAYOUT` to the equivalent legacy
+/// host `D3D12_RESOURCE_STATES` mask (`None` for `UNDEFINED` or unknown).
+#[cfg(any(windows, test))]
+fn enhanced_layout_state(layout: i32) -> Option<u32> {
+    Some(match layout {
+        0 | 18 | 24 => 0,            // COMMON / PRESENT
+        1 | 19 | 25 => 0x8C0,        // GENERIC_READ (SRV + COPY_SOURCE)
+        2 => 0x4,                    // RENDER_TARGET
+        3 | 20 | 26 => 0x8,          // UNORDERED_ACCESS
+        4 => 0x10,                   // DEPTH_STENCIL_WRITE
+        5 => 0x20,                   // DEPTH_STENCIL_READ
+        6 | 21 | 27 => 0xC0,         // SHADER_RESOURCE (PS | NON_PS)
+        7 | 22 | 28 => 0x800,        // COPY_SOURCE
+        8 | 23 | 29 => 0x400,        // COPY_DEST
+        9 => 0x2000,                 // RESOLVE_SOURCE
+        10 => 0x1000,                // RESOLVE_DEST
+        11 => 0x0100_0000,           // SHADING_RATE_SOURCE
+        _ => return None,
+    })
+}
+
+/// The enhanced barriers `(group count, groups)`: translates texture layout
+/// transitions through [`ensure_state`] so host textures stay in the right
+/// state for direct-indexed reads and cross-list `prelude` tracking, and emits
+/// a global UAV barrier for global/buffer/UAV groups.
+extern "system" fn barrier_groups(this: This, count: u32, groups: *const u8) {
     #[cfg(windows)]
     if count > 0
         && let Some(list) = host_list(this)
     {
         use windows::Win32::Graphics::Direct3D12::D3D12_RESOURCE_BARRIER;
-        // SAFETY: the same layout; no resource named.
-        let barrier = unsafe { std::mem::transmute::<Barrier, D3D12_RESOURCE_BARRIER>(UAV_BARRIER) };
-        // SAFETY: an open list.
-        unsafe { list.list.ResourceBarrier(&[barrier]) };
+        const GLOBAL: u32 = 0;
+        const TEXTURE: u32 = 1;
+        const BUFFER: u32 = 2;
+        const ACCESS_UAV: u32 = 0x80;
+        let mut need_uav = groups.is_null();
+        if !groups.is_null() {
+            // SAFETY: the title passes `count` contiguous `D3D12_BARRIER_GROUP` entries.
+            let slice = unsafe { std::slice::from_raw_parts(groups.cast::<BarrierGroup>(), count as usize) };
+            for group in slice {
+                match group.kind {
+                    TEXTURE if !group.barriers.is_null() && group.count > 0 => {
+                        // SAFETY: the group points at `group.count` texture barriers.
+                        let textures = unsafe {
+                            std::slice::from_raw_parts(
+                                group.barriers.cast::<TextureBarrier>(),
+                                group.count as usize,
+                            )
+                        };
+                        for tb in textures {
+                            if !tb.resource.is_null()
+                                && let Some(state) = enhanced_layout_state(tb.layout_after)
+                            {
+                                ensure_state(list, tb.resource, state);
+                            }
+                            if (tb.access_before | tb.access_after) & ACCESS_UAV != 0
+                                || matches!(tb.layout_before, 3 | 20 | 26)
+                                || matches!(tb.layout_after, 3 | 20 | 26)
+                            {
+                                need_uav = true;
+                            }
+                        }
+                    }
+                    GLOBAL | BUFFER => need_uav = true,
+                    _ => need_uav = true,
+                }
+            }
+        }
+        if need_uav {
+            // SAFETY: the same layout; no resource named.
+            let barrier =
+                unsafe { std::mem::transmute::<Barrier, D3D12_RESOURCE_BARRIER>(UAV_BARRIER) };
+            // SAFETY: an open list.
+            unsafe { list.list.ResourceBarrier(&[barrier]) };
+        }
     }
     #[cfg(not(windows))]
-    let _ = (this, count);
+    let _ = (this, count, groups);
 }
 
 /// The bottom-of-pipe value writes `(address, value, flush, flags)`, 32 and
@@ -1284,13 +1995,14 @@ fn defer_write(this: This, address: u64, what: Written, bytes: usize) {
 /// layout): IUnknown 3, object 4, device child 1, list 1, graphics list 96
 /// (59 as on PC, then console ones), then versions 1-6 (6 + 1 + 1 + 11 + 3
 /// + 13): 140 slots.
-const METHODS: [(usize, *const ()); 52] = [
+const METHODS: [(usize, *const ()); 55] = [
     (0, list_query as *const ()),
     (2, list_release as *const ()),
     (7, object::parent_device as *const ()),      // 0x38
     (8, list_type as *const ()),                  // 0x40
     (9, close as *const ()),                      // 0x48
     (10, reset as *const ()),                     // 0x50
+    (11, clear_state as *const ()),               // 0x58 ClearState
     (12, state::draw as *const ()),               // 0x60 instanced
     (13, state::draw_indexed as *const ()),       // 0x68 indexed
     (14, state::dispatch as *const ()),           // 0x70
@@ -1325,9 +2037,11 @@ const METHODS: [(usize, *const ()); 52] = [
     (50, state::targets as *const ()),            // 0x190
     (51, clear_dsv as *const ()),                 // 0x198
     (52, clear_rtv as *const ()),                 // 0x1a0
+    (53, clear_uav_uint as *const ()),            // 0x1a8
+    (54, clear_uav_float as *const ()),           // 0x1b0
     (59, execute_indirect as *const ()),          // 0x1d8 indirect
     (60, copy_memory as *const ()),               // 0x1e0
-    (68, ignored_state as *const ()),             // 0x220 depth bounds
+    (68, state::depth_bounds as *const ()),       // 0x220 depth bounds
     (69, write32 as *const ()),                   // 0x228
     (70, write64 as *const ()),                   // 0x230
     (71, wait_value as *const ()),                // 0x238, 32 bits
@@ -1339,10 +2053,15 @@ const METHODS: [(usize, *const ()); 52] = [
     (127, state::dispatch_mesh as *const ()),     // 0x3f8 mesh dispatch
 ];
 /// The rest of [`METHODS`], kept apart only to stay readable.
-const MORE_METHODS: [(usize, *const ()); 9] = [
-    (28, query_mark as *const ()),             // 0xe0 BeginQuery
-    (29, query_mark as *const ()),             // 0xe8 EndQuery
-    (30, resolve_queries as *const ()),        // 0xf0
+const MORE_METHODS: [(usize, *const ()); 14] = [
+    (28, begin_query as *const ()),            // 0xe0 BeginQuery
+    (29, end_query as *const ()),              // 0xe8 EndQuery
+    (30, resolve_queries as *const ()),        // 0xf0 ResolveQueryData
+    (31, set_predication as *const ()),        // 0xf8 SetPredication
+    (55, discard_resource as *const ()),       // 0x1b8 DiscardResource
+    (56, set_marker as *const ()),             // 0x1c0 SetMarker
+    (57, begin_event as *const ()),            // 0x1c8 BeginEvent
+    (58, end_event as *const ()),              // 0x1d0 EndEvent
     (78, dispatch_x as *const ()),             // 0x270
     (98, state::dispatch_mesh_x as *const ()), // 0x310
     (99, driver_hint as *const ()),            // 0x318
@@ -1445,5 +2164,800 @@ mod tests {
         let release = |o: This| slot::<extern "system" fn(This) -> u32>(o, 0x10)(o);
         assert_eq!(release(list), 0);
         assert_eq!(release(allocator), 0);
+    }
+
+    #[test]
+    fn enhanced_barrier_layouts_map_to_legacy_states() {
+        assert_eq!(enhanced_layout_state(0), Some(0)); // COMMON
+        assert_eq!(enhanced_layout_state(2), Some(0x4)); // RENDER_TARGET
+        assert_eq!(enhanced_layout_state(3), Some(0x8)); // UNORDERED_ACCESS
+        assert_eq!(enhanced_layout_state(4), Some(0x10)); // DEPTH_STENCIL_WRITE
+        assert_eq!(enhanced_layout_state(5), Some(0x20)); // DEPTH_STENCIL_READ
+        assert_eq!(enhanced_layout_state(6), Some(0xC0)); // SHADER_RESOURCE
+        assert_eq!(enhanced_layout_state(7), Some(0x800)); // COPY_SOURCE
+        assert_eq!(enhanced_layout_state(8), Some(0x400)); // COPY_DEST
+        assert_eq!(enhanced_layout_state(21), Some(0xC0)); // DIRECT_QUEUE_SHADER_RESOURCE
+        assert_eq!(enhanced_layout_state(26), Some(0x8)); // COMPUTE_QUEUE_UNORDERED_ACCESS
+        assert_eq!(enhanced_layout_state(-1), None); // UNDEFINED
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn clear_uav_uint_and_float_whole_and_rect_on_warp() {
+        use windows::Win32::Graphics::Direct3D12::{
+            D3D12_RESOURCE_STATE_COPY_SOURCE, D3D12_TEXTURE_COPY_LOCATION,
+        };
+        use windows::core::Interface;
+
+        let Some(host) = crate::host::host() else {
+            return;
+        };
+        let null = std::ptr::null();
+        let resource_iid = guid(
+            0x696442be,
+            0xa72e,
+            0x4059,
+            [0xbc, 0x79, 0x5b, 0x5c, 0x98, 0x04, 0x0f, 0xad],
+        );
+        let heap_iid = guid(
+            0x8efb471d,
+            0x616c,
+            0x4f49,
+            [0x90, 0xf7, 0x12, 0x7b, 0xb7, 0x63, 0xfa, 0x51],
+        );
+        let release = |o: This| slot::<extern "system" fn(This) -> u32>(o, 0x10)(o);
+
+        // Create allocator & command list.
+        let mut allocator = null;
+        assert_eq!(
+            create_allocator(null, 0, &ALLOCATOR_IIDS[0], &mut allocator),
+            S_OK
+        );
+        let mut list = null;
+        assert_eq!(
+            create_list(null, 0, 0, allocator, null, &LIST_IIDS[1], &mut list),
+            S_OK
+        );
+
+        // Create one shader-visible view heap (16 slots) and one CPU-only view heap (16 slots).
+        #[repr(C)]
+        struct ExtendedHeap([u32; 4], [u64; 2]);
+        let mut gpu_heap = null;
+        let gpu_desc = ExtendedHeap([0, 16, 1, 0], [0, 0]);
+        assert_eq!(
+            crate::descriptor::create_heap(null, (&raw const gpu_desc).cast(), &heap_iid, &mut gpu_heap),
+            S_OK
+        );
+        let mut cpu_heap = null;
+        let cpu_desc = ExtendedHeap([0, 16, 0, 0], [0, 0]);
+        assert_eq!(
+            crate::descriptor::create_heap(null, (&raw const cpu_desc).cast(), &heap_iid, &mut cpu_heap),
+            S_OK
+        );
+        let gpu_base = crate::descriptor::heap(gpu_heap).start;
+        let cpu_base = crate::descriptor::heap(cpu_heap).start;
+
+        // Create 4x4 R32_UINT (42) and 4x4 R32_FLOAT (41) UAV textures.
+        #[repr(C)]
+        struct RawDesc {
+            dimension: u32,
+            alignment: u64,
+            width: u64,
+            height: u32,
+            depth_or_array_size: u16,
+            mip_levels: u16,
+            format: u32,
+            sample_count: u32,
+            sample_quality: u32,
+            layout: u32,
+            flags: u32,
+        }
+        let hp: [u32; 5] = [1, 0, 0, 1, 1]; // DEFAULT heap
+        let make_tex = |fmt: u32| -> This {
+            let desc = RawDesc {
+                dimension: 3, // TEXTURE2D
+                alignment: 0,
+                width: 4,
+                height: 4,
+                depth_or_array_size: 1,
+                mip_levels: 1,
+                format: fmt,
+                sample_count: 1,
+                sample_quality: 0,
+                layout: 0,
+                flags: 4, // ALLOW_UNORDERED_ACCESS
+            };
+            let mut tex = null;
+            assert_eq!(
+                crate::resource::create_committed(
+                    null,
+                    (&raw const hp).cast(),
+                    0,
+                    (&raw const desc).cast(),
+                    0,
+                    std::ptr::null(),
+                    &resource_iid,
+                    &mut tex,
+                ),
+                S_OK
+            );
+            tex
+        };
+        let tex_u32 = make_tex(42);
+        let tex_f32 = make_tex(41);
+
+        // Create UAVs (null desc on typed R32_UINT/R32_FLOAT resources, matching host typeless synthesis).
+        crate::descriptor::create_uav(null, tex_u32, null, std::ptr::null(), cpu_base);
+        crate::descriptor::create_uav(null, tex_u32, null, std::ptr::null(), gpu_base);
+        crate::descriptor::create_uav(null, tex_f32, null, std::ptr::null(), cpu_base + 32);
+        crate::descriptor::create_uav(null, tex_f32, null, std::ptr::null(), gpu_base + 32);
+
+        // Bind shader-visible view heap on list (slot 32 / 0x100).
+        slot::<extern "system" fn(This, u32, *const This)>(list, 32 * 8)(list, 1, &gpu_heap);
+
+        let center = Rect {
+            left: 1,
+            top: 1,
+            right: 3,
+            bottom: 3,
+        };
+        // Slot 53 (0x1a8): ClearUnorderedAccessViewUint — whole clear to 7, then centered 2x2 to 99.
+        type ClearUint =
+            extern "system" fn(This, u64, u64, This, *const [u32; 4], u32, *const Rect);
+        let cu = slot::<ClearUint>(list, 53 * 8);
+        let u_bg = [7u32, 0, 0, 0];
+        let u_fg = [99u32, 0, 0, 0];
+        cu(list, gpu_base, cpu_base, tex_u32, &u_bg, 0, std::ptr::null());
+        barrier(list, 1, &UAV_BARRIER);
+        cu(list, gpu_base, cpu_base, tex_u32, &u_fg, 1, &center);
+
+        // Slot 54 (0x1b0): ClearUnorderedAccessViewFloat — whole clear to 1.5, then centered 2x2 to 3.25.
+        type ClearFloat =
+            extern "system" fn(This, u64, u64, This, *const [f32; 4], u32, *const Rect);
+        let cf = slot::<ClearFloat>(list, 54 * 8);
+        let f_bg = [1.5f32, 0.0, 0.0, 0.0];
+        let f_fg = [3.25f32, 0.0, 0.0, 0.0];
+        cf(list, gpu_base + 32, cpu_base + 32, tex_f32, &f_bg, 0, std::ptr::null());
+        barrier(list, 1, &UAV_BARRIER);
+        cf(list, gpu_base + 32, cpu_base + 32, tex_f32, &f_fg, 1, &center);
+
+        // Copy both textures to readback buffers inside the same list and execute.
+        let (rb_u32, ptr_u32) = host.readback_buffer(1024).expect("readback u32");
+        let (rb_f32, ptr_f32) = host.readback_buffer(1024).expect("readback f32");
+        let hl = host_list(list).expect("host list");
+        for (tex, rb, fmt) in [(tex_u32, &rb_u32, 42u32), (tex_f32, &rb_f32, 41u32)] {
+            ensure_state(hl, tex, D3D12_RESOURCE_STATE_COPY_SOURCE.0 as u32);
+            let htex = crate::resource::host_resource(tex).expect("host texture");
+            let dst = CopyLocation {
+                resource: rb.as_raw().cast_const().cast(),
+                kind: 1,
+                footprint: crate::resource::PlacedFootprint {
+                    offset: 0,
+                    format: fmt,
+                    width: 4,
+                    height: 4,
+                    depth: 1,
+                    row_pitch: 256,
+                },
+            };
+            let src = CopyLocation {
+                resource: htex.as_raw().cast_const().cast(),
+                kind: 0,
+                footprint: crate::resource::PlacedFootprint {
+                    offset: 0,
+                    format: 0,
+                    width: 0,
+                    height: 0,
+                    depth: 0,
+                    row_pitch: 0,
+                },
+            };
+            // SAFETY: open list, live resources, verified identical layout to D3D12_TEXTURE_COPY_LOCATION.
+            unsafe {
+                hl.list.CopyTextureRegion(
+                    (&raw const dst).cast::<D3D12_TEXTURE_COPY_LOCATION>(),
+                    0,
+                    0,
+                    0,
+                    (&raw const src).cast::<D3D12_TEXTURE_COPY_LOCATION>(),
+                    None,
+                );
+            }
+        }
+        assert_eq!(close(list), S_OK);
+        host.execute(&[hl]);
+        assert_eq!(host.log_messages(), None, "no D3D12 debug-layer errors");
+
+        // Verify all 16 pixels of both textures.
+        for y in 0..4usize {
+            for x in 0..4usize {
+                let in_center = (1..3).contains(&x) && (1..3).contains(&y);
+                // SAFETY: readback buffers hold 4 rows at 256-byte pitch.
+                let (got_u, got_f) = unsafe {
+                    (
+                        ptr_u32.add(y * 256 + x * 4).cast::<u32>().read(),
+                        ptr_f32.add(y * 256 + x * 4).cast::<f32>().read(),
+                    )
+                };
+                assert_eq!(got_u, if in_center { 99 } else { 7 }, "u32 ({x},{y})");
+                assert_eq!(got_f, if in_center { 3.25 } else { 1.5 }, "f32 ({x},{y})");
+            }
+        }
+
+        let _ = (
+            release(tex_u32),
+            release(tex_f32),
+            release(gpu_heap),
+            release(cpu_heap),
+            release(list),
+            release(allocator),
+        );
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn copy_texture_region_reads_same_list_gpu_written_buffer_aligned_and_unaligned() {
+        use windows::Win32::Graphics::Direct3D12::{
+            D3D12_RESOURCE_STATE_COPY_SOURCE, D3D12_TEXTURE_COPY_LOCATION,
+        };
+        use windows::core::Interface;
+
+        let Some(host) = crate::host::host() else {
+            return;
+        };
+        let null = std::ptr::null();
+        let resource_iid = guid(
+            0x696442be,
+            0xa72e,
+            0x4059,
+            [0xbc, 0x79, 0x5b, 0x5c, 0x98, 0x04, 0x0f, 0xad],
+        );
+        let release = |o: This| slot::<extern "system" fn(This) -> u32>(o, 0x10)(o);
+
+        let mut allocator = null;
+        assert_eq!(
+            create_allocator(null, 0, &ALLOCATOR_IIDS[0], &mut allocator),
+            S_OK
+        );
+        let mut list = null;
+        assert_eq!(
+            create_list(null, 0, 0, allocator, null, &LIST_IIDS[1], &mut list),
+            S_OK
+        );
+
+        #[repr(C)]
+        struct RawDesc {
+            dimension: u32,
+            alignment: u64,
+            width: u64,
+            height: u32,
+            depth_or_array_size: u16,
+            mip_levels: u16,
+            format: u32,
+            sample_count: u32,
+            sample_quality: u32,
+            layout: u32,
+            flags: u32,
+        }
+        let hp: [u32; 5] = [1, 0, 0, 1, 1];
+        let make_tex = || -> This {
+            let desc = RawDesc {
+                dimension: 3,
+                alignment: 0,
+                width: 4,
+                height: 4,
+                depth_or_array_size: 1,
+                mip_levels: 1,
+                format: 42, // R32_UINT
+                sample_count: 1,
+                sample_quality: 0,
+                layout: 0,
+                flags: 0,
+            };
+            let mut tex = null;
+            assert_eq!(
+                crate::resource::create_committed(
+                    null,
+                    (&raw const hp).cast(),
+                    0,
+                    (&raw const desc).cast(),
+                    0,
+                    std::ptr::null(),
+                    &resource_iid,
+                    &mut tex,
+                ),
+                S_OK
+            );
+            tex
+        };
+        let tex_aligned = make_tex();
+        let tex_unaligned = make_tex();
+
+        // Guest buffer (4096 bytes), filled in CPU memory with stale 0xDEAD_BEEF.
+        let buf_desc = RawDesc {
+            dimension: 1, // BUFFER
+            alignment: 0,
+            width: 4096,
+            height: 1,
+            depth_or_array_size: 1,
+            mip_levels: 1,
+            format: 0,
+            sample_count: 1,
+            sample_quality: 0,
+            layout: 1, // ROW_MAJOR
+            flags: 0,
+        };
+        let mut guest_buf = null;
+        assert_eq!(
+            crate::resource::create_committed(
+                null,
+                (&raw const hp).cast(),
+                0,
+                (&raw const buf_desc).cast(),
+                0,
+                std::ptr::null(),
+                &resource_iid,
+                &mut guest_buf,
+            ),
+            S_OK
+        );
+        let (buf_ptr, buf_len) = crate::resource::buffer_bytes(guest_buf).expect("guest buffer");
+        assert!(buf_len >= 4096);
+        // SAFETY: guest buffer holds 4096 writable bytes.
+        unsafe {
+            for w in std::slice::from_raw_parts_mut(buf_ptr.cast::<u32>(), 1024) {
+                *w = 0xDEAD_BEEF;
+            }
+        }
+
+        // Simulate a same-list GPU write into the guest buffer's host shadow:
+        // write 0x1111_0000+i at offset 0 (512-byte aligned, bytes 0..784) and
+        // 0x2222_0000+i at offset 1028 (NOT 512-byte aligned, bytes 1028..1812)
+        // via GPU CopyBufferRegion while CPU title memory remains stale 0xDEAD_BEEF.
+        const UNALIGNED_OFF: usize = 1028;
+        let hl = host_list(list).expect("host list");
+        let shadow = crate::shadow::find(buf_ptr as u64, buf_len).expect("shadow");
+        let (upload_buf, upload_ptr) = hl.upload(host, 4096).expect("upload");
+        // SAFETY: mapped 4096-byte upload buffer.
+        unsafe {
+            let slice = std::slice::from_raw_parts_mut(upload_ptr, 4096);
+            slice.fill(0);
+            for y in 0..4usize {
+                for x in 0..4usize {
+                    let v1 = 0x1111_0000u32 + (y * 4 + x) as u32;
+                    let v2 = 0x2222_0000u32 + (y * 4 + x) as u32;
+                    slice[y * 256 + x * 4..y * 256 + x * 4 + 4].copy_from_slice(&v1.to_le_bytes());
+                    let off2 = UNALIGNED_OFF + y * 256 + x * 4;
+                    slice[off2..off2 + 4].copy_from_slice(&v2.to_le_bytes());
+                }
+            }
+        }
+        shadow.refresh(hl, buf_ptr as u64, 4096);
+        hl.ensure_buffer(&shadow, COPY_DEST);
+        // SAFETY: open list; upload buffer and shadow both cover 4096 bytes.
+        unsafe {
+            hl.list.CopyBufferRegion(&shadow.buffer, 0, &upload_buf, 0, 4096);
+        }
+        shadow.gpu_writes(hl, buf_ptr as u64, 4096);
+
+        // Now record guest CopyTextureRegion (slot 16) from BOTH aligned offset 0
+        // and unaligned offset 1028 in the SAME command list.
+        let copy_tex = |dst_tex: This, src_offset: u64| {
+            let dst = CopyLocation {
+                resource: dst_tex,
+                kind: 0,
+                footprint: crate::resource::PlacedFootprint {
+                    offset: 0,
+                    format: 0,
+                    width: 0,
+                    height: 0,
+                    depth: 0,
+                    row_pitch: 0,
+                },
+            };
+            let src = CopyLocation {
+                resource: guest_buf,
+                kind: 1,
+                footprint: crate::resource::PlacedFootprint {
+                    offset: src_offset,
+                    format: 42,
+                    width: 4,
+                    height: 4,
+                    depth: 1,
+                    row_pitch: 256,
+                },
+            };
+            copy_texture_region(list, &dst, 0, 0, 0, &src, std::ptr::null());
+        };
+        copy_tex(tex_aligned, 0);
+        copy_tex(tex_unaligned, UNALIGNED_OFF as u64);
+
+        // Read both destination textures back to verify GPU-written bytes landed.
+        let (rb_a, ptr_a) = host.readback_buffer(1024).expect("readback aligned");
+        let (rb_u, ptr_u) = host.readback_buffer(1024).expect("readback unaligned");
+        for (tex, rb) in [(tex_aligned, &rb_a), (tex_unaligned, &rb_u)] {
+            ensure_state(hl, tex, D3D12_RESOURCE_STATE_COPY_SOURCE.0 as u32);
+            let htex = crate::resource::host_resource(tex).expect("host texture");
+            let dst = CopyLocation {
+                resource: rb.as_raw().cast_const().cast(),
+                kind: 1,
+                footprint: crate::resource::PlacedFootprint {
+                    offset: 0,
+                    format: 42,
+                    width: 4,
+                    height: 4,
+                    depth: 1,
+                    row_pitch: 256,
+                },
+            };
+            let src = CopyLocation {
+                resource: htex.as_raw().cast_const().cast(),
+                kind: 0,
+                footprint: crate::resource::PlacedFootprint {
+                    offset: 0,
+                    format: 0,
+                    width: 0,
+                    height: 0,
+                    depth: 0,
+                    row_pitch: 0,
+                },
+            };
+            // SAFETY: open list, live resources, verified layout.
+            unsafe {
+                hl.list.CopyTextureRegion(
+                    (&raw const dst).cast::<D3D12_TEXTURE_COPY_LOCATION>(),
+                    0,
+                    0,
+                    0,
+                    (&raw const src).cast::<D3D12_TEXTURE_COPY_LOCATION>(),
+                    None,
+                );
+            }
+        }
+        assert_eq!(close(list), S_OK);
+        host.execute(&[hl]);
+        assert_eq!(host.log_messages(), None, "no D3D12 debug-layer errors");
+
+        for y in 0..4usize {
+            for x in 0..4usize {
+                let idx = (y * 4 + x) as u32;
+                // SAFETY: 4 rows at 256-byte row pitch.
+                let (got_a, got_u) = unsafe {
+                    (
+                        ptr_a.add(y * 256 + x * 4).cast::<u32>().read(),
+                        ptr_u.add(y * 256 + x * 4).cast::<u32>().read(),
+                    )
+                };
+                assert_eq!(got_a, 0x1111_0000 + idx, "aligned ({x},{y})");
+                assert_eq!(got_u, 0x2222_0000 + idx, "unaligned 1028 ({x},{y})");
+            }
+        }
+
+        let _ = (
+            release(tex_aligned),
+            release(tex_unaligned),
+            release(guest_buf),
+            release(list),
+            release(allocator),
+        );
+    }
+
+    #[test]
+    fn allocate_upload_validates_alignment_and_fails_fallibly() {
+        let null = std::ptr::null();
+        let mut allocator = null;
+        assert_eq!(
+            create_allocator(null, 0, &ALLOCATOR_IIDS[0], &mut allocator),
+            S_OK
+        );
+        let mut list = null;
+        assert_eq!(
+            create_list(null, 0, 0, allocator, null, &LIST_IIDS[1], &mut list),
+            S_OK
+        );
+        // Non-power-of-two alignments below 16 must be rejected (#837).
+        assert!(allocate_upload(list, 16, 3).is_null());
+        assert!(allocate_upload(list, 16, 6).is_null());
+        assert!(allocate_upload(list, 16, 12).is_null());
+        assert!(allocate_upload(list, 16, 24).is_null());
+        // Alignment 0 defaults to 16; powers of two <= 16 are promoted to 16.
+        let p0 = allocate_upload(list, 32, 0);
+        assert!(!p0.is_null() && (p0 as usize).is_multiple_of(16));
+        let p4 = allocate_upload(list, 32, 4);
+        assert!(!p4.is_null() && (p4 as usize).is_multiple_of(16));
+        // Unsatisfiable sizes return null cleanly without aborting.
+        assert!(allocate_upload(list, u64::MAX, 16).is_null());
+        assert!(allocate_upload(list, usize::MAX as u64 / 2, 16).is_null());
+        assert!(allocate_upload(null, 16, 16).is_null());
+
+        let release = |o: This| slot::<extern "system" fn(This) -> u32>(o, 0x10)(o);
+        assert_eq!(release(list), 0);
+        assert_eq!(release(allocator), 0);
+    }
+
+    #[test]
+    fn clear_state_discard_predication_and_marker_slots_match_both_tables() {
+        for table in [&LIST_FUNCTIONS.0, &NEWER_LIST_FUNCTIONS.0] {
+            assert_eq!(table[11], clear_state as *const ());
+            assert_eq!(table[31], set_predication as *const ());
+            assert_eq!(table[55], discard_resource as *const ());
+            assert_eq!(table[56], set_marker as *const ());
+            assert_eq!(table[57], begin_event as *const ());
+            assert_eq!(table[58], end_event as *const ());
+        }
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn clear_state_discard_predication_markers_and_targets_on_warp() {
+        use windows::Win32::Foundation::RECT;
+        use windows::Win32::Graphics::Direct3D12::{
+            D3D12_RESOURCE_STATE_COPY_SOURCE, D3D12_TEXTURE_COPY_LOCATION,
+        };
+        use windows::core::Interface;
+
+        let Some(host) = crate::host::host() else {
+            return;
+        };
+        let null = std::ptr::null();
+        let resource_iid = guid(
+            0x696442be,
+            0xa72e,
+            0x4059,
+            [0xbc, 0x79, 0x5b, 0x5c, 0x98, 0x04, 0x0f, 0xad],
+        );
+        let heap_iid = guid(
+            0x8efb471d,
+            0x616c,
+            0x4f49,
+            [0x90, 0xf7, 0x12, 0x7b, 0xb7, 0x63, 0xfa, 0x51],
+        );
+        let release = |o: This| slot::<extern "system" fn(This) -> u32>(o, 0x10)(o);
+
+        let mut allocator = null;
+        assert_eq!(
+            create_allocator(null, 0, &ALLOCATOR_IIDS[0], &mut allocator),
+            S_OK
+        );
+        let mut list = null;
+        assert_eq!(
+            create_list(null, 0, 0, allocator, null, &LIST_IIDS[1], &mut list),
+            S_OK
+        );
+
+        // Edge-case OMSetRenderTargets handle collection: count=0, null, first=0,
+        // cap at 8, and overflow stop without wrapping (#796).
+        let zero_handle = 0u64;
+        let max_handle = u64::MAX - 64;
+        let valid_first = 0x1000u64;
+        assert!(state::collect_target_handles(0, &max_handle, 1).is_empty());
+        assert!(state::collect_target_handles(4, std::ptr::null(), 1).is_empty());
+        assert!(state::collect_target_handles(4, &zero_handle, 1).is_empty());
+        assert_eq!(
+            state::collect_target_handles(16, &valid_first, 1).len(),
+            8
+        );
+        assert_eq!(
+            state::collect_target_handles(4, &max_handle, 1),
+            vec![max_handle]
+        );
+        state::targets(list, 0, std::ptr::null(), 1, std::ptr::null());
+        state::targets(list, 4, &zero_handle, 1, std::ptr::null());
+
+        // Create a 4x1 R8G8B8A8_UNORM render target texture + RTV heap.
+        #[repr(C)]
+        struct HeapDesc {
+            kind: u32,
+            count: u32,
+            flags: u32,
+            mask: u32,
+        }
+        let mut rtv_heap = null;
+        assert_eq!(
+            crate::descriptor::create_heap(
+                null,
+                std::ptr::from_ref(&HeapDesc {
+                    kind: 2, // RTV
+                    count: 4,
+                    flags: 0,
+                    mask: 0,
+                })
+                .cast(),
+                &heap_iid,
+                &mut rtv_heap,
+            ),
+            S_OK
+        );
+        let rtv_handle = slot::<extern "system" fn(This) -> u64>(rtv_heap, 0x48)(rtv_heap);
+
+        #[repr(C)]
+        struct RawDesc {
+            dimension: u32,
+            alignment: u64,
+            width: u64,
+            height: u32,
+            depth_or_array_size: u16,
+            mip_levels: u16,
+            format: u32,
+            sample_count: u32,
+            sample_quality: u32,
+            layout: u32,
+            flags: u32,
+        }
+        let hp: [u32; 5] = [1, 0, 0, 1, 1];
+        let tex_desc = RawDesc {
+            dimension: 3, // TEXTURE2D
+            alignment: 0,
+            width: 4,
+            height: 1,
+            depth_or_array_size: 1,
+            mip_levels: 1,
+            format: 28, // R8G8B8A8_UNORM
+            sample_count: 1,
+            sample_quality: 0,
+            layout: 0,
+            flags: 1, // ALLOW_RENDER_TARGET
+        };
+        let mut tex = null;
+        assert_eq!(
+            crate::resource::create_committed(
+                null,
+                (&raw const hp).cast(),
+                0,
+                (&raw const tex_desc).cast(),
+                0x4, // RENDER_TARGET
+                null.cast(),
+                &resource_iid,
+                &mut tex,
+            ),
+            S_OK
+        );
+        crate::descriptor::create_rtv(null, tex, null.cast(), rtv_handle);
+
+        // Create a 64-byte predicate buffer with [0u64, 1u64].
+        let buf_desc = RawDesc {
+            dimension: 1, // BUFFER
+            alignment: 0,
+            width: 64,
+            height: 1,
+            depth_or_array_size: 1,
+            mip_levels: 1,
+            format: 0,
+            sample_count: 1,
+            sample_quality: 0,
+            layout: 1,
+            flags: 0,
+        };
+        let mut pred_buf = null;
+        assert_eq!(
+            crate::resource::create_committed(
+                null,
+                (&raw const hp).cast(),
+                0,
+                (&raw const buf_desc).cast(),
+                0,
+                null.cast(),
+                &resource_iid,
+                &mut pred_buf,
+            ),
+            S_OK
+        );
+        let (pred_ptr, _) = crate::resource::buffer_bytes(pred_buf).expect("predicate bytes");
+        // SAFETY: 64-byte guest buffer; write 0 at +0 and 1 at +8.
+        unsafe {
+            pred_ptr.cast::<u64>().write(0);
+            pred_ptr.add(8).cast::<u64>().write(1);
+        }
+
+        // Markers/events (including null payload with non-zero size) must succeed cleanly.
+        let label = b"wave7\0";
+        begin_event(list, 1, label.as_ptr().cast(), label.len() as u32);
+        set_marker(list, 1, std::ptr::null(), 16);
+
+        // Put texture into RENDER_TARGET state via DiscardResource + ClearRenderTargetView.
+        let hl = host_list(list).expect("host list");
+        ensure_state(hl, tex, 0x4);
+        discard_resource(list, tex, std::ptr::null());
+        // Invalid inverted rect discard must be cleanly ignored.
+        let bad_rect = RECT {
+            left: 2,
+            top: 0,
+            right: 1,
+            bottom: 1,
+        };
+        let bad_region = DiscardRegion {
+            num_rects: 1,
+            rects: &bad_rect,
+            first_subresource: 0,
+            num_subresources: 1,
+        };
+        discard_resource(list, tex, std::ptr::from_ref(&bad_region).cast());
+
+        // Clear whole 4x1 texture to black, then pixel 0 to red.
+        clear_rtv(list, rtv_handle, &[0.0, 0.0, 0.0, 1.0], 0, std::ptr::null());
+        let r0 = [0i32, 0, 1, 1];
+        clear_rtv(list, rtv_handle, &[1.0, 0.0, 0.0, 1.0], 1, r0.as_ptr().cast());
+
+        // ClearState resets pipeline/state while preserving earlier recorded work and tracked states (#848).
+        clear_state(list, null);
+        let r1 = [1i32, 0, 2, 1];
+        clear_rtv(list, rtv_handle, &[0.0, 1.0, 0.0, 1.0], 1, r1.as_ptr().cast());
+
+        // Predication EQUAL_ZERO on value 0 (+0) -> SKIP clear of pixel 2 (stays black).
+        set_predication(list, pred_buf, 0, 0);
+        let r2 = [2i32, 0, 3, 1];
+        clear_rtv(list, rtv_handle, &[0.0, 0.0, 1.0, 1.0], 1, r2.as_ptr().cast());
+
+        // Predication EQUAL_ZERO on value 1 (+8) -> RUN clear of pixel 3 (becomes blue).
+        set_predication(list, pred_buf, 8, 0);
+        let r3 = [3i32, 0, 4, 1];
+        clear_rtv(list, rtv_handle, &[0.0, 0.0, 1.0, 1.0], 1, r3.as_ptr().cast());
+
+        // Disable predication and close event scope.
+        set_predication(list, null, 0, 0);
+        end_event(list);
+
+        // Read back 4 pixels.
+        let (rb, rb_ptr) = host.readback_buffer(256).expect("readback");
+        ensure_state(hl, tex, D3D12_RESOURCE_STATE_COPY_SOURCE.0 as u32);
+        let htex = crate::resource::host_resource(tex).expect("host texture");
+        let dst = CopyLocation {
+            resource: rb.as_raw().cast_const().cast(),
+            kind: 1,
+            footprint: crate::resource::PlacedFootprint {
+                offset: 0,
+                format: 28,
+                width: 4,
+                height: 1,
+                depth: 1,
+                row_pitch: 256,
+            },
+        };
+        let src = CopyLocation {
+            resource: htex.as_raw().cast_const().cast(),
+            kind: 0,
+            footprint: crate::resource::PlacedFootprint {
+                offset: 0,
+                format: 0,
+                width: 0,
+                height: 0,
+                depth: 0,
+                row_pitch: 0,
+            },
+        };
+        // SAFETY: open list, live resources, verified layout.
+        unsafe {
+            hl.list.CopyTextureRegion(
+                (&raw const dst).cast::<D3D12_TEXTURE_COPY_LOCATION>(),
+                0,
+                0,
+                0,
+                (&raw const src).cast::<D3D12_TEXTURE_COPY_LOCATION>(),
+                None,
+            );
+        }
+        assert_eq!(close(list), S_OK);
+        host.execute(&[hl]);
+        assert_eq!(host.log_messages(), None, "no D3D12 debug-layer errors");
+
+        // SAFETY: 4 RGBA8 pixels (16 bytes) inside 256-byte readback buffer.
+        let got: [u8; 16] = unsafe { *(rb_ptr.cast::<[u8; 16]>()) };
+        assert_eq!(
+            got,
+            [
+                255, 0, 0, 255, // pixel 0: red before ClearState
+                0, 255, 0, 255, // pixel 1: green after ClearState
+                0, 0, 0, 255, // pixel 2: skipped by EQUAL_ZERO predication on 0
+                0, 0, 255, 255, // pixel 3: executed by EQUAL_ZERO predication on 1
+            ]
+        );
+
+        let _ = (
+            release(pred_buf),
+            release(tex),
+            release(rtv_heap),
+            release(list),
+            release(allocator),
+        );
     }
 }

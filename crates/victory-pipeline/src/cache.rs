@@ -65,7 +65,30 @@ impl Cache {
             .open(&tmp)?;
         let written = file.write_all(&output);
         drop(file);
-        let published = written.and_then(|()| std::fs::rename(&tmp, &path));
+        // Publish atomically without replacing an already-published entry:
+        // on Windows NTFS, `rename` uses `MOVEFILE_REPLACE_EXISTING` which
+        // briefly marks an existing file delete-pending and causes concurrent
+        // readers to fail with `ERROR_ACCESS_DENIED` (os error 5) (#890).
+        // `hard_link` leaves any existing file untouched and fails cleanly
+        // with `AlreadyExists` on a race.
+        let published = written.and_then(|()| match std::fs::hard_link(&tmp, &path) {
+            Ok(()) => {
+                let _ = std::fs::remove_file(&tmp);
+                Ok(())
+            }
+            Err(_) if path.is_file() => {
+                let _ = std::fs::remove_file(&tmp);
+                Ok(())
+            }
+            Err(_) => match std::fs::rename(&tmp, &path) {
+                Ok(()) => Ok(()),
+                Err(_) if path.is_file() => {
+                    let _ = std::fs::remove_file(&tmp);
+                    Ok(())
+                }
+                Err(e) => Err(e),
+            },
+        });
         if published.is_err() {
             let _ = std::fs::remove_file(&tmp);
         }
@@ -155,5 +178,31 @@ mod tests {
     fn refuses_cache_inside_repo() {
         let inside = Path::new(env!("CARGO_MANIFEST_DIR")).join("cache");
         assert!(Cache::open(inside).is_err());
+    }
+
+    #[test]
+    fn concurrent_publication_succeeds_without_leaving_temp_files() {
+        let tmp = tempfile::tempdir().unwrap();
+        let cache = std::sync::Arc::new(Cache::open(tmp.path().join("cache")).unwrap());
+        let mut handles = Vec::new();
+        for _ in 0..8 {
+            let cache = std::sync::Arc::clone(&cache);
+            handles.push(std::thread::spawn(move || {
+                let conv = Upper {
+                    version: 1,
+                    runs: AtomicUsize::new(0),
+                };
+                let p = cache.get_or_convert(&conv, b"race-payload").unwrap();
+                assert_eq!(std::fs::read(&p).unwrap(), b"RACE-PAYLOAD");
+                p
+            }));
+        }
+        let paths: Vec<_> = handles.into_iter().map(|h| h.join().unwrap()).collect();
+        let path = &paths[0];
+        assert!(paths.iter().all(|p| p == path));
+        assert_eq!(
+            std::fs::read_dir(path.parent().unwrap()).unwrap().count(),
+            1
+        );
     }
 }

@@ -186,7 +186,11 @@ fn current(dir: &Path) -> std::io::Result<Option<Version>> {
         let file = file.to_string_lossy();
         if file.ends_with(".new") {
             std::fs::remove_dir_all(entry.path())?;
-        } else if let Some(n) = file.strip_prefix('v').and_then(|n| n.parse::<u64>().ok()) {
+        } else if let Some(n) = file
+            .strip_prefix('v')
+            .and_then(|n| n.parse::<u64>().ok())
+            .filter(|&n| file == format!("v{n}"))
+        {
             committed.push(n);
         }
     }
@@ -1351,5 +1355,29 @@ mod tests {
         assert!(found.is_empty());
         close_container(this, container);
         close_provider(this, provider);
+    }
+
+    #[test]
+    fn non_canonical_version_dirs_do_not_delete_committed_version() {
+        let root = std::env::temp_dir().join(format!(
+            "victory-save-canonical-{}",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_dir_all(&root);
+        let dir = container_dir(&root, "Slot_Canonical");
+        commit(
+            &dir,
+            1,
+            "Slot_Canonical",
+            "Display",
+            &[("blob.bin", Source::Data(b"payload"))],
+        )
+        .unwrap();
+        // Create stray non-canonical directory `v01` alongside committed `v1`.
+        std::fs::create_dir_all(dir.join("v01")).unwrap();
+        let v = current(&dir).unwrap().expect("v1 must remain intact");
+        assert_eq!(v.number, 1);
+        assert_eq!(std::fs::read(v.dir.join("0")).unwrap(), b"payload");
+        let _ = std::fs::remove_dir_all(&root);
     }
 }

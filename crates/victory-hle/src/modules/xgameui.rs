@@ -49,6 +49,9 @@ extern "system" fn profile_card_result(_: This, block: *mut AsyncBlock) -> HRESU
     xasync::XAsyncGetResult(block, (&raw const PROFILE).cast(), 0, none, none.cast())
 }
 
+/// `XGameUiTextEntryInputScope::Password` (#881).
+const PASSWORD: u32 = 31;
+
 /// Grand Theft Auto VI treats `E_ABORT` as cancelled and goes on; any
 /// other failure as an error.
 extern "system" fn text_entry_async(
@@ -57,13 +60,14 @@ extern "system" fn text_entry_async(
     title: *const c_char,
     description: *const c_char,
     default: *const c_char,
-    _scope: u32,
+    scope: u32,
     max_length: u32,
 ) -> HRESULT {
     let [title, description, default] = [title, description, default].map(|t| text(t).unwrap_or_default());
-    tracing::info!(title, description, max_length, "text entry");
+    let password = scope == PASSWORD;
+    tracing::info!(title, description, max_length, password, "text entry");
     xasync::pending_with(block, (&raw const TEXT).cast(), move || {
-        match ask(&title, &description, &default, max_length) {
+        match ask(&title, &description, &default, max_length, password) {
             Some(typed) => {
                 tracing::info!(length = typed.chars().count(), "text entry: done");
                 let mut bytes = limit(&typed, max_length).into_bytes();
@@ -112,14 +116,14 @@ fn limit(typed: &str, max: u32) -> String {
 
 /// Asks the user in a modal host dialog; `None` if dismissed.
 #[cfg(not(test))]
-fn ask(title: &str, description: &str, default: &str, max: u32) -> Option<String> {
-    dialog::ask(title, description, default, max)
+fn ask(title: &str, description: &str, default: &str, max: u32, password: bool) -> Option<String> {
+    dialog::ask(title, description, default, max, password)
 }
 
 /// Tests answer for the user: "typed" for a title starting with "Type",
 /// cancelled otherwise.
 #[cfg(test)]
-fn ask(title: &str, _: &str, default: &str, _: u32) -> Option<String> {
+fn ask(title: &str, _: &str, default: &str, _: u32, _: bool) -> Option<String> {
     title.starts_with("Type").then(|| format!("{default}typed"))
 }
 
@@ -134,6 +138,15 @@ mod dialog {
     const EM_SETSEL: u32 = 0xb1;
     const EM_LIMITTEXT: u32 = 0xc5;
 
+    pub(super) fn edit_style(password: bool) -> u32 {
+        let base = wm::WS_BORDER | wm::WS_TABSTOP | wm::ES_AUTOHSCROLL as u32;
+        if password {
+            base | wm::ES_PASSWORD as u32
+        } else {
+            base
+        }
+    }
+
     /// The dialog's state, behind its user data while it runs.
     struct Entry {
         max: u32,
@@ -144,7 +157,13 @@ mod dialog {
     /// from an in-memory template (dialog units, the system font); Enter
     /// accepts, Esc cancels.
     #[allow(dead_code)] // unused in test builds
-    pub(super) fn ask(title: &str, description: &str, default: &str, max: u32) -> Option<String> {
+    pub(super) fn ask(
+        title: &str,
+        description: &str,
+        default: &str,
+        max: u32,
+        password: bool,
+    ) -> Option<String> {
         let mut t: Vec<u16> = Vec::new();
         fn dword(t: &mut Vec<u16>, v: u32) {
             t.extend([v as u16, (v >> 16) as u16]);
@@ -173,8 +192,7 @@ mod dialog {
         let (button, edit, label) = (0x80, 0x81, 0x82);
         let tab = wm::WS_TABSTOP;
         item(0, [7, 7, 226, 10], 0xffff, label, description);
-        let edit_style = wm::WS_BORDER | tab | wm::ES_AUTOHSCROLL as u32;
-        item(edit_style, [7, 20, 226, 12], EDIT as u16, edit, default);
+        item(edit_style(password), [7, 20, 226, 12], EDIT as u16, edit, default);
         let ok = wm::BS_DEFPUSHBUTTON as u32 | tab;
         item(ok, [129, 40, 50, 14], wm::IDOK as u16, button, "OK");
         let cancel = wm::BS_PUSHBUTTON as u32 | tab;
@@ -317,5 +335,14 @@ mod tests {
         assert_eq!(result(this, &mut b, 7, out.as_mut_ptr(), &mut used), S_OK);
         assert_eq!((text(out.as_ptr()).as_deref(), used), (Some("abctyp"), 7));
         assert_eq!(limit("\u{e9}t\u{e9}s", 3), "\u{e9}t\u{e9}");
+    }
+
+    #[test]
+    fn a_password_entry_hides_what_is_typed() {
+        use windows_sys::Win32::UI::WindowsAndMessaging as wm;
+        let plain = dialog::edit_style(false);
+        let masked = dialog::edit_style(true);
+        assert_eq!(plain & wm::ES_PASSWORD as u32, 0);
+        assert_eq!(masked, plain | wm::ES_PASSWORD as u32);
     }
 }

@@ -14,6 +14,35 @@ use windows::Win32::Graphics::Dxgi::Common::*;
 use super::host::{Draw, Host, Root};
 use super::{HostShader, RootType, translate};
 
+/// Returns `VICTORY_EMIT_DUMP` only when it resolves outside any VIctory or
+/// Git checkout, preventing test shader dumps from polluting the repository.
+fn emit_dump_dir() -> Option<PathBuf> {
+    let dir = PathBuf::from(std::env::var_os("VICTORY_EMIT_DUMP")?);
+    let abs = if dir.is_absolute() {
+        dir.clone()
+    } else {
+        std::env::current_dir().ok()?.join(&dir)
+    };
+    let mut cur = abs.as_path();
+    let base = loop {
+        if let Ok(canon) = std::fs::canonicalize(cur) {
+            break canon;
+        }
+        match cur.parent() {
+            Some(p) if !p.as_os_str().is_empty() => cur = p,
+            _ => break abs,
+        }
+    };
+    assert!(
+        !base
+            .ancestors()
+            .any(|a| a.join(".victory-root").is_file() || a.join(".git").exists()),
+        "refusing VICTORY_EMIT_DUMP inside repository: {}",
+        dir.display()
+    );
+    Some(dir)
+}
+
 const RS: &str = "RootFlags(ALLOW_INPUT_ASSEMBLER_INPUT_LAYOUT), \
                   RootConstants(num32BitConstants=4, b0), \
                   DescriptorTable(SRV(t0)), DescriptorTable(Sampler(s0)), \
@@ -706,6 +735,9 @@ fn user_data(s: &HostShader, k: &[u32; 4]) -> Vec<u32> {
             (RootType::Table, 3) => 5 * 32,
             // The typed views of `raw` (compute) from 9.
             (RootType::Table, 6) => 9 * 32,
+            // Root CBV (64 dwords = 256 B) and root SRV (32 dwords = 128 B).
+            (RootType::Descriptor, 4) => 64 * 4,
+            (RootType::Descriptor, 5) => 32 * 4,
             other => panic!("unexpected user data {other:?}"),
         };
     }
@@ -787,14 +819,14 @@ fn translated_shaders_draw_as_pc_ones() {
                 continue;
             }
         };
-        if let Ok(out) = std::env::var("VICTORY_EMIT_DUMP") {
+        if let Some(out) = emit_dump_dir() {
             let stem = name.replace([' ', ','], "_");
             std::fs::write(
-                format!("{out}/{stem}.ps.cdxil"),
+                out.join(format!("{stem}.ps.cdxil")),
                 compile(&console, &dir, src, "ps", "ps_6_5"),
             )
             .unwrap();
-            std::fs::write(format!("{out}/{stem}.ps.dxil"), &ps_c.dxil).unwrap();
+            std::fs::write(out.join(format!("{stem}.ps.dxil")), &ps_c.dxil).unwrap();
         }
         if let Ok(mut v) = super::validator::Validator::load(
             super::validator::Validator::default_path().as_deref(),
@@ -905,10 +937,10 @@ fn translated_mesh_shaders_draw_as_pc_ones() {
             }
         };
         let ps_c = translate(&compile(&console, &dir, src, "mps", "ps_6_5")).unwrap();
-        if let Ok(out) = std::env::var("VICTORY_EMIT_DUMP") {
+        if let Some(out) = emit_dump_dir() {
             let stem = name.replace([' ', ','], "_");
-            std::fs::write(format!("{out}/{stem}.ms.cdxil"), &console_ms).unwrap();
-            std::fs::write(format!("{out}/{stem}.ms.dxil"), &ms_c.dxil).unwrap();
+            std::fs::write(out.join(format!("{stem}.ms.cdxil")), &console_ms).unwrap();
+            std::fs::write(out.join(format!("{stem}.ms.dxil")), &ms_c.dxil).unwrap();
         }
         if let Ok(mut v) = super::validator::Validator::load(
             super::validator::Validator::default_path().as_deref(),
@@ -1181,9 +1213,9 @@ fn translated_compute_matches_pc() {
         .filter(|c| warp || !c.0.starts_with("terminates"))
     {
         let console_cs = compile(&console, &dir, src, "cs", "cs_6_5");
-        if let Ok(out) = std::env::var("VICTORY_EMIT_DUMP") {
+        if let Some(out) = emit_dump_dir() {
             let stem = name.replace([' ', ','], "_");
-            std::fs::write(format!("{out}/{stem}.cs.cdxil"), &console_cs).unwrap();
+            std::fs::write(out.join(format!("{stem}.cs.cdxil")), &console_cs).unwrap();
         }
         let cs_c = match translate(&console_cs) {
             Ok(s) => s,
@@ -1192,9 +1224,9 @@ fn translated_compute_matches_pc() {
                 continue;
             }
         };
-        if let Ok(out) = std::env::var("VICTORY_EMIT_DUMP") {
+        if let Some(out) = emit_dump_dir() {
             let stem = name.replace([' ', ','], "_");
-            std::fs::write(format!("{out}/{stem}.cs.dxil"), &cs_c.dxil).unwrap();
+            std::fs::write(out.join(format!("{stem}.cs.dxil")), &cs_c.dxil).unwrap();
         }
         if let Ok(mut v) = super::validator::Validator::load(
             super::validator::Validator::default_path().as_deref(),

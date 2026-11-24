@@ -59,6 +59,8 @@ pub(crate) fn all() -> Vec<HleModule> {
     #[cfg(windows)]
     all.push(media::module());
     #[cfg(windows)]
+    all.push(media::readwrite_module());
+    #[cfg(windows)]
     all.push(dstorage::module());
     #[cfg(windows)]
     all.push(files::module());

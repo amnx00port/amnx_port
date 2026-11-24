@@ -99,9 +99,12 @@ extern "system" fn set_event_on_completion(this: This, value: u64, event: *mut c
 pub(crate) extern "system" fn signal(this: This, value: u64) -> HRESULT {
     let fence = fence(this);
     let mut waiters = fence.waiters.lock().unwrap_or_else(|e| e.into_inner());
-    fence.value.store(value, Ordering::Release);
+    // Fences are monotonic: a late/out-of-order signal never moves the
+    // completed value backwards (#932).
+    let prev = fence.value.fetch_max(value, Ordering::AcqRel);
+    let reached_now = prev.max(value);
     waiters.retain(|&(wanted, event)| {
-        let reached = wanted <= value;
+        let reached = wanted <= reached_now;
         if reached {
             set_event(event);
         }
@@ -168,6 +171,20 @@ mod tests {
         assert_eq!(unsafe { *(at as *const u64) }, 5);
         // SAFETY: ours.
         unsafe { CloseHandle(event) };
+        assert_eq!(slot::<extern "system" fn(This) -> u32>(f, 0x10)(f), 0);
+    }
+
+    #[test]
+    fn fence_signal_is_monotonic() {
+        let mut f = std::ptr::null();
+        assert_eq!(create(std::ptr::null(), 10, 0, &FENCE_IIDS[0], &mut f), S_OK);
+        let completed = slot::<extern "system" fn(This) -> u64>(f, 0x40);
+        let sig = slot::<extern "system" fn(This, u64) -> HRESULT>(f, 0x50);
+        assert_eq!(sig(f, 25), S_OK);
+        assert_eq!(completed(f), 25);
+        // Out-of-order smaller signal must not roll the fence backwards (#932).
+        assert_eq!(sig(f, 12), S_OK);
+        assert_eq!(completed(f), 25);
         assert_eq!(slot::<extern "system" fn(This) -> u32>(f, 0x10)(f), 0);
     }
 }

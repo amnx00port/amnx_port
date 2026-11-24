@@ -528,7 +528,7 @@ fn programs(fssm: &[u8]) -> Result<Vec<NativeProgram>, ShaderError> {
         let stage_data = &payload[(start + RECORD_SIZE) as usize..];
         let io = match stage {
             HwStage::Ps => ps_io(stage_data, code.len())?,
-            HwStage::Vs => vs_io(stage_data)?,
+            HwStage::Vs | HwStage::Es | HwStage::Ls => vs_io(stage_data)?,
             HwStage::Cs => StageIo::Cs(ComputeIo {
                 rsrc2: u32_at(stage_data, CS_RSRC2)?,
                 threads: [
@@ -538,7 +538,17 @@ fn programs(fssm: &[u8]) -> Result<Vec<NativeProgram>, ShaderError> {
                 ],
             }),
             HwStage::Ms => ms_io(stage_data, u32_at(record, RECORD_LDS)?)?,
-            _ => StageIo::None,
+            // NGG merged geometry stages (`Gs`) carry mesh-style limits when
+            // compiled as NGG, or vertex-style I/O tables otherwise.
+            HwStage::Gs => match ms_io(stage_data, u32_at(record, RECORD_LDS)?) {
+                Ok(StageIo::Ms(ms))
+                    if ms.threads > 0 && ms.max_vertices > 0 && ms.max_primitives > 0 =>
+                {
+                    StageIo::Ms(ms)
+                }
+                _ => vs_io(stage_data).unwrap_or(StageIo::None),
+            },
+            HwStage::Hs => vs_io(stage_data).unwrap_or(StageIo::None),
         };
         out.push(NativeProgram {
             stage,

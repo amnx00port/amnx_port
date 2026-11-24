@@ -205,7 +205,7 @@ pub fn raise(p: &Program, native: &NativeProgram) -> Result<Io, ShaderError> {
                 .collect();
             (loaded, &inputs[..], &[][..])
         }
-        (StageIo::Vs { inputs, outputs }, HwStage::Vs) => {
+        (StageIo::Vs { inputs, outputs }, HwStage::Vs | HwStage::Es | HwStage::Ls) => {
             let mut loaded = vec![
                 (Reg::V(0), Input::VertexId),
                 (Reg::V(2), Input::PrimitiveId),
@@ -237,7 +237,7 @@ pub fn raise(p: &Program, native: &NativeProgram) -> Result<Io, ShaderError> {
             loaded.extend(info.map(|s| (Reg::S(s), Input::GroupInfo)));
             (loaded, &[][..], &[][..])
         }
-        (StageIo::Ms(ms), HwStage::Ms) => {
+        (StageIo::Ms(ms), HwStage::Ms | HwStage::Gs) => {
             let group = p.inputs.iter().find(|i| i.0 == Reg::V(5)).map(|i| i.1);
             // The group input holds the same value in every lane only as the
             // first lane reads it; a VGPR write reads its old value too.

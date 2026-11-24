@@ -5,6 +5,7 @@
 
 mod census;
 mod inspect;
+mod menu;
 mod run;
 mod shader;
 mod translate;
@@ -22,7 +23,7 @@ use clap::{Parser, Subcommand, ValueEnum};
 )]
 struct Cli {
     #[command(subcommand)]
-    command: Command,
+    command: Option<Command>,
 }
 
 #[derive(Subcommand)]
@@ -107,6 +108,8 @@ enum Command {
     },
     /// Show the resolved configuration and check it.
     Config,
+    /// Check this Windows PC's DirectX 12 GPU, shader, and title readiness.
+    Doctor,
 }
 
 #[derive(Clone, Copy, ValueEnum)]
@@ -128,8 +131,23 @@ fn main() -> Result<()> {
     if victory_hle::modules::audio::capture::child() {
         return Ok(());
     }
+    // Drag-and-drop a title `.exe` directly onto `victory.exe` in Windows Explorer.
+    let raw_args: Vec<std::ffi::OsString> = std::env::args_os().collect();
+    if raw_args.len() == 2 {
+        let candidate = PathBuf::from(&raw_args[1]);
+        if candidate.is_file()
+            && candidate
+                .extension()
+                .is_some_and(|e| e.eq_ignore_ascii_case("exe"))
+        {
+            return run::run(&candidate, Unimplemented::Trap, false, true, Console::SeriesX);
+        }
+    }
     let cli = Cli::parse();
-    match cli.command {
+    let Some(command) = cli.command else {
+        return menu::interactive();
+    };
+    match command {
         Command::Inspect {
             file,
             imports,
@@ -162,10 +180,11 @@ fn main() -> Result<()> {
             title_args: _,
         } => run::run(&exe, unimplemented, strict, execute, console),
         Command::Config => show_config(),
+        Command::Doctor => menu::doctor(),
     }
 }
 
-fn show_config() -> Result<()> {
+pub(crate) fn show_config() -> Result<()> {
     let cfg = victory_core::Config::load()?;
     let status = |p: &Option<PathBuf>| match p {
         Some(p) if p.exists() => format!("{}", p.display()),

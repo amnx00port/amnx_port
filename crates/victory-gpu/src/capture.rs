@@ -8,11 +8,54 @@ use std::path::PathBuf;
 use windows::Win32::Graphics::Direct3D12::*;
 use windows::Win32::Graphics::Dxgi::Common::*;
 
-/// The folder frames go to, if capturing.
+/// Returns `true` if `path` (or its deepest existing ancestor) lies inside a
+/// VIctory checkout or Git repository, enforcing rule #1 on diagnostic dumps.
+fn is_inside_repo(path: &std::path::Path) -> bool {
+    let abs = if path.is_absolute() {
+        path.to_path_buf()
+    } else {
+        let Ok(cwd) = std::env::current_dir() else {
+            return true;
+        };
+        cwd.join(path)
+    };
+    let mut cur = abs.as_path();
+    let base = loop {
+        if let Ok(canon) = std::fs::canonicalize(cur) {
+            break canon;
+        }
+        match cur.parent() {
+            Some(p) if !p.as_os_str().is_empty() => cur = p,
+            _ => break abs,
+        }
+    };
+    base.ancestors()
+        .any(|a| a.join(".victory-root").is_file() || a.join(".git").exists())
+}
+
+/// The folder frames go to, if capturing (refused when inside a repository).
 pub(crate) fn folder() -> Option<&'static PathBuf> {
     static FOLDER: std::sync::OnceLock<Option<PathBuf>> = std::sync::OnceLock::new();
     FOLDER
-        .get_or_init(|| std::env::var_os("VICTORY_CAPTURE").map(PathBuf::from))
+        .get_or_init(|| {
+            let path = PathBuf::from(std::env::var_os("VICTORY_CAPTURE")?);
+            if is_inside_repo(&path) {
+                tracing::warn!(
+                    path = %path.display(),
+                    "refusing VICTORY_CAPTURE inside repository (keep captures outside the source tree)"
+                );
+                return None;
+            }
+            if let Err(e) = std::fs::create_dir_all(&path) {
+                tracing::warn!(
+                    path = %path.display(),
+                    error = %e,
+                    "cannot create VICTORY_CAPTURE folder"
+                );
+                return None;
+            }
+            Some(path)
+        })
         .as_ref()
 }
 
@@ -97,12 +140,12 @@ fn crc32(bytes: &[u8]) -> u32 {
 }
 
 /// Records a copy of `texture` (in the copy-source state) into a
-/// readback buffer.
+/// readback buffer, returning the buffer, footprint and allocation size.
 pub(crate) fn read_back(
     device: &ID3D12Device,
     list: &ID3D12GraphicsCommandList,
     texture: &ID3D12Resource,
-) -> Option<(ID3D12Resource, D3D12_PLACED_SUBRESOURCE_FOOTPRINT)> {
+) -> Option<(ID3D12Resource, D3D12_PLACED_SUBRESOURCE_FOOTPRINT, u64)> {
     let mut footprint = D3D12_PLACED_SUBRESOURCE_FOOTPRINT::default();
     let mut total = 0;
     // SAFETY: a live texture; outputs for one subresource.
@@ -165,7 +208,7 @@ pub(crate) fn read_back(
             },
         };
         list.CopyTextureRegion(&to, 0, 0, 0, &from, None);
-        Some((buffer, footprint))
+        Some((buffer, footprint, total))
     }
 }
 
@@ -174,6 +217,7 @@ pub(crate) fn save_read_back(
     frame: u64,
     buffer: &ID3D12Resource,
     footprint: &D3D12_PLACED_SUBRESOURCE_FOOTPRINT,
+    total: u64,
 ) {
     let f = footprint.Footprint;
     let bgra = match f.Format {
@@ -186,12 +230,14 @@ pub(crate) fn save_read_back(
     };
     let mut data = std::ptr::null_mut();
     // SAFETY: the copy finished (every submission is waited for); the
-    // mapping spans the footprint's rows.
+    // readback buffer was allocated with `total` bytes.
     unsafe {
         if buffer.Map(0, None, Some(&mut data)).is_err() {
             return;
         }
-        let len = f.RowPitch as usize * f.Height as usize;
+        let len = (f.RowPitch as usize)
+            .saturating_mul(f.Height as usize)
+            .min(total as usize);
         let rows = std::slice::from_raw_parts(data.cast::<u8>(), len);
         save(frame, f.Width, f.Height, f.RowPitch as usize, bgra, rows);
         buffer.Unmap(0, None);
@@ -210,7 +256,7 @@ static TARGETS: std::sync::Mutex<Vec<(usize, std::sync::Arc<crate::resource::Hos
 
 fn dump_on() -> bool {
     static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *ON.get_or_init(|| folder().is_some() && std::env::var_os("VICTORY_DUMP_TARGETS").is_some())
+    *ON.get_or_init(|| folder().is_some() && crate::host::env_flag("VICTORY_DUMP_TARGETS"))
 }
 
 /// Notes a title texture the frame being built renders to or writes.
@@ -271,16 +317,21 @@ fn dump_one(
     };
     list.close();
     host.execute(&[&list]);
-    let Some((buffer, footprint)) = read else { return };
+    let Some((buffer, footprint, total)) = read else {
+        return;
+    };
     let f = footprint.Footprint;
     let mut data = std::ptr::null_mut();
-    // SAFETY: the copy finished; the mapping spans the footprint's rows.
+    // SAFETY: the copy finished; the readback buffer was allocated with `total` bytes.
     unsafe {
         if buffer.Map(0, None, Some(&mut data)).is_err() {
             return;
         }
         let pitch = f.RowPitch as usize;
-        let rows = std::slice::from_raw_parts(data.cast::<u8>(), pitch * f.Height as usize);
+        let len = pitch
+            .saturating_mul(f.Height as usize)
+            .min(total as usize);
+        let rows = std::slice::from_raw_parts(data.cast::<u8>(), len);
         if let Some(rgba) = to_rgba(f.Format.0 as u32, f.Width as usize, f.Height as usize, pitch, rows) {
             let name = format!(
                 "frame-{frame}-{i:02}-{resource:?}-{}x{}-f{}",

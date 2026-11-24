@@ -97,6 +97,9 @@ pub(crate) enum Cast {
 
 /// Compare predicates: floats 0-15, integers 32-41.
 pub(crate) mod pred {
+    // Not emitted: `fcmp false`/`fcmp true` remove the WARP device, so
+    // `v_cmp_f`/`v_cmp_tru` lower as i1 constants instead.
+    #[allow(dead_code)]
     pub const FALSE: u8 = 0;
     pub const OEQ: u8 = 1;
     pub const OGT: u8 = 2;
@@ -115,6 +118,7 @@ pub(crate) mod pred {
     pub const ULT: u8 = 12;
     pub const ULE: u8 = 13;
     pub const UNE: u8 = 14;
+    #[allow(dead_code)]
     pub const TRUE: u8 = 15;
     pub const EQ: u8 = 32;
     pub const NE: u8 = 33;
@@ -263,6 +267,14 @@ impl Module {
     pub fn int_const(&mut self, ty: Ty, v: i64) -> V {
         self.constant(ty, Const::Int(v))
     }
+    /// The integer value of `v`, if it is an integer constant.
+    pub fn int_value(&self, v: V) -> Option<i64> {
+        let V::Const(i) = v else { return None };
+        match self.consts.get(i as usize) {
+            Some(&(_, Const::Int(x))) => Some(x),
+            _ => None,
+        }
+    }
     pub fn i32(&mut self, v: u32) -> V {
         let t = self.int(32);
         self.int_const(t, i64::from(v as i32))
@@ -292,17 +304,6 @@ impl Module {
             })
             .collect();
         self.constant(ty, Const::Aggregate(ids))
-    }
-
-    /// The value of an integer constant; `None` for anything else.
-    pub fn int_value(&self, v: V) -> Option<i64> {
-        match v {
-            V::Const(i) => match self.consts[i as usize].1 {
-                Const::Int(x) => Some(x),
-                _ => None,
-            },
-            _ => None,
-        }
     }
 
     /// Gives constant `old` the content of `new` (both stay valid).

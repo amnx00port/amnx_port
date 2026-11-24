@@ -35,6 +35,8 @@ pub const ANALYTICS: Guid = Guid::new(
 const CONSOLE_ID: &str = "00000000000000000000000000000000000001";
 /// The retail sandbox.
 const SANDBOX: &str = "RETAIL";
+/// `XSystemXboxLiveSandboxIdMaxBytes` in GDK `XSystem.h` (#862).
+const SANDBOX_ID_MAX_BYTES: usize = 16;
 /// Base64 of 32 bytes: 44 characters (45 bytes with the NUL).
 const DEVICE_ID: &str = "VkljdG9yeSBvZmZsaW5lIGRldmljZSBpZGVudGl0eSE=";
 
@@ -62,6 +64,9 @@ extern "system" fn console_id(_: This, size: usize, buffer: *mut u8, used: *mut 
     put_string(CONSOLE_ID, size, buffer, used)
 }
 extern "system" fn sandbox_id(_: This, size: usize, buffer: *mut u8, used: *mut usize) -> HRESULT {
+    if size < SANDBOX_ID_MAX_BYTES {
+        return super::xasync::E_NOT_SUFFICIENT_BUFFER;
+    }
     put_string(SANDBOX, size, buffer, used)
 }
 /// The device id this title sees (titles see different ones).
@@ -396,5 +401,23 @@ mod tests {
         assert_eq!(size_of::<AnalyticsInfo>(), 0x90);
         assert_eq!(info.os.build, 22000);
         assert_eq!(&info.form[..14], b"Xbox Series X\0");
+    }
+
+    #[test]
+    fn a_sandbox_id_buffer_under_the_documented_minimum_is_refused() {
+        type Get = extern "system" fn(This, usize, *mut u8, *mut usize) -> HRESULT;
+        let get = method::<Get>(&OBJECT, 0x20);
+        let mut buf = [0xAAu8; 16];
+        let mut used = 99usize;
+        for small in [7usize, 15] {
+            assert_eq!(
+                get(&OBJECT, small, buf.as_mut_ptr(), &mut used),
+                crate::modules::xasync::E_NOT_SUFFICIENT_BUFFER
+            );
+            assert!(buf.iter().all(|&b| b == 0xAA));
+        }
+        assert_eq!(get(&OBJECT, 16, buf.as_mut_ptr(), &mut used), S_OK);
+        assert_eq!(&buf[..7], b"RETAIL\0");
+        assert_eq!(used, 7);
     }
 }

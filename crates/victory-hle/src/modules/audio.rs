@@ -624,24 +624,53 @@ fn decode(context: Context, voice: &mut Voice) -> bool {
 
 /// `VICTORY_XMA_DUMP=<dir>`: saves the context words (`<n>-<index>.ctx`)
 /// and input buffer 0 (`.xma`) of the first 32 voices enabled, to test
-/// the decoder on a title's streams outside the title.
+/// the decoder on a title's streams outside the title. Refuses directories
+/// inside a VIctory checkout or Git repository.
 #[cfg(feature = "diagnostics")]
 fn dump_input(index: u32, context: Context) {
     static COUNT: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
-    let Some(dir) = std::env::var_os("VICTORY_XMA_DUMP") else {
+    static DIR: OnceLock<Option<std::path::PathBuf>> = OnceLock::new();
+    let Some(dir) = DIR.get_or_init(|| {
+        let dir = std::path::PathBuf::from(std::env::var_os("VICTORY_XMA_DUMP")?);
+        let abs = if dir.is_absolute() {
+            dir.clone()
+        } else {
+            std::env::current_dir().ok()?.join(&dir)
+        };
+        let mut cur = abs.as_path();
+        let base = loop {
+            if let Ok(canon) = std::fs::canonicalize(cur) {
+                break canon;
+            }
+            match cur.parent() {
+                Some(p) if !p.as_os_str().is_empty() => cur = p,
+                _ => break abs,
+            }
+        };
+        if base
+            .ancestors()
+            .any(|a| a.join(".victory-root").is_file() || a.join(".git").exists())
+        {
+            tracing::warn!(
+                path = %dir.display(),
+                "refusing VICTORY_XMA_DUMP inside repository (keep dumps outside the source tree)"
+            );
+            return None;
+        }
+        Some(dir)
+    }) else {
         return;
     };
     let n = COUNT.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
     if n >= 32 {
         return;
     }
-    let dir = std::path::PathBuf::from(dir);
     let words: Vec<u8> = (0..16).flat_map(|w| context.get(w).to_le_bytes()).collect();
     let input = heap_bytes(
         context.get(5) & !0x7ff,
         context.field(0, 0, 12) as usize * xma::PACKET_BYTES,
     );
-    let _ = std::fs::create_dir_all(&dir);
+    let _ = std::fs::create_dir_all(dir);
     let _ = std::fs::write(dir.join(format!("{n:02}-{index}.ctx")), words);
     let _ = std::fs::write(dir.join(format!("{n:02}-{index}.xma")), input.unwrap_or_default());
 }

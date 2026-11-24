@@ -137,6 +137,7 @@ fn build_valu_cs(body: &[u32]) -> HostShader {
         outputs: Vec::new(),
         prims: Vec::new(),
         mesh_stride: 0,
+        max_wave_size: 64,
     })
     .expect("lower");
 
@@ -148,6 +149,11 @@ fn build_valu_cs(body: &[u32]) -> HostShader {
         static_samplers: Vec::new(),
         root_cbvs: lowered.root_cbvs,
         root_srvs: lowered.root_srvs,
+        root_uavs: lowered.root_uavs,
+        const_cbvs: lowered.const_cbvs,
+        const_srvs: lowered.const_srvs,
+        const_uavs: lowered.const_uavs,
+        wave_size: lowered.wave_size,
     };
 
     if let Ok(mut v) = validator::Validator::load(validator::Validator::default_path().as_deref()) {
@@ -190,6 +196,7 @@ fn run_cases(
                 ud[u.index as usize] = match (u.root, u.slot) {
                     (RootType::Constants, 0) => inputs[u.dword as usize],
                     (RootType::Table, 1) => 0,
+                    (RootType::Descriptor, _) => 1 << 20,
                     other => panic!("unexpected user data {other:?}"),
                 };
             }
@@ -803,6 +810,8 @@ fn bfe_signed_and_unsigned_match_rdna2() {
     let v_unsigned = build_valu_cs(&vop3(0x148, 0, vgpr(1), vgpr(2), vgpr(3)));
     // s_bfe_i32 s6, s0, s1 (SOP2 opcode 0x28: s1 = off[4:0] | width[22:16]); v_mov_b32 v0, s6
     let s_signed = build_valu_cs(&[sop2(0x28, 6, 0, 1), vop1(0x001, 0, sgpr(6))]);
+    // s_bfe_u32 s6, s0, s1 (SOP2 opcode 0x27: s1 = off[4:0] | width[22:16]); v_mov_b32 v0, s6
+    let s_unsigned = build_valu_cs(&[sop2(0x27, 6, 0, 1), vop1(0x001, 0, sgpr(6))]);
 
     let signed_cases: &[([u32; 4], u32)] = &[
         // Field crosses bit 31: extends from bit 31.
@@ -864,6 +873,31 @@ fn bfe_signed_and_unsigned_match_rdna2() {
             got, want,
             "{backend}: v_bfe_u32({:#010x}, {}, {}) = {got:#010x}, want {want:#010x}",
             inp[0], inp[1], inp[2],
+        );
+    });
+    // v_bfe_u32 width is 5-bit (src2[4:0]), so width=32 wraps to 0.
+    run_cases(
+        &v_unsigned,
+        &[[0x8000_0000, 4, 32, 0]],
+        |backend, _, _, got| {
+            assert_eq!(got, 0, "{backend}: v_bfe_u32 width 32 should mask to 0");
+        },
+    );
+
+    // s_bfe_u32 width is 7-bit (src1[22:16]), so width=32 extracts all bits
+    // from offset 4 without sign extension.
+    let mut su_cases = unsigned_cases.to_vec();
+    su_cases.push(([0x8000_0000, 4, 32, 0], 0x0800_0000));
+    let su_in: Vec<[u32; 4]> = su_cases
+        .iter()
+        .map(|&(inp, _)| [inp[0], (inp[1] & 31) | ((inp[2] & 0x7F) << 16), 0, 0])
+        .collect();
+    run_cases(&s_unsigned, &su_in, |backend, i, inp, got| {
+        let want = su_cases[i].1;
+        assert_eq!(
+            got, want,
+            "{backend}: s_bfe_u32({:#010x}, {:#010x}) = {got:#010x}, want {want:#010x}",
+            inp[0], inp[1],
         );
     });
 }
@@ -934,6 +968,162 @@ fn v_cmp_class_f16_matches_rdna2() {
             got, want,
             "{backend}: v_cmp_class_f16(-hi({:#010x}), {:#05x}) = {got}, want {want}",
             inp[0], inp[1],
+        );
+    });
+}
+
+#[test]
+fn v_cmp_f_and_tru_float_do_not_remove_warp() {
+    // VOP3 opcodes: v_cmp_f_f32 (0x000), v_cmp_tru_f32 (0x00f),
+    // v_cmp_f_f16 (0x0c8), v_cmp_tru_f16 (0x0ef).
+    for (name, op, want) in [
+        ("v_cmp_f_f32", 0x000_u16, 0u32),
+        ("v_cmp_tru_f32", 0x00f_u16, 1u32),
+        ("v_cmp_f_f16", 0x0c8_u16, 0u32),
+        ("v_cmp_tru_f16", 0x0ef_u16, 1u32),
+    ] {
+        let shader = build_valu_cs(&[
+            vop3(op, 6, vgpr(1), vgpr(2), 0)[0],
+            vop3(op, 6, vgpr(1), vgpr(2), 0)[1],
+            vop3(0x101, 0, 0x80, 0x81, sgpr(6))[0],
+            vop3(0x101, 0, 0x80, 0x81, sgpr(6))[1],
+        ]);
+        let inputs = [
+            [1.0f32.to_bits(), 2.0f32.to_bits(), 0, 0],
+            [0x7FC0_0000, 0x7FC0_0000, 0, 0], // qNaN
+            [0x7F80_0000, 0xFF80_0000, 0, 0], // +inf / -inf
+        ];
+        run_cases(&shader, &inputs, |backend, _, inp, got| {
+            assert_eq!(got, want, "{backend}: {name}({inp:?}) = {got}, want {want}");
+        });
+    }
+}
+
+#[test]
+fn v_cmp_class_f32_preserves_denormals_and_snans() {
+    // v_cmp_class_f32_e64 s6, v1, v2 (VOP3 opcode 0x088)
+    let cmp_plain = build_valu_cs(&[
+        vop3(0x088, 6, vgpr(1), vgpr(2), 0)[0],
+        vop3(0x088, 6, vgpr(1), vgpr(2), 0)[1],
+        vop3(0x101, 0, 0x80, 0x81, sgpr(6))[0],
+        vop3(0x101, 0, 0x80, 0x81, sgpr(6))[1],
+    ]);
+    // With abs + neg on src0 (w0 bit 8 = abs[0], w1 bit 29 = neg[0]): -|x|.
+    let [mut w0, mut w1] = vop3(0x088, 6, vgpr(1), vgpr(2), 0);
+    w0 |= 1 << 8; // abs[0]
+    w1 |= 1 << 29; // neg[0]
+    let cmp_neg_abs = build_valu_cs(&[
+        w0,
+        w1,
+        vop3(0x101, 0, 0x80, 0x81, sgpr(6))[0],
+        vop3(0x101, 0, 0x80, 0x81, sgpr(6))[1],
+    ]);
+
+    let cases: &[([u32; 4], u32)] = &[
+        ([0x7F80_0001, 1 << 0, 0, 0], 1), // +sNaN -> class 0
+        ([0xFF80_0001, 1 << 0, 0, 0], 1), // -sNaN -> class 0
+        ([0x7FC0_0000, 1 << 1, 0, 0], 1), // +qNaN -> class 1
+        ([0x0000_0001, 1 << 7, 0, 0], 1), // +denormal -> class 7 (not flushed to +0)
+        ([0x8000_0001, 1 << 4, 0, 0], 1), // -denormal -> class 4 (not flushed to -0)
+        ([0x8000_0000, 1 << 5, 0, 0], 1), // -0.0 -> class 5
+        ([0x0000_0000, 1 << 6, 0, 0], 1), // +0.0 -> class 6
+        ([0x3F80_0000, 1 << 8, 0, 0], 1), // +1.0 -> class 8
+        ([0xBF80_0000, 1 << 3, 0, 0], 1), // -1.0 -> class 3
+        ([0x7F80_0000, 1 << 9, 0, 0], 1), // +inf -> class 9
+        ([0xFF80_0000, 1 << 2, 0, 0], 1), // -inf -> class 2
+    ];
+    let inputs: Vec<[u32; 4]> = cases.iter().map(|c| c.0).collect();
+    run_cases(&cmp_plain, &inputs, |backend, i, inp, got| {
+        assert_eq!(
+            got, cases[i].1,
+            "{backend}: v_cmp_class_f32({:#010x}, {:#05x}) = {got}",
+            inp[0], inp[1],
+        );
+    });
+
+    // -|+denormal| -> -denormal (class 4, NOT flushed to -0);
+    // -|+sNaN| -> still sNaN (class 0, NOT quieted to qNaN).
+    let mod_cases: &[([u32; 4], u32)] = &[
+        ([0x0000_0001, 1 << 4, 0, 0], 1),
+        ([0x0000_0001, 1 << 5, 0, 0], 0),
+        ([0x7F80_0001, 1 << 0, 0, 0], 1),
+        ([0x7F80_0001, 1 << 1, 0, 0], 0),
+    ];
+    let mod_in: Vec<[u32; 4]> = mod_cases.iter().map(|c| c.0).collect();
+    run_cases(&cmp_neg_abs, &mod_in, |backend, i, inp, got| {
+        assert_eq!(
+            got, mod_cases[i].1,
+            "{backend}: v_cmp_class_f32(-|{:#010x}|, {:#05x}) = {got}",
+            inp[0], inp[1],
+        );
+    });
+}
+
+#[test]
+fn sdwa_word0_unused_sext_sign_extends_16bit_result() {
+    // v_add_f16_sdwa v0, v1, v2 dst_sel:WORD_0 dst_unused:UNUSED_SEXT src0_sel:WORD_0 src1_sel:WORD_0
+    let sdwa_ext = 1 | (4 << 8) | (1 << 11) | (4 << 16) | (4 << 24);
+    let shader = build_valu_cs(&[0x6400_04F9, sdwa_ext]);
+    let cases: &[([u32; 4], u32)] = &[
+        // -1.0f16 (0xBC00) + 0.0f16 -> 0xBC00, sign-extended to 0xFFFF_BC00
+        ([0xBC00, 0x0000, 0, 0], 0xFFFF_BC00),
+        // +1.0f16 (0x3C00) + 0.0f16 -> 0x3C00, sign-extended to 0x0000_3C00
+        ([0x3C00, 0x0000, 0, 0], 0x0000_3C00),
+        // -0.5f16 (0xB800) + -0.5f16 (0xB800) -> -1.0f16 (0xBC00) -> 0xFFFF_BC00
+        ([0xB800, 0xB800, 0, 0], 0xFFFF_BC00),
+    ];
+    let inputs: Vec<[u32; 4]> = cases.iter().map(|c| c.0).collect();
+    run_cases(&shader, &inputs, |backend, i, inp, got| {
+        assert_eq!(
+            got, cases[i].1,
+            "{backend}: v_add_f16_sdwa({:#06x}, {:#06x}) = {got:#010x}, want {:#010x}",
+            inp[0], inp[1], cases[i].1,
+        );
+    });
+}
+
+#[test]
+fn v_mov_and_cndmask_abs_neg_preserve_subnormals_and_snan() {
+    // v_mov_b32_e64 v0, -|v1| (VOP3 opcode 0x181, abs[0]=1, neg[0]=1)
+    let [mut mov_w0, mut mov_w1] = vop3(0x181, 0, vgpr(1), 0, 0);
+    mov_w0 |= 1 << 8; // abs[0]
+    mov_w1 |= 1 << 29; // neg[0]
+    let mov_neg_abs = build_valu_cs(&[mov_w0, mov_w1]);
+
+    // v_cmp_ne_u32_e64 s6, v3, 0; v_cndmask_b32_e64 v0, |v1|, -v2, s6
+    let [cmp_w0, cmp_w1] = vop3(0x0cd, 6, vgpr(3), 0x80, 0);
+    let [mut cnd_w0, mut cnd_w1] = vop3(0x101, 0, vgpr(1), vgpr(2), sgpr(6));
+    cnd_w0 |= 1 << 8; // abs[0] on v1
+    cnd_w1 |= 1 << 30; // neg[1] on v2
+    let cnd_abs_neg = build_valu_cs(&[cmp_w0, cmp_w1, cnd_w0, cnd_w1]);
+
+    let mov_cases: &[([u32; 4], u32)] = &[
+        ([0x0000_0001, 0, 0, 0], 0x8000_0001), // +subnormal -> -subnormal
+        ([0x8000_0001, 0, 0, 0], 0x8000_0001), // -subnormal -> -subnormal
+        ([0x7F80_0001, 0, 0, 0], 0xFF80_0001), // +sNaN -> -sNaN (unquieted)
+        ([0x0000_0000, 0, 0, 0], 0x8000_0000), // +0.0 -> -0.0
+    ];
+    let mov_in: Vec<[u32; 4]> = mov_cases.iter().map(|c| c.0).collect();
+    run_cases(&mov_neg_abs, &mov_in, |backend, i, inp, got| {
+        assert_eq!(
+            got, mov_cases[i].1,
+            "{backend}: v_mov_b32 -|{:#010x}| = {got:#010x}, want {:#010x}",
+            inp[0], mov_cases[i].1,
+        );
+    });
+
+    let cnd_cases: &[([u32; 4], u32)] = &[
+        ([0x8000_0001, 0x0000_0002, 0, 0], 0x0000_0001), // cond=0 -> |v1| = +subnormal
+        ([0x0000_0001, 0x7F80_0001, 1, 0], 0xFF80_0001), // cond=1 -> -v2 = -sNaN
+        ([0xFF80_0001, 0x8000_0001, 0, 0], 0x7F80_0001), // cond=0 -> |-sNaN| = +sNaN
+        ([0x0000_0001, 0x8000_0001, 1, 0], 0x0000_0001), // cond=1 -> --subnormal = +subnormal
+    ];
+    let cnd_in: Vec<[u32; 4]> = cnd_cases.iter().map(|c| c.0).collect();
+    run_cases(&cnd_abs_neg, &cnd_in, |backend, i, inp, got| {
+        assert_eq!(
+            got, cnd_cases[i].1,
+            "{backend}: v_cndmask_b32({:#010x}, {:#010x}, {}) = {got:#010x}, want {:#010x}",
+            inp[0], inp[1], inp[2], cnd_cases[i].1,
         );
     });
 }
