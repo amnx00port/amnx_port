@@ -747,6 +747,7 @@ mod tests {
         let _ = super::emit(&c, &native, &p, &st, &io, &res);
     }
 
+    #[cfg(windows)]
     #[test]
     fn immediate_sampler_used_with_and_without_comparison_validates_and_runs() {
         let mut tested_orders = 0;
