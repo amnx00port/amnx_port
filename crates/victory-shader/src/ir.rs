@@ -817,6 +817,12 @@ fn effects(
                     if let Some(d) = &v.dst {
                         indexed(d, &mut r)?;
                     }
+                    // Overlapping M0-relative ranges must emit one read and one write per VGPR
+                    // so `ssa()` and `Inst::write` agree on the post-instruction Value.
+                    let mut seen = Vec::new();
+                    w.retain(|reg| !seen.contains(reg) && { seen.push(*reg); true });
+                    seen.clear();
+                    r.retain(|reg| !seen.contains(reg) && { seen.push(*reg); true });
                 }
                 _ => {}
             }
@@ -1223,5 +1229,31 @@ mod tests {
         assert_eq!(vgprs(&movrels.reads), [4, 5, 0]);
         assert_eq!(movrels.read(Reg::V(4)), movreld.write(Reg::V(4)));
         assert!(build(&code, false, 4).is_err(), "v4 is past 4 VGPRs");
+    }
+
+    #[test]
+    fn v_swaprel_b32_deduplicates_overlapping_vgpr_reads_and_writes() {
+        let code: Vec<u8> = [
+            0x7E02_D101_u32, // v_swaprel_b32 v1, v1
+            S_ENDPGM,
+        ]
+        .iter()
+        .flat_map(|w| w.to_le_bytes())
+        .collect();
+        let p = build(&code, false, 4).unwrap();
+        let [swap, _] = &p.blocks[0].insts[..] else {
+            panic!()
+        };
+        let vgprs = |regs: &[(Reg, Value)]| -> Vec<u8> {
+            regs.iter()
+                .filter_map(|r| match r.0 {
+                    Reg::V(v) => Some(v),
+                    _ => None,
+                })
+                .collect()
+        };
+        assert_eq!(vgprs(&swap.reads), [1, 2, 3]);
+        assert_eq!(vgprs(&swap.writes), [1, 2, 3]);
+        assert!(swap.read(Reg::S(M0)).is_some());
     }
 }
