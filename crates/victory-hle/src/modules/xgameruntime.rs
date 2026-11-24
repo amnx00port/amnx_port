@@ -117,6 +117,44 @@ pub extern "system" fn add_ref(_: *const Object) -> u32 {
     1
 }
 
+pub const IID_IUNKNOWN: Guid = Guid::new(0, 0, 0, [0xC0, 0, 0, 0, 0, 0, 0, 0x46]);
+pub const E_NOINTERFACE: HRESULT = 0x8000_4002_u32 as i32;
+const E_POINTER: HRESULT = 0x8000_4003_u32 as i32;
+
+/// Minimal IUnknown query for static runtime and reference-counted HLE objects.
+/// The object may answer its own interface query elsewhere; IUnknown is always
+/// supported and unsupported ids must not leave a stale output pointer behind.
+pub extern "system" fn query_interface(
+    this: *mut Object,
+    iid: *const Guid,
+    out: *mut *mut c_void,
+) -> HRESULT {
+    if out.is_null() {
+        return E_POINTER;
+    }
+    // SAFETY: checked non-null; COM callers provide storage for the result.
+    unsafe { out.write(std::ptr::null_mut()) };
+    if this.is_null() || iid.is_null() {
+        return E_POINTER;
+    }
+    // SAFETY: both pointers were checked and are COM object / IID pointers.
+    if unsafe { *iid } != IID_IUNKNOWN {
+        return E_NOINTERFACE;
+    }
+    // Every HLE COM vtable has AddRef in slot 1. Calling through the actual
+    // table preserves dynamic instance reference counts as well as static ones.
+    // SAFETY: `this` is the valid COM object supplied by the caller.
+    let table = unsafe { (*this).vtable };
+    // SAFETY: slot 1 is present in every vtable using this helper.
+    let add_ref = unsafe { *table.add(1) };
+    // SAFETY: slot 1 is an `extern "system" fn(this) -> u32` in these tables.
+    let add_ref: extern "system" fn(*mut Object) -> u32 = unsafe { std::mem::transmute(add_ref) };
+    add_ref(this);
+    // SAFETY: checked non-null; QueryInterface returns this same IUnknown view.
+    unsafe { out.write(this.cast()) };
+    S_OK
+}
+
 /// A slot nobody has needed yet; logged with its area. Wrong for a slot
 /// that returns `bool` or a value.
 pub extern "system" fn missing<const SLOT: usize>(this: *const Object) -> HRESULT {
