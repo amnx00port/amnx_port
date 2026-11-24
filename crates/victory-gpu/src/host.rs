@@ -1060,6 +1060,74 @@ impl HostList {
             .push(Step::GpuWrite(shadow.clone(), address, len));
     }
 
+    /// Whether this list has already recorded a GPU write into `shadow`.
+    pub(crate) fn has_gpu_write(&self, shadow: &std::sync::Arc<crate::shadow::Shadow>) -> bool {
+        self.deferred().copies.iter().any(|step| {
+            matches!(step, Step::GpuWrite(other, _, size) if *size > 0 && std::sync::Arc::ptr_eq(shadow, other))
+        })
+    }
+
+    /// The host copy when every byte in `ranges` has its latest contents
+    /// written on the GPU into the same [`crate::shadow::Shadow`], with no
+    /// intervening CPU write. Deferred CPU writes keep their upload snapshots.
+    pub(crate) fn written_shadow(
+        &self,
+        ranges: impl IntoIterator<Item = std::ops::Range<usize>>,
+    ) -> Option<std::sync::Arc<crate::shadow::Shadow>> {
+        let mut uncovered: Vec<(usize, usize)> = ranges
+            .into_iter()
+            .filter(|r| r.start < r.end)
+            .map(|r| (r.start, r.end))
+            .collect();
+        if uncovered.is_empty() {
+            return None;
+        }
+        let deferred = self.deferred();
+        let mut chosen: Option<&std::sync::Arc<crate::shadow::Shadow>> = None;
+        for step in deferred.copies.iter().rev() {
+            match step {
+                Step::GpuWrite(shadow, at, size) if *size > 0 => {
+                    let (w0, w1) = (*at, at.saturating_add(*size));
+                    if !uncovered.iter().any(|&(a, b)| w0 < b && a < w1) {
+                        continue;
+                    }
+                    match chosen {
+                        Some(prev) if !std::sync::Arc::ptr_eq(prev, shadow) => return None,
+                        None => chosen = Some(shadow),
+                        Some(_) => {}
+                    }
+                    let mut next = Vec::with_capacity(uncovered.len() + 1);
+                    for (a, b) in uncovered {
+                        if w1 <= a || b <= w0 {
+                            next.push((a, b));
+                        } else {
+                            if a < w0 {
+                                next.push((a, w0));
+                            }
+                            if w1 < b {
+                                next.push((w1, b));
+                            }
+                        }
+                    }
+                    uncovered = next;
+                    if uncovered.is_empty() {
+                        return Some(shadow.clone());
+                    }
+                }
+                Step::Copy(dst, _, size) if *size > 0 => {
+                    let (c0, c1) = (*dst, dst.saturating_add(*size));
+                    if uncovered.iter().any(|&(a, b)| c0 < b && a < c1) {
+                        return None;
+                    }
+                }
+                // Arbitrary deferred CPU work may touch uncovered bytes.
+                Step::Run(_) => return None,
+                _ => {}
+            }
+        }
+        None
+    }
+
     /// Stores `what` (`bytes` of it) at `dst` once the list has run.
     pub(crate) fn defer_write(&self, dst: *mut u8, what: crate::queue::Written, bytes: usize) {
         self.deferred().writes.push((dst as usize, what, bytes));

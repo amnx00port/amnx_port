@@ -416,7 +416,127 @@ fn buffer_range(buffer: This, offset: u64, len: u64) -> Option<*mut u8> {
     Some(unsafe { data.add(offset as usize) })
 }
 
-/// Buffer to buffer: both are host memory, copied at submission.
+/// Copies `len` bytes between guest buffers: on the GPU when an earlier
+/// command in `list` produced the source bytes on the GPU, else at submission
+/// in host memory.
+#[cfg(windows)]
+fn copy_buffer_bytes(list: &crate::host::HostList, to: *mut u8, from: *const u8, len: u64) {
+    let Ok(bytes) = usize::try_from(len) else {
+        return;
+    };
+    if bytes == 0 {
+        return;
+    }
+    let (dst_addr, src_addr) = (to as u64, from as u64);
+    let src_range = src_addr as usize..(src_addr as usize).saturating_add(bytes);
+    let gpu_src = list
+        .written_shadow(std::iter::once(src_range))
+        .and_then(|s| {
+            let off = s.offset_for_range(src_addr, len)?;
+            Some((s, off))
+        });
+    if let Some((src_shadow, src_off)) = gpu_src
+        && let Some(dst_shadow) = crate::shadow::find(dst_addr, len)
+        && let Some(dst_off) = dst_shadow.offset_for_range(dst_addr, len)
+        && record_gpu_buffer_copy(list, &dst_shadow, dst_off, &src_shadow, src_off, len)
+    {
+        src_shadow.refresh(list, src_addr, len);
+        dst_shadow.refresh(list, dst_addr, len);
+        dst_shadow.gpu_writes(list, dst_addr, len);
+        return;
+    }
+    list.defer_copy(to, from, bytes);
+}
+
+/// Records a GPU copy from `src` (in `UNORDERED_ACCESS`) into `dst`, leaving
+/// any GPU-written `Shadow` buffer in `UNORDERED_ACCESS`.
+#[cfg(windows)]
+fn record_gpu_buffer_copy(
+    list: &crate::host::HostList,
+    dst: &std::sync::Arc<crate::shadow::Shadow>,
+    dst_off: u64,
+    src: &std::sync::Arc<crate::shadow::Shadow>,
+    src_off: u64,
+    len: u64,
+) -> bool {
+    use crate::host::transition;
+    use windows::Win32::Graphics::Direct3D12::{
+        D3D12_RESOURCE_STATE_COPY_DEST, D3D12_RESOURCE_STATE_COPY_SOURCE,
+        D3D12_RESOURCE_STATE_UNORDERED_ACCESS,
+    };
+
+    if std::sync::Arc::ptr_eq(dst, src) {
+        let Some((temp, _)) = crate::host::host().and_then(|h| h.shared_buffer(len)) else {
+            return false;
+        };
+        list.keep(&temp);
+        // SAFETY: open list; `src`/`dst` and `temp` stay alive through execution.
+        unsafe {
+            list.list.ResourceBarrier(&[transition(
+                &src.buffer,
+                D3D12_RESOURCE_STATE_UNORDERED_ACCESS,
+                D3D12_RESOURCE_STATE_COPY_SOURCE,
+            )]);
+            list.list
+                .CopyBufferRegion(&temp, 0, &src.buffer, src_off, len);
+            list.list.ResourceBarrier(&[
+                transition(
+                    &src.buffer,
+                    D3D12_RESOURCE_STATE_COPY_SOURCE,
+                    D3D12_RESOURCE_STATE_COPY_DEST,
+                ),
+                transition(
+                    &temp,
+                    D3D12_RESOURCE_STATE_COPY_DEST,
+                    D3D12_RESOURCE_STATE_COPY_SOURCE,
+                ),
+            ]);
+            list.list
+                .CopyBufferRegion(&dst.buffer, dst_off, &temp, 0, len);
+            list.list.ResourceBarrier(&[transition(
+                &dst.buffer,
+                D3D12_RESOURCE_STATE_COPY_DEST,
+                D3D12_RESOURCE_STATE_UNORDERED_ACCESS,
+            )]);
+        }
+        return true;
+    }
+
+    let dst_was_uav = list.has_gpu_write(dst);
+    // SAFETY: open list; `src` and `dst` are kept alive by `refresh`.
+    unsafe {
+        let mut before = vec![transition(
+            &src.buffer,
+            D3D12_RESOURCE_STATE_UNORDERED_ACCESS,
+            D3D12_RESOURCE_STATE_COPY_SOURCE,
+        )];
+        if dst_was_uav {
+            before.push(transition(
+                &dst.buffer,
+                D3D12_RESOURCE_STATE_UNORDERED_ACCESS,
+                D3D12_RESOURCE_STATE_COPY_DEST,
+            ));
+        }
+        list.list.ResourceBarrier(&before);
+        list.list
+            .CopyBufferRegion(&dst.buffer, dst_off, &src.buffer, src_off, len);
+        list.list.ResourceBarrier(&[
+            transition(
+                &src.buffer,
+                D3D12_RESOURCE_STATE_COPY_SOURCE,
+                D3D12_RESOURCE_STATE_UNORDERED_ACCESS,
+            ),
+            transition(
+                &dst.buffer,
+                D3D12_RESOURCE_STATE_COPY_DEST,
+                D3D12_RESOURCE_STATE_UNORDERED_ACCESS,
+            ),
+        ]);
+    }
+    true
+}
+
+/// Buffer to buffer: on the GPU after a same-list GPU write, else at submission.
 extern "system" fn copy_buffer_region(
     this: This,
     dst: This,
@@ -430,7 +550,7 @@ extern "system" fn copy_buffer_region(
         && let Some(to) = buffer_range(dst, dst_offset, len)
         && let Some(from) = buffer_range(src, src_offset, len)
     {
-        list.defer_copy(to, from, len as usize);
+        copy_buffer_bytes(list, to, from, len);
     }
     #[cfg(not(windows))]
     let _ = (this, dst, dst_offset, src, src_offset, len);
@@ -460,7 +580,7 @@ extern "system" fn copy_resource(this: This, dst: This, src: This) {
             crate::resource::buffer_bytes(dst),
             crate::resource::buffer_bytes(src),
         ) {
-            list.defer_copy(to, from, a.min(b) as usize);
+            copy_buffer_bytes(list, to, from, a.min(b));
         }
     }
     #[cfg(not(windows))]
@@ -481,9 +601,105 @@ pub(crate) struct CopyLocation {
     footprint: crate::resource::PlacedFootprint,
 }
 
-/// Texture to texture on the GPU; buffer to texture through an upload
-/// buffer filled at submission. Texture to buffer (read back) is not done
-/// yet.
+/// Selects the host buffer and offset for a placed texture copy source:
+/// the GPU-written [`crate::shadow::Shadow`] buffer (rebased onto a 512-byte
+/// aligned buffer on the GPU if `offset` is unaligned) when an earlier command
+/// in `list` produced the read texels on the GPU, else an upload snapshot
+/// filled from title memory at submission. Also returns any shadow buffer that
+/// must be transitioned back to `UNORDERED_ACCESS` after `CopyTextureRegion`.
+#[cfg(windows)]
+fn placed_copy_source(
+    list: &crate::host::HostList,
+    resource: This,
+    offset: u64,
+    bytes: u64,
+    read: &std::ops::Range<u64>,
+    rows: impl Iterator<Item = std::ops::Range<u64>>,
+) -> Option<(
+    windows::Win32::Graphics::Direct3D12::ID3D12Resource,
+    u64,
+    Option<windows::Win32::Graphics::Direct3D12::ID3D12Resource>,
+)> {
+    use crate::host::transition;
+    use windows::Win32::Graphics::Direct3D12::{
+        D3D12_RESOURCE_STATE_COPY_DEST, D3D12_RESOURCE_STATE_COPY_SOURCE,
+        D3D12_RESOURCE_STATE_UNORDERED_ACCESS, D3D12_TEXTURE_DATA_PLACEMENT_ALIGNMENT,
+    };
+
+    let data = buffer_range(resource, offset, bytes)?;
+    let address = data as u64;
+    let read_address = address + read.start;
+    let read_bytes = read.end - read.start;
+    let absolute = |range: std::ops::Range<u64>| {
+        (address + range.start) as usize..(address + range.end) as usize
+    };
+    let source = list
+        .written_shadow(std::iter::once(absolute(read.clone())))
+        .or_else(|| list.written_shadow(rows.map(absolute)))
+        .and_then(|shadow| {
+            let shadow_off = shadow.offset_for_range(address, bytes)?;
+            Some((shadow, shadow_off))
+        });
+    let Some((shadow, shadow_off)) = source else {
+        let (upload, staging) = list.upload(crate::host::host()?, bytes)?;
+        // The list owns this mapped D3D12 upload buffer. Wine can report
+        // its address as MEM_FREE, so use the host-upload path.
+        list.defer_fill(staging, data, bytes as usize);
+        return Some((upload, 0, None));
+    };
+    shadow.refresh(list, read_address, read_bytes);
+    if shadow_off.is_multiple_of(D3D12_TEXTURE_DATA_PLACEMENT_ALIGNMENT.into()) {
+        // SAFETY: open list; `shadow.buffer` is kept alive by `refresh`.
+        unsafe {
+            list.list.ResourceBarrier(&[transition(
+                &shadow.buffer,
+                D3D12_RESOURCE_STATE_UNORDERED_ACCESS,
+                D3D12_RESOURCE_STATE_COPY_SOURCE,
+            )]);
+        }
+        return Some((
+            shadow.buffer.clone(),
+            shadow_off,
+            Some(shadow.buffer.clone()),
+        ));
+    }
+    // Rebase an unaligned placed offset onto a 512-byte aligned host buffer on
+    // the GPU, preserving box-relative byte offsets inside the footprint.
+    let (staging, _) = crate::host::host()?.shared_buffer(bytes)?;
+    list.keep(&staging);
+    // SAFETY: open list; both buffers are held by `list` and the range is inside both.
+    unsafe {
+        list.list.ResourceBarrier(&[transition(
+            &shadow.buffer,
+            D3D12_RESOURCE_STATE_UNORDERED_ACCESS,
+            D3D12_RESOURCE_STATE_COPY_SOURCE,
+        )]);
+        list.list.CopyBufferRegion(
+            &staging,
+            read.start,
+            &shadow.buffer,
+            shadow_off + read.start,
+            read_bytes,
+        );
+        list.list.ResourceBarrier(&[
+            transition(
+                &shadow.buffer,
+                D3D12_RESOURCE_STATE_COPY_SOURCE,
+                D3D12_RESOURCE_STATE_UNORDERED_ACCESS,
+            ),
+            transition(
+                &staging,
+                D3D12_RESOURCE_STATE_COPY_DEST,
+                D3D12_RESOURCE_STATE_COPY_SOURCE,
+            ),
+        ]);
+    }
+    Some((staging, 0, None))
+}
+
+/// Texture to texture on the GPU; placed buffer to texture from its host copy
+/// after a same-list GPU write, or through an upload buffer filled at
+/// submission. Texture to buffer (read back) is not done yet.
 extern "system" fn copy_texture_region(
     this: This,
     dst: *const CopyLocation,
@@ -495,7 +711,10 @@ extern "system" fn copy_texture_region(
 ) {
     #[cfg(windows)]
     {
-        use windows::Win32::Graphics::Direct3D12::{D3D12_BOX, D3D12_TEXTURE_COPY_LOCATION};
+        use windows::Win32::Graphics::Direct3D12::{
+            D3D12_BOX, D3D12_RESOURCE_STATE_COPY_SOURCE, D3D12_RESOURCE_STATE_UNORDERED_ACCESS,
+            D3D12_TEXTURE_COPY_LOCATION,
+        };
         use windows::core::Interface;
         const FOOTPRINT: u32 = 1;
         // SAFETY: the title passes both locations (null is tolerated).
@@ -512,30 +731,41 @@ extern "system" fn copy_texture_region(
             return;
         };
         let mut from = src;
-        let _upload; // keeps the source alive while this call records it
+        let _buffer; // keeps the source alive while this call records it
+        let mut restore_uav = None;
         #[cfg(feature = "diagnostics")]
         let mut read = None;
+        // SAFETY: the title passes source box coordinates or null.
+        let source_box = unsafe { source_box.as_ref() };
         if src.kind == FOOTPRINT {
-            let (Some(host), Some(bytes)) = (crate::host::host(), src.footprint.bytes()) else {
+            let Some(bytes) = src.footprint.bytes() else {
                 return;
             };
-            let Some(data) = buffer_range(src.resource, src.footprint.offset, bytes) else {
+            let Some((read_span, rows)) = src.footprint.box_reads(source_box.copied()) else {
                 return;
             };
-            let Some((buffer, staging)) = list.upload(host, bytes) else {
+            let Some((buffer, offset, restore)) = placed_copy_source(
+                list,
+                src.resource,
+                src.footprint.offset,
+                bytes,
+                &read_span,
+                rows,
+            ) else {
                 return;
             };
-            // The list owns this mapped D3D12 upload buffer. Wine can report
-            // its address as MEM_FREE, so use the host-upload path.
-            list.defer_fill(staging, data, bytes as usize);
             from.resource = buffer.as_raw().cast_const().cast();
-            from.footprint.offset = 0;
+            from.footprint.offset = offset;
+            restore_uav = restore;
             #[cfg(feature = "diagnostics")]
             {
-                // SAFETY: a live buffer.
-                read = Some((unsafe { buffer.GetGPUVirtualAddress() }, bytes));
+                // SAFETY: a live buffer; the range is inside it.
+                read = Some((
+                    unsafe { buffer.GetGPUVirtualAddress() } + offset + read_span.start,
+                    read_span.end - read_span.start,
+                ));
             }
-            _upload = buffer;
+            _buffer = buffer;
         } else {
             let Some(texture) = crate::resource::host_resource(src.resource) else {
                 return;
@@ -550,7 +780,7 @@ extern "system" fn copy_texture_region(
         crate::texture::host_written(dst.resource);
         let mut to_location = dst;
         to_location.resource = to.as_raw().cast_const().cast();
-        let host_box = (!source_box.is_null()).then(|| source_box.cast::<D3D12_BOX>());
+        let host_box = source_box.map(|bounds| std::ptr::from_ref(bounds).cast::<D3D12_BOX>());
         #[cfg(feature = "diagnostics")]
         {
             let text = || {
@@ -585,8 +815,15 @@ extern "system" fn copy_texture_region(
                 z,
                 (&raw const from).cast(),
                 host_box,
-            )
-        };
+            );
+            if let Some(ref shadow_buf) = restore_uav {
+                list.list.ResourceBarrier(&[crate::host::transition(
+                    shadow_buf,
+                    D3D12_RESOURCE_STATE_COPY_SOURCE,
+                    D3D12_RESOURCE_STATE_UNORDERED_ACCESS,
+                )]);
+            }
+        }
     }
     #[cfg(not(windows))]
     let _ = (this, dst, x, y, z, src, source_box);
@@ -1445,5 +1682,658 @@ mod tests {
         let release = |o: This| slot::<extern "system" fn(This) -> u32>(o, 0x10)(o);
         assert_eq!(release(list), 0);
         assert_eq!(release(allocator), 0);
+    }
+
+    #[cfg(windows)]
+    mod placed_copy_gpu {
+        use super::*;
+        use std::sync::atomic::{AtomicU32, Ordering};
+        use windows::Win32::Graphics::Direct3D::Fxc::D3DCompile;
+        use windows::Win32::Graphics::Direct3D::ID3DBlob;
+        use windows::Win32::Graphics::Direct3D12::*;
+        use windows::Win32::Graphics::Dxgi::Common::*;
+        use windows::Win32::Graphics::Dxgi::*;
+        use windows::core::{Interface, PCSTR, s};
+
+        const WIDTH: usize = 4;
+        const HEIGHT: usize = 4;
+        const ROW_PITCH: usize = 256;
+        const ALIGNED_OFFSET: usize = 512;
+        const UNALIGNED_OFFSET: usize = 516;
+        const FOOTPRINT_BYTES: usize = (HEIGHT - 1) * ROW_PITCH + WIDTH * 4;
+        const FORMAT: DXGI_FORMAT = DXGI_FORMAT_R8G8B8A8_UNORM;
+
+        static DEBUG_ERRORS: AtomicU32 = AtomicU32::new(0);
+
+        unsafe extern "system" fn count_debug_errors(
+            _: D3D12_MESSAGE_CATEGORY,
+            severity: D3D12_MESSAGE_SEVERITY,
+            id: D3D12_MESSAGE_ID,
+            desc: PCSTR,
+            _: *mut std::ffi::c_void,
+        ) {
+            if severity.0 <= D3D12_MESSAGE_SEVERITY_ERROR.0
+                && id != D3D12_MESSAGE_ID_CREATEPIPELINELIBRARY_INVALIDLIBRARYBLOB
+            {
+                DEBUG_ERRORS.fetch_add(1, Ordering::Relaxed);
+                // SAFETY: D3D12 supplies a valid NUL-terminated string during the callback.
+                let text = unsafe { desc.to_string() }.unwrap_or_default();
+                eprintln!("D3D12 debug error (id={}): {text}", id.0);
+            }
+        }
+
+        struct DebugGuard(Option<(ID3D12InfoQueue1, u32)>);
+        impl Drop for DebugGuard {
+            fn drop(&mut self) {
+                if let Some((ref queue, cookie)) = self.0 {
+                    // SAFETY: cookie was registered on `queue`.
+                    let _ = unsafe { queue.UnregisterMessageCallback(cookie) };
+                }
+            }
+        }
+
+        fn attach_debug(device: &ID3D12Device, tag: &str) -> DebugGuard {
+            DEBUG_ERRORS.store(0, Ordering::Relaxed);
+            // SAFETY: plain DXGI adapter query for logging the active test backend.
+            if let Ok(desc) = unsafe {
+                CreateDXGIFactory2::<IDXGIFactory4>(DXGI_CREATE_FACTORY_FLAGS(0))
+                    .and_then(|f| f.EnumAdapterByLuid::<IDXGIAdapter1>(device.GetAdapterLuid()))
+                    .and_then(|a| a.GetDesc1())
+            } {
+                eprintln!(
+                    "{tag} adapter: {} ({:04x}:{:04x}, flags={:#x})",
+                    String::from_utf16_lossy(&desc.Description).trim_end_matches('\0'),
+                    desc.VendorId,
+                    desc.DeviceId,
+                    desc.Flags
+                );
+            }
+            DebugGuard(device.cast::<ID3D12InfoQueue1>().ok().and_then(|queue| {
+                let mut cookie = 0;
+                // SAFETY: static callback function, unregistered on drop.
+                unsafe {
+                    queue.RegisterMessageCallback(
+                        Some(count_debug_errors),
+                        D3D12_MESSAGE_CALLBACK_FLAG_NONE,
+                        std::ptr::null_mut(),
+                        &mut cookie,
+                    )
+                }
+                .ok()
+                .map(|()| (queue, cookie))
+            }))
+        }
+
+        struct Held(This);
+        impl Drop for Held {
+            fn drop(&mut self) {
+                slot::<extern "system" fn(This) -> u32>(self.0, 0x10)(self.0);
+            }
+        }
+
+        fn make_resource(desc: D3D12_RESOURCE_DESC) -> Held {
+            let heap = D3D12_HEAP_PROPERTIES {
+                Type: D3D12_HEAP_TYPE_DEFAULT,
+                ..Default::default()
+            };
+            let iid = ID3D12Resource::IID;
+            let mut out = std::ptr::null();
+            assert_eq!(
+                crate::resource::create_committed(
+                    std::ptr::null(),
+                    (&raw const heap).cast(),
+                    0,
+                    (&raw const desc).cast(),
+                    D3D12_RESOURCE_STATE_COMMON.0 as u32,
+                    std::ptr::null(),
+                    (&raw const iid).cast(),
+                    &mut out,
+                ),
+                S_OK
+            );
+            Held(out)
+        }
+
+        fn make_texture() -> Held {
+            make_resource(D3D12_RESOURCE_DESC {
+                Dimension: D3D12_RESOURCE_DIMENSION_TEXTURE2D,
+                Width: WIDTH as u64,
+                Height: HEIGHT as u32,
+                DepthOrArraySize: 1,
+                MipLevels: 1,
+                Format: FORMAT,
+                SampleDesc: DXGI_SAMPLE_DESC {
+                    Count: 1,
+                    Quality: 0,
+                },
+                ..Default::default()
+            })
+        }
+
+        fn make_buffer(initial: &[u8]) -> Held {
+            let res = make_resource(D3D12_RESOURCE_DESC {
+                Dimension: D3D12_RESOURCE_DIMENSION_BUFFER,
+                Width: initial.len() as u64,
+                Height: 1,
+                DepthOrArraySize: 1,
+                MipLevels: 1,
+                SampleDesc: DXGI_SAMPLE_DESC {
+                    Count: 1,
+                    Quality: 0,
+                },
+                Layout: D3D12_TEXTURE_LAYOUT_ROW_MAJOR,
+                ..Default::default()
+            });
+            let (ptr, size) = crate::resource::buffer_bytes(res.0).unwrap();
+            assert_eq!(size, initial.len() as u64);
+            // SAFETY: freshly created committed guest buffer of `initial.len()` bytes.
+            unsafe { std::ptr::copy_nonoverlapping(initial.as_ptr(), ptr, initial.len()) };
+            res
+        }
+
+        fn make_guest_list() -> (Held, Held) {
+            let null = std::ptr::null();
+            let mut alloc = null;
+            assert_eq!(
+                create_allocator(null, 0, &ALLOCATOR_IIDS[0], &mut alloc),
+                S_OK
+            );
+            let alloc = Held(alloc);
+            let mut list = null;
+            assert_eq!(
+                create_list(null, 0, 0, alloc.0, null, &LIST_IIDS[1], &mut list),
+                S_OK
+            );
+            (Held(list), alloc)
+        }
+
+        fn pattern(tag: u8) -> [[u8; 4]; WIDTH * HEIGHT] {
+            std::array::from_fn(|idx| {
+                let (x, y) = ((idx % WIDTH) as u8, (idx / WIDTH) as u8);
+                [
+                    tag,
+                    11u8.wrapping_add(x * 23),
+                    19u8.wrapping_add(y * 31),
+                    255,
+                ]
+            })
+        }
+
+        fn placed_bytes(tag: u8, offset: usize) -> Vec<u8> {
+            let mut buf = vec![0x5a; offset + FOOTPRINT_BYTES];
+            for (idx, px) in pattern(tag).into_iter().enumerate() {
+                let at = offset + (idx / WIDTH) * ROW_PITCH + (idx % WIDTH) * 4;
+                buf[at..at + 4].copy_from_slice(&px);
+            }
+            buf
+        }
+
+        fn writer_pso(device: &ID3D12Device) -> (ID3D12RootSignature, ID3D12PipelineState) {
+            const HLSL: &str = r#"
+                cbuffer Params : register(b0) { uint dst_byte_offset; uint word_count; }
+                ByteAddressBuffer src_words : register(t0);
+                RWByteAddressBuffer dst_words : register(u0);
+                [RootSignature("RootConstants(num32BitConstants=2, b0), SRV(t0), UAV(u0)")]
+                [numthreads(64, 1, 1)]
+                void main(uint3 tid : SV_DispatchThreadID) {
+                    if (tid.x < word_count) {
+                        uint off = tid.x * 4;
+                        dst_words.Store(dst_byte_offset + off, src_words.Load(off));
+                    }
+                }
+            "#;
+            let mut blob: Option<ID3DBlob> = None;
+            // SAFETY: static HLSL source and valid output blob pointer.
+            unsafe {
+                D3DCompile(
+                    HLSL.as_ptr().cast(),
+                    HLSL.len(),
+                    s!("placed_writer"),
+                    None,
+                    None,
+                    s!("main"),
+                    s!("cs_5_1"),
+                    0,
+                    0,
+                    &mut blob,
+                    None,
+                )
+            }
+            .expect("compile synthetic placed writer shader");
+            let blob = blob.unwrap();
+            // SAFETY: compiled DXBC blob embeds the root signature.
+            unsafe {
+                let code = std::slice::from_raw_parts(
+                    blob.GetBufferPointer().cast::<u8>(),
+                    blob.GetBufferSize(),
+                );
+                let root: ID3D12RootSignature = device.CreateRootSignature(0, code).unwrap();
+                let pso = device
+                    .CreateComputePipelineState(&D3D12_COMPUTE_PIPELINE_STATE_DESC {
+                        pRootSignature: std::mem::transmute_copy(&root),
+                        CS: D3D12_SHADER_BYTECODE {
+                            pShaderBytecode: code.as_ptr().cast(),
+                            BytecodeLength: code.len(),
+                        },
+                        ..Default::default()
+                    })
+                    .unwrap();
+                (root, pso)
+            }
+        }
+
+        fn dispatch_uav_write(
+            recorded: &crate::host::HostList,
+            (root, pso): &(ID3D12RootSignature, ID3D12PipelineState),
+            (dst_buf, byte_offset): (&Held, usize),
+            upload_src: &ID3D12Resource,
+            write_len: usize,
+        ) {
+            assert_eq!(write_len % 4, 0);
+            let (data, buffer_size) = crate::resource::buffer_bytes(dst_buf.0).unwrap();
+            let buffer_base = data as u64;
+            let shadow = crate::shadow::find(buffer_base, buffer_size).unwrap();
+            recorded.keep(root);
+            recorded.keep(pso);
+            recorded.keep(upload_src);
+            shadow.refresh(recorded, buffer_base, buffer_size);
+            shadow.gpu_writes(recorded, buffer_base + byte_offset as u64, write_len as u64);
+            let words = (write_len / 4) as u32;
+            let params = [byte_offset as u32, words];
+            // SAFETY: open command list; root views point into live buffers.
+            unsafe {
+                recorded.list.SetComputeRootSignature(root);
+                recorded.list.SetPipelineState(pso);
+                recorded
+                    .list
+                    .SetComputeRoot32BitConstants(0, 2, params.as_ptr().cast(), 0);
+                recorded
+                    .list
+                    .SetComputeRootShaderResourceView(1, upload_src.GetGPUVirtualAddress());
+                recorded
+                    .list
+                    .SetComputeRootUnorderedAccessView(2, shadow.gpu(buffer_base));
+                recorded.list.Dispatch(words.div_ceil(64), 1, 1);
+                recorded.list.ResourceBarrier(&[D3D12_RESOURCE_BARRIER {
+                    Type: D3D12_RESOURCE_BARRIER_TYPE_UAV,
+                    Flags: D3D12_RESOURCE_BARRIER_FLAG_NONE,
+                    Anonymous: D3D12_RESOURCE_BARRIER_0 {
+                        UAV: std::mem::ManuallyDrop::new(D3D12_RESOURCE_UAV_BARRIER {
+                            pResource: std::mem::ManuallyDrop::new(None),
+                        }),
+                    },
+                }]);
+            }
+        }
+
+        fn record_placed_copy(
+            list: &Held,
+            dst_tex: &Held,
+            src_buf: &Held,
+            offset: usize,
+            [dst_x, dst_y]: [u32; 2],
+            src_box: Option<&[u32; 6]>,
+        ) {
+            let native_fp = D3D12_PLACED_SUBRESOURCE_FOOTPRINT {
+                Offset: offset as u64,
+                Footprint: D3D12_SUBRESOURCE_FOOTPRINT {
+                    Format: FORMAT,
+                    Width: WIDTH as u32,
+                    Height: HEIGHT as u32,
+                    Depth: 1,
+                    RowPitch: ROW_PITCH as u32,
+                },
+            };
+            // SAFETY: `PlacedFootprint` matches `D3D12_PLACED_SUBRESOURCE_FOOTPRINT` layout.
+            let footprint = unsafe {
+                std::mem::transmute::<
+                    D3D12_PLACED_SUBRESOURCE_FOOTPRINT,
+                    crate::resource::PlacedFootprint,
+                >(native_fp)
+            };
+            let src = CopyLocation {
+                resource: src_buf.0,
+                kind: 1,
+                footprint,
+            };
+            let dst = CopyLocation {
+                resource: dst_tex.0,
+                kind: 0,
+                // SAFETY: all-zero selects subresource index 0.
+                footprint: unsafe { std::mem::zeroed() },
+            };
+            type CopyFn = extern "system" fn(
+                This,
+                *const CopyLocation,
+                u32,
+                u32,
+                u32,
+                *const CopyLocation,
+                *const [u32; 6],
+            );
+            slot::<CopyFn>(list.0, 0x80)(
+                list.0,
+                &dst,
+                dst_x,
+                dst_y,
+                0,
+                &src,
+                src_box.map_or(std::ptr::null(), std::ptr::from_ref),
+            );
+        }
+
+        fn record_texture_readback(
+            host: &crate::host::Host,
+            recorded: &crate::host::HostList,
+            tex: &Held,
+        ) -> ID3D12Resource {
+            ensure_state(recorded, tex.0, D3D12_RESOURCE_STATE_COPY_SOURCE.0 as u32);
+            let host_tex = crate::resource::host_resource(tex.0).unwrap();
+            let mut rb: Option<ID3D12Resource> = None;
+            // SAFETY: plain readback buffer creation and texture-to-buffer copy recording.
+            unsafe {
+                host.device
+                    .CreateCommittedResource(
+                        &D3D12_HEAP_PROPERTIES {
+                            Type: D3D12_HEAP_TYPE_READBACK,
+                            ..Default::default()
+                        },
+                        D3D12_HEAP_FLAG_NONE,
+                        &D3D12_RESOURCE_DESC {
+                            Dimension: D3D12_RESOURCE_DIMENSION_BUFFER,
+                            Width: FOOTPRINT_BYTES as u64,
+                            Height: 1,
+                            DepthOrArraySize: 1,
+                            MipLevels: 1,
+                            SampleDesc: DXGI_SAMPLE_DESC {
+                                Count: 1,
+                                Quality: 0,
+                            },
+                            Layout: D3D12_TEXTURE_LAYOUT_ROW_MAJOR,
+                            ..Default::default()
+                        },
+                        D3D12_RESOURCE_STATE_COPY_DEST,
+                        None,
+                        &mut rb,
+                    )
+                    .unwrap();
+                let rb = rb.unwrap();
+                let dst_loc = D3D12_TEXTURE_COPY_LOCATION {
+                    pResource: std::mem::transmute_copy(&rb),
+                    Type: D3D12_TEXTURE_COPY_TYPE_PLACED_FOOTPRINT,
+                    Anonymous: D3D12_TEXTURE_COPY_LOCATION_0 {
+                        PlacedFootprint: D3D12_PLACED_SUBRESOURCE_FOOTPRINT {
+                            Offset: 0,
+                            Footprint: D3D12_SUBRESOURCE_FOOTPRINT {
+                                Format: FORMAT,
+                                Width: WIDTH as u32,
+                                Height: HEIGHT as u32,
+                                Depth: 1,
+                                RowPitch: ROW_PITCH as u32,
+                            },
+                        },
+                    },
+                };
+                let src_loc = D3D12_TEXTURE_COPY_LOCATION {
+                    pResource: std::mem::transmute_copy(host_tex),
+                    Type: D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX,
+                    Anonymous: D3D12_TEXTURE_COPY_LOCATION_0 {
+                        SubresourceIndex: 0,
+                    },
+                };
+                recorded
+                    .list
+                    .CopyTextureRegion(&dst_loc, 0, 0, 0, &src_loc, None);
+                rb
+            }
+        }
+
+        fn read_pixels(rb: &ID3D12Resource) -> [[u8; 4]; WIDTH * HEIGHT] {
+            let mut ptr = std::ptr::null_mut();
+            // SAFETY: GPU work completed; `rb` holds `FOOTPRINT_BYTES` bytes.
+            unsafe {
+                rb.Map(0, None, Some(&mut ptr)).unwrap();
+                let out = std::array::from_fn(|idx| {
+                    let at = (idx / WIDTH) * ROW_PITCH + (idx % WIDTH) * 4;
+                    ptr.cast::<u8>().add(at).cast::<[u8; 4]>().read_unaligned()
+                });
+                rb.Unmap(0, None);
+                out
+            }
+        }
+
+        #[test]
+        fn placed_copy_reads_same_list_gpu_writes_and_preserves_cpu_snapshots() {
+            let Some(host) = crate::host::host() else {
+                return;
+            };
+            let _dbg = attach_debug(&host.device, "placed_copy_full");
+            let writer = writer_pso(&host.device);
+
+            // 1. Direct same-list Compute UAV write -> CopyTextureRegion at both
+            //    512-byte aligned and 516-byte unaligned offsets, including replay.
+            let (upload, mapped) = host.upload_buffer(FOOTPRINT_BYTES as u64).unwrap();
+            for offset in [ALIGNED_OFFSET, UNALIGNED_OFFSET] {
+                let src = make_buffer(&placed_bytes(17, offset));
+                let (data, size) = crate::resource::buffer_bytes(src.0).unwrap();
+                let dst = make_texture();
+                let (list, _alloc) = make_guest_list();
+                let recorded = host_list(list.0).unwrap();
+
+                dispatch_uav_write(recorded, &writer, (&src, offset), &upload, FOOTPRINT_BYTES);
+                record_placed_copy(&list, &dst, &src, offset, [0, 0], None);
+                let rb = record_texture_readback(host, recorded, &dst);
+                assert_eq!(close(list.0), S_OK);
+
+                for tag in [198u8, 223u8] {
+                    let fresh = placed_bytes(tag, offset);
+                    // SAFETY: `mapped` holds `FOOTPRINT_BYTES` bytes and idle between executes.
+                    unsafe {
+                        std::ptr::copy_nonoverlapping(
+                            fresh[offset..].as_ptr(),
+                            mapped,
+                            FOOTPRINT_BYTES,
+                        );
+                    }
+                    host.execute(&[recorded]);
+                    assert_eq!(
+                        read_pixels(&rb),
+                        pattern(tag),
+                        "UAV offset={offset} tag={tag}"
+                    );
+                    // SAFETY: synchronous execution completed; guest buffer remains live.
+                    let guest_after = unsafe { std::slice::from_raw_parts(data, size as usize) };
+                    assert_eq!(guest_after, fresh.as_slice());
+                }
+            }
+
+            // 2. Chained same-list Compute UAV -> guest CopyBufferRegion -> CopyTextureRegion,
+            //    plus two ordered CPU CopyBufferRegion snapshots in the same list.
+            let uav_intermediate = make_buffer(&placed_bytes(10, ALIGNED_OFFSET));
+            let placed_src = make_buffer(&placed_bytes(20, UNALIGNED_OFFSET));
+            let cpu_snap_a = make_buffer(&placed_bytes(41, ALIGNED_OFFSET));
+            let cpu_snap_b = make_buffer(&placed_bytes(73, ALIGNED_OFFSET));
+            let chained_fresh = placed_bytes(165, ALIGNED_OFFSET);
+            // SAFETY: `mapped` holds `FOOTPRINT_BYTES` bytes.
+            unsafe {
+                std::ptr::copy_nonoverlapping(
+                    chained_fresh[ALIGNED_OFFSET..].as_ptr(),
+                    mapped,
+                    FOOTPRINT_BYTES,
+                );
+            }
+
+            let tex_chained = make_texture();
+            let tex_cpu_a = make_texture();
+            let tex_cpu_b = make_texture();
+            let (list, _alloc) = make_guest_list();
+            let recorded = host_list(list.0).unwrap();
+
+            dispatch_uav_write(
+                recorded,
+                &writer,
+                (&uav_intermediate, ALIGNED_OFFSET),
+                &upload,
+                FOOTPRINT_BYTES,
+            );
+            copy_buffer_region(
+                list.0,
+                placed_src.0,
+                UNALIGNED_OFFSET as u64,
+                uav_intermediate.0,
+                ALIGNED_OFFSET as u64,
+                FOOTPRINT_BYTES as u64,
+            );
+            record_placed_copy(
+                &list,
+                &tex_chained,
+                &placed_src,
+                UNALIGNED_OFFSET,
+                [0, 0],
+                None,
+            );
+
+            // Subsequent CPU buffer copies into `uav_intermediate` must revert to
+            // ordered submission-time CPU snapshots.
+            let full_len = (ALIGNED_OFFSET + FOOTPRINT_BYTES) as u64;
+            copy_buffer_region(list.0, uav_intermediate.0, 0, cpu_snap_a.0, 0, full_len);
+            record_placed_copy(
+                &list,
+                &tex_cpu_a,
+                &uav_intermediate,
+                ALIGNED_OFFSET,
+                [0, 0],
+                None,
+            );
+            copy_buffer_region(list.0, uav_intermediate.0, 0, cpu_snap_b.0, 0, full_len);
+            record_placed_copy(
+                &list,
+                &tex_cpu_b,
+                &uav_intermediate,
+                ALIGNED_OFFSET,
+                [0, 0],
+                None,
+            );
+
+            let rb_chained = record_texture_readback(host, recorded, &tex_chained);
+            let rb_cpu_a = record_texture_readback(host, recorded, &tex_cpu_a);
+            let rb_cpu_b = record_texture_readback(host, recorded, &tex_cpu_b);
+            assert_eq!(close(list.0), S_OK);
+            host.execute(&[recorded]);
+
+            assert_eq!(read_pixels(&rb_chained), pattern(165));
+            assert_eq!(read_pixels(&rb_cpu_a), pattern(41));
+            assert_eq!(read_pixels(&rb_cpu_b), pattern(73));
+            assert_eq!(DEBUG_ERRORS.load(Ordering::Relaxed), 0);
+        }
+
+        #[test]
+        fn placed_boxed_copy_reads_gpu_writes_and_rebases_subregions() {
+            let Some(host) = crate::host::host() else {
+                return;
+            };
+            let _dbg = attach_debug(&host.device, "placed_copy_boxed");
+            let writer = writer_pso(&host.device);
+            let seed_buf = make_buffer(&placed_bytes(57, ALIGNED_OFFSET));
+
+            // Case A: single-row box [0, 0, 0, 2, 1, 1] at aligned offset 512,
+            //         8-byte GPU write covering only the 2 boxed pixels.
+            // Case B: nonzero-origin box [1, 2, 0, 3, 3, 1] at unaligned offset 516,
+            //         copied to destination (0, 2) via GPU rebase.
+            for (offset, src_box, dst_xy, tag) in [
+                (ALIGNED_OFFSET, [0, 0, 0, 2, 1, 1], [0, 0], 181u8),
+                (UNALIGNED_OFFSET, [1, 2, 0, 3, 3, 1], [0, 2], 204u8),
+            ] {
+                let [left, top, _, right, bottom, _] = src_box.map(|v| v as usize);
+                let span_begin = offset + top * ROW_PITCH + left * 4;
+                let span_end = offset + (bottom - 1) * ROW_PITCH + right * 4;
+                let span_len = span_end - span_begin;
+
+                let old = placed_bytes(17, offset);
+                let fresh = placed_bytes(tag, offset);
+                let src = make_buffer(&old);
+                let dst = make_texture();
+                let (upload, mapped) = host.upload_buffer(span_len as u64).unwrap();
+                // SAFETY: `mapped` holds `span_len` bytes.
+                unsafe {
+                    std::ptr::copy_nonoverlapping(
+                        fresh[span_begin..span_end].as_ptr(),
+                        mapped,
+                        span_len,
+                    );
+                }
+
+                let (list, _alloc) = make_guest_list();
+                let recorded = host_list(list.0).unwrap();
+                record_placed_copy(&list, &dst, &seed_buf, ALIGNED_OFFSET, [0, 0], None);
+                dispatch_uav_write(recorded, &writer, (&src, span_begin), &upload, span_len);
+                record_placed_copy(&list, &dst, &src, offset, dst_xy, Some(&src_box));
+                let rb = record_texture_readback(host, recorded, &dst);
+                assert_eq!(close(list.0), S_OK);
+                host.execute(&[recorded]);
+
+                let got = read_pixels(&rb);
+                let expected = pattern(tag);
+                let seed = pattern(57);
+                let [dx, dy] = dst_xy.map(|v| v as usize);
+                let (bw, bh) = (right - left, bottom - top);
+                for (i, px) in got.into_iter().enumerate() {
+                    let (x, y) = (i % WIDTH, i / WIDTH);
+                    if (dx..dx + bw).contains(&x) && (dy..dy + bh).contains(&y) {
+                        let sx = left + (x - dx);
+                        let sy = top + (y - dy);
+                        assert_eq!(px, expected[sy * WIDTH + sx]);
+                    } else {
+                        assert_eq!(px, seed[i]);
+                    }
+                }
+            }
+
+            // Case C: two pitched rows [1, 1, 0, 3, 3, 1] at unaligned offset 516
+            //         written by two separate 8-byte GPU dispatches (leaving the
+            //         row-pitch gap untouched) plus a 4-byte partial GPU overwrite
+            //         of the first pixel in row 1.
+            let src_box = [1u32, 1, 0, 3, 3, 1];
+            let src = make_buffer(&placed_bytes(17, UNALIGNED_OFFSET));
+            let dst = make_texture();
+            let row1_fresh = placed_bytes(140, UNALIGNED_OFFSET);
+            let row2_fresh = placed_bytes(190, UNALIGNED_OFFSET);
+            let override_px = [250u8, 12, 34, 255];
+
+            let r1_off = UNALIGNED_OFFSET + ROW_PITCH + 4;
+            let r2_off = UNALIGNED_OFFSET + 2 * ROW_PITCH + 4;
+            let (up1, m1) = host.upload_buffer(8).unwrap();
+            let (up2, m2) = host.upload_buffer(8).unwrap();
+            let (up_ov, m_ov) = host.upload_buffer(4).unwrap();
+            // SAFETY: each upload buffer fits its 8-byte or 4-byte payload.
+            unsafe {
+                std::ptr::copy_nonoverlapping(row1_fresh[r1_off..r1_off + 8].as_ptr(), m1, 8);
+                std::ptr::copy_nonoverlapping(row2_fresh[r2_off..r2_off + 8].as_ptr(), m2, 8);
+                std::ptr::copy_nonoverlapping(override_px.as_ptr(), m_ov, 4);
+            }
+
+            let (list, _alloc) = make_guest_list();
+            let recorded = host_list(list.0).unwrap();
+            record_placed_copy(&list, &dst, &seed_buf, ALIGNED_OFFSET, [0, 0], None);
+            dispatch_uav_write(recorded, &writer, (&src, r1_off), &up1, 8);
+            dispatch_uav_write(recorded, &writer, (&src, r2_off), &up2, 8);
+            dispatch_uav_write(recorded, &writer, (&src, r1_off), &up_ov, 4);
+            record_placed_copy(&list, &dst, &src, UNALIGNED_OFFSET, [2, 0], Some(&src_box));
+            let rb = record_texture_readback(host, recorded, &dst);
+            assert_eq!(close(list.0), S_OK);
+            host.execute(&[recorded]);
+
+            let got = read_pixels(&rb);
+            let p140 = pattern(140);
+            let p190 = pattern(190);
+            let seed = pattern(57);
+            assert_eq!(got[2], override_px);
+            assert_eq!(got[3], p140[WIDTH + 2]);
+            assert_eq!(got[WIDTH + 2], p190[2 * WIDTH + 1]);
+            assert_eq!(got[WIDTH + 3], p190[2 * WIDTH + 2]);
+            assert_eq!(got[0], seed[0]);
+            assert_eq!(got[3 * WIDTH], seed[3 * WIDTH]);
+            assert_eq!(DEBUG_ERRORS.load(Ordering::Relaxed), 0);
+        }
     }
 }
