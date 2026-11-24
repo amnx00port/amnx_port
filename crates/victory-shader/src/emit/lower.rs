@@ -43,6 +43,9 @@ pub(crate) struct Lowered {
     /// Whether the program uses wave operations.
     #[cfg(test)]
     pub wave_ops: bool,
+    /// `ResourceProperties` passed to `heap_handle`.
+    #[cfg(test)]
+    pub heap_props: Vec<(u32, u32)>,
 }
 
 pub(crate) struct Parts<'a> {
@@ -174,6 +177,8 @@ struct Lower<'a> {
     exports: HashMap<Site, &'a Export>,
     interps: HashMap<Site, &'a Interp>,
     handles: HashMap<(usize, Site, u8, bool, u32), V>,
+    /// Heap descriptors inferred to be UAVs across the program.
+    uav_heaps: UavHeaps,
     /// Blocks splitting the edge from one IR block to another.
     edges: HashMap<(usize, usize), usize>,
     /// Per IR block: a `done` export is behind every lane entering it.
@@ -342,6 +347,119 @@ fn unsupported(offset: usize, what: Why) -> Stop {
     Stop::Fail(ShaderError::Unsupported { offset, what })
 }
 
+/// The used-resource entry a descriptor loaded from a table or root
+/// descriptor falls in.
+fn used_kind_of<'a>(
+    native: &'a NativeProgram,
+    scalar: &HashMap<Site, Address>,
+    src: &Source,
+) -> Option<&'a UsedResource> {
+    if let Source::Phi { args, .. } | Source::Select { args, .. } | Source::Lanes { args, .. } = src
+    {
+        return used_kind_of(native, scalar, args.first()?);
+    }
+    if let Source::LanePhi { args, .. } = src {
+        return args
+            .iter()
+            .flatten()
+            .find_map(|a| used_kind_of(native, scalar, a));
+    }
+    if let Source::Built { address, .. } = src {
+        let rp = native.layout.get(address.param)?;
+        return native
+            .used
+            .iter()
+            .find(|u| u.root == RootType::Descriptor && u.user_data == rp.user_data);
+    }
+    let (Source::Loaded { load, first } | Source::Fetched { load, first }) = src else {
+        return None;
+    };
+    let a = scalar.get(load)?;
+    let rp = native.layout.get(a.param)?;
+    if rp.root != RootType::Table {
+        return None;
+    }
+    let dword = (a.offset / 4) + u32::from(*first);
+    native
+        .used
+        .iter()
+        .filter(|u| {
+            u.root == RootType::Table
+                && u.user_data == rp.user_data
+                && u.table_offset_dwords <= dword
+        })
+        .max_by_key(|u| u.table_offset_dwords)
+}
+
+/// Heap descriptor sources inferred to be UAVs from program-wide uses.
+#[derive(Default)]
+struct UavHeaps {
+    loads: HashSet<(Site, u8)>,
+    addrs: HashSet<(usize, u32, Option<Value>)>,
+}
+
+impl UavHeaps {
+    fn contains(&self, scalar: &HashMap<Site, Address>, load: Site, first: u8) -> bool {
+        self.loads.contains(&(load, first))
+            || scalar.get(&load).is_some_and(|a| {
+                self.addrs.contains(&(
+                    a.param,
+                    a.offset.wrapping_add(4 * u32::from(first)),
+                    a.dynamic,
+                ))
+            })
+    }
+}
+
+/// Scans the program's resource uses and marks every heap descriptor source
+/// that has any store, atomic, or (for dynamic heap descriptors) `glc` access
+/// as a UAV.
+fn infer_uav_heaps(x: &Parts, scalar: &HashMap<Site, Address>) -> UavHeaps {
+    let mut heaps = UavHeaps::default();
+    for d in &x.res.descriptors {
+        if d.role != Role::Resource {
+            continue;
+        }
+        let inst = &x.p.blocks[d.site.0].insts[d.site.1];
+        let name = inst.name();
+        let store_or_atomic = name.contains("store") || name.contains("atomic");
+        let glc = match &inst.fields {
+            Fields::Buffer { cache, .. }
+            | Fields::Image { cache, .. }
+            | Fields::Smem { cache, .. } => cache.glc,
+            _ => false,
+        };
+        let used = used_kind_of(x.native, scalar, &d.source);
+        // Only infer UAV from `glc` when no UsedResource declares the view as
+        // an SRV or CBV: DXIL `IsGloballyCoherent` is invalid on non-UAVs.
+        let heap_glc = glc && used.is_none_or(|u| u.kind == ResourceType::Uav);
+        if !(store_or_atomic || heap_glc) {
+            continue;
+        }
+        for leaf in d.source.leaves() {
+            let (Source::Loaded { load, first } | Source::Fetched { load, first }) = *leaf else {
+                continue;
+            };
+            if let Some(a) = scalar.get(&load) {
+                if matches!(
+                    x.native.layout.get(a.param).map(|p| p.root),
+                    Some(RootType::Table | RootType::ResourceHeap)
+                ) {
+                    heaps.loads.insert((load, first));
+                    heaps.addrs.insert((
+                        a.param,
+                        a.offset.wrapping_add(4 * u32::from(first)),
+                        a.dynamic,
+                    ));
+                }
+            } else {
+                heaps.loads.insert((load, first));
+            }
+        }
+    }
+    heaps
+}
+
 impl<'a> Lower<'a> {
     fn new(x: &'a Parts<'a>, bad: &'a HashMap<Value, Why>) -> Self {
         let p = x.p;
@@ -449,6 +567,8 @@ impl<'a> Lower<'a> {
                 }
             }
         }
+        let scalar: HashMap<Site, Address> = x.res.scalar.iter().copied().collect();
+        let uav_heaps = infer_uav_heaps(x, &scalar);
         Lower {
             s,
             x,
@@ -475,10 +595,11 @@ impl<'a> Lower<'a> {
                 .iter()
                 .map(|d| ((d.site, d.role == Role::Sampler), &d.source))
                 .collect(),
-            scalar: x.res.scalar.iter().copied().collect(),
+            scalar,
             exports: x.io.exports.iter().map(|e| (e.site, e)).collect(),
             interps: x.io.interps.iter().map(|(s, i)| (*s, i)).collect(),
             handles: HashMap::new(),
+            uav_heaps,
             edges: HashMap::new(),
             exported: vec![false; p.blocks.len()],
             rpo: vec![usize::MAX; p.blocks.len()],
@@ -902,6 +1023,8 @@ impl<'a> Lower<'a> {
         let root_cbvs = self.s.root_cbvs.iter().map(|r| r.0).collect();
         let root_srvs = self.s.root_srvs.iter().map(|r| r.0).collect();
         let cmp_samplers = self.s.cmp_samplers;
+        #[cfg(test)]
+        let heap_props = self.s.heap_props.clone();
         Ok(Lowered {
             cmp_samplers,
             root_cbvs,
@@ -910,6 +1033,8 @@ impl<'a> Lower<'a> {
             nonuniform_handles: self.s.nonuniform_handles,
             #[cfg(test)]
             wave_ops: self.s.flags & flags::WAVE_OPS != 0,
+            #[cfg(test)]
+            heap_props,
             dxil: self.s.finish(),
             user_data,
             samplers: self.samplers,
@@ -2800,6 +2925,7 @@ impl<'a> Lower<'a> {
             data,
             offset,
             soffset,
+            cache,
             ..
         } = &inst.fields
         else {
@@ -2829,6 +2955,7 @@ impl<'a> Lower<'a> {
             .copied()
             .ok_or("an untracked descriptor")?;
         let kind = self.used_kind(src);
+        let uav = self.is_uav(src);
         let c = self.cur;
         let (base, extra) = self.built_offset(src)?;
         let offset = &((*offset as u32).wrapping_add(base) as i32);
@@ -2850,8 +2977,10 @@ impl<'a> Lower<'a> {
             }
             return Ok(());
         }
-        if matches!(kind, Some(u) if u.kind == ResourceType::Srv) {
-            let h = self.handle(site, src, false, (11, 0))?;
+        if uav || matches!(kind, Some(u) if u.kind == ResourceType::Srv) {
+            let uav_bit = if uav { 0x1000 } else { 0 };
+            let glc_bit = if uav && cache.glc { 0x4000 } else { 0 };
+            let h = self.handle(site, src, false, (11 | uav_bit | glc_bit, 0))?;
             for k in 0..count {
                 let off = self.s.m.i32(4 * k);
                 let a = self.s.m.bin(c, Bin::Add, addr, off);
@@ -2963,9 +3092,7 @@ impl<'a> Lower<'a> {
         let used = self.used_kind(&src);
         let ui: &Inst = &self.x.p.blocks[at.0].insts[at.1];
         let un = ui.name();
-        let uav = un.contains("store")
-            || un.contains("atomic")
-            || used.is_some_and(|u| u.kind == ResourceType::Uav);
+        let uav = un.contains("store") || un.contains("atomic") || self.is_uav(&src);
         let u = if uav { 0x1000 } else { 0 };
         let (props, image) = match &ui.fields {
             Fields::Image { dim, .. } => {
@@ -3260,42 +3387,20 @@ impl<'a> Lower<'a> {
 
     /// The used-resource entry a descriptor loaded from a table falls in.
     fn used_kind(&self, src: &Source) -> Option<&'a UsedResource> {
-        if let Source::Phi { args, .. } | Source::Select { args, .. } | Source::Lanes { args, .. } =
-            src
-        {
-            return self.used_kind(args.first()?);
-        }
-        if let Source::LanePhi { args, .. } = src {
-            return args.iter().flatten().find_map(|a| self.used_kind(a));
-        }
-        if let Source::Built { address, .. } = src {
-            let rp = self.x.native.layout.get(address.param)?;
-            return self
-                .x
-                .native
-                .used
-                .iter()
-                .find(|u| u.root == RootType::Descriptor && u.user_data == rp.user_data);
-        }
-        let (Source::Loaded { load, first } | Source::Fetched { load, first }) = src else {
-            return None;
-        };
-        let a = self.scalar.get(load)?;
-        let rp = self.x.native.layout.get(a.param)?;
-        if rp.root != RootType::Table {
-            return None;
-        }
-        let dword = (a.offset / 4) + u32::from(*first);
-        self.x
-            .native
-            .used
-            .iter()
-            .filter(|u| {
-                u.root == RootType::Table
-                    && u.user_data == rp.user_data
-                    && u.table_offset_dwords <= dword
+        used_kind_of(self.x.native, &self.scalar, src)
+    }
+
+    /// Whether `src` is a UAV (declared in `used`, or a heap descriptor with
+    /// any store, atomic, or `glc` access in the program).
+    fn is_uav(&self, src: &Source) -> bool {
+        self.used_kind(src)
+            .is_some_and(|u| u.kind == ResourceType::Uav)
+            || src.leaves().into_iter().any(|leaf| match *leaf {
+                Source::Loaded { load, first } | Source::Fetched { load, first } => {
+                    self.uav_heaps.contains(&self.scalar, load, first)
+                }
+                _ => false,
             })
-            .max_by_key(|u| u.table_offset_dwords)
     }
 
     /// A handle for the descriptor `src` read at `site`.
@@ -5585,6 +5690,7 @@ impl<'a> Lower<'a> {
             d16,
             tfe,
             lwe,
+            cache,
             ..
         } = &inst.fields
         else {
@@ -5646,11 +5752,10 @@ impl<'a> Lower<'a> {
             .copied()
             .ok_or("an untracked image")?;
         let store = name.starts_with("image_store");
-        let uav = store
-            || self
-                .used_kind(src)
-                .is_some_and(|u| u.kind == ResourceType::Uav);
-        let props = (kind | if uav { 0x1000 } else { 0 }, 0x409);
+        let atomic = name.starts_with("image_atomic_");
+        let uav = store || atomic || self.is_uav(src);
+        let coherent = if uav && cache.glc { 0x4000 } else { 0 };
+        let props = (kind | if uav { 0x1000 } else { 0 } | coherent, 0x409);
         if let Some(op) = name.strip_prefix("image_atomic_") {
             // DXIL's atomic operations on a 32-bit integer texture UAV; the
             // old value returns with glc. Sub is the add of the negation.
@@ -5666,9 +5771,6 @@ impl<'a> Lower<'a> {
                 "swap" => 8,
                 "cmpswap" => u32::MAX,
                 _ => return Err(name),
-            };
-            let Fields::Image { cache, .. } = &inst.fields else {
-                unreachable!()
             };
             if *d16 || *a16 {
                 return Err("a 16-bit image atomic");
@@ -5697,7 +5799,7 @@ impl<'a> Lower<'a> {
                 Some(v) if cache.glc => self.i32_of(v)?,
                 _ => self.s.m.i32(0),
             };
-            let h = self.handle(site, src, false, (kind | 0x1000, 0x105))?;
+            let h = self.handle(site, src, false, (kind | 0x1000 | coherent, 0x105))?;
             let at = self.begin_guarded(guard);
             let i32t = self.s.t.i32;
             let mut args = vec![h];
@@ -6160,6 +6262,7 @@ impl<'a> Lower<'a> {
             format,
             lds,
             tfe,
+            cache,
             ..
         } = &inst.fields
         else {
@@ -6269,8 +6372,9 @@ impl<'a> Lower<'a> {
             }
             return Ok(());
         }
-        let uav = store || atomic.is_some() || used.is_some_and(|u| u.kind == ResourceType::Uav);
+        let uav = store || atomic.is_some() || self.is_uav(src);
         let u = if uav { 0x1000 } else { 0 };
+        let g = if uav && cache.glc { 0x4000 } else { 0 };
         let iu = self.s.m.undef(self.s.t.i32);
         if let Some(op) = atomic {
             let d = data.as_ref().ok_or("buffer atomic data")?;
@@ -6281,10 +6385,13 @@ impl<'a> Lower<'a> {
                     if stride < 4 || !stride.is_multiple_of(4) {
                         return Err("a structured buffer of unknown stride");
                     }
-                    let h = self.handle(site, src, false, (12 | u, stride))?;
+                    let h = self.handle(site, src, false, (12 | u | g, stride))?;
                     (h, [index, off, iu])
                 }
-                None => (self.handle(site, src, false, (11 | u, 0))?, [off, iu, iu]),
+                None => (
+                    self.handle(site, src, false, (11 | u | g, 0))?,
+                    [off, iu, iu],
+                ),
             };
             let Operand::Vector { reg, .. } = *d else {
                 return Err("buffer atomic data");
@@ -6351,7 +6458,7 @@ impl<'a> Lower<'a> {
                 if count != 4 || *offen || *offset != 0 {
                     return Err("a typed buffer store of some channels or at an offset");
                 }
-                args.push(self.handle(site, src, false, (10 | u, 0x409))?);
+                args.push(self.handle(site, src, false, (10 | u | g, 0x409))?);
                 args.extend([index.unwrap_or(self.s.m.i32(0)), iu]);
                 for x in vals {
                     args.push(self.as_float(x));
@@ -6364,11 +6471,11 @@ impl<'a> Lower<'a> {
                         if stride < 4 || !stride.is_multiple_of(4) {
                             return Err("a structured buffer of unknown stride");
                         }
-                        args.push(self.handle(site, src, false, (12 | u, stride))?);
+                        args.push(self.handle(site, src, false, (12 | u | g, stride))?);
                         args.extend([index, off]);
                     }
                     None => {
-                        args.push(self.handle(site, src, false, (11 | u, 0))?);
+                        args.push(self.handle(site, src, false, (11 | u | g, 0))?);
                         args.extend([off, iu]);
                     }
                 }
@@ -6390,7 +6497,7 @@ impl<'a> Lower<'a> {
             if index.is_some() {
                 return Err("a typed-format load by index");
             }
-            let h = self.handle(site, src, false, (11 | u, 0))?;
+            let h = self.handle(site, src, false, (11 | u | g, 0))?;
             let Some(Operand::Vector { reg, .. }) = *data else {
                 return Err("a buffer result");
             };
@@ -6406,7 +6513,7 @@ impl<'a> Lower<'a> {
             if uav {
                 self.s.flags |= flags::TYPED_UAV_LOADS;
             }
-            let h = self.handle(site, src, false, (10 | u, 0x409))?;
+            let h = self.handle(site, src, false, (10 | u | g, 0x409))?;
             let index = index.unwrap_or(self.s.m.i32(0));
             self.s.op(
                 c,
@@ -6425,7 +6532,7 @@ impl<'a> Lower<'a> {
                     if stride < 4 || !stride.is_multiple_of(4) {
                         return Err("a structured buffer of unknown stride");
                     }
-                    let h = self.handle(site, src, false, (12 | u, stride))?;
+                    let h = self.handle(site, src, false, (12 | u | g, stride))?;
                     self.s.op(
                         c,
                         "rawBufferLoad.f32",
@@ -6436,7 +6543,7 @@ impl<'a> Lower<'a> {
                     )
                 }
                 None => {
-                    let h = self.handle(site, src, false, (11 | u, 0))?;
+                    let h = self.handle(site, src, false, (11 | u | g, 0))?;
                     self.s.op(
                         c,
                         "rawBufferLoad.f32",
@@ -7099,9 +7206,7 @@ mod tests {
             S_ENDPGM,
         ];
 
-        let code: Vec<u8> = words.iter()
-            .flat_map(|w| w.to_le_bytes())
-            .collect();
+        let code: Vec<u8> = words.iter().flat_map(|w| w.to_le_bytes()).collect();
 
         let native = NativeProgram {
             stage: HwStage::Cs,
@@ -7118,9 +7223,12 @@ mod tests {
 
         let p = ir::build(&native.code, false, 256).unwrap();
 
-        assert!(p.blocks.iter()
-            .flat_map(|b| &b.insts)
-            .any(|i| i.name() == "v_perm_b32"));
+        assert!(
+            p.blocks
+                .iter()
+                .flat_map(|b| &b.insts)
+                .any(|i| i.name() == "v_perm_b32")
+        );
 
         let st = structure::structure(&p).unwrap();
         let res = resource::track(&p, &native.layout, native.stage, Some(&st)).unwrap();
@@ -7137,13 +7245,12 @@ mod tests {
             outputs: vec![],
             prims: vec![],
             mesh_stride: 0,
-        }).unwrap();
+        })
+        .unwrap();
 
-        let container =
-            crate::Container::parse(&emitted.dxil).unwrap();
+        let container = crate::Container::parse(&emitted.dxil).unwrap();
 
-        let features =
-            container.part(crate::FourCC::SFI0).unwrap();
+        let features = container.part(crate::FourCC::SFI0).unwrap();
 
         u64::from_le_bytes(features.data.try_into().unwrap())
     }
@@ -7417,5 +7524,119 @@ mod tests {
         assert!(f10(0x3FF).is_nan());
         // A 16-bit float is a half already, sign included.
         assert_eq!(half(0xBC00 << half_shift(16)), -1.0);
+    }
+
+    fn validate_dxil(dxil: &[u8]) {
+        #[cfg(windows)]
+        if let Ok(mut v) = super::super::validator::Validator::load(
+            super::super::validator::Validator::default_path().as_deref(),
+        ) {
+            v.validate(&mut dxil.to_vec())
+                .expect("DXIL validation failed");
+        } else {
+            eprintln!("no dxil.dll; validation skipped");
+        }
+        #[cfg(not(windows))]
+        let _ = dxil;
+    }
+
+    #[test]
+    fn heap_buffer_load_and_store_both_emit_raw_uav_and_validate() {
+        // Heap descriptor 0 (s[8:11]) is read by buffer_load_dword and written by
+        // buffer_store_dword. Put the load and store in separate blocks so both
+        // emit their own handle and we verify both get 0x100B (raw UAV).
+        let words = [
+            0xBE84_0300, // s_mov_b32 s4, s0 (ResourceHeap base)
+            0xBE85_0380, // s_mov_b32 s5, 0
+            0xF408_0202,
+            0xFA00_0000, // s_load_dwordx4 s[8:11], s[4:5], null (heap index 0)
+            0x7E02_0280, // v_mov_b32 v1, 0
+            0xBF06_8001, // s_cmp_eq_u32 s1, 0
+            0xBF85_0002, // s_cbranch_scc1 -> store block
+            0xE030_0000,
+            0x8002_0100, // buffer_load_dword v1, v0, s[8:11], 0 offset:0
+            0xE070_0004,
+            0x8002_0100, // buffer_store_dword v1, v0, s[8:11], 0 offset:4
+            S_ENDPGM,
+        ];
+        let layout = vec![
+            root(RootType::ResourceHeap, 0, 0),
+            root(RootType::Constants, 1, 1),
+        ];
+        let l = lower_with(&words, layout, vec![]).unwrap();
+        assert_eq!(l.heap_props, vec![(0x100B, 0), (0x100B, 0), (0x100B, 0)]);
+        validate_dxil(&l.dxil);
+    }
+
+    #[test]
+    fn heap_s_buffer_load_with_buffer_store_emits_raw_uav_and_validates() {
+        // Heap descriptor 0 (s[8:11]) is read by s_buffer_load_dword and written
+        // by buffer_store_dword -> raw UAV (0x100B), not CBV (13).
+        // Heap descriptor 1 (s[12:15]) is read only by s_buffer_load_dword
+        // without glc -> stays CBV (13, 0x1_0000).
+        let words = [
+            0xBE84_0300, // s_mov_b32 s4, s0
+            0xBE85_0380, // s_mov_b32 s5, 0
+            0xF408_0202,
+            0xFA00_0000, // s_load_dwordx4 s[8:11], s[4:5], null (heap index 0)
+            0xF408_0302,
+            0xFA00_0020, // s_load_dwordx4 s[12:15], s[4:5], 0x20 (heap index 1)
+            0xF420_0184,
+            0xFA00_0000, // s_buffer_load_dword s6, s[8:11], null
+            0xF420_01C6,
+            0xFA00_0000, // s_buffer_load_dword s7, s[12:15], null
+            0x8006_0706, // s_add_u32 s6, s6, s7
+            0x7E02_0206, // v_mov_b32 v1, s6
+            0xE070_0004,
+            0x8002_0100, // buffer_store_dword v1, v0, s[8:11], 0 offset:4
+            S_ENDPGM,
+        ];
+        let layout = vec![root(RootType::ResourceHeap, 0, 0)];
+        let l = lower_with(&words, layout, vec![]).unwrap();
+        assert_eq!(l.heap_props, vec![(0x100B, 0), (13, 0x1_0000)]);
+        validate_dxil(&l.dxil);
+    }
+
+    #[test]
+    fn glc_uav_buffer_and_image_loads_emit_globally_coherent_and_validate() {
+        // Heap descriptor 0 (s[8:11]): buffer_load_dword ... glc -> UAV + IsGloballyCoherent (0x500B),
+        // while its descriptor_data / non-glc buffer_store_dword use raw UAV (0x100B).
+        // Heap descriptor 1 (s[12:15]): read-only non-glc buffer_load_dword -> SRV (11, 0).
+        // Heap descriptor 2 (s[16:23]): image_load ... glc -> 2D UAV + IsGloballyCoherent (0x5002, 0x409),
+        // while its descriptor_data uses 2D UAV (0x1002, 0x409).
+        let words = [
+            0xBE84_0300, // s_mov_b32 s4, s0
+            0xBE85_0380, // s_mov_b32 s5, 0
+            0xF408_0202,
+            0xFA00_0000, // s_load_dwordx4 s[8:11], s[4:5], null (heap index 0)
+            0xF408_0302,
+            0xFA00_0020, // s_load_dwordx4 s[12:15], s[4:5], 0x20 (heap index 1)
+            0xF40C_0402,
+            0xFA00_0040, // s_load_dwordx8 s[16:23], s[4:5], 0x40 (heap index 2)
+            0xE030_4000,
+            0x8002_0100, // buffer_load_dword v1, v0, s[8:11], 0 offset:0 glc
+            0xE030_0000,
+            0x8003_0200, // buffer_load_dword v2, v0, s[12:15], 0 offset:0
+            0xF000_2F08,
+            0x0004_0400, // image_load v[4:7], v[0:1], s[16:23] dmask:0xf dim:2D glc
+            0x4A02_0302, // v_add_nc_u32 v1, v2, v1
+            0x4A02_0304, // v_add_nc_u32 v1, v4, v1
+            0xE070_0004,
+            0x8002_0100, // buffer_store_dword v1, v0, s[8:11], 0 offset:4 (non-glc store)
+            S_ENDPGM,
+        ];
+        let layout = vec![root(RootType::ResourceHeap, 0, 0)];
+        let l = lower_with(&words, layout, vec![]).unwrap();
+        assert_eq!(
+            l.heap_props,
+            vec![
+                (0x100B, 0),
+                (11, 0),
+                (0x1002, 0x409),
+                (0x500B, 0),
+                (0x5002, 0x409),
+            ]
+        );
+        validate_dxil(&l.dxil);
     }
 }
