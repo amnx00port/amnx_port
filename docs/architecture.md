@@ -97,3 +97,16 @@ the lanes take, from structurisation), and accessed with a non-uniform heap
 index in one pass. `victory translate`
 runs every shader it finds (containers, SGD5 files) through these and
 lists what they cannot handle yet.
+
+An address the program computes itself (a pointer it loads, picks by
+control flow or builds) traces to no root parameter. Such accesses go
+through the address map (`victory_shader::emit::address_map`): the host
+copies of title memory sorted by address, which the shader searches, then
+reads or writes through a raw view in the descriptor heap. The ray-tracing
+passes walk the BVH this way and test each node with
+`image_bvh_intersect_ray`, which no host shader model has: the translation
+reads the node through the map and tests it as Microsoft's software model
+of the instruction does (`SoftwareBvhIntersectRay` in the XDXR traversal
+headers). Descriptor words a program reads as numbers (a buffer's address,
+say) come from a copy of the view heap in the console's layout, 32 bytes a
+slot, that the host keeps beside it.

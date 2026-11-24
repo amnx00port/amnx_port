@@ -33,6 +33,58 @@ pub(crate) struct HostHeap {
     /// Where the search for free dynamic slots starts, and which are taken
     /// (by lists not yet reset).
     next: Mutex<(u32, Vec<bool>)>,
+    /// View heaps: the console words of each slot's descriptor, 8 dwords
+    /// per slot, for shaders that read descriptors as numbers: the buffer,
+    /// its mapping and its host GPU address.
+    words: Option<(ID3D12Resource, usize, u64)>,
+}
+
+/// A GFX10 buffer descriptor's dword 3 for raw access: X Y Z W selects, a
+/// 32-bit float format, raw out-of-range checking, resource level 1. The
+/// address and size in dwords 0 to 2 are what programs read.
+const RAW_DWORD3: u32 = 0x3101_6FAC;
+
+/// The console words of a descriptor for `view`, as far as programs read
+/// them as numbers: a buffer descriptor's address, stride and record count
+/// for buffer views, constant buffers and acceleration structures (whose
+/// descriptor is a buffer at the structure); zero otherwise.
+pub(crate) fn console_words(view: &View) -> [u32; 8] {
+    let (address, len, stride) = match view {
+        View::Constant(address, size) => (*address, u64::from(*size), 0),
+        // An acceleration structure (dimension 11) names no resource: its
+        // location is the union's first quadword.
+        View::Shader(0, Some(d)) if d[1] == 11 => (
+            u64::from(d[4]) | u64::from(d[5]) << 32,
+            u64::from(u32::MAX),
+            0,
+        ),
+        v => match buffer_range(v) {
+            Some((address, len)) => {
+                let stride = match v {
+                    View::Shader(_, Some(d)) | View::Unordered(_, _, Some(d)) => d[7],
+                    View::Placed(_, _, d) => d[7],
+                    _ => 0,
+                };
+                (address, len, stride)
+            }
+            None => return [0; 8],
+        },
+    };
+    let records = if stride > 0 {
+        len / u64::from(stride)
+    } else {
+        len
+    };
+    [
+        address as u32,
+        (address >> 32) as u32 & 0xFFFF | (stride & 0x3FFF) << 16,
+        records.min(u64::from(u32::MAX)) as u32,
+        RAW_DWORD3,
+        0,
+        0,
+        0,
+        0,
+    ]
 }
 
 /// Host heaps' GPU ranges (start, bytes, bytes per slot, sampler), for
@@ -136,6 +188,20 @@ impl HostHeap {
             u64::from(step),
             sampler,
         ));
+        let words = if sampler {
+            None
+        } else {
+            let bytes = u64::from(count + extra) * 32;
+            host.shared_buffer(bytes).map(|(buffer, data)| {
+                crate::host::name(&buffer, || format!("descriptor words {count}+{extra}"));
+                // SAFETY: a fresh mapping of `bytes`; a live buffer.
+                unsafe {
+                    std::ptr::write_bytes(data, 0, bytes as usize);
+                    let gpu = buffer.GetGPUVirtualAddress();
+                    (buffer, data as usize, gpu)
+                }
+            })
+        };
         let h = HostHeap {
             heap,
             cpu,
@@ -146,6 +212,7 @@ impl HostHeap {
             made: Mutex::new(vec![0; count as usize]),
             kept: Mutex::new(vec![None; (count + extra) as usize]),
             next: Mutex::new((0, vec![false; extra as usize])),
+            words,
         };
         // A slot never written is undefined: shaders reading one (a slot
         // the title wrote in a way we do not know, or a table entry no
@@ -286,6 +353,7 @@ impl HostHeap {
             null_for(view, self.cpu(index));
         }
         self.keep(index, kept.flatten());
+        self.write_words(index, console_words(view));
     }
 
     /// Makes slot `index` read nothing: a null view, or a plain sampler.
@@ -296,6 +364,61 @@ impl HostHeap {
             null_view(self.cpu(index));
         }
         self.keep(index, None);
+        self.write_words(index, [0; 8]);
+    }
+
+    /// The host GPU address of the heap's descriptor words (view heaps).
+    pub(crate) fn words(&self) -> Option<u64> {
+        self.words.as_ref().map(|w| w.2)
+    }
+
+    fn write_words(&self, index: u32, words: [u32; 8]) {
+        let Some((_, data, _)) = self.words else {
+            return;
+        };
+        if index >= self.count + self.dynamic {
+            return;
+        }
+        // SAFETY: slot `index` of the mapping, 32 bytes each.
+        unsafe {
+            std::ptr::copy_nonoverlapping(
+                words.as_ptr(),
+                (data as *mut u32).add(index as usize * 8),
+                8,
+            );
+        }
+    }
+
+    /// Makes slot `index` (a dynamic one) a raw unordered access view of
+    /// `n` dwords of `buffer` from dword `first` on, holding the buffer
+    /// while the slot does; a null one (reads give zero) without a buffer.
+    pub(crate) fn raw_uav_at(
+        &self,
+        index: u32,
+        buffer: Option<&ID3D12Resource>,
+        first: u64,
+        n: u32,
+    ) {
+        let Some(host) = host() else { return };
+        let desc = D3D12_UNORDERED_ACCESS_VIEW_DESC {
+            Format: DXGI_FORMAT_R32_TYPELESS,
+            ViewDimension: D3D12_UAV_DIMENSION_BUFFER,
+            Anonymous: D3D12_UNORDERED_ACCESS_VIEW_DESC_0 {
+                Buffer: D3D12_BUFFER_UAV {
+                    FirstElement: first,
+                    NumElements: n,
+                    Flags: D3D12_BUFFER_UAV_FLAG_RAW,
+                    ..Default::default()
+                },
+            },
+        };
+        // SAFETY: a slot of our heap and a live buffer, or none.
+        unsafe {
+            host.device
+                .CreateUnorderedAccessView(buffer, None, Some(&desc), self.cpu(index))
+        };
+        self.keep(index, buffer.cloned());
+        self.write_words(index, [0; 8]);
     }
 
     /// Slot `index` now views `resource` (or nothing of the host's).
@@ -310,6 +433,7 @@ impl HostHeap {
     /// memory (the list's own, which it holds).
     pub(crate) fn constant_at(&self, index: u32, gpu: u64, size: u32) {
         self.keep(index, None);
+        self.write_words(index, [0; 8]);
         let Some(host) = host() else { return };
         let desc = D3D12_CONSTANT_BUFFER_VIEW_DESC {
             BufferLocation: gpu,
@@ -362,6 +486,8 @@ impl HostHeap {
             }
             return None;
         };
+        // Even buffer views made only for draws have their words now.
+        self.write_words(index, console_words(&view));
         if made[index as usize] != key {
             let later = !for_draw && view.is_buffer();
             made[index as usize] = if later { 0 } else { key };

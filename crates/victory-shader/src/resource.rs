@@ -38,6 +38,43 @@ pub struct Address {
 /// offset is then the byte offset in the code.
 pub const CODE: usize = usize::MAX;
 
+/// [`Address::param`] of an address only known when the program runs: a
+/// pointer it loads from memory, picks by control flow or computes (a
+/// ray-tracing traversal follows the pointers in its BVH). The lowering
+/// rebuilds the 64-bit address from the instruction's own operands and
+/// reads title memory through the address map; `offset` and `dynamic`
+/// are unused.
+pub const GLOBAL: usize = usize::MAX - 1;
+
+/// Why an address has no root parameter, when the program computes it
+/// from values a translation can reproduce: such an access reads title
+/// memory at that address ([`GLOBAL`]). An address in an SGPR the
+/// hardware fills (the console's spill table, say) has no host value, so
+/// that case stays a refusal, as do the code-relative ones.
+fn runtime_address(why: &str) -> bool {
+    matches!(
+        why,
+        "an address not from a root parameter"
+            | "an address from a phi"
+            | "an address loaded from memory"
+            | "an address with two computed terms"
+            | "an address from a root parameter that is no address"
+    )
+}
+
+/// The address of a memory access, or [`GLOBAL`] when [`runtime_address`]
+/// says why it has none.
+fn or_global(a: Result<Address, &'static str>) -> Result<Address, &'static str> {
+    match a {
+        Err(why) if runtime_address(why) => Ok(Address {
+            param: GLOBAL,
+            offset: 0,
+            dynamic: None,
+        }),
+        a => a,
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Source {
     /// Dwords `first..` of what the scalar load at `load` reads (see
@@ -192,6 +229,9 @@ pub fn track(
                 Ok(())
             };
             match &inst.fields {
+                // The BVH descriptor is read as data (its base address and
+                // flags): no host view stands for it.
+                Fields::Image { .. } if inst.name().starts_with("image_bvh") => {}
                 Fields::Image { rsrc, sampler, .. } => {
                     descriptor(rsrc, Role::Resource)?;
                     if let Some(s) = sampler {
@@ -208,7 +248,8 @@ pub fn track(
                     soffset,
                     ..
                 } if inst.name().contains("_load_") || inst.name().contains("_store_") => {
-                    let address = t.smem_address(inst, base, *offset, soffset).map_err(fail)?;
+                    let address =
+                        or_global(t.smem_address(inst, base, *offset, soffset)).map_err(fail)?;
                     out.scalar.push((site, address));
                 }
                 Fields::Flat {
@@ -217,9 +258,9 @@ pub fn track(
                     offset,
                     ..
                 } if inst.name().starts_with("global_") => {
-                    let address = t
-                        .flat_address(inst, addr.as_ref(), saddr.as_ref(), *offset)
-                        .map_err(fail)?;
+                    let address =
+                        or_global(t.flat_address(inst, addr.as_ref(), saddr.as_ref(), *offset))
+                            .map_err(fail)?;
                     out.scalar.push((site, address));
                 }
                 _ => {}

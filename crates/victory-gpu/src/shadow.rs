@@ -99,6 +99,11 @@ impl Shadow {
         address - self.start
     }
 
+    /// The title memory the copy holds: its first address and length.
+    pub(crate) fn span(&self) -> (u64, u64) {
+        (self.start, self.len)
+    }
+
     /// Brings `len` bytes at `address` up to date when `list` is submitted,
     /// and keeps the copy alive until the list is reset.
     pub(crate) fn refresh(self: &Arc<Self>, list: &HostList, address: u64, len: u64) {
@@ -464,6 +469,23 @@ fn loose(address: u64, end: u64) -> Option<Arc<Shadow>> {
     let shadow = Arc::new(Shadow::new(buffer, data, gpu, start, len));
     map.insert((start, len), shadow.clone());
     Some(shadow)
+}
+
+/// Every host copy of title memory made so far (buffers' and loose
+/// windows'), for the address map.
+pub(crate) fn all() -> Vec<Arc<Shadow>> {
+    let mut out: Vec<Arc<Shadow>> = buffers()
+        .values()
+        .filter_map(|e| e.shadow.clone())
+        .collect();
+    out.extend(
+        LOOSE
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .values()
+            .cloned(),
+    );
+    out
 }
 
 /// For device-removed reports: the copy of title memory whose host range

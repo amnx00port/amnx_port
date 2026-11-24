@@ -8,7 +8,9 @@
 use std::ffi::{CStr, CString};
 use std::sync::Arc;
 
-use victory_shader::emit::{ROOT_CBV_SPACE, SAMPLER_SPACE, USER_DATA_SPACE};
+use victory_shader::emit::{
+    ADDRESS_MAP_SPACE, DESCRIPTOR_WORDS_SPACE, ROOT_CBV_SPACE, SAMPLER_SPACE, USER_DATA_SPACE,
+};
 use windows::Win32::Graphics::Direct3D::ID3DBlob;
 use windows::Win32::Graphics::Direct3D12::*;
 use windows::Win32::Graphics::Dxgi::Common::*;
@@ -251,6 +253,10 @@ pub(crate) struct Stage {
     /// Root parameters of its root views: (title root parameter, ours).
     pub(crate) root_cbvs: Vec<(u8, u32)>,
     pub(crate) root_srvs: Vec<(u8, u32)>,
+    /// The root parameters of the address map and of the descriptor words,
+    /// when it reads them.
+    pub(crate) address_map: Option<u32>,
+    pub(crate) descriptor_words: Option<u32>,
 }
 
 impl Stage {
@@ -339,6 +345,8 @@ impl HostPipeline {
                 user_data: None,
                 root_cbvs: Vec::new(),
                 root_srvs: Vec::new(),
+                address_map: None,
+                descriptor_words: None,
             };
             let dwords = t.user_data_dwords();
             if dwords > 0 {
@@ -375,6 +383,29 @@ impl HostPipeline {
                             Descriptor: D3D12_ROOT_DESCRIPTOR1 {
                                 ShaderRegister: u32::from(slot),
                                 RegisterSpace: ROOT_CBV_SPACE,
+                                Flags: D3D12_ROOT_DESCRIPTOR_FLAG_DATA_VOLATILE,
+                            },
+                        },
+                        ShaderVisibility: visibility,
+                    });
+                }
+            }
+            for (wanted, space, out) in [
+                (t.address_map, ADDRESS_MAP_SPACE, &mut stage.address_map),
+                (
+                    t.descriptor_words,
+                    DESCRIPTOR_WORDS_SPACE,
+                    &mut stage.descriptor_words,
+                ),
+            ] {
+                if wanted {
+                    *out = Some(params.len() as u32);
+                    params.push(D3D12_ROOT_PARAMETER1 {
+                        ParameterType: D3D12_ROOT_PARAMETER_TYPE_SRV,
+                        Anonymous: D3D12_ROOT_PARAMETER1_0 {
+                            Descriptor: D3D12_ROOT_DESCRIPTOR1 {
+                                ShaderRegister: 0,
+                                RegisterSpace: space,
                                 Flags: D3D12_ROOT_DESCRIPTOR_FLAG_DATA_VOLATILE,
                             },
                         },

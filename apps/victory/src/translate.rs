@@ -198,7 +198,10 @@ pub fn run(
             let next = AtomicUsize::new(0);
             std::thread::scope(|s| {
                 for _ in 0..threads.min(jobs.len()) {
-                    s.spawn(|| {
+                    // Pipeline creation converts DXIL on this thread.
+                    let worker = std::thread::Builder::new()
+                        .stack_size(victory_shader::emit::PIPELINE_STACK);
+                    let spawned = worker.spawn_scoped(s, || {
                         let mut t = Tally {
                             list,
                             ..Tally::default()
@@ -217,6 +220,9 @@ pub fn run(
                         }
                         lock(&total).merge(t);
                     });
+                    if let Err(e) = spawned {
+                        eprintln!("no translation worker: {e}");
+                    }
                 }
             });
         }

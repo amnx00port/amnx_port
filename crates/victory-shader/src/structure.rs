@@ -607,7 +607,7 @@ impl<'a> Lanes<'a> {
                     .collect()
             })
             .collect();
-        let exits = blocks
+        let exits: Vec<LaneExit> = blocks
             .iter()
             .enumerate()
             .map(|(n, block)| match block.exit {
@@ -624,6 +624,7 @@ impl<'a> Lanes<'a> {
         if self.b.overflow {
             return Err(TOO_LARGE);
         }
+        let active = self.active_joins(&exits);
         Ok(Structured {
             masks: self.masks.iter().map(|(&(lo, _), &m)| (lo, m)).collect(),
             highs: self
@@ -633,12 +634,64 @@ impl<'a> Lanes<'a> {
                 .map(|&(lo, hi)| (hi, lo))
                 .collect(),
             paired_masks: if self.p.wave64 { self.masks } else { Map::default() },
-            active: self.active,
+            active,
             bools: self.b,
             exits,
             guards,
             reach: cond.to_vec(),
         })
+    }
+
+    /// [`Structured::active`] with the mask joins whose lanes all run where
+    /// they are joined: each incoming mask is active and written in the
+    /// block it arrives from (or is the join itself, passed on), and every
+    /// lane there leaves by that edge together (a jump, or a branch on a
+    /// uniform condition). A ray-tracing traversal keeps the lanes still
+    /// walking in such a mask across its loop. Wave32 only.
+    fn active_joins(&self, exits: &[LaneExit]) -> HashSet<Value> {
+        let mut active = self.active.clone();
+        if self.p.wave64 {
+            return active;
+        }
+        let together = |q: usize, to: usize| match exits[q] {
+            LaneExit::Jump(t) => t == to,
+            LaneExit::Branch {
+                when,
+                taken,
+                not_taken,
+            } => {
+                (taken == to || not_taken == to)
+                    && self
+                        .b
+                        .support(when)
+                        .iter()
+                        .all(|a| matches!(a, Atom::Uniform(_)))
+            }
+            LaneExit::End | LaneExit::Indirect => false,
+        };
+        let written_in = |v: Value| self.defs.get(&v).or(self.phis.get(&v)).map(|d| d.0);
+        loop {
+            let mut grew = false;
+            for (j, block) in self.p.blocks.iter().enumerate() {
+                for phi in &block.phis {
+                    let v = phi.value;
+                    if active.contains(&v) || !self.masks.contains_key(&(v, v)) {
+                        continue;
+                    }
+                    let all = phi.args.iter().zip(&block.preds).all(|(&arg, &q)| {
+                        arg == v
+                            || active.contains(&arg) && written_in(arg) == Some(q) && together(q, j)
+                    });
+                    if all {
+                        active.insert(v);
+                        grew = true;
+                    }
+                }
+            }
+            if !grew {
+                return active;
+            }
+        }
     }
 
     fn key(&self, value: impl Fn(Reg) -> Option<Value>, code: u8) -> Option<Key> {
