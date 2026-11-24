@@ -937,3 +937,39 @@ fn v_cmp_class_f16_matches_rdna2() {
         );
     });
 }
+
+#[test]
+fn v_cvt_f16_f32_applies_vop3_clamp() {
+    // Initialize v0 so the conversion's low-half write must preserve its high half.
+    let [mut w0, w1] = vop3(0x18a, 0, vgpr(1), 0, 0);
+    w0 |= 1 << 15; // CLAMP
+    let shader = build_valu_cs(&[vop1(0x001, 0, sgpr(3)), w0, w1]);
+    let cases = [[0xbf00_0000, 0, 0, 0xbeef_1234]]; // -0.5 -> 0.0
+
+    if Host::new(false).is_err() && Host::new(true).is_err() {
+        eprintln!("no SM 6.6 host or WARP device; skipped");
+        return;
+    }
+
+    run_cases(&shader, &cases, |backend, _, _, got| {
+        assert_eq!(got, 0xbeef_0000, "{backend}: clamp before f16 conversion");
+    });
+}
+
+#[test]
+fn v_cvt_f32_f16_applies_vop3_abs_then_neg() {
+    let [mut w0, mut w1] = vop3(0x18b, 0, vgpr(1), 0, 0);
+    w0 |= 1 << 8; // ABS[0]
+    w1 |= 1 << 29; // NEG[0]
+    let shader = build_valu_cs(&[w0, w1]);
+    let cases = [[0x0000_3c00, 0, 0, 0]]; // +1.0 f16
+
+    if Host::new(false).is_err() && Host::new(true).is_err() {
+        eprintln!("no SM 6.6 host or WARP device; skipped");
+        return;
+    }
+
+    run_cases(&shader, &cases, |backend, _, _, got| {
+        assert_eq!(got, 0xbf80_0000, "{backend}: abs then neg on f16 source");
+    });
+}

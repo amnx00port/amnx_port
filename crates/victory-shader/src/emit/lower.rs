@@ -4109,7 +4109,10 @@ impl<'a> Lower<'a> {
             }
             "v_cvt_f16_f32" if v.opsel == 0 => {
                 // Rounded to nearest even (the MODE default) into the low half.
-                let a = f(self, 0)?;
+                let mut a = f(self, 0)?;
+                if v.clamp {
+                    a = self.unary(7, a);
+                }
                 let r = self
                     .s
                     .op(c, "legacyF32ToF16", Attr::ReadNone, self.s.t.i32, 130, &[a]);
@@ -4145,10 +4148,7 @@ impl<'a> Lower<'a> {
                 int(self, r)
             }
             "v_cvt_f32_f16" if v.opsel == 0 => {
-                let a = s(self, 0)?;
-                let r = self
-                    .s
-                    .op(c, "legacyF16ToF32", Attr::ReadNone, self.s.t.f32, 131, &[a]);
+                let r = self.half_fsrc(inst, 0)?;
                 float(self, r)
             }
             "v_cndmask_b32" => {
