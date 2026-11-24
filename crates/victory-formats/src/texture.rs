@@ -157,6 +157,16 @@ pub struct Tail {
     pub y: u32,
 }
 
+
+struct Subresource {
+    mip: Mip,
+    first: u32,
+    row_pitch: usize,
+    depth_pitch: usize,
+    bytes: usize,
+}
+
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Layout {
     pub desc: Desc,
@@ -523,7 +533,8 @@ impl Layout {
     /// depth slice).
     fn split(&self, z: u32) -> (u32, u32) {
         if self.thick {
-            (z / self.block[2], z % self.block[2])
+            let bd = self.block[2];
+            (z >> bd.trailing_zeros(), z & (bd - 1))
         } else {
             (z, 0)
         }
@@ -563,16 +574,18 @@ impl Layout {
         // In the tail the pattern of the shifted position gives the mip's
         // offset inside the tail block.
         let y = y + m.tail.map_or(0, |t| t.y);
-        let blocks = u64::from(y / bh) * u64::from(m.pitch / bw);
-        (blocks << log2) + u64::from(self.pattern[1][(y % bh) as usize] | self.pattern[2][z as usize])
+        let blocks =
+            u64::from(y >> bh.trailing_zeros()) * u64::from(m.pitch >> bw.trailing_zeros());
+        (blocks << log2)
+            + u64::from(self.pattern[1][(y & (bh - 1)) as usize] | self.pattern[2][z as usize])
     }
 
     /// The part of an address that depends on the column.
     fn column(&self, m: &Mip, x: u32) -> u64 {
         let bw = self.block[0];
         let x = x + m.tail.map_or(0, |t| t.x);
-        (u64::from(x / bw) << self.alignment.trailing_zeros())
-            + u64::from(self.pattern[0][(x % bw) as usize])
+        (u64::from(x >> bw.trailing_zeros()) << self.alignment.trailing_zeros())
+            + u64::from(self.pattern[0][(x & (bw - 1)) as usize])
     }
 
     /// Depth slices a subresource of mip `mip` covers: the mip's depth for
@@ -594,9 +607,7 @@ impl Layout {
         row_pitch: usize,
         depth_pitch: usize,
     ) -> Result<(), Error> {
-        self.walk(tiled.len(), mip, slice, linear.len(), row_pitch, depth_pitch, |t, l, len| {
-            linear[l..][..len].copy_from_slice(&tiled[t..][..len]);
-        })
+        self.copy_subresource::<true>(linear, tiled, mip, slice, row_pitch, depth_pitch)
     }
 
     /// The reverse of [`Layout::detile`]: linear rows into tiled memory.
@@ -609,25 +620,20 @@ impl Layout {
         row_pitch: usize,
         depth_pitch: usize,
     ) -> Result<(), Error> {
-        self.walk(tiled.len(), mip, slice, linear.len(), row_pitch, depth_pitch, |t, l, len| {
-            tiled[t..][..len].copy_from_slice(&linear[l..][..len]);
-        })
+        self.copy_subresource::<false>(tiled, linear, mip, slice, row_pitch, depth_pitch)
     }
 
-    /// Visits contiguous runs as (tiled byte offset, linear byte offset, length).
-    #[allow(clippy::too_many_arguments)]
-    fn walk(
+
+    fn copy_subresource<const DETILE: bool>(
         &self,
-        tiled_len: usize,
+        dst: &mut [u8],
+        src: &[u8],
         mip: u32,
         slice: u32,
-        linear_len: usize,
         row_pitch: usize,
         depth_pitch: usize,
-        mut copy: impl FnMut(usize, usize, usize),
     ) -> Result<(), Error> {
-        let m = self.mips.get(mip as usize).ok_or(Error::Invalid)?;
-        let depth = m.depth;
+        let m = *self.mips.get(mip as usize).ok_or(Error::Invalid)?;
         let first = if self.desc.dimension == Dimension::Tex3d {
             if slice != 0 {
                 return Err(Error::Invalid);
@@ -642,52 +648,153 @@ impl Layout {
         if !self.addressable() {
             return Err(Error::Unsupported);
         }
+
         let n = self.desc.element_bytes as usize;
         let bytes = m.width as usize * n;
-        let need = (depth as usize - 1)
+        let need = (m.depth as usize - 1)
             .checked_mul(depth_pitch)
             .zip((m.height as usize - 1).checked_mul(row_pitch))
             .and_then(|(depth_offset, row_offset)| depth_offset.checked_add(row_offset))
             .and_then(|offset| offset.checked_add(bytes))
             .ok_or(Error::TooSmall)?;
+        let (tiled_len, linear_len) = if DETILE {
+            (src.len(), dst.len())
+        } else {
+            (dst.len(), src.len())
+        };
         if tiled_len < self.size as usize || linear_len < need || row_pitch < bytes {
             return Err(Error::TooSmall);
         }
-        let linear = self.desc.swizzle == Swizzle::LINEAR;
+
+        let sub = Subresource {
+            mip: m,
+            first,
+            row_pitch,
+            depth_pitch,
+            bytes,
+        };
+        if self.desc.swizzle == Swizzle::LINEAR {
+            for z in 0..m.depth {
+                let (s, _) = self.split(first + z);
+                let base = u64::from(s) * self.slice_size + m.offset;
+                let linear_plane = z as usize * depth_pitch;
+                for y in 0..m.height {
+                    let linear_row = linear_plane + y as usize * row_pitch;
+                    let tiled_row = (base + u64::from(y) * u64::from(m.pitch) * n as u64) as usize;
+                    if DETILE {
+                        dst[linear_row..][..bytes].copy_from_slice(&src[tiled_row..][..bytes]);
+                    } else {
+                        dst[tiled_row..][..bytes].copy_from_slice(&src[linear_row..][..bytes]);
+                    }
+                }
+            }
+            return Ok(());
+        }
+
         // The row and depth contribute one common base to every column, so
         // the same contiguous runs repeat on every row, including mip tails.
         let mut runs = Vec::new();
-        if !linear {
-            let mut first_linear = 0;
-            let mut first_tiled = self.column(m, 0) as usize;
-            for x in 1..m.width {
-                let offset = self.column(m, x) as usize;
-                let at = x as usize * n;
-                if offset != first_tiled + (at - first_linear) {
-                    runs.push((first_tiled, first_linear, at - first_linear));
-                    first_tiled = offset;
-                    first_linear = at;
-                }
+        let mut first_linear = 0;
+        let mut first_tiled = self.column(&m, 0) as usize;
+        for x in 1..m.width {
+            let offset = self.column(&m, x) as usize;
+            let at = x as usize * n;
+            if offset != first_tiled + (at - first_linear) {
+                runs.push((first_tiled, first_linear, at - first_linear));
+                first_tiled = offset;
+                first_linear = at;
             }
-            runs.push((first_tiled, first_linear, bytes - first_linear));
         }
-        for z in 0..depth {
-            let (s, inner) = self.split(first + z);
+        runs.push((first_tiled, first_linear, bytes - first_linear));
+
+        let (head, tail) = match runs.last() {
+            Some(&last) if runs.len() > 1 && last.2 != runs[0].2 => {
+                (&runs[..runs.len() - 1], Some(last))
+            }
+            _ => (runs.as_slice(), None),
+        };
+        let uniform = head
+            .first()
+            .map(|r| r.2)
+            .filter(|&len| head.iter().all(|r| r.2 == len));
+
+        match uniform {
+            Some(4) => self.copy_fixed::<4, DETILE>(&sub, dst, src, head, tail),
+            Some(8) => self.copy_fixed::<8, DETILE>(&sub, dst, src, head, tail),
+            Some(16) => self.copy_fixed::<16, DETILE>(&sub, dst, src, head, tail),
+            Some(32) => self.copy_fixed::<32, DETILE>(&sub, dst, src, head, tail),
+            _ => self.copy_var::<DETILE>(&sub, dst, src, &runs),
+        }
+        Ok(())
+    }
+
+
+    fn copy_fixed<const N: usize, const DETILE: bool>(
+        &self,
+        sub: &Subresource,
+        dst: &mut [u8],
+        src: &[u8],
+        head: &[(usize, usize, usize)],
+        tail: Option<(usize, usize, usize)>,
+    ) {
+        let m = &sub.mip;
+        for z in 0..m.depth {
+            let (s, inner) = self.split(sub.first + z);
             let base = u64::from(s) * self.slice_size + m.offset;
+            let linear_plane = z as usize * sub.depth_pitch;
             for y in 0..m.height {
-                let linear_row = z as usize * depth_pitch + y as usize * row_pitch;
-                if linear {
-                    let tiled_row = base + u64::from(y) * u64::from(m.pitch) * n as u64;
-                    copy(tiled_row as usize, linear_row, bytes);
+                let linear_row = linear_plane + y as usize * sub.row_pitch;
+                let tiled_row = (base + self.row(m, y, inner)) as usize;
+                if DETILE {
+                    let row = &mut dst[linear_row..linear_row + sub.bytes];
+                    for &(tiled, linear, _) in head {
+                        row[linear..][..N].copy_from_slice(&src[tiled_row + tiled..][..N]);
+                    }
+                    if let Some((tiled, linear, len)) = tail {
+                        row[linear..][..len].copy_from_slice(&src[tiled_row + tiled..][..len]);
+                    }
                 } else {
-                    let tiled_row = (base + self.row(m, y, inner)) as usize;
-                    for &(tiled, linear, len) in &runs {
-                        copy(tiled_row + tiled, linear_row + linear, len);
+                    let row = &src[linear_row..linear_row + sub.bytes];
+                    for &(tiled, linear, _) in head {
+                        dst[tiled_row + tiled..][..N].copy_from_slice(&row[linear..][..N]);
+                    }
+                    if let Some((tiled, linear, len)) = tail {
+                        dst[tiled_row + tiled..][..len].copy_from_slice(&row[linear..][..len]);
                     }
                 }
             }
         }
-        Ok(())
+    }
+
+
+    fn copy_var<const DETILE: bool>(
+        &self,
+        sub: &Subresource,
+        dst: &mut [u8],
+        src: &[u8],
+        runs: &[(usize, usize, usize)],
+    ) {
+        let m = &sub.mip;
+        for z in 0..m.depth {
+            let (s, inner) = self.split(sub.first + z);
+            let base = u64::from(s) * self.slice_size + m.offset;
+            let linear_plane = z as usize * sub.depth_pitch;
+            for y in 0..m.height {
+                let linear_row = linear_plane + y as usize * sub.row_pitch;
+                let tiled_row = (base + self.row(m, y, inner)) as usize;
+                if DETILE {
+                    let row = &mut dst[linear_row..linear_row + sub.bytes];
+                    for &(tiled, linear, len) in runs {
+                        row[linear..][..len].copy_from_slice(&src[tiled_row + tiled..][..len]);
+                    }
+                } else {
+                    let row = &src[linear_row..linear_row + sub.bytes];
+                    for &(tiled, linear, len) in runs {
+                        dst[tiled_row + tiled..][..len].copy_from_slice(&row[linear..][..len]);
+                    }
+                }
+            }
+        }
     }
 }
 
@@ -940,6 +1047,41 @@ mod tests {
                         assert!(back[base + plane - 11..base + plane].iter().all(|&b| b == 0xcc));
                     }
                 }
+            }
+        }
+    }
+
+
+    #[test]
+    fn fixed_and_tail_run_paths_round_trip() {
+        let cases = [
+            desc(35, 19, 4, 16, Swizzle::SW_64KB_D),
+            desc(37, 13, 4, 4, Swizzle::SW_64KB_S),
+            desc(19, 11, 3, 1, Swizzle::SW_4KB_D),
+            Desc {
+                dimension: Dimension::Tex3d,
+                depth: 9,
+                ..desc(11, 7, 3, 2, Swizzle::SW_4KB_S)
+            },
+            desc(1, 1, 1, 1, Swizzle::SW_4KB_S),
+            desc(1, 1, 1, 2, Swizzle::SW_64KB_D),
+        ];
+
+        for d in cases {
+            let l = Layout::new(&d).unwrap();
+            let mut tiled = vec![0u8; l.size as usize];
+            let n = d.element_bytes as usize;
+            for mip in 0..d.mips {
+                let m = l.mips[mip as usize];
+                let row = m.width as usize * n;
+                let plane = row * m.height as usize;
+                let linear: Vec<u8> = (0..plane * m.depth as usize)
+                    .map(|i| (i * 17 + mip as usize * 5 + 1) as u8)
+                    .collect();
+                l.tile(&mut tiled, mip, 0, &linear, row, plane).unwrap();
+                let mut back = vec![0u8; linear.len()];
+                l.detile(&tiled, mip, 0, &mut back, row, plane).unwrap();
+                assert_eq!(back, linear, "{d:?} mip {mip}");
             }
         }
     }
