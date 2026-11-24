@@ -649,13 +649,35 @@ impl<'a> Lower<'a> {
                     dword(self, at)?
                 }
                 Some((width, signed)) => {
-                    // shortcut: the field is taken not to cross a dword.
                     let (not3, three) = (self.s.m.i32(!3), self.s.m.i32(3));
                     let at = self.s.m.bin(c, Bin::And, off, not3);
                     let w = dword(self, at)?;
                     let byte = self.s.m.bin(c, Bin::And, off, three);
                     let sh = self.s.m.bin(c, Bin::Shl, byte, three);
-                    let x = self.s.m.bin(c, Bin::LShr, w, sh);
+                    let mut x = self.s.m.bin(c, Bin::LShr, w, sh);
+                    if width == 16 && (a.dynamic.is_some() || a.offset & 3 == 3) {
+                        // A 16-bit load at byte offset 3 mod 4 takes its high
+                        // byte from the next dword; guard dynamic offsets so
+                        // non-straddling loads never read past a buffer's end.
+                        let br = if a.dynamic.is_some() {
+                            let mut crosses = self.s.m.cmp(c, pred::EQ, byte, three);
+                            if let Some(g) = guard {
+                                crosses = self.s.m.bin(c, Bin::And, crosses, g);
+                            }
+                            self.begin_guarded(Some(crosses))
+                        } else {
+                            None
+                        };
+                        let cur = self.cur;
+                        let four = self.s.m.i32(4);
+                        let next = self.s.m.bin(cur, Bin::Add, at, four);
+                        let hi = dword(self, next)?;
+                        let eight = self.s.m.i32(8);
+                        let hi = self.s.m.bin(cur, Bin::Shl, hi, eight);
+                        let combined = self.s.m.bin(cur, Bin::Or, x, hi);
+                        x = self.end_guarded(br, &[(combined, x)])[0];
+                    }
+                    let c = self.cur;
                     let left = self.s.m.i32(32 - width);
                     let x = self.s.m.bin(c, Bin::Shl, x, left);
                     self.s

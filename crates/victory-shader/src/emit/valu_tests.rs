@@ -937,3 +937,296 @@ fn v_cmp_class_f16_matches_rdna2() {
         );
     });
 }
+
+/// SOP1 `s_getpc_b64 s[sdst:sdst+1]`.
+const fn s_getpc_b64(sdst: u8) -> u32 {
+    0xBE80_0000 | (sdst as u32) << 16 | 0x1F << 8
+}
+
+/// GLOBAL `global_load_* vdst, vaddr, s[saddr:saddr+1] offset:off`.
+const fn global_load(op: u16, vdst: u8, vaddr: u8, saddr: u8, offset: i16) -> [u32; 2] {
+    [
+        0x37 << 26 | (op as u32 & 0x7F) << 18 | 2 << 14 | (offset as u32 & 0xFFF),
+        (vdst as u32) << 24 | (saddr as u32 & 0x7F) << 16 | vaddr as u32,
+    ]
+}
+
+/// Builds and lowers a 1-thread synthetic RDNA2 compute shader with a root
+/// constant (`s0`, copied to `v1`), a raw UAV table (`s1`), a root SRV
+/// (`s[2:3]`), `body` leaving its result in `v0`, and optional `tail` dwords
+/// appended after `s_endpgm` (for `s_getpc_b64` constant-table tests).
+fn build_global_load_cs(body: &[u32], tail: &[u32]) -> HostShader {
+    let mut words = Vec::new();
+    // s[4:5] = descriptor table address (heap index 0 -> byte offset 0).
+    words.push(s_mov_b32(4, 1));
+    words.push(s_mov_b32(5, 0x80)); // inline constant 0
+    words.extend_from_slice(&s_load_dwordx4(8, 4));
+    // Mask dynamic byte offset from root constant s0 into v1 so resource
+    // tracking treats v1 as a computed byte offset rather than a root base.
+    words.extend_from_slice(&vop3(0x11B, 1, sgpr(0), 0x80 + 31, 0)); // v_and_b32 v1, s0, 31
+    words.extend_from_slice(body);
+    words.extend_from_slice(&buffer_store_dword(0, 8, 0));
+    words.push(S_ENDPGM);
+    words.extend_from_slice(tail);
+
+    let code: Vec<u8> = words.iter().flat_map(|w| w.to_le_bytes()).collect();
+    let native = NativeProgram {
+        stage: HwStage::Cs,
+        wave64: false,
+        vgprs: 8,
+        layout: vec![
+            RootParam {
+                root: RootType::Constants,
+                table_offset_dwords: 0,
+                sgprs: 1,
+                base_register: 0,
+                user_data: 0,
+                slot: 0,
+            },
+            RootParam {
+                root: RootType::Table,
+                table_offset_dwords: 0,
+                sgprs: 1,
+                base_register: 0,
+                user_data: 1,
+                slot: 1,
+            },
+            RootParam {
+                root: RootType::Descriptor,
+                table_offset_dwords: 0,
+                sgprs: 2,
+                base_register: 0,
+                user_data: 2,
+                slot: 2,
+            },
+        ],
+        used: vec![
+            UsedResource {
+                kind: ResourceType::Uav,
+                root: RootType::Table,
+                table_offset_dwords: 0,
+                lower_bound: 0,
+                stride: 0,
+                dwords: 4,
+                user_data: 1,
+                slot: 1,
+            },
+            UsedResource {
+                kind: ResourceType::Srv,
+                root: RootType::Descriptor,
+                table_offset_dwords: 0,
+                lower_bound: 0,
+                stride: 1,
+                dwords: 0,
+                user_data: 2,
+                slot: 2,
+            },
+        ],
+        io: StageIo::Cs(ComputeIo {
+            rsrc2: 4 << 1, // 4 user SGPRs: s0..s3
+            threads: [1, 1, 1],
+        }),
+        code,
+    };
+
+    let p = ir::build(&native.code, native.wave64, native.vgprs).expect("ir::build");
+    let st = structure::structure(&p).expect("structure");
+    let res =
+        resource::track(&p, &native.layout, native.stage, Some(&st)).expect("resource::track");
+    let io = io::raise(&p, &native).expect("io::raise");
+    let lowered = lower::lower(&lower::Parts {
+        native: &native,
+        p: &p,
+        st: &st,
+        io: &io,
+        res: &res,
+        inputs: Vec::new(),
+        outputs: Vec::new(),
+        prims: Vec::new(),
+        mesh_stride: 0,
+    })
+    .expect("lower");
+
+    let shader = HostShader {
+        stage: HwStage::Cs,
+        dxil: lowered.dxil,
+        user_data: lowered.user_data,
+        samplers: lowered.samplers,
+        static_samplers: Vec::new(),
+        root_cbvs: lowered.root_cbvs,
+        root_srvs: lowered.root_srvs,
+    };
+
+    if let Ok(mut v) = validator::Validator::load(validator::Validator::default_path().as_deref()) {
+        let mut copy = shader.dxil.clone();
+        let ours = copy[4..20].to_vec();
+        v.validate(&mut copy).expect("DXIL validation failed");
+        assert_eq!(copy[4..20], ours[..], "container hash mismatch");
+    }
+
+    shader
+}
+
+#[test]
+fn global_load_short_straddling_dword_boundary() {
+    // 12-byte pattern: straddling halfwords at byte 3 (0xFFFE = -2) and
+    // byte 7 (0x8180) cross dword boundaries with non-zero and sign-setting
+    // high bytes.
+    let table: [u32; 3] = [0xFE7B_3412, 0x8001_A5FF, 0x00CD_AB81];
+    let bytes: Vec<u8> = table.iter().flat_map(|w| w.to_le_bytes()).collect();
+    let expected = |off: usize, signed: bool| -> u32 {
+        let raw = u16::from_le_bytes([bytes[off], bytes[off + 1]]);
+        if signed {
+            i32::from(raw as i16) as u32
+        } else {
+            u32::from(raw)
+        }
+    };
+
+    // Root SRV with dynamic byte offset in v1, and static straddling offset 3.
+    let srv_ushort_dyn = build_global_load_cs(&global_load(0x00a, 0, 1, 2, 0), &[]);
+    let srv_sshort_dyn = build_global_load_cs(&global_load(0x00b, 0, 1, 2, 0), &[]);
+    let srv_ushort_static = build_global_load_cs(
+        &[
+            vop1(0x001, 1, 0x80), // v_mov_b32 v1, 0
+            global_load(0x00a, 0, 1, 2, 3)[0],
+            global_load(0x00a, 0, 1, 2, 3)[1],
+        ],
+        &[],
+    );
+    let srv_sshort_static = build_global_load_cs(
+        &[
+            vop1(0x001, 1, 0x80), // v_mov_b32 v1, 0
+            global_load(0x00b, 0, 1, 2, 3)[0],
+            global_load(0x00b, 0, 1, 2, 3)[1],
+        ],
+        &[],
+    );
+
+    // Code constant table (`s_getpc_b64` -> `CODE`) with dynamic and static
+    // straddling offsets; 20 bytes lie between `s_getpc_b64` and `tail`:
+    // global_load (8) + buffer_store_dword (8) + s_endpgm (4).
+    let code_ushort_dyn = build_global_load_cs(
+        &[
+            s_getpc_b64(6),
+            global_load(0x00a, 0, 1, 6, 20)[0],
+            global_load(0x00a, 0, 1, 6, 20)[1],
+        ],
+        &table,
+    );
+    let code_sshort_dyn = build_global_load_cs(
+        &[
+            s_getpc_b64(6),
+            global_load(0x00b, 0, 1, 6, 20)[0],
+            global_load(0x00b, 0, 1, 6, 20)[1],
+        ],
+        &table,
+    );
+    let code_sshort_static = build_global_load_cs(
+        &[
+            vop1(0x001, 1, 0x80), // v_mov_b32 v1, 0
+            s_getpc_b64(6),
+            global_load(0x00b, 0, 1, 6, 23)[0],
+            global_load(0x00b, 0, 1, 6, 23)[1],
+        ],
+        &table,
+    );
+
+    let run = |shader: &HostShader, offsets: &[usize], signed: bool, label_kind: &str| {
+        let _one = ONE_AT_A_TIME.lock().unwrap_or_else(|e| e.into_inner());
+        let mut ran = 0;
+        for (backend, warp) in [("hardware", false), ("warp", true)] {
+            let Ok(host) = Host::new(warp) else {
+                eprintln!("no SM 6.6 {backend} device; skipped");
+                continue;
+            };
+            let (root, pso) = host
+                .compute_pipeline(shader)
+                .unwrap_or_else(|e| panic!("{backend}: compute_pipeline failed: {e}"));
+            for &off in offsets {
+                let mut ud = vec![0u32; shader.user_data_dwords().max(1) as usize];
+                for u in &shader.user_data {
+                    ud[u.index as usize] = match (u.root, u.slot) {
+                        (RootType::Constants, 0) => off as u32,
+                        (RootType::Table, 1) => 0,
+                        other => panic!("unexpected user data {other:?}"),
+                    };
+                }
+                let mut roots = vec![(0, Root::Constants(ud))];
+                if !shader.root_srvs.is_empty() {
+                    roots.push((
+                        1,
+                        Root::View {
+                            srv: true,
+                            data: table.to_vec(),
+                        },
+                    ));
+                }
+                let out = host
+                    .dispatch(
+                        &root,
+                        &pso,
+                        &Dispatch {
+                            roots,
+                            views: &[View::RawUav(1)],
+                            samplers: &[],
+                            groups: [1, 1, 1],
+                        },
+                    )
+                    .unwrap_or_else(|e| panic!("{backend}: dispatch failed: {e}"));
+                let want = expected(off, signed);
+                assert_eq!(
+                    out[0][0], want,
+                    "{backend}: {label_kind} at byte offset {off} = {:#010x}, want {want:#010x}",
+                    out[0][0],
+                );
+            }
+            ran += 1;
+        }
+        assert!(ran > 0, "neither hardware nor WARP SM 6.6 device available");
+    };
+
+    let all_offsets: Vec<usize> = (0..=10).collect();
+    run(
+        &srv_ushort_dyn,
+        &all_offsets,
+        false,
+        "srv global_load_ushort (dyn)",
+    );
+    run(
+        &srv_sshort_dyn,
+        &all_offsets,
+        true,
+        "srv global_load_sshort (dyn)",
+    );
+    run(
+        &srv_ushort_static,
+        &[3],
+        false,
+        "srv global_load_ushort (static +3)",
+    );
+    run(
+        &srv_sshort_static,
+        &[3],
+        true,
+        "srv global_load_sshort (static +3)",
+    );
+    run(
+        &code_ushort_dyn,
+        &all_offsets,
+        false,
+        "code global_load_ushort (dyn)",
+    );
+    run(
+        &code_sshort_dyn,
+        &all_offsets,
+        true,
+        "code global_load_sshort (dyn)",
+    );
+    run(
+        &code_sshort_static,
+        &[3],
+        true,
+        "code global_load_sshort (static +3)",
+    );
+}
