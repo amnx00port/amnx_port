@@ -5,7 +5,7 @@
 //! `v_med3_f32`/`v_med3_f16` with NaN operands, `v_fract_f32`/`v_fract_f16`
 //! near `1.0`, and turn-range reduction for `v_sin_*`/`v_cos_*`.
 
-use super::host::{Dispatch, Host, Root, View};
+use super::host::{Dispatch, Host, Root, Stride, View};
 use super::{HostShader, lower, validator};
 use crate::native::{
     ComputeIo, HwStage, NativeProgram, ResourceType, RootParam, RootType, StageIo, UsedResource,
@@ -28,12 +28,17 @@ const fn sop2(op: u8, sdst: u8, src0: u8, src1: u8) -> u32 {
         | src0 as u32
 }
 
-/// SMEM `s_load_dwordx4 s[dst:dst+3], s[base:base+1], 0` (soffset = null).
-const fn s_load_dwordx4(dst: u8, base: u8) -> [u32; 2] {
+/// SMEM `s_load_dwordx4 s[dst:dst+3], s[base:base+1], offset` (soffset = null).
+const fn s_load_dwordx4_at(dst: u8, base: u8, offset: u32) -> [u32; 2] {
     [
         0x3D << 26 | 0x02 << 18 | (dst as u32) << 6 | (base as u32 >> 1),
-        125 << 25,
+        125 << 25 | (offset & 0x1F_FFFF),
     ]
+}
+
+/// SMEM `s_load_dwordx4 s[dst:dst+3], s[base:base+1], 0` (soffset = null).
+const fn s_load_dwordx4(dst: u8, base: u8) -> [u32; 2] {
+    s_load_dwordx4_at(dst, base, 0)
 }
 
 /// VOP1 `op vdst, src0` (`src0`: 0..105 = SGPR, 256..511 = VGPR).
@@ -54,6 +59,22 @@ const fn buffer_store_dword(vdata: u8, srsrc: u8, byte_off: u16) -> [u32; 2] {
     [
         0x38 << 26 | 0x1C << 18 | (byte_off as u32 & 0xFFF),
         0x80 << 24 | ((srsrc as u32 >> 2) & 0x1F) << 16 | (vdata as u32) << 8,
+    ]
+}
+
+/// MUBUF `buffer_store_dwordx4 v[vdata:vdata+3], off, s[srsrc:srsrc+3], 0 offset:byte_off`.
+const fn buffer_store_dwordx4(vdata: u8, srsrc: u8, byte_off: u16) -> [u32; 2] {
+    [
+        0x38 << 26 | 0x1E << 18 | (byte_off as u32 & 0xFFF),
+        0x80 << 24 | ((srsrc as u32 >> 2) & 0x1F) << 16 | (vdata as u32) << 8,
+    ]
+}
+
+/// MTBUF `tbuffer_load_format_{x,xy,xyz,xyzw}` with `offen`, `soffset = 0`, `offset = 0`.
+const fn tbuffer_load_format(op: u8, format: u8, vdata: u8, vaddr: u8, srsrc: u8) -> [u32; 2] {
+    [
+        0x3A << 26 | (format as u32 & 0x7F) << 19 | (op as u32 & 7) << 16 | 1 << 12,
+        0x80 << 24 | ((srsrc as u32 >> 2) & 0x1F) << 16 | (vdata as u32) << 8 | vaddr as u32,
     ]
 }
 
@@ -936,4 +957,365 @@ fn v_cmp_class_f16_matches_rdna2() {
             inp[0], inp[1],
         );
     });
+}
+
+fn build_tbuffer_load_cs(op: u8, format: u8) -> HostShader {
+    let mut words = Vec::new();
+    // s[4:5] = descriptor table address (heap index 0 = SRV, index 1 = UAV).
+    words.push(s_mov_b32(5, 0x80)); // inline constant 0
+    words.extend_from_slice(&s_load_dwordx4_at(8, 4, 0));
+    words.extend_from_slice(&s_load_dwordx4_at(12, 4, 32));
+    // v4 = byte offset (s0); initialize v0..v3 with sentinel (s1) to verify
+    // partial loads (_xy, _xyz) do not clobber unloaded VGPRs.
+    words.push(vop1(0x001, 4, sgpr(0)));
+    for r in 0..4u8 {
+        words.push(vop1(0x001, r, sgpr(1)));
+    }
+    words.extend_from_slice(&tbuffer_load_format(op, format, 0, 4, 8));
+    words.extend_from_slice(&buffer_store_dwordx4(0, 12, 0));
+    words.push(S_ENDPGM);
+
+    let code: Vec<u8> = words.iter().flat_map(|w| w.to_le_bytes()).collect();
+    let native = NativeProgram {
+        stage: HwStage::Cs,
+        wave64: false,
+        vgprs: 8,
+        layout: vec![
+            RootParam {
+                root: RootType::Constants,
+                table_offset_dwords: 0,
+                sgprs: 4,
+                base_register: 0,
+                user_data: 0,
+                slot: 0,
+            },
+            RootParam {
+                root: RootType::Table,
+                table_offset_dwords: 0,
+                sgprs: 1,
+                base_register: 0,
+                user_data: 4,
+                slot: 1,
+            },
+        ],
+        used: vec![
+            UsedResource {
+                kind: ResourceType::Srv,
+                root: RootType::Table,
+                table_offset_dwords: 0,
+                lower_bound: 0,
+                stride: 0,
+                dwords: 4,
+                user_data: 4,
+                slot: 1,
+            },
+            UsedResource {
+                kind: ResourceType::Uav,
+                root: RootType::Table,
+                table_offset_dwords: 8,
+                lower_bound: 0,
+                stride: 0,
+                dwords: 4,
+                user_data: 4,
+                slot: 1,
+            },
+        ],
+        io: StageIo::Cs(ComputeIo {
+            rsrc2: 5 << 1, // 5 user SGPRs: s0..s4
+            threads: [1, 1, 1],
+        }),
+        code,
+    };
+
+    let p = ir::build(&native.code, native.wave64, native.vgprs).expect("ir::build");
+    let st = structure::structure(&p).expect("structure");
+    let res =
+        resource::track(&p, &native.layout, native.stage, Some(&st)).expect("resource::track");
+    let io = io::raise(&p, &native).expect("io::raise");
+    let lowered = lower::lower(&lower::Parts {
+        native: &native,
+        p: &p,
+        st: &st,
+        io: &io,
+        res: &res,
+        inputs: Vec::new(),
+        outputs: Vec::new(),
+        prims: Vec::new(),
+        mesh_stride: 0,
+    })
+    .expect("lower");
+
+    let shader = HostShader {
+        stage: HwStage::Cs,
+        dxil: lowered.dxil,
+        user_data: lowered.user_data,
+        samplers: lowered.samplers,
+        static_samplers: Vec::new(),
+        root_cbvs: lowered.root_cbvs,
+        root_srvs: lowered.root_srvs,
+    };
+
+    if let Ok(mut v) = validator::Validator::load(validator::Validator::default_path().as_deref()) {
+        let mut copy = shader.dxil.clone();
+        let ours = copy[4..20].to_vec();
+        v.validate(&mut copy).expect("DXIL validation failed");
+        assert_eq!(copy[4..20], ours[..], "container hash mismatch");
+    }
+
+    shader
+}
+
+#[test]
+fn tbuffer_load_format_zero_pads_missing_channels() {
+    const SENTINEL: u32 = 0xDEAD_BEEF;
+    let f = f32::to_bits;
+
+    struct Case<'a> {
+        name: &'a str,
+        op: u8,
+        format: u8,
+        data: &'a [u32],
+        reads: &'a [(u32, [u32; 4])],
+    }
+
+    let suite: &[Case] = &[
+        // 1-channel formats (_xyzw): channels 1..4 must be strictly 0 (not 1/1.0 in .w).
+        Case {
+            name: "8_UNORM_xyzw",
+            op: 3,
+            format: 1,
+            data: &[0x0056_34FF],
+            reads: &[(0, [f(1.0), 0, 0, 0]), (3, [f(0.0), 0, 0, 0])],
+        },
+        Case {
+            name: "8_UINT_xyzw",
+            op: 3,
+            format: 5,
+            data: &[0x0000_2A00],
+            reads: &[(1, [42, 0, 0, 0])],
+        },
+        Case {
+            name: "8_SINT_xyzw",
+            op: 3,
+            format: 6,
+            data: &[0x00FE_0000],
+            reads: &[(2, [(-2i32) as u32, 0, 0, 0])],
+        },
+        Case {
+            name: "16_FLOAT_xyzw",
+            op: 3,
+            format: 13,
+            data: &[0xC000_3C00],
+            reads: &[(0, [f(1.0), 0, 0, 0]), (2, [f(-2.0), 0, 0, 0])],
+        },
+        Case {
+            name: "32_UINT_xyzw",
+            op: 3,
+            format: 20,
+            data: &[0x1234_5678],
+            reads: &[(0, [0x1234_5678, 0, 0, 0])],
+        },
+        Case {
+            name: "32_SINT_xyzw",
+            op: 3,
+            format: 21,
+            data: &[(-74i32) as u32],
+            reads: &[(0, [(-74i32) as u32, 0, 0, 0])],
+        },
+        Case {
+            name: "32_FLOAT_xyzw",
+            op: 3,
+            format: 22,
+            data: &[f(42.5)],
+            reads: &[(0, [f(42.5), 0, 0, 0])],
+        },
+        // 2-channel formats (_xyzw): channels 2..4 must be strictly 0.
+        Case {
+            name: "8_8_UNORM_xyzw",
+            op: 3,
+            format: 14,
+            data: &[0xFF00_00FF],
+            reads: &[(0, [f(1.0), f(0.0), 0, 0]), (2, [f(0.0), f(1.0), 0, 0])],
+        },
+        Case {
+            name: "16_16_SNORM_xyzw",
+            op: 3,
+            format: 24,
+            data: &[0x8000_7FFF],
+            reads: &[(0, [f(1.0), f(-1.0), 0, 0])],
+        },
+        Case {
+            name: "16_16_FLOAT_xyzw",
+            op: 3,
+            format: 29,
+            data: &[0xC000_3C00],
+            reads: &[(0, [f(1.0), f(-2.0), 0, 0])],
+        },
+        Case {
+            name: "32_32_UINT_xyzw",
+            op: 3,
+            format: 62,
+            data: &[0xDEAD_0001, 0xBEEF_0002],
+            reads: &[(0, [0xDEAD_0001, 0xBEEF_0002, 0, 0])],
+        },
+        Case {
+            name: "32_32_FLOAT_xyzw",
+            op: 3,
+            format: 64,
+            data: &[f(1.5), f(-3.25)],
+            reads: &[(0, [f(1.5), f(-3.25), 0, 0])],
+        },
+        // 3-channel formats (_xyzw): channel 3 (.w) must be strictly 0.
+        Case {
+            name: "10_11_11_FLOAT_xyzw",
+            op: 3,
+            format: 36,
+            data: &[0x7820_0440],
+            reads: &[(0, [f(4.0), f(2.0), f(1.0), 0])],
+        },
+        Case {
+            name: "11_11_10_FLOAT_xyzw",
+            op: 3,
+            format: 43,
+            data: &[0x8810_01E0],
+            reads: &[(0, [f(1.0), f(2.0), f(4.0), 0])],
+        },
+        Case {
+            name: "32_32_32_UINT_xyzw",
+            op: 3,
+            format: 72,
+            data: &[10, 20, 30],
+            reads: &[(0, [10, 20, 30, 0])],
+        },
+        Case {
+            name: "32_32_32_SINT_xyzw",
+            op: 3,
+            format: 73,
+            data: &[(-1i32) as u32, (-2i32) as u32, 3],
+            reads: &[(0, [(-1i32) as u32, (-2i32) as u32, 3, 0])],
+        },
+        Case {
+            name: "32_32_32_FLOAT_xyzw",
+            op: 3,
+            format: 74,
+            data: &[f(1.0), f(2.0), f(-3.0)],
+            reads: &[(0, [f(1.0), f(2.0), f(-3.0), 0])],
+        },
+        // Partial loads (_xyz, _xy) and 4-channel controls.
+        Case {
+            name: "8_UNORM_xyz",
+            op: 2,
+            format: 1,
+            data: &[0x0000_00FF],
+            reads: &[(0, [f(1.0), 0, 0, SENTINEL])],
+        },
+        Case {
+            name: "16_16_FLOAT_xyz",
+            op: 2,
+            format: 29,
+            data: &[0xC000_3C00],
+            reads: &[(0, [f(1.0), f(-2.0), 0, SENTINEL])],
+        },
+        Case {
+            name: "8_8_8_8_UNORM_xyz",
+            op: 2,
+            format: 56,
+            data: &[0xFF00_FFFF],
+            reads: &[(0, [f(1.0), f(1.0), f(0.0), SENTINEL])],
+        },
+        Case {
+            name: "8_UNORM_xy",
+            op: 1,
+            format: 1,
+            data: &[0x0000_00FF],
+            reads: &[(0, [f(1.0), 0, SENTINEL, SENTINEL])],
+        },
+        Case {
+            name: "32_32_32_FLOAT_xy",
+            op: 1,
+            format: 74,
+            data: &[f(1.0), f(2.0), f(-3.0)],
+            reads: &[(0, [f(1.0), f(2.0), SENTINEL, SENTINEL])],
+        },
+        Case {
+            name: "32_32_32_32_FLOAT_xy",
+            op: 1,
+            format: 77,
+            data: &[f(1.0), f(-2.0), f(3.5), f(-4.25)],
+            reads: &[(0, [f(1.0), f(-2.0), SENTINEL, SENTINEL])],
+        },
+        Case {
+            name: "8_8_8_8_UNORM_xyzw",
+            op: 3,
+            format: 56,
+            data: &[0xFF00_FF00],
+            reads: &[(0, [f(0.0), f(1.0), f(0.0), f(1.0)])],
+        },
+        Case {
+            name: "32_32_32_32_FLOAT_xyzw",
+            op: 3,
+            format: 77,
+            data: &[f(1.0), f(-2.0), f(3.5), f(-4.25)],
+            reads: &[(0, [f(1.0), f(-2.0), f(3.5), f(-4.25)])],
+        },
+    ];
+
+    let compiled: Vec<(&Case, HostShader)> = suite
+        .iter()
+        .map(|case| (case, build_tbuffer_load_cs(case.op, case.format)))
+        .collect();
+
+    let _one = ONE_AT_A_TIME.lock().unwrap_or_else(|e| e.into_inner());
+    let mut ran = 0;
+    for (backend, warp) in [("hardware", false), ("warp", true)] {
+        let Ok(host) = Host::new(warp) else {
+            eprintln!("no SM 6.6 {backend} device; skipped");
+            continue;
+        };
+        for &(case, ref shader) in &compiled {
+            let (root, pso) = host.compute_pipeline(shader).unwrap_or_else(|e| {
+                panic!("{backend}: {}: compute_pipeline failed: {e}", case.name)
+            });
+            for &(byte_off, want) in case.reads {
+                let mut ud = vec![0u32; shader.user_data_dwords().max(1) as usize];
+                for u in &shader.user_data {
+                    ud[u.index as usize] = match (u.root, u.slot) {
+                        (RootType::Constants, 0) => match u.dword {
+                            0 => byte_off,
+                            1 => SENTINEL,
+                            _ => 0,
+                        },
+                        (RootType::Table, 1) => 0,
+                        other => panic!("unexpected user data {other:?}"),
+                    };
+                }
+                let out = host
+                    .dispatch(
+                        &root,
+                        &pso,
+                        &Dispatch {
+                            roots: vec![(0, Root::Constants(ud))],
+                            views: &[
+                                View::Buffer {
+                                    data: case.data,
+                                    stride: Stride::Raw,
+                                },
+                                View::RawUav(4),
+                            ],
+                            samplers: &[],
+                            groups: [1, 1, 1],
+                        },
+                    )
+                    .unwrap_or_else(|e| panic!("{backend}: {}: dispatch failed: {e}", case.name));
+                let got: [u32; 4] = out[0][..4].try_into().expect("4 dwords");
+                assert_eq!(
+                    got, want,
+                    "{backend}: {} @ off {byte_off}: got {got:#010x?}, want {want:#010x?}",
+                    case.name,
+                );
+            }
+        }
+        ran += 1;
+    }
+    assert!(ran > 0, "neither hardware nor WARP SM 6.6 device available");
 }
