@@ -66,14 +66,57 @@ unsafe impl Sync for Staging {}
 static STAGING: Mutex<Option<HashMap<usize, Arc<Staging>>>> = Mutex::new(None);
 
 /// Textures the host GPU wrote by a copy or resolve: their contents are on
-/// the host, not in title memory, which stays as it was.
-static HOST_WRITTEN: Mutex<Option<std::collections::HashSet<usize>>> = Mutex::new(None);
+/// the host, unless the title writes their memory after `since`.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum HostWritten {
+    Unwatched,
+    Watched { start: usize, end: usize, since: u64 },
+}
+
+static HOST_WRITTEN: Mutex<Option<HashMap<usize, HostWritten>>> = Mutex::new(None);
 
 /// A host copy or resolve writes `resource`.
 pub(crate) fn host_written(resource: This) {
-    let mut set = HOST_WRITTEN.lock().unwrap_or_else(|e| e.into_inner());
-    set.get_or_insert_with(Default::default)
-        .insert(resource as usize);
+    let watched = (|| {
+        let (memory, desc) = crate::resource::texture_memory(resource)?;
+        let layout = crate::resource::texture_layout(&desc)?;
+        let size = layout.planes[0].layout.size as usize;
+        let start = memory as usize;
+        let end = start.checked_add(size)?;
+        let (since, _) = crate::watch::writes(start, end, false)?;
+        Some(HostWritten::Watched { start, end, since })
+    })()
+    .unwrap_or(HostWritten::Unwatched);
+    let mut map = HOST_WRITTEN.lock().unwrap_or_else(|e| e.into_inner());
+    map.get_or_insert_with(HashMap::new)
+        .insert(resource as usize, watched);
+}
+
+fn host_written_still_current(resource: usize) -> bool {
+    let entry = {
+        let map = HOST_WRITTEN.lock().unwrap_or_else(|e| e.into_inner());
+        map.as_ref().and_then(|m| m.get(&resource).copied())
+    };
+    let Some(entry) = entry else {
+        return false;
+    };
+    match entry {
+        HostWritten::Unwatched => true,
+        HostWritten::Watched { start, end, since } => {
+            let changed = crate::watch::writes(start, end, false)
+                .is_some_and(|(_, written)| written.iter().any(|&(_, w)| w > since));
+            if !changed {
+                return true;
+            }
+            let mut map = HOST_WRITTEN.lock().unwrap_or_else(|e| e.into_inner());
+            if let Some(m) = map.as_mut()
+                && matches!(m.get(&resource), Some(HostWritten::Watched { since: s, .. }) if *s == since)
+            {
+                m.remove(&resource);
+            }
+            false
+        }
+    }
 }
 
 /// The title released a resource.
@@ -101,14 +144,7 @@ pub(crate) fn title_written(texture: &ID3D12Resource) -> bool {
 /// submission if the memory changed. Leaves the texture in the copy
 /// destination state.
 pub(crate) fn upload(list: &HostList, resource: This, texture: &ID3D12Resource) {
-    let host_written = HOST_WRITTEN
-        .lock()
-        .unwrap_or_else(|e| e.into_inner())
-        .as_ref()
-        .is_some_and(|set| set.contains(&(resource as usize)));
-    // shortcut: a texture the host copied into keeps the host's contents
-    // even if the title later writes its memory too.
-    if host_written || !list.first_use(resource as usize) {
+    if host_written_still_current(resource as usize) || !list.first_use(resource as usize) {
         return;
     }
     let Some(staging) = staging(resource, texture) else {
@@ -341,4 +377,53 @@ fn staging(resource: This, texture: &ID3D12Resource) -> Option<Arc<Staging>> {
     });
     map.insert(resource as usize, s.clone());
     Some(s)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn host_written_invalidates_after_write_watch_hit() {
+        use windows_sys::Win32::System::Memory::{
+            MEM_COMMIT, MEM_RELEASE, MEM_RESERVE, PAGE_READWRITE, VirtualAlloc, VirtualFree,
+        };
+        const MEM_WRITE_WATCH: u32 = 0x0020_0000;
+        const LEN: usize = 64 * 1024;
+        // SAFETY: reserves and commits a private write-watched region.
+        let mem = unsafe {
+            VirtualAlloc(
+                std::ptr::null(),
+                LEN,
+                MEM_RESERVE | MEM_COMMIT | MEM_WRITE_WATCH,
+                PAGE_READWRITE,
+            )
+        } as *mut u8;
+        assert!(!mem.is_null());
+        let start = mem as usize;
+        let end = start + LEN;
+        let fake_res = 0xDEAD_BEEFusize;
+        struct Guard(*mut u8, usize, usize, usize);
+        impl Drop for Guard {
+            fn drop(&mut self) {
+                forget(self.3);
+                crate::watch::clear_range(self.1, self.2);
+                // SAFETY: frees the allocation above.
+                unsafe { VirtualFree(self.0.cast(), 0, MEM_RELEASE) };
+            }
+        }
+        let _guard = Guard(mem, start, end, fake_res);
+        let (since, _) = crate::watch::writes(start, end, false).unwrap();
+        {
+            let mut map = HOST_WRITTEN.lock().unwrap_or_else(|e| e.into_inner());
+            map.get_or_insert_with(HashMap::new)
+                .insert(fake_res, HostWritten::Watched { start, end, since });
+        }
+        assert!(host_written_still_current(fake_res));
+        // Writing to the watched memory invalidates the host-written entry.
+        // SAFETY: `mem` is a committed RW allocation of `LEN` bytes.
+        unsafe { mem.write_volatile(0x42) };
+        assert!(!host_written_still_current(fake_res));
+        assert!(!host_written_still_current(fake_res));
+    }
 }

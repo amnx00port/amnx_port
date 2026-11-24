@@ -283,6 +283,16 @@ fn writable(at: usize) -> bool {
 }
 
 #[cfg(test)]
+pub(crate) fn clear_range(start: usize, end: usize) {
+    let (first, last) = (start / PAGE, end.div_ceil(PAGE));
+    let mut j = JOURNAL.lock().unwrap_or_else(|e| e.into_inner());
+    let keys: Vec<usize> = j.written.range(first..last).map(|(&p, _)| p).collect();
+    for k in keys {
+        j.written.remove(&k);
+    }
+}
+
+#[cfg(test)]
 mod tests {
     use super::*;
     use windows_sys::Win32::System::Memory::{
