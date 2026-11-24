@@ -939,20 +939,39 @@ fn v_cmp_class_f16_matches_rdna2() {
 }
 
 #[test]
-fn v_mad_f32_flushes_subnormal_sum_before_omod() {
+fn v_mad_f32_flushes_subnormals_around_omod() {
     // 1.5 * FLT_MIN - FLT_MIN is a positive subnormal. RDNA flushes it
     // before mul:2, so it remains +0 instead of becoming FLT_MIN.
     let [w0, mut w1] = vop3(0x141, 0, vgpr(1), vgpr(2), vgpr(3));
     w1 |= 1 << 27; // OMOD = multiply by two.
-    let shader = build_valu_cs(&[w0, w1]);
-    let cases = [[0x00c0_0000, 0x0080_0000, 0x8080_0000, 0]];
+    let before_omod = build_valu_cs(&[w0, w1]);
+    let before_cases = [[0x00c0_0000, 0x0080_0000, 0x8080_0000, 0]];
+    // A subnormal product is flushed before the normal accumulator is added.
+    let product_cases = [[0x0080_0000, 0x3f00_0000, 0x0080_0000, 0]];
+    // A subnormal input is flushed before arithmetic; without that, it nudges
+    // FLT_MIN to the next representable f32 before mul:2.
+    let input_cases = [[0x0000_0001, 0x3f80_0000, 0x0080_0000, 0]];
+    // OMOD=div:2 turns FLT_MIN into a subnormal, which the result flush clears.
+    let [out_w0, mut out_w1] = vop3(0x141, 0, vgpr(1), vgpr(2), vgpr(3));
+    out_w1 |= 3 << 27;
+    let after_omod = build_valu_cs(&[out_w0, out_w1]);
+    let after_cases = [[0x0080_0000, 0x3f80_0000, 0, 0]];
 
     if Host::new(false).is_err() && Host::new(true).is_err() {
         eprintln!("no SM 6.6 host or WARP device; skipped");
         return;
     }
 
-    run_cases(&shader, &cases, |backend, _, _, got| {
+    run_cases(&before_omod, &before_cases, |backend, _, _, got| {
         assert_eq!(got, 0, "{backend}: MAD flushes subnormal sum before OMOD");
+    });
+    run_cases(&before_omod, &product_cases, |backend, _, _, got| {
+        assert_eq!(got, 0x0100_0000, "{backend}: MAD flushes subnormal product");
+    });
+    run_cases(&before_omod, &input_cases, |backend, _, _, got| {
+        assert_eq!(got, 0x0100_0000, "{backend}: MAD flushes subnormal input");
+    });
+    run_cases(&after_omod, &after_cases, |backend, _, _, got| {
+        assert_eq!(got, 0, "{backend}: MAD flushes subnormal after OMOD");
     });
 }
