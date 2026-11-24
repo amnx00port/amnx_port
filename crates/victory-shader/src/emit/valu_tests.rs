@@ -937,3 +937,6 @@ fn v_cmp_class_f16_matches_rdna2() {
         );
     });
 }
+
+#[path = "valu_sweep_tests.rs"]
+mod sweep;
