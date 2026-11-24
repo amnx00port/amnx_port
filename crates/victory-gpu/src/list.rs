@@ -882,15 +882,24 @@ extern "system" fn set_predication(this: This, buffer: This, offset: u64, operat
         let Some(data) = buffer_range(buffer, offset, 8) else {
             return;
         };
-        #[cfg(feature = "diagnostics")]
-        host.note_op(|| format!("set predication {buffer:?}+{offset:#x} {operation:?}"));
         if let Some(resource) = crate::resource::host_resource(buffer) {
+            #[cfg(feature = "diagnostics")]
+            host.note_op(|| format!("set predication {buffer:?}+{offset:#x} {operation:?}"));
             ensure_state(host, buffer, D3D12_RESOURCE_STATE_PREDICATION.0 as u32);
             // SAFETY: an open list and a live buffer with an aligned predicate.
             unsafe { host.list.SetPredication(Some(resource), offset, operation) };
         } else if let Some(device) = crate::host::host()
             && let Some((upload, mapped)) = host.upload(device, 8)
         {
+            #[cfg(feature = "diagnostics")]
+            {
+                // SAFETY: `upload` is a live committed buffer owned by `host`.
+                let gpu = unsafe { upload.GetGPUVirtualAddress() };
+                host.note_read(
+                    || format!("set predication {buffer:?}+{offset:#x} {operation:?}"),
+                    (gpu, 8),
+                );
+            }
             // Title buffers live in CPU memory. Take each predicate at its place
             // among deferred title writes. The list owns the upload, whose
             // GENERIC_READ state includes PREDICATION.
@@ -912,12 +921,42 @@ fn event_payload(data: *const c_void, size: u32) -> (Option<*const c_void>, u32)
     }
 }
 
+#[cfg(all(windows, feature = "diagnostics"))]
+fn decode_marker_label(metadata: u32, data: Option<*const c_void>, size: u32) -> Option<String> {
+    let ptr = data?.cast::<u8>();
+    // SAFETY: caller provides `size` readable bytes for this marker call.
+    let bytes = unsafe { std::slice::from_raw_parts(ptr, size as usize) };
+    // PIX_EVENT_UNICODE_VERSION = 0, PIX_EVENT_ANSI_VERSION = 1.
+    let text = if metadata == 0 && bytes.len() >= 2 && bytes.len().is_multiple_of(2) {
+        let units: Vec<u16> = bytes
+            .as_chunks::<2>()
+            .0
+            .iter()
+            .map(|c| u16::from_le_bytes(*c))
+            .take_while(|&u| u != 0)
+            .collect();
+        String::from_utf16_lossy(&units)
+    } else {
+        let len = bytes.iter().position(|&b| b == 0).unwrap_or(bytes.len());
+        String::from_utf8_lossy(&bytes[..len]).into_owned()
+    };
+    (!text.is_empty()).then_some(text)
+}
+
 extern "system" fn set_marker(this: This, metadata: u32, data: *const c_void, size: u32) {
     #[cfg(windows)]
     if let Some(host) = host_list(this) {
         let (data, size) = event_payload(data, size);
         #[cfg(feature = "diagnostics")]
-        host.note_op(|| format!("set marker metadata={metadata:#x} size={size}"));
+        if crate::host::dred_on() {
+            // `note_op` already emits a host `SetMarker` breadcrumb so
+            // `HostList::notes` stays 1:1 with `D3D12_AUTO_BREADCRUMB_OP_SETMARKER`.
+            host.note_op(|| match decode_marker_label(metadata, data, size) {
+                Some(label) => format!("set marker {label:?} metadata={metadata:#x}"),
+                None => format!("set marker metadata={metadata:#x} size={size}"),
+            });
+            return;
+        }
         // SAFETY: an open list; the caller provides `size` bytes for this call.
         unsafe { host.list.SetMarker(metadata, data, size) };
     }
