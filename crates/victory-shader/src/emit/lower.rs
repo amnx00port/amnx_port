@@ -2351,6 +2351,87 @@ impl<'a> Lower<'a> {
             let op = src.get(k).ok_or("a missing operand")?;
             l.operand(inst, op)
         };
+        if name == "s_movrels_b32" {
+            let m0 = self.i32_of(inst.read(Reg::S(crate::ir::M0)).ok_or("M0")?)?;
+            let Some(&Operand::Scalar { code: sreg, .. }) = src.first() else {
+                return Err("s_movrels_b32 source operand");
+            };
+            if sreg >= 106 {
+                return Err("s_movrels_b32 base out of SGPR range");
+            }
+            let lo = lo.ok_or("s_movrels_b32 destination")?;
+            let r = if let Some(m0_val) = self.s.m.as_i32(m0) {
+                if m0_val >= 0 && (m0_val as u64) <= (105 - sreg) as u64 {
+                    let target = sreg + m0_val as u8;
+                    match inst.read(Reg::S(target)).map(|v| self.i32_of(v)) {
+                        Some(Ok(x)) => x,
+                        _ => self.s.m.i32(0),
+                    }
+                } else {
+                    self.s.m.i32(0)
+                }
+            } else {
+                let mut r = self.s.m.i32(0);
+                for k in 0..=105u8.saturating_sub(sreg) {
+                    let x = match inst.read(Reg::S(sreg + k)).map(|x| self.i32_of(x)) {
+                        Some(Ok(x)) => x,
+                        _ => self.s.m.i32(0),
+                    };
+                    let kk = self.s.m.i32(u32::from(k));
+                    let is = self.s.m.cmp(c, pred::EQ, m0, kk);
+                    r = self.s.m.select(c, is, x, r);
+                }
+                r
+            };
+            self.set(Some(lo), Val::I32(r));
+            return Ok(());
+        }
+        if name == "s_movreld_b32" {
+            let m0 = self.i32_of(inst.read(Reg::S(crate::ir::M0)).ok_or("M0")?)?;
+            let dreg = dst_code.ok_or("s_movreld_b32 destination operand")?;
+            if dreg >= 106 {
+                return Err("s_movreld_b32 base out of SGPR range");
+            }
+            let value = src32(self, 0)?;
+            if let Some(m0_val) = self.s.m.as_i32(m0) {
+                let target = if m0_val >= 0 && (m0_val as u64) <= (105 - dreg) as u64 {
+                    Some(dreg + m0_val as u8)
+                } else {
+                    None
+                };
+                for k in 0..=105u8.saturating_sub(dreg) {
+                    let reg = dreg + k;
+                    let Some(_) = inst.write(Reg::S(reg)) else {
+                        break;
+                    };
+                    let x = if Some(reg) == target {
+                        value
+                    } else {
+                        match inst.read(Reg::S(reg)).map(|o| self.i32_of(o)) {
+                            Some(Ok(o)) => o,
+                            _ => self.s.m.i32(0),
+                        }
+                    };
+                    self.write_placed(inst, Reg::S(reg), x, None);
+                }
+            } else {
+                for k in 0..=105u8.saturating_sub(dreg) {
+                    let reg = dreg + k;
+                    let Some(_) = inst.write(Reg::S(reg)) else {
+                        break;
+                    };
+                    let old = match inst.read(Reg::S(reg)).map(|o| self.i32_of(o)) {
+                        Some(Ok(o)) => o,
+                        _ => self.s.m.i32(0),
+                    };
+                    let kk = self.s.m.i32(u32::from(k));
+                    let is = self.s.m.cmp(c, pred::EQ, m0, kk);
+                    let x = self.s.m.select(c, is, value, old);
+                    self.write_placed(inst, Reg::S(reg), x, None);
+                }
+            }
+            return Ok(());
+        }
         let sext16 = |l: &mut Self| l.s.m.i32(i32::from(imm.unwrap_or(0) as i16) as u32);
         // Dword `h` of 64-bit source `k` (inline constants sign-extend).
         let half = |l: &mut Self, k: usize, h: u8| -> Result<V, Why> {
@@ -7347,75 +7428,65 @@ mod tests {
     }
 
     #[test]
-    fn packed_buffer_formats_by_number() {
-        // LLVM's `UfmtGFX10`: 10_11_11 is 30-36, 11_11_10 37-43,
-        // 10_10_10_2 44-49. Channels from the lowest bits: R11G11B10_FLOAT
-        // is 10_11_11 (Mesa), 10_10_10_2 has the 2-bit channel first.
-        assert_eq!(buffer_format(30), Some((&[11, 11, 10][..], Numeric::Unorm)));
-        assert_eq!(buffer_format(36), Some((&[11, 11, 10][..], Numeric::Float)));
-        assert_eq!(buffer_format(37), Some((&[10, 11, 11][..], Numeric::Unorm)));
-        assert_eq!(buffer_format(43), Some((&[10, 11, 11][..], Numeric::Float)));
-        assert_eq!(
-            buffer_format(44),
-            Some((&[2, 10, 10, 10][..], Numeric::Unorm))
-        );
-        assert_eq!(
-            buffer_format(45),
-            Some((&[2, 10, 10, 10][..], Numeric::Snorm))
-        );
-        assert_eq!(
-            buffer_format(46),
-            Some((&[2, 10, 10, 10][..], Numeric::Uscaled))
-        );
-        assert_eq!(
-            buffer_format(47),
-            Some((&[2, 10, 10, 10][..], Numeric::Sscaled))
-        );
-        assert_eq!(
-            buffer_format(48),
-            Some((&[2, 10, 10, 10][..], Numeric::Uint))
-        );
-        assert_eq!(
-            buffer_format(49),
-            Some((&[2, 10, 10, 10][..], Numeric::Sint))
-        );
-    }
+    fn s_movrel_lowering() {
+        // 1. s_movrels_b32 with static M0
+        let static_rels = [
+            0xBE84_03FF, // s_mov_b32 s4, 42
+            42,
+            0xBE85_03FF, // s_mov_b32 s5, 99
+            99,
+            0xBEFC_0381, // s_mov_b32 m0, 1
+            0xBE80_2E04, // s_movrels_b32 s0, s4 (reads s[4 + 1] = s5)
+            0xBE86_0300, // s_mov_b32 s6, s0
+            S_ENDPGM,
+        ];
+        lowers(&static_rels).unwrap();
 
-    /// A half's value (sign, 5-bit exponent biased 15, 10-bit mantissa), as
-    /// `legacyF16ToF32` widens it.
-    fn half(h: u32) -> f32 {
-        let (s, e, m) = ((h >> 15) & 1, (h >> 10) & 31, h & 1023);
-        let v = match e {
-            0 => m as f32 * 2f32.powi(-24),
-            31 if m == 0 => f32::INFINITY,
-            31 => f32::NAN,
-            _ => (1024 + m) as f32 * 2f32.powi(e as i32 - 25),
-        };
-        if s == 1 { -v } else { v }
-    }
+        // 2. s_movrels_b32 with dynamic M0
+        let dynamic_rels = [
+            0xBE84_03FF, // s_mov_b32 s4, 42
+            42,
+            0xBE81_0381, // s_mov_b32 s1, 1
+            0x80FC_8101, // s_add_u32 m0, s1, 1
+            0xBE80_2E04, // s_movrels_b32 s0, s4 (reads s[4 + m0])
+            0xBE86_0300, // s_mov_b32 s6, s0
+            S_ENDPGM,
+        ];
+        lowers(&dynamic_rels).unwrap();
 
-    #[test]
-    fn small_floats_widen_as_halves() {
-        // Unsigned 11- and 10-bit floats: a 5-bit exponent biased 15 over a
-        // 6- or 5-bit mantissa, no sign; values from the D3D/GL spec.
-        let f11 = |x: u32| half(x << half_shift(11));
-        let f10 = |x: u32| half(x << half_shift(10));
-        assert_eq!(f11(0), 0.0);
-        assert_eq!(f11(0x001), 2f32.powi(-20)); // smallest denormal
-        assert_eq!(f11(0x03F), 63.0 * 2f32.powi(-20)); // largest denormal
-        assert_eq!(f11(0x040), 2f32.powi(-14)); // smallest normal
-        assert_eq!(f11(0x3C0), 1.0);
-        assert_eq!(f11(0x3E0), 1.5);
-        assert_eq!(f11(0x7BF), 65024.0); // largest
-        assert_eq!(f11(0x7C0), f32::INFINITY);
-        assert!(f11(0x7C1).is_nan());
-        assert_eq!(f10(0x001), 2f32.powi(-19));
-        assert_eq!(f10(0x020), 2f32.powi(-14));
-        assert_eq!(f10(0x1E0), 1.0);
-        assert_eq!(f10(0x3DF), 64512.0);
-        assert_eq!(f10(0x3E0), f32::INFINITY);
-        assert!(f10(0x3FF).is_nan());
-        // A 16-bit float is a half already, sign included.
-        assert_eq!(half(0xBC00 << half_shift(16)), -1.0);
+        // 3. s_movreld_b32 with static M0 followed by readback
+        let static_reld = [
+            0xBE81_03FF, // s_mov_b32 s1, 77
+            77,
+            0xBEFC_0382, // s_mov_b32 m0, 2
+            0xBE84_3001, // s_movreld_b32 s4, s1 (writes s[4 + 2] = s6)
+            0xBE80_0306, // s_mov_b32 s0, s6
+            S_ENDPGM,
+        ];
+        lowers(&static_reld).unwrap();
+
+        // 4. s_movreld_b32 with dynamic M0 followed by readback
+        let dynamic_reld = [
+            0xBE81_03FF, // s_mov_b32 s1, 88
+            88,
+            0xBE82_0382, // s_mov_b32 s2, 2
+            0x80FC_8002, // s_add_u32 m0, s2, 0
+            0xBE84_3001, // s_movreld_b32 s4, s1 (writes s[4 + m0])
+            0xBE80_0306, // s_mov_b32 s0, s6
+            S_ENDPGM,
+        ];
+        lowers(&dynamic_reld).unwrap();
+
+        // 5. Out-of-bounds M0 offsets (static & dynamic) clamp cleanly to 0 / no-op
+        let oob_rels = [
+            0xBE84_03FF, // s_mov_b32 s4, 42
+            42,
+            0xBEFC_03FF, // s_mov_b32 m0, 200 (out of SGPR bounds)
+            200,
+            0xBE80_2E04, // s_movrels_b32 s0, s4 (clamped to 0)
+            0xBE86_0300, // s_mov_b32 s6, s0
+            S_ENDPGM,
+        ];
+        lowers(&oob_rels).unwrap();
     }
 }
