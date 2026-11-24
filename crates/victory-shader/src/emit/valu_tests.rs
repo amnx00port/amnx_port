@@ -122,13 +122,17 @@ fn build_valu_cs(body: &[u32]) -> HostShader {
         code,
     };
 
+    lower_synthetic_compute(&native)
+}
+
+fn lower_synthetic_compute(native: &NativeProgram) -> HostShader {
     let p = ir::build(&native.code, native.wave64, native.vgprs).expect("ir::build");
     let st = structure::structure(&p).expect("structure");
     let res =
         resource::track(&p, &native.layout, native.stage, Some(&st)).expect("resource::track");
-    let io = io::raise(&p, &native).expect("io::raise");
+    let io = io::raise(&p, native).expect("io::raise");
     let lowered = lower::lower(&lower::Parts {
-        native: &native,
+        native,
         p: &p,
         st: &st,
         io: &io,
@@ -936,4 +940,151 @@ fn v_cmp_class_f16_matches_rdna2() {
             inp[0], inp[1],
         );
     });
+}
+
+/// Indexed vector loads from a CBV, stored to a raw UAV for comparison with host data.
+fn build_indexed_cbv_cs(load_op: u32, byte_offset: u16, dynamic: bool) -> HostShader {
+    let store_op = load_op + 16; // The matching dword width in the MUBUF store opcodes.
+    let mut words = vec![s_mov_b32(1, 0x80), s_mov_b32(3, 0x80)];
+    words.extend(s_load_dwordx4(8, 0));
+    words.extend(s_load_dwordx4(12, 2));
+    // v0/v1 hold the input row and optional byte offset, v2 the output offset.
+    words.push(vop1(1, 1, sgpr(4)));
+    words.extend([
+        0x3404_0084,         // v_lshlrev_b32 v2, 4, v0
+        vop1(1, 3, sgpr(5)), // v_mov_b32 v3, s5; group ID
+        0x3406_0689,         // v_lshlrev_b32 v3, 9, v3; output group base
+        0x4a04_0503,         // v_add_nc_u32 v2, v3, v2
+        0xE000_2000 | (load_op << 18) | (u32::from(dynamic) << 12) | u32::from(byte_offset),
+        0x8002_0400, // buffer_load_dword[xN] v4..., v0 or v[0:1], s[8:11]
+        0xE000_1000 | (store_op << 18),
+        0x8003_0402, // buffer_store_dword[xN] v4..., v2, s[12:15], 0 offen
+        S_ENDPGM,
+    ]);
+    let native = NativeProgram {
+        stage: HwStage::Cs,
+        wave64: false,
+        vgprs: 8,
+        layout: vec![
+            RootParam {
+                root: RootType::Table,
+                table_offset_dwords: 0,
+                sgprs: 1,
+                base_register: 0,
+                user_data: 0,
+                slot: 0,
+            },
+            RootParam {
+                root: RootType::Table,
+                table_offset_dwords: 0,
+                sgprs: 1,
+                base_register: 0,
+                user_data: 2,
+                slot: 1,
+            },
+            RootParam {
+                root: RootType::Constants,
+                table_offset_dwords: 0,
+                sgprs: 1,
+                base_register: 0,
+                user_data: 4,
+                slot: 2,
+            },
+        ],
+        used: [(ResourceType::Cbv, 0, 0), (ResourceType::Uav, 2, 1)]
+            .into_iter()
+            .map(|(kind, user_data, slot)| UsedResource {
+                kind,
+                user_data,
+                slot,
+                root: RootType::Table,
+                table_offset_dwords: 0,
+                lower_bound: 0,
+                stride: 0,
+                dwords: 4,
+            })
+            .collect(),
+        io: StageIo::Cs(ComputeIo {
+            rsrc2: 5 << 1 | 1 << 7,
+            threads: [32, 1, 1],
+        }),
+        code: words.iter().flat_map(|w| w.to_le_bytes()).collect(),
+    };
+    lower_synthetic_compute(&native)
+}
+
+#[test]
+fn indexed_cbv_loads_match_their_byte_addresses() {
+    let _one = ONE_AT_A_TIME.lock().unwrap_or_else(|e| e.into_inner());
+    let input: Vec<u32> = (0u32..192)
+        .map(|i| (i + 1).wrapping_mul(0x91de_2f71).rotate_left(i % 32))
+        .collect();
+    // The opcode order is dword, dwordx2, dwordx4, dwordx3.
+    let variants = [(12, 1), (13, 2), (15, 3), (14, 4)]
+        .into_iter()
+        .flat_map(|(op, count)| {
+            (0..=28)
+                .step_by(4)
+                .map(|offset| (offset, false))
+                .chain([(0, true)])
+                .map(move |(offset, dynamic)| {
+                    (
+                        count,
+                        offset,
+                        dynamic,
+                        build_indexed_cbv_cs(op, offset, dynamic),
+                    )
+                })
+        })
+        .collect::<Vec<_>>();
+    let mut ran = false;
+
+    for (label, warp) in [("hardware", false), ("warp", true)] {
+        let Ok(host) = Host::new(warp) else {
+            eprintln!("no SM 6.6 {label} device; skipped");
+            continue;
+        };
+        ran = true;
+        for (count, offset, dynamic, shader) in &variants {
+            let (root, pso) = host.compute_pipeline(shader).expect("compute pipeline");
+            let byte_offsets: &[u32] = if *dynamic { &[0, 4, 12, 16] } else { &[0] };
+            for &dynamic_offset in byte_offsets {
+                let mut ud = vec![0u32; shader.user_data_dwords() as usize];
+                for u in &shader.user_data {
+                    ud[u.index as usize] = match (u.root, u.slot) {
+                        (RootType::Table, 0) => 0,
+                        (RootType::Table, 1) => 32,
+                        (RootType::Constants, 2) => dynamic_offset,
+                        other => panic!("unexpected user data {other:?}"),
+                    };
+                }
+                let actual = host
+                    .dispatch(
+                        &root,
+                        &pso,
+                        &Dispatch {
+                            roots: vec![(0, Root::Constants(ud))],
+                            views: &[View::Cbv(&input), View::RawUav(256)],
+                            samplers: &[],
+                            groups: [2, 1, 1],
+                        },
+                    )
+                    .expect("compute dispatch");
+                let dword = (usize::from(*offset) + dynamic_offset as usize) / 4;
+                assert_eq!(actual[0].len(), 256);
+                for (group_index, group) in actual[0].as_chunks::<128>().0.iter().enumerate() {
+                    for (lane, got) in group.as_chunks::<4>().0.iter().enumerate() {
+                        let first = lane * 4 + dword;
+                        assert_eq!(
+                            &got[..*count],
+                            &input[first..first + count],
+                            "{label}: {count} dwords at byte offset {} + {dynamic_offset}, group {group_index}, lane {lane}",
+                            offset
+                        );
+                    }
+                }
+            }
+        }
+    }
+    assert!(ran, "neither hardware nor WARP SM 6.6 device available");
 }
