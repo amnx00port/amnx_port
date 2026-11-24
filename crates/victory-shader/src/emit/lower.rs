@@ -342,6 +342,50 @@ fn unsupported(offset: usize, what: Why) -> Stop {
     Stop::Fail(ShaderError::Unsupported { offset, what })
 }
 
+/// A byte or halfword LDS access: `ds_read_{u,i}{8,16}[_d16[_hi]]` and
+/// `ds_write_b{8,16}[_d16_hi]`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct SubDword {
+    write: bool,
+    bits: u32,
+    /// Reads: sign-extended.
+    signed: bool,
+    /// Reads: the result is 16 bits wide and goes into one half of the VGPR,
+    /// the other half kept (`Some(true)`: the high half). Writes: the data
+    /// comes from the high half (`Some(true)`).
+    d16: Option<bool>,
+}
+
+impl SubDword {
+    fn of(name: &str) -> Option<Self> {
+        let (write, rest) = match name.strip_prefix("ds_read_") {
+            Some(r) => (false, r),
+            None => (true, name.strip_prefix("ds_write_")?),
+        };
+        let (ty, d16) = match rest.split_once("_d16") {
+            None => (rest, None),
+            Some((t, "")) if !write => (t, Some(false)),
+            Some((t, "_hi")) => (t, Some(true)),
+            Some(_) => return None,
+        };
+        let (signed, bits) = match (write, ty) {
+            (false, "u8") => (false, 8),
+            (false, "i8") => (true, 8),
+            (false, "u16") => (false, 16),
+            (false, "i16") => (true, 16),
+            (true, "b8") => (false, 8),
+            (true, "b16") => (false, 16),
+            _ => return None,
+        };
+        Some(Self {
+            write,
+            bits,
+            signed,
+            d16,
+        })
+    }
+}
+
 impl<'a> Lower<'a> {
     fn new(x: &'a Parts<'a>, bad: &'a HashMap<Value, Why>) -> Self {
         let p = x.p;
@@ -2061,6 +2105,129 @@ impl<'a> Lower<'a> {
             .collect()
     }
 
+    /// A byte or halfword LDS read or write at byte address `a + offset`,
+    /// through the dword holding it.
+    #[allow(clippy::too_many_arguments)]
+    fn ds_sub_dword(
+        &mut self,
+        inst: &Inst,
+        sub: SubDword,
+        a: V,
+        offset: u32,
+        dst_reg: Option<u8>,
+        data: &[Operand],
+        guard: Option<V>,
+    ) -> Result<(), Why> {
+        use super::bitcode::Rmw;
+        let c = self.cur;
+        let k = |l: &mut Self, v: u32| l.s.m.i32(v);
+        // shortcut: as for dwords, in bounds.
+        let o = k(self, offset);
+        let at = self.s.m.bin(c, Bin::Add, a, o);
+        let two = k(self, 2);
+        let index = self.s.m.bin(c, Bin::LShr, at, two);
+        let lds = self.s.lds();
+        let p = self.s.m.element(c, lds, index);
+        let three = k(self, 3);
+        let byte = self.s.m.bin(c, Bin::And, at, three);
+        let shift = self.s.m.bin(c, Bin::Shl, byte, three);
+        let mask = k(self, (1 << sub.bits) - 1);
+        // A halfword at byte 3 of a dword takes its high byte from byte 0 of
+        // the next, as the hardware reads and writes it (measured on RDNA2):
+        // `next` is that dword then, else the same one again, with nothing
+        // of it read or written.
+        let next = if sub.bits == 16 {
+            let straddle = self.s.m.cmp(c, pred::EQ, byte, three);
+            let one = k(self, 1);
+            let after = self.s.m.bin(c, Bin::Add, index, one);
+            let i = self.s.m.select(c, straddle, after, index);
+            Some((straddle, self.s.m.element(c, lds, i)))
+        } else {
+            None
+        };
+        let zero = k(self, 0);
+        let eight = k(self, 8);
+        if !sub.write {
+            let reg = dst_reg.ok_or("an LDS read result")?;
+            let x = self.s.m.load(c, p);
+            let x = self.s.m.bin(c, Bin::LShr, x, shift);
+            let x = match next {
+                None => x,
+                Some((straddle, p2)) => {
+                    let y = self.s.m.load(c, p2);
+                    let y = self.s.m.bin(c, Bin::Shl, y, eight);
+                    let y = self.s.m.select(c, straddle, y, zero);
+                    self.s.m.bin(c, Bin::Or, x, y)
+                }
+            };
+            let x = if sub.signed {
+                let up = k(self, 32 - sub.bits);
+                let x = self.s.m.bin(c, Bin::Shl, x, up);
+                self.s.m.bin(c, Bin::AShr, x, up)
+            } else {
+                self.s.m.bin(c, Bin::And, x, mask)
+            };
+            let x = match sub.d16 {
+                None => x,
+                Some(high) => {
+                    let old = inst.read(Reg::V(reg)).ok_or("an unread operand")?;
+                    let old = self.i32_of(old)?;
+                    let low16 = k(self, 0xFFFF);
+                    let half = self.s.m.bin(c, Bin::And, x, low16);
+                    if high {
+                        let keep = self.s.m.bin(c, Bin::And, old, low16);
+                        let sixteen = k(self, 16);
+                        let half = self.s.m.bin(c, Bin::Shl, half, sixteen);
+                        self.s.m.bin(c, Bin::Or, keep, half)
+                    } else {
+                        let high16 = k(self, 0xFFFF_0000);
+                        let keep = self.s.m.bin(c, Bin::And, old, high16);
+                        self.s.m.bin(c, Bin::Or, keep, half)
+                    }
+                }
+            };
+            self.write(inst, Reg::V(reg), x, guard);
+            return Ok(());
+        }
+        let d = self.vgprs(inst, data.first().ok_or("an LDS write")?, 1)?[0];
+        let d = if sub.d16 == Some(true) {
+            let sixteen = k(self, 16);
+            self.s.m.bin(c, Bin::LShr, d, sixteen)
+        } else {
+            d
+        };
+        let d = self.s.m.bin(c, Bin::And, d, mask);
+        let set = self.s.m.bin(c, Bin::Shl, d, shift);
+        let bits = self.s.m.bin(c, Bin::Shl, mask, shift);
+        let ones = k(self, !0);
+        let clear = self.s.m.bin(c, Bin::Xor, bits, ones);
+        // The high byte of a straddling halfword, for the next dword.
+        let high = match next {
+            None => None,
+            Some((straddle, p2)) => {
+                let byte_mask = k(self, 0xFF);
+                let bits2 = self.s.m.select(c, straddle, byte_mask, zero);
+                let clear2 = self.s.m.bin(c, Bin::Xor, bits2, ones);
+                let set2 = self.s.m.bin(c, Bin::LShr, d, eight);
+                let set2 = self.s.m.select(c, straddle, set2, zero);
+                Some((p2, clear2, set2))
+            }
+        };
+        // Lanes write other bytes of the same dword at the same time, so
+        // the bytes go in atomically: cleared, then set. shortcut: lanes
+        // writing the same bytes at once leave their values or-ed together
+        // where the hardware keeps the highest lane's (measured on RDNA2).
+        let at = self.begin_guarded(guard);
+        self.s.m.atomic(self.cur, Rmw::And, p, clear);
+        self.s.m.atomic(self.cur, Rmw::Or, p, set);
+        if let Some((p2, clear2, set2)) = high {
+            self.s.m.atomic(self.cur, Rmw::And, p2, clear2);
+            self.s.m.atomic(self.cur, Rmw::Or, p2, set2);
+        }
+        self.end_guarded(at, &[]);
+        Ok(())
+    }
+
     /// LDS (thread-group shared memory) and `ds_swizzle`.
     fn ds(&mut self, inst: &Inst, b: usize, i: usize) -> Result<(), Why> {
         let Fields::Ds {
@@ -2158,6 +2325,9 @@ impl<'a> Lower<'a> {
                 (u32::from(*offset1) * scale, w),
             ]
         };
+        if let Some(sub) = SubDword::of(name) {
+            return self.ds_sub_dword(inst, sub, a, offset, dst_reg, data, guard);
+        }
         if let Some(rest) = name.strip_prefix("ds_read") {
             let elements = if rest.starts_with('2') {
                 pair(name)
@@ -6947,7 +7117,7 @@ impl<'a> Lower<'a> {
 
 #[cfg(test)]
 mod tests {
-    use super::{Lowered, Numeric, Parts, buffer_format, half_shift, lower};
+    use super::{Lowered, Numeric, Parts, SubDword, buffer_format, half_shift, lower};
     use crate::native::{
         ComputeIo, HwStage, NativeProgram, ResourceType, RootParam, RootType, StageIo, UsedResource,
     };
@@ -7324,6 +7494,43 @@ mod tests {
         assert_eq!(refusal(&words), refusal(&direct));
         words[8] = 0xBF07_8000; // read the group id instead; the timestamp is dead
         lowers(&words, group_ids_xy).expect("dead timestamp");
+    }
+
+    #[test]
+    fn sub_dword_lds_names() {
+        let s = |write, bits, signed, d16| {
+            Some(SubDword {
+                write,
+                bits,
+                signed,
+                d16,
+            })
+        };
+        assert_eq!(SubDword::of("ds_read_i8"), s(false, 8, true, None));
+        assert_eq!(SubDword::of("ds_read_u16"), s(false, 16, false, None));
+        assert_eq!(
+            SubDword::of("ds_read_u8_d16"),
+            s(false, 8, false, Some(false))
+        );
+        assert_eq!(
+            SubDword::of("ds_read_i16_d16_hi"),
+            s(false, 16, true, Some(true))
+        );
+        assert_eq!(SubDword::of("ds_write_b8"), s(true, 8, false, None));
+        assert_eq!(
+            SubDword::of("ds_write_b16_d16_hi"),
+            s(true, 16, false, Some(true))
+        );
+        for name in [
+            "ds_read_b32",
+            "ds_read2_b32",
+            "ds_write_b64",
+            "ds_write_b8_d16",
+            "ds_read_u8_d32",
+            "ds_add_u32",
+        ] {
+            assert_eq!(SubDword::of(name), None, "{name}");
+        }
     }
 
     #[test]
