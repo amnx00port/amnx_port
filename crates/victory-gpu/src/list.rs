@@ -452,10 +452,10 @@ extern "system" fn copy_resource(this: This, dst: This, src: This) {
             }
             ensure_state(list, dst, COPY_DEST);
             ensure_state(list, src, COPY_SOURCE);
-            crate::texture::host_written(dst);
             #[cfg(feature = "diagnostics")]
             list.note_op(|| format!("copy resource {src:?} to {dst:?}"));
             if dst_copy.mip_drop() == 0 && src_copy.mip_drop() == 0 {
+                crate::texture::host_written(dst);
                 // SAFETY: an open list and live textures.
                 unsafe { list.list.CopyResource(to, from) };
             } else {
@@ -471,12 +471,15 @@ extern "system" fn copy_resource(this: This, dst: This, src: This) {
                     && a.DepthOrArraySize == b.DepthOrArraySize
                     && a.MipLevels == b.MipLevels
                 {
+                    crate::texture::host_written(dst);
                     // SAFETY: an open list and matching live textures.
                     unsafe { list.list.CopyResource(to, from) };
                 } else {
                     // Copy the overlapping surviving mip levels subresource by
                     // subresource so differing mip-drop counts never invalidate
-                    // the host command list.
+                    // the host command list, and only mark the subresources
+                    // actually written as host-owned so untouched upper mips
+                    // remain eligible for title-memory upload.
                     let start = dst_copy.mip_drop().max(src_copy.mip_drop());
                     let end = dst_copy.title_mips.min(src_copy.title_mips);
                     let slices = if a.Dimension == D3D12_RESOURCE_DIMENSION_TEXTURE3D {
@@ -521,6 +524,7 @@ extern "system" fn copy_resource(this: This, dst: This, src: This) {
                                     SubresourceIndex: src_sub,
                                 },
                             };
+                            crate::texture::host_written_subresource(dst, dst_sub);
                             // SAFETY: an open list and matching subresources.
                             unsafe {
                                 list.list

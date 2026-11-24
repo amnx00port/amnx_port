@@ -2554,4 +2554,259 @@ mod tests {
         slot::<Release>(src_mip1, 0x10)(src_mip1);
         slot::<Release>(image, 0x10)(image);
     }
+
+    /// Regression test for partial `CopyResource` between mismatched mip-drop
+    /// levels: copied subresources stay host-owned while untouched upper mips
+    /// remain eligible for title-memory upload (with no-copy and full-copy
+    /// controls).
+    #[cfg(windows)]
+    #[test]
+    fn partial_copy_resource_preserves_untouched_mip_uploads() {
+        use std::sync::atomic::AtomicU32;
+        use windows::Win32::Graphics::Direct3D12::*;
+        use windows::core::Interface;
+        let Some(host) = crate::host::host() else {
+            return; // no host GPU here
+        };
+        let desc = ResourceDesc {
+            layout: 1, // linear so title memory bytes map directly per mip
+            ..tex2d(256, 48, 6, 28, 0)
+        };
+        let byte_size = texture_layout(&desc).expect("texture layout").size as usize;
+
+        let make_tex = |drop: u32, fill: u8| -> (This, Vec<u8>) {
+            let mut mem = vec![fill; byte_size];
+            let local_pressure = AtomicU32::new(0);
+            let (tex, actual_drop) =
+                host_texture_with_drop(&desc, 0, std::ptr::null(), drop, &local_pressure)
+                    .expect("host texture creation");
+            assert_eq!(actual_drop, drop);
+            let state = crate::host::legal_state(&tex, crate::host::texture_state(0));
+            let res_box = Box::new(Resource {
+                object: Object::new(&RESOURCE_FUNCTIONS),
+                desc,
+                heap: PROPERTIES,
+                heap_flags: 0,
+                backing: Backing::Address(mem.as_mut_ptr()),
+                host: Some(std::sync::Arc::new(HostTexture {
+                    texture: tex,
+                    state: state.into(),
+                    title_mips: 6,
+                    mip_drop: actual_drop,
+                    is_3d: false,
+                })),
+            });
+            (Box::into_raw(res_box).cast(), mem)
+        };
+
+        let upload_now = |tex: This| {
+            let list = host.new_list().unwrap();
+            let hc = host_copy(tex).unwrap();
+            crate::texture::upload(&list, tex, &hc.texture);
+            list.close();
+            host.execute(&[&list]);
+        };
+
+        let readback_row = |tex: This, host_sub: u32, w: u32, h: u32| -> Vec<u8> {
+            let row_pitch = (w * 4).next_multiple_of(256);
+            let buf_size = u64::from(row_pitch) * u64::from(h);
+            let readback_heap = D3D12_HEAP_PROPERTIES {
+                Type: D3D12_HEAP_TYPE_READBACK,
+                ..Default::default()
+            };
+            let readback_desc = D3D12_RESOURCE_DESC {
+                Dimension: D3D12_RESOURCE_DIMENSION_BUFFER,
+                Width: buf_size,
+                Height: 1,
+                DepthOrArraySize: 1,
+                MipLevels: 1,
+                SampleDesc: windows::Win32::Graphics::Dxgi::Common::DXGI_SAMPLE_DESC {
+                    Count: 1,
+                    Quality: 0,
+                },
+                Layout: D3D12_TEXTURE_LAYOUT_ROW_MAJOR,
+                ..Default::default()
+            };
+            let mut rb: Option<ID3D12Resource> = None;
+            // SAFETY: plain readback buffer creation.
+            unsafe {
+                host.device
+                    .CreateCommittedResource(
+                        &readback_heap,
+                        D3D12_HEAP_FLAG_NONE,
+                        &readback_desc,
+                        D3D12_RESOURCE_STATE_COPY_DEST,
+                        None,
+                        &mut rb,
+                    )
+                    .unwrap();
+            }
+            let rb = rb.unwrap();
+            let host_tex = host_resource(tex).unwrap();
+            let back = host.new_list().unwrap();
+            if let Some((_, before)) = host_transition(tex, 0x800) {
+                // SAFETY: open list and live texture.
+                unsafe {
+                    back.list.ResourceBarrier(&[crate::host::transition(
+                        host_tex,
+                        D3D12_RESOURCE_STATES(before as i32),
+                        D3D12_RESOURCE_STATE_COPY_SOURCE,
+                    )]);
+                }
+            }
+            #[repr(C)]
+            struct Location {
+                resource: This,
+                kind: u32,
+                footprint: PlacedFootprint,
+            }
+            let out_to = Location {
+                resource: rb.as_raw().cast_const().cast(),
+                kind: 1,
+                footprint: PlacedFootprint {
+                    offset: 0,
+                    format: 28,
+                    width: w,
+                    height: h,
+                    depth: 1,
+                    row_pitch,
+                },
+            };
+            let out_from = Location {
+                resource: host_tex.as_raw().cast_const().cast(),
+                kind: 0,
+                footprint: PlacedFootprint {
+                    offset: u64::from(host_sub),
+                    ..NO_FOOTPRINT
+                },
+            };
+            // SAFETY: open list, live resources, valid footprints.
+            unsafe {
+                back.list.CopyTextureRegion(
+                    (&raw const out_to).cast(),
+                    0,
+                    0,
+                    0,
+                    (&raw const out_from).cast(),
+                    None,
+                );
+            }
+            back.close();
+            host.execute(&[&back]);
+            let mut mapped = std::ptr::null_mut();
+            // SAFETY: copy finished; buffer holds buf_size bytes.
+            unsafe {
+                rb.Map(
+                    0,
+                    Some(&D3D12_RANGE {
+                        Begin: 0,
+                        End: buf_size as usize,
+                    }),
+                    Some(&mut mapped),
+                )
+                .unwrap();
+                let slice = std::slice::from_raw_parts(mapped.cast::<u8>(), (w * 4) as usize);
+                let out = slice.to_vec();
+                rb.Unmap(0, None);
+                out
+            }
+        };
+
+        let run_copy_resource = |dst: This, src: This| {
+            let null = std::ptr::null();
+            let queue_iid = guid(
+                0x0ec870a6,
+                0x5d7e,
+                0x4c22,
+                [0x8c, 0xfc, 0x5b, 0xaa, 0xe0, 0x76, 0x16, 0xed],
+            );
+            let allocator_iid = guid(
+                0x6102dee4,
+                0xaf59,
+                0x4b09,
+                [0xb9, 0x99, 0xb4, 0x4d, 0x73, 0xf0, 0x9b, 0x24],
+            );
+            let list_iid = guid(
+                0x5b160d0f,
+                0xac1b,
+                0x4185,
+                [0x8b, 0xa8, 0xb3, 0xae, 0x42, 0xa5, 0xa4, 0x55],
+            );
+            let (mut queue, mut allocator, mut list) = (null, null, null);
+            let queue_desc = [0u32; 4];
+            assert_eq!(
+                crate::queue::create(null, queue_desc.as_ptr().cast(), &queue_iid, &mut queue),
+                S_OK
+            );
+            assert_eq!(
+                crate::list::create_allocator(null, 0, &allocator_iid, &mut allocator),
+                S_OK
+            );
+            assert_eq!(
+                crate::list::create_list(null, 0, 0, allocator, null, &list_iid, &mut list),
+                S_OK
+            );
+            type CopyRes = extern "system" fn(This, This, This);
+            type Close = extern "system" fn(This) -> HRESULT;
+            type Execute = extern "system" fn(This, u32, *const This);
+            slot::<CopyRes>(list, 0x88)(list, dst, src);
+            assert_eq!(slot::<Close>(list, 0x48)(list), S_OK);
+            slot::<Execute>(queue, 0x50)(queue, 1, &list);
+            slot::<Release>(list, 0x10)(list);
+            slot::<Release>(allocator, 0x10)(allocator);
+            slot::<Release>(queue, 0x10)(queue);
+        };
+
+        // 1) No-copy control: title memory update uploads normally.
+        let (no_copy, mut no_copy_mem) = make_tex(1, 0xA4);
+        upload_now(no_copy);
+        assert!(readback_row(no_copy, 0, 128, 24).iter().all(|&b| b == 0xA4));
+        no_copy_mem.fill(0xC8);
+        upload_now(no_copy);
+        assert!(
+            readback_row(no_copy, 0, 128, 24).iter().all(|&b| b == 0xC8),
+            "no-copy control should upload updated 0xC8"
+        );
+        slot::<Release>(no_copy, 0x10)(no_copy);
+        drop(no_copy_mem);
+
+        // 2) Full-copy control (same mip drop 1 -> 1): CopyResource suppresses
+        //    subsequent title-memory uploads.
+        let (full_src, full_src_mem) = make_tex(1, 0x33);
+        let (full_dst, mut full_dst_mem) = make_tex(1, 0xA4);
+        upload_now(full_dst);
+        run_copy_resource(full_dst, full_src);
+        full_dst_mem.fill(0xC8);
+        upload_now(full_dst);
+        assert!(
+            readback_row(full_dst, 0, 128, 24).iter().all(|&b| b == 0x33),
+            "full-copy control should preserve GPU-copied 0x33"
+        );
+        slot::<Release>(full_dst, 0x10)(full_dst);
+        slot::<Release>(full_src, 0x10)(full_src);
+        drop((full_dst_mem, full_src_mem));
+
+        // 3) Partial-copy integrity (src drop=2 -> dst drop=1): guest mips 2..5
+        //    are copied (host mips 1..4 on dst) while untouched guest mip 1
+        //    (host mip 0 on dst) must still accept subsequent uploads.
+        let (part_src, part_src_mem) = make_tex(2, 0x55);
+        let (part_dst, mut part_dst_mem) = make_tex(1, 0xA4);
+        upload_now(part_dst);
+        run_copy_resource(part_dst, part_src);
+        part_dst_mem.fill(0xC8);
+        upload_now(part_dst);
+        assert!(
+            readback_row(part_dst, 0, 128, 24).iter().all(|&b| b == 0xC8),
+            "untouched guest mip 1 (host mip 0) must upload updated 0xC8 instead of stale 0xA4"
+        );
+        assert!(
+            readback_row(part_dst, 1, 64, 12).iter().all(|&b| b == 0x55),
+            "copied guest mip 2 (host mip 1) must preserve GPU-copied 0x55"
+        );
+        // SAFETY: plain device query.
+        assert!(unsafe { host.device.GetDeviceRemovedReason() }.is_ok());
+        slot::<Release>(part_dst, 0x10)(part_dst);
+        slot::<Release>(part_src, 0x10)(part_src);
+        drop((part_dst_mem, part_src_mem));
+    }
 }

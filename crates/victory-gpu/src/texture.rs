@@ -67,15 +67,37 @@ unsafe impl Sync for Staging {}
 
 static STAGING: Mutex<Option<HashMap<usize, Arc<Staging>>>> = Mutex::new(None);
 
+/// Which host subresources of a texture the host GPU wrote by a copy or
+/// resolve: those subresources keep their host contents rather than being
+/// overwritten by title memory, while untouched subresources (e.g. upper
+/// mips skipped by a cross-mip-drop partial `CopyResource`) still upload.
+enum HostWritten {
+    All,
+    Subresources(std::collections::HashSet<u32>),
+}
+
 /// Textures the host GPU wrote by a copy or resolve: their contents are on
 /// the host, not in title memory, which stays as it was.
-static HOST_WRITTEN: Mutex<Option<std::collections::HashSet<usize>>> = Mutex::new(None);
+static HOST_WRITTEN: Mutex<Option<HashMap<usize, HostWritten>>> = Mutex::new(None);
 
-/// A host copy or resolve writes `resource`.
+/// A host copy or resolve writes the entire `resource`.
 pub(crate) fn host_written(resource: This) {
-    let mut set = HOST_WRITTEN.lock().unwrap_or_else(|e| e.into_inner());
-    set.get_or_insert_with(Default::default)
-        .insert(resource as usize);
+    let mut map = HOST_WRITTEN.lock().unwrap_or_else(|e| e.into_inner());
+    map.get_or_insert_with(Default::default)
+        .insert(resource as usize, HostWritten::All);
+}
+
+/// A partial host copy writes a single host subresource of `resource`,
+/// leaving untouched subresources eligible for title-memory upload.
+pub(crate) fn host_written_subresource(resource: This, host_subresource: u32) {
+    let mut map = HOST_WRITTEN.lock().unwrap_or_else(|e| e.into_inner());
+    let entry = map
+        .get_or_insert_with(Default::default)
+        .entry(resource as usize)
+        .or_insert_with(|| HostWritten::Subresources(Default::default()));
+    if let HostWritten::Subresources(set) = entry {
+        set.insert(host_subresource);
+    }
 }
 
 /// The title released a resource.
@@ -84,9 +106,9 @@ pub(crate) fn forget(resource: usize) {
     if let Some(map) = map.as_mut() {
         map.remove(&resource);
     }
-    let mut set = HOST_WRITTEN.lock().unwrap_or_else(|e| e.into_inner());
-    if let Some(set) = set.as_mut() {
-        set.remove(&resource);
+    let mut written = HOST_WRITTEN.lock().unwrap_or_else(|e| e.into_inner());
+    if let Some(written) = written.as_mut() {
+        written.remove(&resource);
     }
 }
 
@@ -103,24 +125,38 @@ pub(crate) fn title_written(texture: &ID3D12Resource) -> bool {
 /// submission if the memory changed. Leaves the texture in the copy
 /// destination state.
 pub(crate) fn upload(list: &HostList, resource: This, texture: &ID3D12Resource) {
-    let host_written = HOST_WRITTEN
-        .lock()
-        .unwrap_or_else(|e| e.into_inner())
-        .as_ref()
-        .is_some_and(|set| set.contains(&(resource as usize)));
-    // shortcut: a texture the host copied into keeps the host's contents
-    // even if the title later writes its memory too.
-    if host_written || !list.first_use(resource as usize) {
+    let written_subs = {
+        let map = HOST_WRITTEN.lock().unwrap_or_else(|e| e.into_inner());
+        match map.as_ref().and_then(|m| m.get(&(resource as usize))) {
+            Some(HostWritten::All) => return,
+            Some(HostWritten::Subresources(set)) => Some(set.clone()),
+            None => None,
+        }
+    };
+    // shortcut: subresources the host copied into keep the host's contents
+    // even if the title later writes their memory too.
+    if !list.first_use(resource as usize) {
         return;
     }
     let Some(staging) = staging(resource, texture) else {
         return;
     };
+    if let Some(ref written) = written_subs
+        && (0..staging.footprints.len() as u32).all(|sub| written.contains(&sub))
+    {
+        return;
+    }
     const COPY_DEST: u32 = 0x400;
     crate::list::ensure_state(list, resource, COPY_DEST);
     // The staging buffer lives as long as `staging`, which the deferred
     // refresh below holds until the list is reset.
     for (i, footprint) in staging.footprints.iter().enumerate() {
+        if written_subs
+            .as_ref()
+            .is_some_and(|written| written.contains(&(i as u32)))
+        {
+            continue;
+        }
         #[cfg(feature = "diagnostics")]
         {
             let f = footprint.Footprint;
