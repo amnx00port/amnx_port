@@ -1180,3 +1180,12 @@ pub(crate) fn stencil_ref(list: &HostList, reference: u32) {
     // SAFETY: an open list.
     unsafe { list.list.OMSetStencilRef(reference) };
 }
+
+pub(crate) fn depth_bounds(list: &HostList, min: f32, max: f32) {
+    if crate::host::host().is_some_and(|h| h.depth_bounds())
+        && let Ok(list1) = list.list.cast::<ID3D12GraphicsCommandList1>()
+    {
+        // SAFETY: an open list on a device that supports depth bounds.
+        unsafe { list1.OMSetDepthBounds(min, max) };
+    }
+}

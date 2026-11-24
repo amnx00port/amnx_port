@@ -597,6 +597,8 @@ mod tests {
         put(0x20, ms.len() as u64);
         put(0x30, ps.as_ptr() as u64);
         put(0x38, ps.len() as u64);
+        // Depth-stencil 1 at 0x210: DepthBoundsTestEnable sits at +4 + 52 = 0x248.
+        put(0x248, 1);
         // Topology type 3 (triangles), one render target of format 28.
         put(0x278, 14 | 3 << 32);
         put(0x280, 15 | 28 << 32);
@@ -613,6 +615,7 @@ mod tests {
         {
             let g = pipeline(p).host.graphics.as_deref().unwrap();
             assert_eq!(g.topology.0, 3);
+            assert!(g.depth_bounds);
             assert_eq!(
                 (g.targets.NumRenderTargets, g.targets.RTFormats[0].0),
                 (1, 28)
