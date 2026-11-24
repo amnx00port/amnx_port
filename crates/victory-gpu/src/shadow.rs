@@ -37,8 +37,8 @@ pub(crate) struct Shadow {
     copied: Mutex<Vec<u64>>,
     /// Whether the memory is write-watched: unknown, yes, no.
     watched: AtomicU8,
-    /// Ranges shaders of a submission not yet copied back may be writing:
-    /// title memory there is older than the copy.
+    /// Disjoint sorted ranges shaders of a submission not yet copied back
+    /// may be writing: title memory there is older than the copy.
     pending: Mutex<Vec<(usize, usize)>>,
     /// The copy's bytes before the submission ran, from an offset on,
     /// covering the ranges its shaders write: what the GPU wrote differs.
@@ -73,6 +73,58 @@ fn give_back(v: Vec<u8>) {
         pool.sort_by_key(|v| std::cmp::Reverse(v.capacity()));
         pool.truncate(8);
     }
+}
+
+fn merge_range(ranges: &mut Vec<(usize, usize)>, mut from: usize, mut to: usize) {
+    if from >= to {
+        return;
+    }
+
+    let pos = ranges.partition_point(|&(_, end)| end < from);
+    let mut end = pos;
+    while end < ranges.len() && ranges[end].0 <= to {
+        from = from.min(ranges[end].0);
+        to = to.max(ranges[end].1);
+        end += 1;
+    }
+
+    if pos == end {
+        ranges.insert(pos, (from, to));
+    } else {
+        ranges[pos] = (from, to);
+        ranges.drain(pos + 1..end);
+    }
+}
+
+fn merge_gpu_writes(title: &mut [u8], host: &mut [u8], old: &[u8]) -> bool {
+    let mut changed = false;
+    let (t_chunks, t_rem) = title.as_chunks_mut::<8>();
+    let (h_chunks, h_rem) = host.as_chunks_mut::<8>();
+    let (o_chunks, o_rem) = old.as_chunks::<8>();
+
+    for ((t, h), o) in t_chunks.iter_mut().zip(h_chunks.iter_mut()).zip(o_chunks) {
+        if *h == *o {
+            *h = *t;
+            continue;
+        }
+        for ((tb, hb), ob) in t.iter_mut().zip(h.iter_mut()).zip(o) {
+            if *hb != *ob && *tb != *hb {
+                *tb = *hb;
+                changed = true;
+            }
+            *hb = *tb;
+        }
+    }
+
+    for ((tb, hb), ob) in t_rem.iter_mut().zip(h_rem.iter_mut()).zip(o_rem) {
+        if *hb != *ob && *tb != *hb {
+            *tb = *hb;
+            changed = true;
+        }
+        *hb = *tb;
+    }
+
+    changed
 }
 
 const NOT_WATCHED: u8 = 2;
@@ -125,7 +177,10 @@ impl Shadow {
     fn inside(&self, address: usize, len: usize) -> (usize, usize) {
         let (start, end) = (self.start as usize, (self.start + self.len) as usize);
         let from = address.clamp(start, end);
-        (from - start, (address + len).clamp(from, end) - start)
+        (
+            from - start,
+            address.saturating_add(len).clamp(from, end) - start,
+        )
     }
 
     /// Shaders of `list` may write `[address, address + len)` of the copy
@@ -149,11 +204,16 @@ impl Shadow {
     /// 174 MB heap dozens of times), in reused memory (fresh snapshots cost
     /// ~2.3 million page faults per world frame).
     pub(crate) fn writing(&self, address: usize, len: usize) {
-        self.pending
-            .lock()
-            .unwrap_or_else(|e| e.into_inner())
-            .push((address, address + len));
         let (from, to) = self.inside(address, len);
+        if from >= to {
+            return;
+        }
+        let base = self.start as usize;
+        merge_range(
+            &mut self.pending.lock().unwrap_or_else(|e| e.into_inner()),
+            base + from,
+            base + to,
+        );
         // SAFETY: inside the mapping.
         let host = |a: usize, b: usize| unsafe { std::slice::from_raw_parts(self.data.add(a), b - a) };
         let mut before = self.before.lock().unwrap_or_else(|e| e.into_inner());
@@ -185,77 +245,82 @@ impl Shadow {
     /// title's threads write the same buffers while the GPU runs (its
     /// command memory shares the big GPU heap with what shaders write), and
     /// putting back the copy's older bytes there broke the title's own
-    /// records (a fence list read as -1, title+0x4e9b54a). Returns the bytes
-    /// written.
-    pub(crate) fn copy_back(&self, address: usize, len: usize) -> usize {
-        let mut snapshot = self.before.lock().unwrap_or_else(|e| e.into_inner());
+    /// records (a fence list read as -1, title+0x4e9b54a). Declared ranges
+    /// are merged into disjoint spans in `pending`, so each byte is diffed
+    /// against the snapshot at most once. Returns the bytes written.
+    pub(crate) fn copy_back_all(&self) -> usize {
+        let ranges = std::mem::take(&mut *self.pending.lock().unwrap_or_else(|e| e.into_inner()));
+        let snapshot = self
+            .before
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .take();
+        let Some((taken, before)) = snapshot else {
+            return 0;
+        };
+
         let mut written = 0;
-        let (from, to) = self.inside(address, len);
         let start = self.start as usize;
-        if let Some((taken, before)) = &*snapshot
-            && *taken <= from
-            && to <= taken + before.len()
-            && from < to
-        {
-            let before = &before[from - taken..to - taken];
+        const PIECE: usize = 64 << 10;
+        let mut title = Vec::new();
+        let mut synced = Vec::new();
+
+        for (range_start, range_end) in ranges {
+            let (from, to) = self.inside(range_start, range_end - range_start);
+            if taken > from || to > taken + before.len() || from >= to {
+                continue;
+            }
+            let slice_before = &before[from - taken..to - taken];
             // By 64 KiB piece: the copy compared with its bytes before the
             // submission, title memory read only where the GPU wrote.
-            const PIECE: usize = 64 << 10;
-            let mut title = vec![0u8; PIECE];
-            let mut synced = Vec::new();
             let mut at = from;
             while at < to {
                 let n = (PIECE - (start + at) % PIECE).min(to - at);
                 // SAFETY: inside the mapping; only the submitting thread
                 // writes it.
                 let host = unsafe { std::slice::from_raw_parts_mut(self.data.add(at), n) };
-                let old = &before[at - from..at - from + n];
-                let title = &mut title[..n];
-                if host != old && crate::host::read_into((start + at) as *const u8, title) {
-                    // Title memory with the GPU's bytes put in; the copy
-                    // takes the title's bytes in turn.
-                    let mut changed = false;
-                    for ((t, h), o) in title.iter_mut().zip(host.iter_mut()).zip(old) {
-                        if *h != *o && *t != *h {
-                            *t = *h;
-                            changed = true;
+                let old = &slice_before[at - from..at - from + n];
+                if host != old {
+                    if title.len() < PIECE {
+                        title.resize(PIECE, 0);
+                    }
+                    let title_piece = &mut title[..n];
+                    if crate::host::read_into((start + at) as *const u8, title_piece) {
+                        // Title memory with the GPU's bytes put in; the copy
+                        // takes the title's bytes in turn.
+                        if merge_gpu_writes(title_piece, host, old) {
+                            crate::watch::writing(start + at, n);
+                            crate::host::write_mapped(
+                                (start + at) as *mut u8,
+                                title_piece.as_ptr(),
+                                n,
+                            );
+                            written += n;
                         }
-                        *h = *t;
+                        if (start + at).is_multiple_of(PAGE) && n == PAGE {
+                            synced.push((start + at) / PAGE);
+                        }
                     }
-                    if changed {
-                        crate::watch::writing(start + at, n);
-                        crate::host::write_mapped((start + at) as *mut u8, title.as_ptr(), n);
-                        written += n;
-                    }
-                    synced.push((start + at) / PAGE);
                 }
                 at += n;
             }
-            // Pages made equal to title memory are current in the copy, so
-            // our own write is not taken for the title's; others keep what
-            // they had (a title write there shows at the next refresh).
-            let (first, last) = ((start + from).div_ceil(PAGE), (start + to) / PAGE);
-            if first < last
-                && !synced.is_empty()
-                && self.watched.load(Ordering::Relaxed) != NOT_WATCHED
-                && let Some((now, _)) = crate::watch::writes(first * PAGE, last * PAGE, true)
-            {
-                let base = start / PAGE;
-                let mut copied = self.copied.lock().unwrap_or_else(|e| e.into_inner());
-                for page in synced.into_iter().filter(|p| (first..last).contains(p)) {
-                    copied[page - base] = now;
-                }
+        }
+
+        // Pages made equal to title memory are current in the copy, so
+        // our own write is not taken for the title's; others keep what
+        // they had (a title write there shows at the next refresh).
+        if let (Some(&first), Some(&last)) = (synced.first(), synced.last())
+            && self.watched.load(Ordering::Relaxed) != NOT_WATCHED
+            && let Some((now, _)) = crate::watch::writes(first * PAGE, (last + 1) * PAGE, true)
+        {
+            let base = start / PAGE;
+            let mut copied = self.copied.lock().unwrap_or_else(|e| e.into_inner());
+            for page in synced {
+                copied[page - base] = now;
             }
         }
-        // Every submitted step that declared the range is done with it (one
-        // submission runs at a time), and the snapshot with the last range.
-        let mut pending = self.pending.lock().unwrap_or_else(|e| e.into_inner());
-        pending.retain(|&r| r != (address, address + len));
-        if pending.is_empty()
-            && let Some((_, bytes)) = snapshot.take()
-        {
-            give_back(bytes);
-        }
+
+        give_back(before);
         written
     }
 
@@ -264,11 +329,11 @@ impl Shadow {
     /// write-watched). Returns the bytes copied.
     pub(crate) fn update(&self, address: usize, len: usize) -> usize {
         let (start, end) = (self.start as usize, (self.start + self.len) as usize);
-        let (from, to) = (address.max(start), (address + len).min(end));
+        let (from, to) = (address.max(start), address.saturating_add(len).min(end));
         if from >= to {
             return 0;
         }
-        let mut busy: Vec<(usize, usize)> = self
+        let busy: Vec<(usize, usize)> = self
             .pending
             .lock()
             .unwrap_or_else(|e| e.into_inner())
@@ -280,7 +345,6 @@ impl Shadow {
             // Around ranges shaders are writing: the gaps, each as below
             // (in the world most submissions have such ranges; copying the
             // gaps whole cost ~1 s per frame).
-            busy.sort_unstable();
             let (mut at, mut bytes) = (from, 0);
             for (a, e) in busy {
                 if a > at {
@@ -496,4 +560,59 @@ pub(crate) fn near(va: u64) -> String {
         ));
     }
     text
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn overlapping_and_adjacent_ranges_merge() {
+        let mut ranges = Vec::new();
+        merge_range(&mut ranges, 100, 500);
+        merge_range(&mut ranges, 200, 500);
+        merge_range(&mut ranges, 0, 150);
+        merge_range(&mut ranges, 500, 600);
+        merge_range(&mut ranges, 50, 50);
+        assert_eq!(ranges, [(0, 600)]);
+
+        merge_range(&mut ranges, 1000, 1200);
+        merge_range(&mut ranges, 700, 800);
+        assert_eq!(ranges, [(0, 600), (700, 800), (1000, 1200)]);
+
+        merge_range(&mut ranges, 550, 1050);
+        assert_eq!(ranges, [(0, 1200)]);
+    }
+
+    #[test]
+    fn merge_gpu_writes_keeps_title_bytes_and_handles_tail() {
+        let old = [0u8; 21];
+        let mut title = [0u8; 21];
+        let mut host = [0u8; 21];
+
+        title[3] = 0x11;
+        assert!(!merge_gpu_writes(&mut title, &mut host, &old));
+        assert_eq!(title[3], 0x11);
+        assert_eq!(host, title);
+
+        let old = [0u8; 21];
+        let mut title = [0u8; 21];
+        let mut host = [0u8; 21];
+        title[2] = 0xaa;
+        title[12] = 0xbb;
+        title[14] = 0x77;
+        title[20] = 0xcc;
+        host[10] = 0x42;
+        host[14] = 0x77;
+        host[19] = 0x99;
+
+        assert!(merge_gpu_writes(&mut title, &mut host, &old));
+        assert_eq!(title[2], 0xaa);
+        assert_eq!(title[10], 0x42);
+        assert_eq!(title[12], 0xbb);
+        assert_eq!(title[14], 0x77);
+        assert_eq!(title[19], 0x99);
+        assert_eq!(title[20], 0xcc);
+        assert_eq!(host, title);
+    }
 }

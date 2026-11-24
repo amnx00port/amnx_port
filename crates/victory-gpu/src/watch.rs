@@ -85,18 +85,27 @@ pub(crate) fn writes(start: usize, end: usize, guarded: bool) -> Option<(u64, Ve
         add(C::Watches, 1);
         add(C::WatchUs, started.elapsed().as_micros() as u64);
     }
-    j.asked += 1;
-    let now = j.asked;
-    let pages = j.found[..count].iter().map(|&at| at / PAGE).chain(guarded);
-    for page in pages.collect::<Vec<_>>() {
-        j.written.insert(page, now);
+    let Journal {
+        asked,
+        written,
+        found,
+    } = j;
+    *asked += 1;
+    let now = *asked;
+    let mut prev = usize::MAX;
+    for &at in &found[..count] {
+        let page = at / PAGE;
+        if page != prev {
+            written.insert(page, now);
+            prev = page;
+        }
+    }
+    for page in guarded {
+        written.insert(page, now);
     }
     Some((
         now,
-        j.written
-            .range(first..last)
-            .map(|(&p, &w)| (p, w))
-            .collect(),
+        written.range(first..last).map(|(&p, &w)| (p, w)).collect(),
     ))
 }
 
@@ -190,19 +199,49 @@ fn protect(g: &mut Guards, from: usize, to: usize) {
 /// notes them written; true if any was guarded.
 fn open(g: &mut Guards, start: usize, end: usize) -> bool {
     use windows_sys::Win32::System::Memory::{PAGE_READWRITE, VirtualProtect};
+    if start >= end {
+        return false;
+    }
     let blocks: Vec<usize> = g
         .protected
         .range(start / BLOCK..end.div_ceil(BLOCK))
         .copied()
         .collect();
-    for &block in &blocks {
-        g.protected.remove(&block);
-        g.clean.remove(&block);
-        let mut old = 0;
-        // SAFETY: a block we made read-only.
-        unsafe { VirtualProtect((block * BLOCK) as *const _, BLOCK, PAGE_READWRITE, &mut old) };
+    if blocks.is_empty() {
+        return false;
     }
-    !blocks.is_empty()
+    let set = |from: usize, to: usize| {
+        let mut old = 0;
+        // SAFETY: blocks we made read-only.
+        unsafe {
+            VirtualProtect(
+                (from * BLOCK) as *const _,
+                (to - from) * BLOCK,
+                PAGE_READWRITE,
+                &mut old,
+            ) != 0
+        }
+    };
+    let mut i = 0;
+    while i < blocks.len() {
+        let from = blocks[i];
+        let mut to = from + 1;
+        while i + 1 < blocks.len() && blocks[i + 1] == to {
+            i += 1;
+            to += 1;
+        }
+        for block in from..to {
+            g.protected.remove(&block);
+            g.clean.remove(&block);
+        }
+        if !set(from, to) {
+            for block in from..to {
+                set(block, block + 1);
+            }
+        }
+        i += 1;
+    }
+    true
 }
 
 /// Before our own write into title memory `[at, at + len)` through the
@@ -210,6 +249,9 @@ fn open(g: &mut Guards, start: usize, end: usize) -> bool {
 /// The runtime calls it (as `kernel_will_write`) before the title's kernel
 /// reads into its own memory.
 pub fn writing(at: usize, len: usize) {
+    if len == 0 {
+        return;
+    }
     // The length is the title's (`fread`'s size times count, saturated).
     open(&mut guards(), at, at.saturating_add(len));
 }
@@ -217,6 +259,9 @@ pub fn writing(at: usize, len: usize) {
 /// The runtime mapped or unmapped title memory `[at, at + len)`: what it
 /// shows is new and read-write, so it is no longer guarded.
 pub fn title_memory_remapped(at: usize, len: usize) {
+    if len == 0 {
+        return;
+    }
     let mut g = guards();
     let blocks: Vec<usize> = g
         .protected
@@ -367,6 +412,47 @@ mod tests {
         // SAFETY: our view.
         unsafe { UnmapViewOfFile(windows_sys::Win32::System::Memory::MEMORY_MAPPED_VIEW_ADDRESS { Value: view as *mut _ }) };
         title_memory_remapped(view, 2 * BLOCK);
+    }
+
+    #[test]
+    fn zero_length_does_not_open_and_open_coalesces_runs() {
+        use windows_sys::Win32::Foundation::CloseHandle;
+        use windows_sys::Win32::System::Memory::{
+            CreateFileMappingW, FILE_MAP_WRITE, MEMORY_MAPPED_VIEW_ADDRESS, MapViewOfFile,
+            UnmapViewOfFile,
+        };
+        // SAFETY: a pagefile section of four blocks, mapped read-write.
+        let (section, view) = unsafe {
+            let section = CreateFileMappingW(
+                -1isize as _,
+                std::ptr::null(),
+                PAGE_READWRITE,
+                0,
+                (4 * BLOCK) as u32,
+                std::ptr::null(),
+            );
+            assert!(!section.is_null());
+            let view = MapViewOfFile(section, FILE_MAP_WRITE, 0, 0, 4 * BLOCK).Value as usize;
+            (section, view)
+        };
+        assert_ne!(view, 0);
+        assert!(guard(view, view + 4 * BLOCK).is_some());
+        writing(view + 100, 0);
+        title_memory_remapped(view + 100, 0);
+        assert_eq!(guard(view, view + 4 * BLOCK), Some(Vec::new()));
+        writing(view, 3 * BLOCK);
+        assert!(writable(view) && writable(view + 2 * BLOCK));
+        assert!(!writable(view + 3 * BLOCK));
+        assert_eq!(
+            guard(view, view + 4 * BLOCK),
+            Some((view / PAGE..view / PAGE + 3).collect())
+        );
+        // SAFETY: our view and section.
+        unsafe {
+            UnmapViewOfFile(MEMORY_MAPPED_VIEW_ADDRESS { Value: view as *mut _ });
+            CloseHandle(section);
+        }
+        title_memory_remapped(view, 4 * BLOCK);
     }
 
     /// A write or mapping that runs past the end of the address space (a
