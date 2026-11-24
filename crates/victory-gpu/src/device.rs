@@ -529,4 +529,78 @@ mod tests {
         assert_eq!(query(&levels, 0x10).0, E_INVALIDARG);
         assert_eq!(query(&levels[4..], 0x18).0, UNSUPPORTED);
     }
+
+    #[test]
+    fn feature_options_reports_rdna2_caps() {
+        type Check = extern "system" fn(This, u32, *mut c_void, u32) -> HRESULT;
+        let device = device();
+        let check = slot::<Check>(device, 0x68);
+        let mut opts = [0u32; 16];
+        assert_eq!(check(device, 0, opts.as_mut_ptr().cast(), 64), S_OK);
+        assert_eq!(opts[0], 1, "double-precision shader support");
+        assert_eq!(opts[2], 2, "minimum precision 16-bit");
+        assert_eq!(opts[3], 3, "tiled resources tier 3");
+        assert_eq!(opts[4], 3, "resource binding tier 3");
+        assert_eq!(opts[8], 3, "conservative rasterization tier 3");
+        assert_eq!(opts[9], 40, "GPU address bits per resource");
+        assert_eq!(opts[15], 2, "resource heap tier 2");
+
+        // Wrong size or null data returns E_INVALIDARG
+        assert_eq!(check(device, 0, opts.as_mut_ptr().cast(), 60), E_INVALIDARG);
+        assert_eq!(check(device, 0, std::ptr::null_mut(), 64), E_INVALIDARG);
+    }
+
+    #[test]
+    fn feature_architecture_is_unified_cache_coherent() {
+        type Check = extern "system" fn(This, u32, *mut c_void, u32) -> HRESULT;
+        let device = device();
+        let check = slot::<Check>(device, 0x68);
+        let mut arch = [0u32; 4]; // node 0
+        assert_eq!(check(device, 1, arch.as_mut_ptr().cast(), 16), S_OK);
+        assert_eq!(
+            (arch[1], arch[2], arch[3]),
+            (0, 1, 1),
+            "not tile-based, unified, cache-coherent"
+        );
+        arch[0] = 1; // non-zero node
+        assert_eq!(check(device, 1, arch.as_mut_ptr().cast(), 16), E_INVALIDARG);
+        assert_eq!(check(device, 1, arch.as_mut_ptr().cast(), 12), E_INVALIDARG);
+        assert_eq!(check(device, 1, std::ptr::null_mut(), 16), E_INVALIDARG);
+    }
+
+    #[test]
+    fn feature_format_support_advertises_capabilities() {
+        type Check = extern "system" fn(This, u32, *mut c_void, u32) -> HRESULT;
+        let device = device();
+        let check = slot::<Check>(device, 0x68);
+        let mut q = [28u32, 0, 0]; // DXGI_FORMAT_R8G8B8A8_UNORM
+        assert_eq!(check(device, 3, q.as_mut_ptr().cast(), 12), S_OK);
+        assert_eq!(q[1], 0x7fff_ffff);
+        assert_eq!(q[2], 0xffff);
+        assert_eq!(check(device, 3, q.as_mut_ptr().cast(), 8), E_INVALIDARG);
+        assert_eq!(check(device, 3, std::ptr::null_mut(), 12), E_INVALIDARG);
+    }
+
+    #[test]
+    fn feature_multisample_counts_quality_levels() {
+        type Check = extern "system" fn(This, u32, *mut c_void, u32) -> HRESULT;
+        let device = device();
+        let check = slot::<Check>(device, 0x68);
+        let query = |sample_count: u32| {
+            let mut q = [28u32, sample_count, 0, 0];
+            let hr = check(device, 4, q.as_mut_ptr().cast(), 16);
+            (hr, q[3])
+        };
+        assert_eq!(query(1), (S_OK, 1));
+        assert_eq!(query(2), (S_OK, 1));
+        assert_eq!(query(4), (S_OK, 1));
+        assert_eq!(query(8), (S_OK, 1));
+        assert_eq!(query(3), (S_OK, 0));
+        assert_eq!(query(16), (S_OK, 0));
+
+        let mut q = [28u32, 1, 0, 0];
+        assert_eq!(check(device, 4, q.as_mut_ptr().cast(), 12), E_INVALIDARG);
+        assert_eq!(check(device, 4, std::ptr::null_mut(), 16), E_INVALIDARG);
+        assert_eq!(check(device, 99, q.as_mut_ptr().cast(), 16), E_NOTIMPL);
+    }
 }
