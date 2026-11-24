@@ -3,7 +3,8 @@
 //!
 //! Covers RDNA2 hardware semantics that differ from naive DXIL lowering:
 //! `v_med3_f32`/`v_med3_f16` with NaN operands, `v_fract_f32`/`v_fract_f16`
-//! near `1.0`, and turn-range reduction for `v_sin_*`/`v_cos_*`.
+//! near `1.0`, turn-range reduction for `v_sin_*`/`v_cos_*`, and single
+//! rounding for `v_fma_mixlo_f16`/`v_fma_mixhi_f16`.
 
 use super::host::{Dispatch, Host, Root, View};
 use super::{HostShader, lower, validator};
@@ -238,6 +239,134 @@ fn f16_to_f32(bits: u16) -> f32 {
         _ => sign | ((u32::from(exp) + 112) << 23) | (u32::from(mant) << 13),
     };
     f32::from_bits(f32_bits)
+}
+
+fn run_fma_mix_f16(high: bool, modifiers: [u32; 2], cases: &[([u32; 3], u16)]) {
+    const OLD: u32 = 0xA55A_69C3;
+    let op = if high { 0xCC22_0000 } else { 0xCC21_0000 };
+    let shader = build_valu_cs(&[
+        vop1(0x001, 0, vgpr(4)), // v_mov_b32 v0, v4
+        op | modifiers[0],
+        0x040E_0501 | modifiers[1], // v_fma_mix{lo,hi}_f16 v0, v1, v2, v3
+    ]);
+    let container = crate::Container::parse(&shader.dxil).unwrap();
+    let sfi0 = container.part(crate::FourCC::SFI0).unwrap();
+    let requirements = u64::from_le_bytes(sfi0.data.try_into().unwrap());
+    const WIDE_OPS: u64 = 0x0001 | 0x0020 | 0x8000; // Doubles, double extensions, int64.
+    assert_eq!(requirements & WIDE_OPS, 0);
+
+    let inputs: Vec<_> = cases.iter().map(|&([a, b, c], _)| [a, b, c, OLD]).collect();
+    run_cases(&shader, &inputs, |backend, i, src, got| {
+        let (result, other, kept) = if high {
+            ((got >> 16) as u16, got as u16, OLD as u16)
+        } else {
+            (got as u16, (got >> 16) as u16, (OLD >> 16) as u16)
+        };
+        assert_eq!(other, kept, "{backend}: high={high}, inputs={src:08x?}");
+        let expected = cases[i].1;
+        if is_f16_nan(expected) {
+            assert!(
+                is_f16_nan(result),
+                "{backend}: expected NaN, got {result:04x}"
+            );
+        } else {
+            assert_eq!(
+                result, expected,
+                "{backend}: high={high}, inputs={src:08x?}"
+            );
+        }
+    });
+}
+
+#[test]
+fn v_fma_mix_f16_rounds_once() {
+    let half_ulp = 2.0f32.powi(-11);
+    let eps = f32::EPSILON;
+    let normal_boundary = 2.0f32.powi(-14) - 2.0f32.powi(-25);
+    let cases = [
+        // The exact sums miss the midpoint by +2^-46 and -2^-46.
+        // Rounding first to f32 would give 0x3C00 and 0x3C02, respectively.
+        ([1.0 + eps, 1.0 + eps, half_ulp - 2.0 * eps], 0x3C01),
+        ([1.0 + eps, 1.0 - eps, 3.0 * half_ulp], 0x3C01),
+        // A contribution too small to keep in the aligned significand can still break a tie.
+        ([1.0 + half_ulp, 1.0, f32::from_bits(1)], 0x3C01),
+        ([f32::from_bits(1), -1.0, 1.0 + 3.0 * half_ulp], 0x3C01),
+        ([1.0 + half_ulp, 1.0, 0.0], 0x3C00), // exact ties to even
+        ([1.0 + 3.0 * half_ulp, 1.0, 0.0], 0x3C02),
+        // Cancellation down to -2^-22, and a subnormal input scaled up to +2^-22.
+        (
+            [4096.0 + half_ulp, 4096.0 - half_ulp, -16_777_216.0],
+            0x8004,
+        ),
+        ([f32::from_bits(1), 2.0f32.powi(127), 0.0], 0x0004),
+        // The midpoint between zero and the smallest subnormal, and just above it.
+        ([2.0f32.powi(-25), 1.0, 0.0], 0x0000),
+        ([2.0f32.powi(-25), 1.0, 2.0f32.powi(-55)], 0x0001),
+        // The midpoint below the smallest normal, and just below the midpoint.
+        ([normal_boundary, 1.0, 0.0], 0x0400),
+        ([normal_boundary, 1.0, -2.0f32.powi(-40)], 0x03FF),
+        // The overflow midpoint, and just below it.
+        ([65_520.0, 1.0, 0.0], 0x7C00),
+        ([65_520.0, 1.0, -2.0f32.powi(-12)], 0x7BFF),
+    ]
+    .map(|(src, half)| (src.map(f32::to_bits), half));
+    for high in [false, true] {
+        run_fma_mix_f16(high, [0; 2], &cases);
+    }
+}
+
+#[test]
+fn v_fma_mix_f16_preserves_special_values() {
+    let inf = f32::INFINITY;
+    let nan = f32::NAN;
+    let cases = [
+        ([-0.0, 1.0, -0.0], 0x8000),
+        ([-0.0, 1.0, 0.0], 0x0000),
+        ([-1.0, 1.0, 1.0], 0x0000),
+        ([-2.0f32.powi(-26), 1.0, 0.0], 0x8000),
+        ([inf, -1.0, 0.0], 0xFC00),
+        ([f32::MAX, 2.0, -inf], 0xFC00),
+        ([inf, f32::from_bits(1), 0.0], 0x7C00),
+        ([inf, 0.0, 1.0], 0x7E00),
+        ([inf, 1.0, -inf], 0x7E00),
+        ([1.0, 1.0, nan], 0x7E00),
+    ]
+    .map(|(src, half)| (src.map(f32::to_bits), half));
+    run_fma_mix_f16(false, [0; 2], &cases);
+}
+
+#[test]
+fn v_fma_mix_f16_clamps_the_rounded_half() {
+    let inf = f32::INFINITY;
+    let cases = [
+        ([0.5 + 2.0f32.powi(-12), 1.0, 2.0f32.powi(-26)], 0x3801),
+        ([2.0f32.powi(-25), 1.0, 2.0f32.powi(-55)], 0x0001),
+        ([2.0, 1.0, 0.0], 0x3C00),
+        ([-1.0, 1.0, 0.0], 0x0000),
+        ([-0.0, 1.0, -0.0], 0x0000),
+        ([inf, 1.0, 0.0], 0x3C00),
+        ([-inf, 1.0, 0.0], 0x0000),
+        ([f32::NAN, 1.0, 0.0], 0x0000),
+        ([1.0, inf, -inf], 0x0000),
+    ]
+    .map(|(src, half)| (src.map(f32::to_bits), half));
+    for high in [false, true] {
+        run_fma_mix_f16(high, [1 << 15, 0], &cases);
+    }
+}
+
+#[test]
+fn v_fma_mix_f16_selects_and_modifies_sources() {
+    // Negate the f32 in v1, take the absolute value of v2.hi, and add v3.lo.
+    let cases = [
+        (
+            [(1.0 + f32::EPSILON).to_bits(), 0xB800_7E00, 0x7C00_3800],
+            0x8001,
+        ),
+        ([1, 0xBC00_7E00, 0x7C00_0000], 0x8000), // negated f32 subnormal
+        ([1.0f32.to_bits(), 0x8001_7E00, 0x7C00_0000], 0x8001), // f16 subnormal
+    ];
+    run_fma_mix_f16(true, [0x5200, 0x3000_0000], &cases);
 }
 
 #[test]
