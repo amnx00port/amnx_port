@@ -28,6 +28,11 @@ const fn sop2(op: u8, sdst: u8, src0: u8, src1: u8) -> u32 {
         | src0 as u32
 }
 
+/// SOP1 `op sdst, src0`.
+const fn sop1(op: u8, sdst: u8, src0: u8) -> u32 {
+    0xBE80_0000 | (sdst as u32) << 16 | (op as u32) << 8 | src0 as u32
+}
+
 /// SMEM `s_load_dwordx4 s[dst:dst+3], s[base:base+1], 0` (soffset = null).
 const fn s_load_dwordx4(dst: u8, base: u8) -> [u32; 2] {
     [
@@ -709,6 +714,51 @@ fn v_cvt_u16_and_i16_f16_saturate() {
                 u32::from(want),
                 "{backend}: {what}({:#06x}) = {got:#010x}, want {want:#06x}",
                 cases[i].0,
+            );
+        });
+    }
+}
+
+#[test]
+fn s_bfm_and_s_bitset_use_the_low_five_bits() {
+    // s_bfm_b32 s6, s0, s1 (SOP2 0x24): ((1 << s0[4:0]) - 1) << s1[4:0].
+    let bfm = build_valu_cs(&[sop2(0x24, 6, 0, 1), vop1(0x001, 0, sgpr(6))]);
+    let counts = [0u32, 1, 4, 16, 31, 32, 33];
+    let shifts = [0u32, 1, 8, 31, 32];
+    let mut cases = Vec::new();
+    for width in counts {
+        for offset in shifts {
+            cases.push([width, offset, 0, 0]);
+        }
+    }
+    run_cases(&bfm, &cases, |backend, _, inp, got| {
+        let want = (1u32 << (inp[0] & 31)).wrapping_sub(1) << (inp[1] & 31);
+        assert_eq!(
+            got, want,
+            "{backend}: s_bfm_b32({}, {}) = {got:#010x}, want {want:#010x}",
+            inp[0], inp[1],
+        );
+    });
+
+    // s_bitset{0,1}_b32 s0, s1 (SOP1 0x1b, 0x1d) clear or set bit s1[4:0] of s0.
+    let mut cases = Vec::new();
+    for old in [0u32, 0xFFFF_FFFF, 0x1234_5678] {
+        for bit in [0u32, 5, 31, 32, 37] {
+            cases.push([old, bit, 0, 0]);
+        }
+    }
+    for (name, op, set) in [
+        ("s_bitset0_b32", 0x1b, false),
+        ("s_bitset1_b32", 0x1d, true),
+    ] {
+        let shader = build_valu_cs(&[sop1(op, 0, 1), vop1(0x001, 0, sgpr(0))]);
+        run_cases(&shader, &cases, |backend, _, inp, got| {
+            let mask = 1u32 << (inp[1] & 31);
+            let want = if set { inp[0] | mask } else { inp[0] & !mask };
+            assert_eq!(
+                got, want,
+                "{backend}: {name}({:#010x}, {}) = {got:#010x}, want {want:#010x}",
+                inp[0], inp[1],
             );
         });
     }
