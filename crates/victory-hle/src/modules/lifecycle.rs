@@ -20,12 +20,21 @@ use windows_sys::core::{PCSTR, PCWSTR, w};
 use crate::{HleModule, hle_export};
 
 type Routine = extern "system" fn(quiesced: u8, context: *mut c_void);
+type ConstrainedRoutine = extern "system" fn(constrained: u8, context: *mut c_void);
 
 /// Registration id, routine and context of each suspend routine.
 static ROUTINES: Mutex<Vec<(usize, Routine, usize)>> = Mutex::new(Vec::new());
+static CONSTRAINED_ROUTINES: Mutex<Vec<(usize, ConstrainedRoutine, usize)>> =
+    Mutex::new(Vec::new());
 
 fn routines() -> MutexGuard<'static, Vec<(usize, Routine, usize)>> {
     ROUTINES.lock().unwrap_or_else(|e| e.into_inner())
+}
+
+fn constrained_routines() -> MutexGuard<'static, Vec<(usize, ConstrainedRoutine, usize)>> {
+    CONSTRAINED_ROUTINES
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
 }
 
 /// How long the console lets suspend routines run before it ends the title.
@@ -54,6 +63,29 @@ pub extern "system" fn RegisterAppStateChangeNotification(
 
 pub extern "system" fn UnregisterAppStateChangeNotification(registration: usize) {
     routines().retain(|&(id, ..)| id != registration);
+}
+
+pub extern "system" fn RegisterAppConstrainedChangeNotification(
+    routine: Option<ConstrainedRoutine>,
+    context: *mut c_void,
+    registration: *mut usize,
+) -> u32 {
+    let Some(routine) = routine else {
+        return ERROR_INVALID_PARAMETER;
+    };
+    if registration.is_null() {
+        return ERROR_INVALID_PARAMETER;
+    }
+    static NEXT: AtomicUsize = AtomicUsize::new(1);
+    let id = NEXT.fetch_add(1, Ordering::Relaxed);
+    constrained_routines().push((id, routine, context as usize));
+    // SAFETY: checked non-null; the title passes room for its registration.
+    unsafe { registration.write(id) };
+    0
+}
+
+pub extern "system" fn UnregisterAppConstrainedChangeNotification(registration: usize) {
+    constrained_routines().retain(|&(id, ..)| id != registration);
 }
 
 /// The window procedure a title window had before ours.
@@ -303,6 +335,8 @@ pub(crate) fn module() -> HleModule {
         exports: vec![
             hle_export!(RegisterAppStateChangeNotification),
             hle_export!(UnregisterAppStateChangeNotification),
+            hle_export!(RegisterAppConstrainedChangeNotification),
+            hle_export!(UnregisterAppConstrainedChangeNotification),
             hle_export!(CreateWindowExW),
             hle_export!(CreateWindowExA),
         ],
@@ -329,6 +363,44 @@ mod tests {
         UnregisterAppStateChangeNotification(a);
         let left: Vec<_> = routines().iter().map(|r| r.0).collect();
         assert_eq!(left, [b]);
+    }
+
+    #[test]
+    fn constrained_registrations_come_and_go() {
+        let exports: Vec<_> = module().exports.iter().map(|export| export.name).collect();
+        assert!(exports.contains(&"RegisterAppConstrainedChangeNotification"));
+        assert!(exports.contains(&"UnregisterAppConstrainedChangeNotification"));
+
+        let mut invalid = 99;
+        assert_eq!(
+            RegisterAppConstrainedChangeNotification(None, std::ptr::null_mut(), &mut invalid),
+            ERROR_INVALID_PARAMETER
+        );
+        assert_eq!(invalid, 99, "failed registration must not write an id");
+        assert_eq!(
+            RegisterAppConstrainedChangeNotification(
+                Some(noop),
+                std::ptr::null_mut(),
+                std::ptr::null_mut()
+            ),
+            ERROR_INVALID_PARAMETER
+        );
+
+        let (mut a, mut b) = (0, 0);
+        assert_eq!(
+            RegisterAppConstrainedChangeNotification(Some(noop), std::ptr::null_mut(), &mut a,),
+            0
+        );
+        assert_eq!(
+            RegisterAppConstrainedChangeNotification(Some(noop), std::ptr::null_mut(), &mut b,),
+            0
+        );
+        assert_ne!(a, 0);
+        assert_ne!(a, b);
+        UnregisterAppConstrainedChangeNotification(a);
+        let left: Vec<_> = constrained_routines().iter().map(|r| r.0).collect();
+        assert_eq!(left, [b]);
+        UnregisterAppConstrainedChangeNotification(b);
     }
 
     #[test]
