@@ -835,8 +835,10 @@ fn host_texture(
         d.format = family(d.format);
     }
     // The clear value names the format too: format, then color or depth
-    // and stencil (5 words).
-    let clear_value = (!clear.is_null()).then(|| {
+    // and stencil (5 words). D3D12 only allows an optimized clear value on
+    // render targets and depth-stencil textures.
+    const ALLOW_CLEAR: u32 = 1 | 2;
+    let clear_value = (!clear.is_null() && d.flags & ALLOW_CLEAR != 0).then(|| {
         // SAFETY: the title passes a whole clear value.
         let mut value = unsafe { clear.cast::<[u32; 5]>().read_unaligned() };
         value[0] = pc_format(value[0]);
@@ -1173,8 +1175,12 @@ pub(crate) fn texture_at(address: u64, desc: &[u32; 14]) -> Option<This> {
     if made != S_OK {
         return None;
     }
+    if resource(out).host.is_none() {
+        object::release_boxed::<Resource>(out);
+        return None;
+    }
     map.insert((address, *desc), out as usize);
-    resource(out).host.is_some().then_some(out)
+    Some(out)
 }
 
 pub(crate) extern "system" fn create_placed(
@@ -1840,5 +1846,68 @@ mod tests {
         // The resource keeps the heap alive.
         assert_eq!(slot::<Release>(heap, 0x10)(heap), 1);
         assert_eq!(slot::<Release>(placed, 0x10)(placed), 0);
+    }
+
+    /// D3D12 rejects `pOptimizedClearValue` when neither ALLOW_RENDER_TARGET
+    /// nor ALLOW_DEPTH_STENCIL is set; `host_texture` must ignore a non-null
+    /// clear value on sampled/UAV-only textures so creation succeeds.
+    #[cfg(windows)]
+    #[test]
+    fn non_target_texture_ignores_clear_value_and_placed_cache_skips_failures() {
+        if crate::host::host().is_none() {
+            return; // no host GPU
+        }
+        let null = std::ptr::null();
+        let desc = ResourceDesc {
+            dimension: 3,
+            alignment: 0,
+            width: 16,
+            height: 16,
+            depth_or_array_size: 1,
+            mip_levels: 1,
+            format: 28, // R8G8B8A8_UNORM
+            sample_count: 1,
+            sample_quality: 0,
+            layout: 0,
+            flags: 0, // sampled-only (not RT or DS)
+        };
+        let clear = [28u32, 0, 0, 0, 0];
+        let mut tex = null;
+        assert_eq!(
+            create_at_address(
+                null,
+                0x4_0000,
+                &desc,
+                0,
+                clear.as_ptr().cast(),
+                &RESOURCE_IIDS[0],
+                &mut tex,
+            ),
+            S_OK
+        );
+        assert!(
+            host_resource(tex).is_some(),
+            "non-target texture with non-null clear value must still get a host copy"
+        );
+        assert_eq!(slot::<Release>(tex, 0x10)(tex), 0);
+
+        // An invalid format (0 = DXGI_FORMAT_UNKNOWN) fails host texture creation.
+        // Calling `texture_at` twice must return `None` both times without caching
+        // a failed `host == None` resource in `PLACED_TEXTURES`.
+        let bad_words: [u32; 14] = [
+            3, 0, // dimension=2D, pad
+            0, 0, // alignment
+            16, 0, // width=16
+            16,    // height=16
+            (1 << 16) | 1,
+            0, 1, 0, 0, 0, // format=UNKNOWN (rejected by D3D12)
+            0,
+        ];
+        assert!(texture_at(0x5_0000, &bad_words).is_none());
+        assert!(texture_at(0x5_0000, &bad_words).is_none());
+        assert!(!PLACED_TEXTURES
+            .lock()
+            .unwrap()
+            .contains_key(&(0x5_0000, bad_words)));
     }
 }
