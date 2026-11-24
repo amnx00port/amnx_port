@@ -405,6 +405,24 @@ macro_rules! once {
     }};
 }
 
+/// The element count of a buffer view of `count` elements from `first` on a
+/// host copy of `capacity` elements, cut to fit; `None` for a view that would
+/// be an invalid call (the debug layer removes the device, drivers may fault):
+/// one starting at or past the end, or one of no elements (the title's own
+/// record count can be 0). A null view reads 0 and drops writes.
+///
+/// `capacity` comes from the host copy's width, which `shadow` rounds up to
+/// 64 KiB on purpose (so views ending in the buffer's last 256 bytes fit):
+/// views into that padding stay legal, and this never refuses a view the
+/// host would take.
+fn cut_to_copy(first: u64, count: u32, capacity: u64) -> Option<u32> {
+    if first >= capacity {
+        return None;
+    }
+    let count = u64::from(count).min(capacity - first) as u32;
+    (count > 0).then_some(count)
+}
+
 /// A view description from its words, with the format as the host has it.
 fn srv_desc(words: &[u32; 10]) -> D3D12_SHADER_RESOURCE_VIEW_DESC {
     let mut words = *words;
@@ -515,7 +533,17 @@ fn buffer_srv(
         );
         return None;
     }
-    buffer.FirstElement += offset / element;
+    // A corrupt descriptor can carry any first element: saturate so it
+    // stays past the copy (and null) instead of wrapping to a small one.
+    buffer.FirstElement = buffer.FirstElement.saturating_add(offset / element);
+    // SAFETY: a live buffer.
+    let capacity = unsafe { shadow.buffer.GetDesc() }.Width / element;
+    let Some(count) = cut_to_copy(buffer.FirstElement, buffer.NumElements, capacity) else {
+        let (first, count) = (buffer.FirstElement, buffer.NumElements);
+        once!(first, count, capacity, "buffer view past the end of its host copy, or of no elements: null");
+        return None;
+    };
+    buffer.NumElements = count;
     let host = host()?;
     // SAFETY: a live buffer and a slot of our heap.
     unsafe {
@@ -557,7 +585,17 @@ fn buffer_uav(
         once!(offset, element, "unordered buffer view not on an element of its host copy");
         return None;
     }
-    buffer.FirstElement += offset / element;
+    // A corrupt descriptor can carry any first element: saturate so it
+    // stays past the copy (and null) instead of wrapping to a small one.
+    buffer.FirstElement = buffer.FirstElement.saturating_add(offset / element);
+    // SAFETY: a live buffer.
+    let capacity = unsafe { shadow.buffer.GetDesc() }.Width / element;
+    let Some(count) = cut_to_copy(buffer.FirstElement, buffer.NumElements, capacity) else {
+        let (first, count) = (buffer.FirstElement, buffer.NumElements);
+        once!(first, count, capacity, "buffer view past the end of its host copy, or of no elements: null");
+        return None;
+    };
+    buffer.NumElements = count;
     buffer.CounterOffsetInBytes = 0;
     let host = host()?;
     // SAFETY: a live buffer and a slot of our heap.
@@ -923,6 +961,49 @@ fn null_view(at: D3D12_CPU_DESCRIPTOR_HANDLE) {
 mod tests {
     use super::*;
 
+    /// A buffer view of no elements, which the host refuses (removing the
+    /// device), makes a null slot; one of an element is made as usual.
+    #[test]
+    fn buffer_views_of_no_elements_are_null() {
+        let Some(host) = host() else {
+            return; // no host GPU
+        };
+        let Some(heap) = HostHeap::new(false, 4) else {
+            return;
+        };
+        // A title buffer the view's memory lies in (its copy is made on the
+        // host; title memory is not read).
+        let (address, len) = (0x7e00_0000_0000_u64, 0x1000_u64);
+        crate::shadow::register(usize::MAX - 1, address, len);
+        let mut resource = [0u32; 14];
+        resource[0] = 1; // a buffer
+        resource[4] = len as u32;
+        let placed = |unordered: bool, elements: u32| {
+            let mut desc = [0u32; 16];
+            desc[1] = 1; // buffer dimension
+            if unordered {
+                // NumElements, StructureByteStride
+                (desc[4], desc[5]) = (elements, 16);
+            } else {
+                desc[2] = D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING;
+                (desc[6], desc[7]) = (elements, 16);
+            }
+            (desc[10], desc[11]) = (address as u32, (address >> 32) as u32);
+            View::Placed(unordered, resource, desc)
+        };
+        let kept = |index: u32| heap.kept.lock().unwrap()[index as usize].is_some();
+        for unordered in [false, true] {
+            heap.make_at(0, &placed(unordered, 1));
+            assert!(kept(0), "a view of an element (unordered: {unordered})");
+            heap.make_at(1, &placed(unordered, 0));
+            assert!(!kept(1), "a view of no elements (unordered: {unordered})");
+            // SAFETY: a plain device query.
+            let removed = unsafe { host.device.GetDeviceRemovedReason() };
+            assert!(removed.is_ok(), "device removed: {removed:?} (unordered: {unordered})");
+        }
+        crate::shadow::unregister(usize::MAX - 1, address);
+    }
+
     /// A null texture UAV keeps the title's dimension (3D for the world's
     /// wind field), and is 2D when the title names none.
     #[test]
@@ -956,6 +1037,76 @@ mod tests {
         null_for(&view, heap.cpu(0));
         // SAFETY: a plain device query.
         assert!(unsafe { host.device.GetDeviceRemovedReason() }.is_ok());
+    }
+
+    /// Views past their host copy's end are null, views running past it
+    /// are cut, and views of no elements are null; with no device.
+    #[test]
+    fn views_are_cut_to_their_host_copy() {
+        // A copy of 4,096 elements (a 0x1000-byte title buffer of 16-byte
+        // elements, padded to 64 KiB).
+        assert_eq!(cut_to_copy(0, 16, 4096), Some(16));
+        assert_eq!(cut_to_copy(4095, 4, 4096), Some(1), "cut to the last element");
+        assert_eq!(cut_to_copy(4096, 1, 4096), None, "starts at the end");
+        assert_eq!(cut_to_copy(u64::MAX, 1, 4096), None, "far past the end");
+        assert_eq!(cut_to_copy(8, 0, 4096), None, "no elements");
+        assert_eq!(cut_to_copy(0, u32::MAX, 4096), Some(4096), "cut to the whole copy");
+    }
+
+    /// [`views_are_cut_to_their_host_copy`] through the heap: a buffer view
+    /// past its host copy makes a null slot, one running past it is kept and
+    /// cut, and the device stays alive (both are invalid calls the host
+    /// removes the device for).
+    #[test]
+    fn a_buffer_view_past_its_host_copy_is_null_and_one_running_past_it_is_cut() {
+        let Some(host) = host() else {
+            return; // no host GPU
+        };
+        let Some(heap) = HostHeap::new(false, 4) else {
+            return;
+        };
+        // A title buffer whose view's memory it holds; its host copy is 64 KiB
+        // (padded), so 4,096 elements of 16 bytes.
+        let (address, len) = (0x7e00_2000_0000_u64, 0x1000_u64);
+        crate::shadow::register(usize::MAX - 2, address, len);
+        let mut resource = [0u32; 14];
+        resource[0] = 1; // a buffer
+        resource[4] = len as u32;
+        let placed = |unordered: bool, first: u64, elements: u32| {
+            let mut desc = [0u32; 16];
+            desc[1] = 1; // buffer dimension
+            if unordered {
+                // FirstElement, NumElements, StructureByteStride
+                (desc[2], desc[3]) = (first as u32, (first >> 32) as u32);
+                (desc[4], desc[5]) = (elements, 16);
+            } else {
+                // The union is 8-byte aligned, so a shader resource view's
+                // buffer starts a word later than an unordered access one's.
+                desc[2] = D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING;
+                (desc[4], desc[5]) = (first as u32, (first >> 32) as u32);
+                (desc[6], desc[7]) = (elements, 16);
+            }
+            (desc[10], desc[11]) = (address as u32, (address >> 32) as u32);
+            View::Placed(unordered, resource, desc)
+        };
+        let kept = |index: u32| heap.kept.lock().unwrap()[index as usize].is_some();
+        for unordered in [false, true] {
+            // The first element past the copy: no slot to read.
+            heap.make_at(0, &placed(unordered, 4096, 1));
+            assert!(!kept(0), "a view past the copy (unordered: {unordered})");
+            // The last element, and one whose last element runs past it.
+            heap.make_at(1, &placed(unordered, 4095, 1));
+            assert!(kept(1), "the copy's last element (unordered: {unordered})");
+            heap.make_at(2, &placed(unordered, 4095, 4));
+            assert!(kept(2), "a view cut to its copy (unordered: {unordered})");
+            // SAFETY: a plain device query.
+            let removed = unsafe { host.device.GetDeviceRemovedReason() };
+            assert!(
+                removed.is_ok(),
+                "device removed: {removed:?} (unordered: {unordered})"
+            );
+        }
+        crate::shadow::unregister(usize::MAX - 2, address);
     }
 
     /// Dynamic slots stay taken until given back, and runs do not wrap.
