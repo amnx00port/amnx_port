@@ -147,7 +147,7 @@ pub(crate) fn run(log: &Path, paths: Vec<PathBuf>) -> Result<()> {
             if !entry.file_type().is_file() {
                 continue;
             }
-            if entry.metadata().map_or(true, |m| m.len() > MAX_FILE) {
+            if !entry.metadata().is_ok_and(|m| m.len() <= MAX_FILE) {
                 skipped += 1;
                 continue;
             }
