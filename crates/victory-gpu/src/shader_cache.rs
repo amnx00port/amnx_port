@@ -131,7 +131,7 @@ fn cached(
     (converter.translate)(container)
 }
 
-const MAGIC: &[u8; 4] = b"VSH1";
+const MAGIC: &[u8; 4] = b"VSH2";
 const STAGES: [HwStage; 8] = [
     HwStage::Ls,
     HwStage::Hs,
@@ -173,6 +173,7 @@ fn encode(s: &HostShader) -> Vec<u8> {
     let word = |out: &mut Vec<u8>, v: u32| out.extend(v.to_le_bytes());
     let stage = STAGES.iter().position(|&x| x == s.stage).unwrap_or(0) as u32;
     word(&mut out, stage);
+    word(&mut out, s.wave_size.unwrap_or(0));
     word(&mut out, s.dxil.len() as u32);
     out.extend(&s.dxil);
     word(&mut out, s.user_data.len() as u32);
@@ -234,6 +235,7 @@ fn decode(bytes: &[u8]) -> Option<HostShader> {
         return None;
     }
     let stage = *STAGES.get(r.word()? as usize)?;
+    let wave_size = Some(r.word()?).filter(|&size| size != 0);
     let dxil = r.list()?;
     let n = r.word()? as usize;
     let mut user_data = Vec::with_capacity(n.min(256));
@@ -268,6 +270,7 @@ fn decode(bytes: &[u8]) -> Option<HostShader> {
     let root_srvs = r.list()?;
     r.0.is_empty().then_some(HostShader {
         stage,
+        wave_size,
         dxil,
         user_data,
         samplers,
@@ -284,6 +287,7 @@ mod tests {
     fn shader() -> HostShader {
         HostShader {
             stage: HwStage::Ps,
+            wave_size: None,
             dxil: b"DXBC and the rest".to_vec(),
             user_data: vec![UserData {
                 index: 8,
@@ -324,7 +328,7 @@ mod tests {
 
         // A damaged entry is a miss, translated and stored again.
         for e in walk(dir.path()) {
-            std::fs::write(e, b"VSH1 broken").unwrap();
+            std::fs::write(e, b"VSH2 broken").unwrap();
         }
         assert_eq!(cached(&cache, &build, container, translate), Ok(shader()));
         assert_eq!(runs.load(Ordering::Relaxed), 3);
@@ -350,10 +354,16 @@ mod tests {
 
     #[test]
     fn entries_round_trip_and_reject_damage() {
+        for wave_size in [None, Some(32), Some(64)] {
+            let shader = HostShader {
+                wave_size,
+                ..shader()
+            };
+            assert_eq!(decode(&encode(&shader)), Some(shader));
+        }
         let bytes = encode(&shader());
-        assert_eq!(decode(&bytes), Some(shader()));
         assert_eq!(decode(&bytes[..bytes.len() - 1]), None);
         assert_eq!(decode(&[bytes.as_slice(), &[0]].concat()), None);
-        assert_eq!(decode(b"VSH0"), None);
+        assert_eq!(decode(b"VSH1"), None);
     }
 }
