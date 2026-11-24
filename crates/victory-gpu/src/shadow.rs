@@ -102,7 +102,7 @@ impl Shadow {
     /// Brings `len` bytes at `address` up to date when `list` is submitted,
     /// and keeps the copy alive until the list is reset.
     pub(crate) fn refresh(self: &Arc<Self>, list: &HostList, address: u64, len: u64) {
-        let len = len.min(self.start + self.len - address);
+        let len = len.min(self.left(address));
         list.defer_refresh(self, address as usize, len as usize);
     }
 
@@ -125,7 +125,10 @@ impl Shadow {
     fn inside(&self, address: usize, len: usize) -> (usize, usize) {
         let (start, end) = (self.start as usize, (self.start + self.len) as usize);
         let from = address.clamp(start, end);
-        (from - start, (address + len).clamp(from, end) - start)
+        (
+            from - start,
+            address.saturating_add(len).clamp(from, end) - start,
+        )
     }
 
     /// Shaders of `list` may write `[address, address + len)` of the copy
@@ -149,34 +152,52 @@ impl Shadow {
     /// 174 MB heap dozens of times), in reused memory (fresh snapshots cost
     /// ~2.3 million page faults per world frame).
     pub(crate) fn writing(&self, address: usize, len: usize) {
-        self.pending
-            .lock()
-            .unwrap_or_else(|e| e.into_inner())
-            .push((address, address + len));
         let (from, to) = self.inside(address, len);
+        if from >= to {
+            return;
+        }
+        let end = address.saturating_add(len);
+        {
+            let mut pending = self.pending.lock().unwrap_or_else(|e| e.into_inner());
+            if pending.contains(&(address, end)) {
+                return;
+            }
+            pending.push((address, end));
+        }
         // SAFETY: inside the mapping.
-        let host = |a: usize, b: usize| unsafe { std::slice::from_raw_parts(self.data.add(a), b - a) };
+        let host =
+            |a: usize, b: usize| unsafe { std::slice::from_raw_parts(self.data.add(a), b - a) };
         let mut before = self.before.lock().unwrap_or_else(|e| e.into_inner());
-        let (start, end) = match &*before {
+        if let Some((at, bytes)) = &mut *before
+            && *at <= from
+            && to <= *at + bytes.len()
+        {
+            // Snapshot union already covers `[from, to)`; refresh only this
+            // newly declared range in place so a refresh since the surrounding
+            // snapshot was taken cannot leave a stale baseline, without
+            // reallocating or recopying the entire union.
+            bytes[from - *at..to - *at].copy_from_slice(host(from, to));
+            return;
+        }
+        let (start, finish) = match &*before {
             Some((at, bytes)) => ((*at).min(from), (at + bytes.len()).max(to)),
             None => (from, to),
         };
-        if let Some((at, bytes)) = &*before
-            && (*at, at + bytes.len()) == (start, end)
-        {
-            return;
-        }
         // Parts newly covered from the copy, the rest as it was taken.
-        let mut grown = pooled(end - start);
+        let mut grown = pooled(finish - start);
         match before.take() {
             Some((at, bytes)) => {
                 grown.extend_from_slice(host(start, at));
                 grown.extend_from_slice(&bytes);
-                grown.extend_from_slice(host(at + bytes.len(), end));
+                grown.extend_from_slice(host(at + bytes.len(), finish));
                 give_back(bytes);
             }
-            None => grown.extend_from_slice(host(start, end)),
+            None => grown.extend_from_slice(host(start, finish)),
         }
+        // The range just declared is snapshotted as it is now: a refresh
+        // since the surrounding snapshot was taken must not leave a stale
+        // baseline (a gap turned into a write would replay the old bytes).
+        grown[from - start..to - start].copy_from_slice(host(from, to));
         *before = Some((start, grown));
     }
 
@@ -247,10 +268,23 @@ impl Shadow {
                 }
             }
         }
+        // The copy-back leaves the copy equal to title memory over the range;
+        // the snapshot takes those bytes so an overlapping copy-back does not
+        // replay a title edit the GPU did not make.
+        if let Some((taken, before)) = snapshot.as_mut()
+            && *taken <= from
+            && to <= *taken + before.len()
+            && from < to
+        {
+            let (s, e) = (from - *taken, to - *taken);
+            // SAFETY: inside the mapping.
+            let host = unsafe { std::slice::from_raw_parts(self.data.add(from), to - from) };
+            before[s..e].copy_from_slice(host);
+        }
         // Every submitted step that declared the range is done with it (one
         // submission runs at a time), and the snapshot with the last range.
         let mut pending = self.pending.lock().unwrap_or_else(|e| e.into_inner());
-        pending.retain(|&r| r != (address, address + len));
+        pending.retain(|&r| r != (address, address.saturating_add(len)));
         if pending.is_empty()
             && let Some((_, bytes)) = snapshot.take()
         {
@@ -264,7 +298,7 @@ impl Shadow {
     /// write-watched). Returns the bytes copied.
     pub(crate) fn update(&self, address: usize, len: usize) -> usize {
         let (start, end) = (self.start as usize, (self.start + self.len) as usize);
-        let (from, to) = (address.max(start), (address + len).min(end));
+        let (from, to) = (address.max(start), address.saturating_add(len).min(end));
         if from >= to {
             return 0;
         }
@@ -370,45 +404,95 @@ struct Entry {
     shadow: Option<Arc<Shadow>>,
 }
 
-/// Title buffers by (start address, resource), with their copy once made.
-static BUFFERS: Mutex<BTreeMap<(u64, usize), Entry>> = Mutex::new(BTreeMap::new());
+struct Buffers {
+    by_start: BTreeMap<(u64, usize), Entry>,
+    /// Longest registered buffer length; bounds reverse scans in [`find`].
+    max_len: u64,
+}
 
-fn buffers() -> std::sync::MutexGuard<'static, BTreeMap<(u64, usize), Entry>> {
+/// Title buffers by (start address, resource), with their copy once made.
+static BUFFERS: Mutex<Buffers> = Mutex::new(Buffers {
+    by_start: BTreeMap::new(),
+    max_len: 0,
+});
+
+fn buffers() -> std::sync::MutexGuard<'static, Buffers> {
     BUFFERS.lock().unwrap_or_else(|e| e.into_inner())
 }
 
 /// A title buffer exists at `start` (`len` bytes).
 pub(crate) fn register(resource: usize, start: u64, len: u64) {
-    buffers().insert(
-        (start, resource),
-        Entry {
-            end: start + len,
-            shadow: None,
-        },
-    );
+    let Some(end) = start.checked_add(len) else {
+        return;
+    };
+    let mut state = buffers();
+    let replaced = state
+        .by_start
+        .insert((start, resource), Entry { end, shadow: None });
+    if len >= state.max_len {
+        state.max_len = len;
+    } else if replaced.is_some_and(|old| old.end - start == state.max_len) {
+        state.max_len = state
+            .by_start
+            .iter()
+            .map(|(&(s, _), e)| e.end - s)
+            .max()
+            .unwrap_or(0);
+    }
 }
 
 /// The title released it; lists that still hold its copy keep it alive.
 pub(crate) fn unregister(resource: usize, start: u64) {
-    buffers().remove(&(start, resource));
+    let mut state = buffers();
+    if let Some(removed) = state.by_start.remove(&(start, resource))
+        && removed.end - start == state.max_len
+    {
+        state.max_len = state
+            .by_start
+            .iter()
+            .map(|(&(s, _), e)| e.end - s)
+            .max()
+            .unwrap_or(0);
+    }
 }
 
 /// The copy of the innermost title buffer holding `[address, address +
 /// len)`, made on first use.
 pub(crate) fn find(address: u64, len: u64) -> Option<Arc<Shadow>> {
-    let end = address.checked_add(len.max(1))?;
-    let mut map = buffers();
-    let key = map
-        .range(..=(address, usize::MAX))
-        .rev()
-        .take(64)
-        .find(|(_, e)| e.end >= end)
-        .map(|(k, _)| *k);
-    let Some(key) = key else {
-        drop(map);
+    let required = len.max(1);
+    let end = address.checked_add(required)?;
+    let mut state = buffers();
+    // No registered buffer can cover `[address, end)` if `required > max_len`,
+    // or if its start is below `end - max_len`.
+    let mut key: Option<((u64, usize), u64)> = None;
+    if required <= state.max_len {
+        let min_start = end.saturating_sub(state.max_len);
+        // The innermost buffer holding the range: the largest start at or below
+        // `address` whose end reaches `end`; of equal starts, the smallest end.
+        // Same-start entries are contiguous, so the first covering block found
+        // in start-descending order is the innermost.
+        for (&k, e) in state
+            .by_start
+            .range((min_start, 0)..=(address, usize::MAX))
+            .rev()
+        {
+            if let Some((best, bend)) = &key {
+                if best.0 != k.0 {
+                    break;
+                }
+                if e.end >= end && e.end < *bend {
+                    key = Some((k, e.end));
+                }
+            } else if e.end >= end {
+                key = Some((k, e.end));
+            }
+        }
+    }
+    let Some((key, _)) = key else {
+        drop(state);
         return loose(address, end);
     };
-    let entry = map.get_mut(&key)?;
+    let entry = state.by_start.get_mut(&key)?;
     if entry.shadow.is_none() {
         let len = entry.end - key.0;
         // Rounded up so that views ending in the buffer's last 256 bytes fit.
@@ -447,7 +531,7 @@ static LOOSE: Mutex<BTreeMap<(u64, u64), Arc<Shadow>>> = Mutex::new(BTreeMap::ne
 
 fn loose(address: u64, end: u64) -> Option<Arc<Shadow>> {
     let start = address & !(WINDOW - 1);
-    let len = end.next_multiple_of(WINDOW) - start;
+    let len = end.checked_next_multiple_of(WINDOW)?.checked_sub(start)?;
     let mut map = LOOSE.lock().unwrap_or_else(|e| e.into_inner());
     if let Some(shadow) = map.get(&(start, len)) {
         return Some(shadow.clone());
@@ -470,6 +554,7 @@ fn loose(address: u64, end: u64) -> Option<Arc<Shadow>> {
 /// starts closest below host GPU address `va`, and where `va` is in it.
 pub(crate) fn near(va: u64) -> String {
     let mut all: Vec<(u64, u64, u64)> = buffers()
+        .by_start
         .values()
         .filter_map(|e| e.shadow.as_deref().map(|s| (s.gpu, s.start, s.len)))
         .collect();
@@ -496,4 +581,197 @@ pub(crate) fn near(va: u64) -> String {
         ));
     }
     text
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn overflowing_registrations_do_not_enter_the_map() {
+        let start = u64::MAX - 8;
+        register(0, start, 9);
+        assert!(!buffers().by_start.contains_key(&(start, 0)));
+    }
+
+    #[test]
+    fn overflowing_loose_window_is_rejected() {
+        assert!(find(u64::MAX, 1).is_none());
+        assert!(find(u64::MAX - 1, 1).is_none());
+    }
+
+    #[test]
+    fn max_len_tracks_register_replace_and_unregister() {
+        // Use a distinctive large length above any concurrent test's buffers.
+        let base = 0x7000_0000_0000u64;
+        let big = 0x10_0000_0000u64;
+        let mid = 0x08_0000_0000u64;
+        register(9001, base, mid);
+        assert!(buffers().max_len >= mid);
+        register(9002, base + 0x1000, big);
+        assert_eq!(buffers().max_len, big);
+        // Shrinking the current longest entry recomputes max_len.
+        register(9002, base + 0x1000, 64);
+        assert_eq!(buffers().max_len, mid);
+        // Unregistering the remaining longest entry recomputes max_len again.
+        unregister(9001, base);
+        assert!(buffers().max_len < mid);
+        unregister(9002, base + 0x1000);
+    }
+}
+
+#[cfg(all(test, feature = "diagnostics"))]
+mod warp_tests {
+    use super::*;
+
+    fn warp() -> Option<&'static crate::host::Host> {
+        if std::env::var_os("VICTORY_D3D12_WARP").is_none() {
+            eprintln!("skipping live D3D12 test: VICTORY_D3D12_WARP is unset");
+            return None;
+        }
+        Some(host().expect("create the requested WARP device"))
+    }
+
+    fn shadow(device: &crate::host::Host, title: &mut [u8]) -> Shadow {
+        let (buffer, data) = device
+            .shared_buffer(PAGE as u64)
+            .expect("map a WARP shadow buffer");
+        // SAFETY: the buffer is live and mapped for at least title.len() bytes.
+        let gpu = unsafe { buffer.GetGPUVirtualAddress() };
+        Shadow::new(
+            buffer,
+            data,
+            gpu,
+            title.as_mut_ptr() as u64,
+            title.len() as u64,
+        )
+    }
+
+    struct Registration(usize, u64);
+
+    impl Registration {
+        fn new(resource: usize, start: u64, len: u64) -> Self {
+            register(resource, start, len);
+            Self(resource, start)
+        }
+    }
+
+    impl Drop for Registration {
+        fn drop(&mut self) {
+            unregister(self.0, self.1);
+        }
+    }
+
+    #[test]
+    fn lookup_checks_past_noncovering_buffers() {
+        let Some(_device) = warp() else { return };
+        let mut title = vec![0u8; 160];
+        let start = title.as_mut_ptr() as u64;
+        let _outer = Registration::new(0, start, 160);
+        let _short: Vec<_> = (1..=70)
+            .map(|i| Registration::new(0, start + i, 1))
+            .collect();
+        let copy = find(start + 90, 4).unwrap();
+        assert_eq!(copy.offset(start + 90), 90);
+    }
+
+    #[test]
+    fn equal_start_lookup_chooses_the_smallest_covering_buffer() {
+        let Some(_device) = warp() else { return };
+        let mut title = vec![0u8; 64];
+        let start = title.as_mut_ptr() as u64;
+        let _short = Registration::new(1, start, 8);
+        let _long = Registration::new(2, start, 64);
+        assert_eq!(find(start + 4, 4).unwrap().left(start + 4), 4);
+        assert_eq!(find(start + 4, 5).unwrap().left(start + 4), 60);
+    }
+
+    #[test]
+    fn oversized_updates_and_writes_clip_to_the_buffer() {
+        let Some(device) = warp() else { return };
+        let mut title = [1u8; 16];
+        let copy = shadow(device, &mut title);
+        let start = copy.start as usize;
+        assert_eq!(copy.update(start - 2, usize::MAX), title.len());
+        copy.writing(start + 14, usize::MAX);
+        // SAFETY: within the live mapping; the title and host copy are distinct.
+        unsafe { copy.data.add(15).write(9) };
+        assert_eq!(copy.copy_back(start + 14, usize::MAX), 2);
+        assert_eq!(title[15], 9);
+    }
+
+    #[test]
+    fn refresh_past_the_end_does_not_underflow() {
+        let Some(device) = warp() else { return };
+        let mut title = [1u8; 16];
+        let copy = Arc::new(shadow(device, &mut title));
+        let list = device.new_list().unwrap();
+        copy.refresh(&list, copy.start + copy.len + 1, 1);
+    }
+
+    #[test]
+    fn a_newly_declared_gap_takes_its_own_baseline() {
+        let Some(device) = warp() else { return };
+        let mut title = [1u8; 16];
+        let copy = shadow(device, &mut title);
+        let start = copy.start as usize;
+        assert_eq!(copy.update(start, title.len()), title.len());
+        copy.writing(start, 2);
+        copy.writing(start + 12, 2);
+        title[6] = 2;
+        assert_eq!(copy.update(start + 6, 1), 1);
+        copy.writing(start + 6, 1);
+        title[6] = 3;
+        assert_eq!(copy.copy_back(start + 6, 1), 0);
+        assert_eq!(title[6], 3);
+        assert_eq!(copy.copy_back(start, 2), 0);
+        assert_eq!(copy.copy_back(start + 12, 2), 0);
+    }
+
+    #[test]
+    fn overlapping_copy_backs_do_not_replay_an_earlier_cpu_edit() {
+        let Some(device) = warp() else { return };
+        let mut title = [1u8; 16];
+        let copy = shadow(device, &mut title);
+        let start = copy.start as usize;
+        assert_eq!(copy.update(start, title.len()), title.len());
+        copy.writing(start, 8);
+        copy.writing(start + 4, 8);
+        title[5] = 2;
+        // SAFETY: within the live mapping; simulates a GPU write before copy-back.
+        unsafe { copy.data.write(9) };
+        assert_eq!(copy.copy_back(start, 8), 8);
+        assert_eq!(title[0], 9);
+        title[5] = 3;
+        assert_eq!(copy.copy_back(start + 4, 8), 0);
+        assert_eq!(title[5], 3);
+    }
+
+    #[test]
+    fn covered_subrange_refreshes_in_place_without_reallocating_snapshot() {
+        let Some(device) = warp() else { return };
+        let mut title = [1u8; 32];
+        let copy = shadow(device, &mut title);
+        let start = copy.start as usize;
+        assert_eq!(copy.update(start, title.len()), title.len());
+        // Establish a snapshot union covering [0, 32) while leaving [10, 14) undeclared.
+        copy.writing(start, 4);
+        copy.writing(start + 28, 4);
+        let ptr_before = {
+            let guard = copy.before.lock().unwrap();
+            guard.as_ref().unwrap().1.as_ptr()
+        };
+        // Update the gap inside the already-covered union and declare it.
+        title[10] = 7;
+        assert_eq!(copy.update(start + 10, 4), 4);
+        copy.writing(start + 10, 4);
+        assert_eq!(title[10], 7);
+        let (ptr_after, byte10) = {
+            let guard = copy.before.lock().unwrap();
+            let (_, bytes) = guard.as_ref().unwrap();
+            (bytes.as_ptr(), bytes[10])
+        };
+        assert_eq!(ptr_before, ptr_after, "covered subrange must not reallocate");
+        assert_eq!(byte10, 7, "newly declared subrange baseline must refresh");
+    }
 }
