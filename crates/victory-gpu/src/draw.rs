@@ -996,7 +996,7 @@ impl State {
             s.refresh(list, *at, 4);
         }
         // Bounded first: the clamp binds a compute pipeline of its own and
-        // copies clamped active records into a scratch buffer at offset 0.
+        // copies clamped active records into a bump-allocated scratch slice.
         let count_arg = counter.as_ref().map(|(s, at)| (&s.buffer, s.offset(*at)));
         let Some(bounded) = crate::indirect::bound(
             list,
@@ -1034,7 +1034,7 @@ impl State {
                 &signature,
                 max,
                 &bounded.scratch,
-                0,
+                bounded.offset,
                 counter.as_ref().map(|(s, _)| &s.buffer),
                 counter.as_ref().map_or(0, |(s, at)| s.offset(*at)),
             )

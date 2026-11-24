@@ -299,9 +299,9 @@ pub(crate) struct HostList {
     /// The work its indirect executions may still do (`indirect`): a
     /// shader-writable word, zeroed when the list is submitted.
     budget: OnceLock<Option<(ID3D12Resource, usize)>>,
-    /// Device-local scratch buffer for clamped indirect arguments (`indirect`),
-    /// grown to the largest indirect execution recorded on the list.
-    indirect_args: Mutex<Option<(ID3D12Resource, u64)>>,
+    /// Device-local scratch buffer for clamped indirect arguments (`indirect`):
+    /// `(buffer, capacity, bump_used)`, reset to `used = 0` on `HostList::reset`.
+    indirect_args: Mutex<Option<(ID3D12Resource, u64, u64)>>,
     /// The texts of the markers `note_op` set, in order (for device-removed
     /// data without marker texts), with the host GPU range a copy reads.
     #[cfg(feature = "diagnostics")]
@@ -891,6 +891,14 @@ impl HostList {
             let mut scratch = self.scratch.lock().unwrap_or_else(|e| e.into_inner());
             (scratch.current, scratch.used) = (0, 0);
         }
+        if let Some((_, _, used)) = self
+            .indirect_args
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .as_mut()
+        {
+            *used = 0;
+        }
         // SAFETY: the list is not executing.
         let reset = unsafe {
             self.allocator
@@ -1146,31 +1154,34 @@ impl HostList {
         Some(unsafe { buffer.GetGPUVirtualAddress() })
     }
 
-    /// A device-local unordered-access buffer of at least `size` bytes for
-    /// clamped indirect arguments, reused across executions and resets of the
-    /// list. Smaller buffers replaced mid-list stay alive until
-    /// [`HostList::reset`].
-    pub(crate) fn indirect_scratch(&self, size: u64) -> Option<ID3D12Resource> {
-        let needed = size.max(64 << 10);
+    /// Bump-allocates a 16-byte-aligned slice of at least `size` bytes inside
+    /// a device-local unordered-access buffer for clamped indirect arguments,
+    /// returning `(buffer, byte_offset)`. The bump offset resets to `0` on
+    /// [`HostList::reset`]; smaller buffers replaced mid-list stay alive until
+    /// reset.
+    pub(crate) fn indirect_scratch(&self, size: u64) -> Option<(ID3D12Resource, u64)> {
+        let needed = size.next_multiple_of(16);
         let mut slot = self.indirect_args.lock().unwrap_or_else(|e| e.into_inner());
-        if let Some((buffer, cap)) = &*slot
-            && *cap >= needed
+        if let Some((buffer, cap, used)) = slot.as_mut()
+            && used.checked_add(needed).is_some_and(|end| end <= *cap)
         {
-            return Some(buffer.clone());
+            let offset = *used;
+            *used += needed;
+            return Some((buffer.clone(), offset));
         }
-        let prev = slot.as_ref().map_or(0, |(_, cap)| *cap);
+        let prev = slot.as_ref().map_or(0, |(_, cap, _)| *cap);
         let alloc = prev
             .saturating_mul(2)
-            .max(needed)
+            .max(needed.max(64 << 10))
             .next_multiple_of(64 << 10);
         let buffer = host()?.uav_buffer(alloc)?;
         name(&buffer, || format!("indirect arguments {alloc:#x}"));
-        let old = slot.replace((buffer.clone(), alloc));
+        let old = slot.replace((buffer.clone(), alloc, needed));
         drop(slot);
-        if let Some((old_buf, _)) = old {
+        if let Some((old_buf, _, _)) = old {
             self.keep(&old_buf);
         }
-        Some(buffer)
+        Some((buffer, 0))
     }
 
     /// Keeps `object` alive until the list is reset.

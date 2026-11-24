@@ -221,10 +221,11 @@ fn validate_layout(
 
 /// Records, in `list`, the non-destructive clamp of up to `records` records of
 /// `kind` (PC argument numbering) `stride` bytes apart from `src` (and bounded
-/// by the 32-bit count in `count` when given) into a device-local scratch
-/// buffer, leaving that scratch buffer in `INDIRECT_ARGUMENT` at offset `0`.
-/// Replaces the list's compute root signature and pipeline (callers bind
-/// theirs after). `None` if the clamp or alignment is not available.
+/// by the 32-bit count in `count` when given) into a bump-allocated slice of a
+/// device-local scratch buffer, leaving that scratch buffer in
+/// `INDIRECT_ARGUMENT` at `Bounded::offset`. Replaces the list's compute root
+/// signature and pipeline (callers bind theirs after). `None` if the clamp or
+/// alignment is not available.
 ///
 /// The argument and count buffers are read in place (root SRVs, and the
 /// count by `ExecuteIndirect`). One the list's shaders already wrote is in
@@ -238,19 +239,31 @@ pub(crate) fn bound(
     spec: (u32, u32, u32),
 ) -> Option<Bounded> {
     let bytes = validate_layout(spec, src.1, count.map(|(_, off)| off))?;
-    let (c, budget, dst) = (clamp()?, list.budget()?, list.indirect_scratch(bytes)?);
+    let (c, budget, (dst, offset)) = (clamp()?, list.budget()?, list.indirect_scratch(bytes)?);
     let written = written_among(src.0, count.map(|(b, _)| b), |b| list.gpu_written(b));
-    record_clamp(c, &list.list, &dst, budget, src, count, spec, &written).then_some(Bounded {
+    record_clamp(
+        c,
+        &list.list,
+        (&dst, offset),
+        budget,
+        src,
+        count,
+        spec,
+        &written,
+    )
+    .then_some(Bounded {
         scratch: dst,
+        offset,
         written,
     })
 }
 
-/// A clamp recorded by [`bound`]: the scratch buffer `ExecuteIndirect` reads
-/// the arguments from, and the title buffers moved out of unordered access
-/// until [`done`].
+/// A clamp recorded by [`bound`]: the scratch buffer and byte offset
+/// `ExecuteIndirect` reads the arguments from, and the title buffers moved out
+/// of unordered access until [`done`].
 pub(crate) struct Bounded {
     pub(crate) scratch: ID3D12Resource,
+    pub(crate) offset: u64,
     written: Vec<ID3D12Resource>,
 }
 
@@ -282,7 +295,7 @@ fn written_among(
 fn record_clamp(
     c: &Clamp,
     l: &ID3D12GraphicsCommandList,
-    dst: &ID3D12Resource,
+    (dst, dst_offset): (&ID3D12Resource, u64),
     budget: u64,
     (src, src_offset): (&ID3D12Resource, u64),
     count: Option<(&ID3D12Resource, u64)>,
@@ -296,8 +309,14 @@ fn record_clamp(
     ) else {
         return false;
     };
+    if !dst_offset.is_multiple_of(4) {
+        return false;
+    }
     // SAFETY: live D3D12 buffer resources.
-    let (src_base, dst_gpu) = unsafe { (src.GetGPUVirtualAddress(), dst.GetGPUVirtualAddress()) };
+    let (src_base, dst_base) = unsafe { (src.GetGPUVirtualAddress(), dst.GetGPUVirtualAddress()) };
+    let Some(dst_gpu) = dst_base.checked_add(dst_offset) else {
+        return false;
+    };
     if !src_base.is_multiple_of(4) || !dst_gpu.is_multiple_of(4) || !budget.is_multiple_of(4) {
         return false;
     }
@@ -441,6 +460,7 @@ void main() {
         fence: ID3D12Fence,
         submitted: u64,
         event: HANDLE,
+        info_queue: Option<ID3D12InfoQueue>,
         clamp: Clamp,
         worker: Clamp,
     }
@@ -449,6 +469,22 @@ void main() {
         fn new() -> Option<Self> {
             // SAFETY: plain DXGI WARP query and D3D12 test harness setup.
             unsafe {
+                let debug_on = std::env::var_os("VICTORY_D3D12_DEBUG").is_some();
+                let mut debug_enabled = false;
+                if debug_on {
+                    let mut layer: Option<ID3D12Debug> = None;
+                    if D3D12GetDebugInterface(&mut layer).is_ok()
+                        && let Some(layer) = &layer
+                    {
+                        layer.EnableDebugLayer();
+                        debug_enabled = true;
+                        if std::env::var_os("VICTORY_D3D12_GBV").is_some()
+                            && let Ok(d1) = layer.cast::<ID3D12Debug1>()
+                        {
+                            d1.SetEnableGPUBasedValidation(true);
+                        }
+                    }
+                }
                 let factory: IDXGIFactory4 =
                     CreateDXGIFactory2(DXGI_CREATE_FACTORY_FLAGS(0)).ok()?;
                 let adapter: IDXGIAdapter = factory.EnumWarpAdapter().ok()?;
@@ -459,6 +495,18 @@ void main() {
                 let mut device: Option<ID3D12Device> = None;
                 D3D12CreateDevice(&adapter, D3D_FEATURE_LEVEL_12_0, &mut device).ok()?;
                 let device = device?;
+                let info_queue = debug_enabled
+                    .then(|| device.cast::<ID3D12InfoQueue>().ok())
+                    .flatten();
+                if debug_enabled {
+                    assert!(
+                        info_queue.is_some(),
+                        "ID3D12InfoQueue must be available when the D3D12 debug layer is enabled"
+                    );
+                }
+                if let Some(q) = &info_queue {
+                    q.ClearStoredMessages();
+                }
                 let queue: ID3D12CommandQueue = device
                     .CreateCommandQueue(&D3D12_COMMAND_QUEUE_DESC {
                         Type: D3D12_COMMAND_LIST_TYPE_DIRECT,
@@ -483,6 +531,7 @@ void main() {
                     fence,
                     submitted: 0,
                     event,
+                    info_queue,
                     clamp,
                     worker,
                 })
@@ -590,6 +639,41 @@ void main() {
             sig.unwrap()
         }
 
+        fn drain_debug_errors(&self) -> Vec<String> {
+            let Some(q) = &self.info_queue else {
+                return Vec::new();
+            };
+            let mut errors = Vec::new();
+            // SAFETY: querying messages stored in our `ID3D12InfoQueue`.
+            unsafe {
+                let count = q.GetNumStoredMessages();
+                for i in 0..count {
+                    let mut len = 0usize;
+                    if q.GetMessage(i, None, &mut len).is_err() || len == 0 {
+                        continue;
+                    }
+                    let mut buf = vec![0u8; len];
+                    let msg = buf.as_mut_ptr().cast::<D3D12_MESSAGE>();
+                    if q.GetMessage(i, Some(msg), &mut len).is_err() {
+                        continue;
+                    }
+                    let m = &*msg;
+                    if matches!(
+                        m.Severity,
+                        D3D12_MESSAGE_SEVERITY_CORRUPTION | D3D12_MESSAGE_SEVERITY_ERROR
+                    ) {
+                        let text = std::slice::from_raw_parts(
+                            m.pDescription.cast::<u8>(),
+                            m.DescriptionByteLength.saturating_sub(1),
+                        );
+                        errors.push(String::from_utf8_lossy(text).into_owned());
+                    }
+                }
+                q.ClearStoredMessages();
+            }
+            errors
+        }
+
         fn submit_and_wait(&mut self) {
             self.submitted += 1;
             // SAFETY: closing, executing, waiting on fence, and resetting our list.
@@ -605,6 +689,12 @@ void main() {
                 self.allocator.Reset().unwrap();
                 self.list.Reset(&self.allocator, None).unwrap();
             }
+            let errors = self.drain_debug_errors();
+            assert!(
+                errors.is_empty(),
+                "D3D12 debug/GBV errors:\n{}",
+                errors.join("\n")
+            );
         }
     }
 
@@ -698,7 +788,7 @@ void main() {
         let (_budget_buf, budget_ptr, budget_gpu) = warp.shared_buffer(256);
         let (_hits_buf, hits_ptr, hits_gpu) = warp.shared_buffer(256);
         let (readback_buf, readback_ptr, _) = warp.shared_buffer((STRIDE * 8) as u64);
-        let dst_buf = warp.default_uav(u64::from(STRIDE) * u64::from(MAX));
+        let dst_buf = warp.default_uav(u64::from(STRIDE) * u64::from(MAX) * 2);
         let sig = warp.signature(KIND_DISPATCH, STRIDE);
 
         // Fill the entire source buffer with non-zero sentinel bytes, then
@@ -753,13 +843,15 @@ void main() {
             std::ptr::write_bytes(readback_ptr, 0, (STRIDE * 8) as usize);
         }
 
-        // Record Call #1 (`eff_count = 3` out of `MAX = 4096`), copy the first
-        // 5 records of `dst_buf` out for inspection, then record Call #2
-        // (`eff_count = 2` out of `MAX = 4096`) reusing `dst_buf` in the same list!
+        // Record Call #1 (`eff_count = 3` out of `MAX = 4096`) at offset 0,
+        // copy the first 5 records of `dst_buf` out for inspection, then record
+        // Call #2 (`eff_count = 2` out of `MAX = 4096`) at a non-zero bump
+        // offset in the SAME command list!
+        let call2_offset = (u64::from(STRIDE) * u64::from(MAX)).next_multiple_of(16);
         assert!(record_clamp(
             &warp.clamp,
             &warp.list,
-            &dst_buf,
+            (&dst_buf, 0),
             budget_gpu,
             (&src_buf, ARGS_OFFSET as u64),
             Some((&count_buf, COUNT_OFFSET_1 as u64)),
@@ -800,12 +892,13 @@ void main() {
             )]);
         }
 
-        // Call #2 in the SAME command list (`eff_count = 2` -> records 0 and 1:
-        // 6 + 5 = 11 groups). Would run empty if Call #1's tail blew `BUDGET`!
+        // Call #2 in the SAME command list at `call2_offset` (`eff_count = 2` ->
+        // records 0 and 1: 6 + 5 = 11 groups). Would run empty if Call #1's tail
+        // blew `BUDGET`!
         assert!(record_clamp(
             &warp.clamp,
             &warp.list,
-            &dst_buf,
+            (&dst_buf, call2_offset),
             budget_gpu,
             (&src_buf, ARGS_OFFSET as u64),
             Some((&count_buf, COUNT_OFFSET_2 as u64)),
@@ -821,7 +914,7 @@ void main() {
                 &sig,
                 MAX,
                 &dst_buf,
-                0,
+                call2_offset,
                 Some(&count_buf),
                 COUNT_OFFSET_2 as u64,
             );
@@ -923,7 +1016,7 @@ void main() {
         assert!(record_clamp(
             &warp.clamp,
             &warp.list,
-            &dst_buf,
+            (&dst_buf, 0),
             budget_gpu,
             (&src_buf, 0),
             Some((&src_buf, COUNT_OFFSET as u64)),
@@ -1000,7 +1093,7 @@ void main() {
         assert!(record_clamp(
             &warp.clamp,
             &warp.list,
-            &dst_buf,
+            (&dst_buf, 0),
             budget_gpu,
             (&src_buf, 0),
             None,
@@ -1085,7 +1178,7 @@ void main() {
         }
 
         // First two calls fit inside the initial 64 KiB scratch buffer and
-        // must reuse the exact same `ID3D12Resource`.
+        // bump-allocate non-overlapping offsets in the same `ID3D12Resource`.
         let b1 = bound(&list, (&src_buf, 0), Some((&count_buf, 0)), (0, 16, 64)).unwrap();
         done(&list, &b1);
         let b2 = bound(&list, (&src_buf, 64), Some((&count_buf, 0)), (1, 20, 128)).unwrap();
@@ -1095,6 +1188,8 @@ void main() {
             b2.scratch.as_raw(),
             "scratch buffer within capacity must be reused"
         );
+        assert_eq!(b1.offset, 0);
+        assert_eq!(b2.offset, 16 * 64, "second call bump-allocates past first");
 
         // A call needing >64 KiB grows the scratch buffer mid-list while keeping
         // `b1` alive until reset.
@@ -1105,13 +1200,14 @@ void main() {
             b1.scratch.as_raw(),
             "larger request must grow scratch buffer"
         );
+        assert_eq!(b3.offset, 0);
 
         list.close();
         host.execute(&[&list]);
         list.reset();
 
-        // After reset, requests up to the grown high-water mark reuse `b3` with
-        // zero new allocations.
+        // After reset, the bump offset resets to 0 and requests up to the grown
+        // high-water mark reuse `b3` with zero new allocations.
         let b4 = bound(&list, (&src_buf, 0), Some((&count_buf, 0)), (1, 20, 4096)).unwrap();
         done(&list, &b4);
         assert_eq!(
@@ -1119,6 +1215,7 @@ void main() {
             b3.scratch.as_raw(),
             "grown scratch buffer must persist across reset"
         );
+        assert_eq!(b4.offset, 0, "bump offset must reset to 0 after list reset");
         list.close();
         host.execute(&[&list]);
         list.reset();
