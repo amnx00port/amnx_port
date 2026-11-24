@@ -292,5 +292,27 @@ x.rpf@0x70 new Gs  validated
         assert!(r.contains("        3  a  ->  b"), "{r}");
         assert!(!r.contains("c  ->  d"), "{r}");
         assert!(r.contains("... 1 more pairs (--top)"), "{r}");
+        // A --top above the number of pairs prints them all, with no note.
+        let r = report(&d, 5);
+        assert!(r.contains("c  ->  d") && !r.contains("more pairs"), "{r}");
+    }
+
+    #[test]
+    fn a_listing_without_program_lines_is_refused() {
+        // Made without --list: only the header and the summary.
+        assert!(
+            parse("programs     3 translated of 3\n        2  emit: x  (e.g. p@0x1 n Ps)\n")
+                .is_empty()
+        );
+        let dir = std::env::temp_dir();
+        let (empty, full) = (
+            dir.join("victory-listdiff-empty.txt"),
+            dir.join("victory-listdiff-full.txt"),
+        );
+        std::fs::write(&empty, "containers   0\n").unwrap();
+        std::fs::write(&full, BEFORE).unwrap();
+        let err = run(&empty, &full, 20).unwrap_err().to_string();
+        assert!(err.contains("no program lines"), "{err}");
+        let _ = (std::fs::remove_file(empty), std::fs::remove_file(full));
     }
 }
