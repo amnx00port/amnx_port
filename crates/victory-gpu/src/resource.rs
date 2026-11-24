@@ -821,20 +821,71 @@ const MIN_DROPPED_EXTENT: u64 = 64;
 /// texture allocation hits `E_OUTOFMEMORY`.
 static OOM_MIP_PRESSURE: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
 
-/// User-configured baseline mip drop from `VICTORY_TEXTURE_MIP_DROP` (0..=3).
-fn configured_mip_drop() -> u32 {
-    static CONFIGURED: std::sync::OnceLock<u32> = std::sync::OnceLock::new();
+/// Adapters with at most 8 GiB dedicated VRAM (including iGPUs) or hosts with
+/// at most 16 GiB physical RAM proactively default to `mip_drop = 1` before
+/// the first texture allocation so world streaming does not hit the commit
+/// ceiling before reactive OOM recovery can help (see #1226).
+const LOW_VRAM_THRESHOLD: u64 = 8 << 30;
+const LOW_RAM_THRESHOLD: u64 = 16 << 30;
+
+/// Proactive baseline mip drop chosen from host VRAM and RAM when
+/// `VICTORY_TEXTURE_MIP_DROP` is not explicitly configured.
+fn proactive_mip_drop(dedicated_vram: Option<u64>, system_ram: Option<u64>) -> u32 {
+    let low_vram = dedicated_vram.is_some_and(|v| v <= LOW_VRAM_THRESHOLD);
+    let low_ram = system_ram.is_some_and(|r| r <= LOW_RAM_THRESHOLD);
+    u32::from(low_vram || low_ram)
+}
+
+#[cfg(windows)]
+fn host_ram_bytes() -> Option<u64> {
+    use windows_sys::Win32::System::SystemInformation::{GlobalMemoryStatusEx, MEMORYSTATUSEX};
+    // SAFETY: plain POD struct with `dwLength` initialized before calling `GlobalMemoryStatusEx`.
+    let mut status: MEMORYSTATUSEX = unsafe { std::mem::zeroed() };
+    status.dwLength = size_of::<MEMORYSTATUSEX>() as u32;
+    // SAFETY: `status` is valid and `dwLength` matches its size.
+    let ok = unsafe { GlobalMemoryStatusEx(&mut status) };
+    (ok != 0 && status.ullTotalPhys > 0).then_some(status.ullTotalPhys)
+}
+
+/// User-configured baseline mip drop from `VICTORY_TEXTURE_MIP_DROP` (0..=3),
+/// or `None` when unset so proactive host-budget detection applies.
+fn configured_mip_drop() -> Option<u32> {
+    static CONFIGURED: std::sync::OnceLock<Option<u32>> = std::sync::OnceLock::new();
     *CONFIGURED.get_or_init(|| {
         std::env::var("VICTORY_TEXTURE_MIP_DROP")
             .ok()
             .and_then(|v| v.trim().parse::<u32>().ok())
-            .map_or(0, |n| n.min(MAX_MIP_DROP))
+            .map(|n| n.min(MAX_MIP_DROP))
     })
 }
 
+#[cfg(windows)]
+fn default_mip_drop() -> u32 {
+    static DEFAULT: std::sync::OnceLock<u32> = std::sync::OnceLock::new();
+    *DEFAULT.get_or_init(|| {
+        let vram = crate::host::host().and_then(crate::host::Host::dedicated_video_memory);
+        let ram = host_ram_bytes();
+        let drop = proactive_mip_drop(vram, ram);
+        if drop > 0 {
+            tracing::info!(
+                drop,
+                vram_mib = vram.map(|v| v >> 20),
+                ram_mib = ram.map(|r| r >> 20),
+                "low host VRAM/RAM budget detected; proactively defaulting texture mip drop (set VICTORY_TEXTURE_MIP_DROP=0 to disable)"
+            );
+        }
+        drop
+    })
+}
+
+#[cfg(not(windows))]
+fn default_mip_drop() -> u32 {
+    0
+}
+
 fn requested_mip_drop() -> u32 {
-    configured_mip_drop()
-        .max(OOM_MIP_PRESSURE.load(std::sync::atomic::Ordering::Relaxed))
+    let base = configured_mip_drop().unwrap_or_else(default_mip_drop);
+    base.max(OOM_MIP_PRESSURE.load(std::sync::atomic::Ordering::Relaxed))
         .min(MAX_MIP_DROP)
 }
 
@@ -2203,6 +2254,20 @@ mod tests {
         );
         assert_eq!(err, Err((E_OUTOFMEMORY, 0)));
         assert_eq!(pressure3.load(Relaxed), 0);
+    }
+
+    #[test]
+    fn proactive_mip_drop_triggers_on_low_vram_or_low_ram() {
+        // 8 GiB GPU or 128 MiB iGPU -> proactive drop = 1.
+        assert_eq!(proactive_mip_drop(Some(8 << 30), Some(32 << 30)), 1);
+        assert_eq!(proactive_mip_drop(Some(128 << 20), Some(15 << 30)), 1);
+        // 10 GiB GPU on a 16 GiB RAM host -> proactive drop = 1 (commit ceiling).
+        assert_eq!(proactive_mip_drop(Some(10 << 30), Some(16 << 30)), 1);
+        // >8 GiB GPU and >16 GiB RAM -> native full quality (0).
+        assert_eq!(proactive_mip_drop(Some(10 << 30), Some(32 << 30)), 0);
+        assert_eq!(proactive_mip_drop(Some(24 << 30), Some(64 << 30)), 0);
+        // Unknown budget -> conservative 0.
+        assert_eq!(proactive_mip_drop(None, None), 0);
     }
 
     /// End-to-end host GPU test: a mip-dropped 256x256 texture allocates as
