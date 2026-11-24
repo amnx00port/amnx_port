@@ -117,10 +117,11 @@ pub(crate) fn fail(what: std::fmt::Arguments) -> ! {
     }
 }
 
+static HOST: OnceLock<Option<Host>> = OnceLock::new();
+
 /// The host GPU, created on first use; `None` without one (a run then
 /// behaves as before: nothing executes).
 pub(crate) fn host() -> Option<&'static Host> {
-    static HOST: OnceLock<Option<Host>> = OnceLock::new();
     HOST.get_or_init(|| match create() {
         Ok(host) => Some(host),
         Err(e) => {
@@ -129,6 +130,17 @@ pub(crate) fn host() -> Option<&'static Host> {
         }
     })
     .as_ref()
+}
+
+/// Install a specific adapter before invoking the normal binding path.
+/// The fixture runs alone in its test process.
+#[cfg(test)]
+pub(crate) fn install_test_device(device: ID3D12Device) -> &'static Host {
+    assert!(
+        HOST.set(Some(create_host(device, false).unwrap())).is_ok(),
+        "test device must be installed before the host initializes"
+    );
+    host().unwrap()
 }
 
 fn create() -> windows::core::Result<Host> {
@@ -183,7 +195,13 @@ fn create() -> windows::core::Result<Host> {
         } else {
             D3D12CreateDevice(None, D3D_FEATURE_LEVEL_12_0, &mut device)?;
         }
-        let device = device.ok_or_else(windows::core::Error::empty)?;
+        create_host(device.ok_or_else(windows::core::Error::empty)?, debug)
+    }
+}
+
+fn create_host(device: ID3D12Device, debug: bool) -> windows::core::Result<Host> {
+    // SAFETY: plain D3D12 object creation with valid descriptions.
+    unsafe {
         let messages = debug
             .then(|| device.cast::<ID3D12InfoQueue>().ok())
             .flatten();
@@ -396,6 +414,8 @@ enum Step {
 struct Deferred {
     /// Destination, source, bytes.
     copies: Vec<Step>,
+    /// Changes whenever recorded CPU work can write title bytes.
+    title_write_version: usize,
     uploads: Vec<ID3D12Resource>,
     /// Host objects the list's commands name (pipelines, root signatures,
     /// descriptor heaps): the title may release its objects before it
@@ -1018,7 +1038,12 @@ impl HostList {
         deferred
             .copies
             .push(Step::Copy(dst as usize, src as usize, len));
+        deferred.title_write_version += 1;
         deferred.refreshed.clear();
+    }
+
+    pub(crate) fn title_write_version(&self) -> usize {
+        self.deferred().title_write_version
     }
 
     /// Copies `len` bytes of title memory at `src` into the list's upload
@@ -1146,8 +1171,10 @@ impl HostList {
     /// Runs `work` when the list is submitted, in order with its copies.
     /// `work` may write title memory (refreshes after it copy again).
     pub(crate) fn defer(&self, work: impl Fn() + Send + 'static) {
-        self.deferred().copies.push(Step::Run(Box::new(work)));
-        self.deferred().refreshed.clear();
+        let mut deferred = self.deferred();
+        deferred.copies.push(Step::Run(Box::new(work)));
+        deferred.title_write_version += 1;
+        deferred.refreshed.clear();
     }
 
     /// As [`HostList::defer`], for work that writes only host memory.

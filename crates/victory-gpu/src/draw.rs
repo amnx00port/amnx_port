@@ -71,22 +71,21 @@ pub(crate) struct State {
     /// Graphics, compute.
     host_roots: [usize; 2],
     host_heaps: [usize; 2],
-    /// Tables made afresh in this list: (table, what it holds) → first
-    /// dynamic slot.
-    fresh_tables: std::collections::HashMap<(u64, u64), u32>,
-    /// The dynamic slots the list holds: title heap, first, count; given
-    /// back when the list is reset or released.
-    dynamic: Vec<(usize, u32, u32)>,
+    /// Rebuilt tables by title address and record hash.
+    fresh_tables: std::collections::HashMap<(u64, u64), FreshTable>,
+    /// Keep each shared range until this list can no longer be submitted.
+    shared_tables:
+        std::collections::HashMap<usize, std::sync::Arc<crate::descriptor::host::SharedTable>>,
+    /// Dynamic list-local tables (including their CBV descriptors).
+    dynamic: Vec<crate::descriptor::host::DynamicRange>,
     /// A fresh table of the stage being bound could not be made.
     table_failed: bool,
 }
 
-impl Drop for State {
-    fn drop(&mut self) {
-        for &(heap, first, n) in &self.dynamic {
-            crate::descriptor::release_dynamic(heap, first, n);
-        }
-    }
+struct FreshTable {
+    first: u32,
+    /// None for tables without a CBV. Their descriptors do not depend on a staged upload.
+    upload_version: Option<usize>,
 }
 
 /// Draws recorded on the host GPU since the last frame line.
@@ -702,6 +701,25 @@ impl State {
                 .map(|u| u.table_offset_dwords / 8 + 1)
                 .max()
                 .unwrap_or(1);
+            if !entries.iter().any(|u| u.kind == ResourceType::Cbv)
+                && let Some(shared) = heap
+                    .with_texture_table(table, n, |views| {
+                        let shared = host.shared_textures(n, views)?;
+                        for u in &entries {
+                            let offset = u.table_offset_dwords / 8;
+                            if let Ok(i) = views.binary_search_by_key(&offset, |view| view.slot) {
+                                readable(list, u, views[i].view);
+                            }
+                        }
+                        Some(shared)
+                    })
+                    .flatten()
+            {
+                made.push((slot, shared.first() * 32));
+                let identity = std::sync::Arc::as_ptr(&shared) as usize;
+                self.shared_tables.entry(identity).or_insert(shared);
+                continue;
+            }
             // The table and what its entries hold (record words).
             let key = {
                 use std::hash::{Hash, Hasher};
@@ -713,7 +731,10 @@ impl State {
                 }
                 (table, h.finish())
             };
-            if let Some(&first) = self.fresh_tables.get(&key) {
+            if let Some(cached) = self.fresh_tables.get(&key)
+                && cached.upload_version.is_none_or(|version| version == list.title_write_version())
+            {
+                let first = cached.first;
                 for u in entries.iter().filter(|u| u.kind != ResourceType::Cbv) {
                     let handle = table + u64::from(u.table_offset_dwords) * 4;
                     if let Some(view) = crate::descriptor::view(handle) {
@@ -723,7 +744,7 @@ impl State {
                 made.push((slot, first * 32));
                 continue;
             }
-            let Some(first) = host.dynamic(n) else {
+            let Some(range) = host.reserve_dynamic(n) else {
                 // Without its fresh table the shader would read the title's
                 // slots, which for constant buffer tables hold no constant
                 // view: a texture or null descriptor read as a buffer gives
@@ -732,9 +753,9 @@ impl State {
                 self.table_failed = true;
                 continue;
             };
-            self.fresh_tables.insert(key, first);
-            self.dynamic
-                .push((std::ptr::from_ref(heap) as usize, first, n));
+            let first = range.first;
+            let mut upload_version = None;
+            self.dynamic.push(range);
             // The whole range: a shader may index past the entries its
             // used-resource list names (descriptor arrays).
             for k in 0..n {
@@ -742,6 +763,7 @@ impl State {
                 let used = entries.iter().find(|u| u.table_offset_dwords / 8 == k);
                 match crate::descriptor::view(table + u64::from(k) * 32) {
                     Some(View::Constant(address, size)) => {
+                        upload_version.get_or_insert_with(|| list.title_write_version());
                         let Some((gpu, to)) = list.scratch(u64::from(size)) else {
                             host.make_null(index);
                             continue;
@@ -763,9 +785,21 @@ impl State {
                     }
                 }
             }
+            // Older ranges remain owned by the list, whose previous commands
+            // still refer to those descriptors and upload addresses.
+            self.fresh_tables.insert(key, FreshTable { first, upload_version });
             made.push((slot, first * 32));
         }
         made
+    }
+
+    #[cfg(test)]
+    pub(crate) fn test_compute_tables(
+        &mut self,
+        list: &HostList,
+        used: &[UsedResource],
+    ) -> Vec<(u8, u32)> {
+        self.tables(list, used, true)
     }
 
     /// The first draws, at debug level: what they bind and read
