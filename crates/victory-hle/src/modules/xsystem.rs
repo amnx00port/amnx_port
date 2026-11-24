@@ -3,6 +3,7 @@
 //! chose ([`victory_gpu::console`]).
 #![allow(clippy::not_unsafe_ptr_arg_deref)]
 
+use crate::modules::xasync::E_NOT_SUFFICIENT_BUFFER;
 use super::xgameruntime::{
     Guid, HRESULT, Interface, Methods, Object, add_ref, missing, put_string,
 };
@@ -35,6 +36,8 @@ pub const ANALYTICS: Guid = Guid::new(
 const CONSOLE_ID: &str = "00000000000000000000000000000000000001";
 /// The retail sandbox.
 const SANDBOX: &str = "RETAIL";
+/// XSystemXboxLiveSandboxIdMaxBytes from XSystem.h (16 bytes).
+const SANDBOX_ID_MAX_BYTES: usize = 16;
 /// Base64 of 32 bytes: 44 characters (45 bytes with the NUL).
 const DEVICE_ID: &str = "VkljdG9yeSBvZmZsaW5lIGRldmljZSBpZGVudGl0eSE=";
 
@@ -62,6 +65,9 @@ extern "system" fn console_id(_: This, size: usize, buffer: *mut u8, used: *mut 
     put_string(CONSOLE_ID, size, buffer, used)
 }
 extern "system" fn sandbox_id(_: This, size: usize, buffer: *mut u8, used: *mut usize) -> HRESULT {
+    if size < SANDBOX_ID_MAX_BYTES {
+        return E_NOT_SUFFICIENT_BUFFER;
+    }
     put_string(SANDBOX, size, buffer, used)
 }
 /// The device id this title sees (titles see different ones).
@@ -396,5 +402,28 @@ mod tests {
         assert_eq!(size_of::<AnalyticsInfo>(), 0x90);
         assert_eq!(info.os.build, 22000);
         assert_eq!(&info.form[..14], b"Xbox Series X\0");
+    }
+
+    #[test]
+    fn a_sandbox_id_buffer_under_the_documented_minimum_is_refused() {
+        type Get = extern "system" fn(This, usize, *mut u8, *mut usize) -> HRESULT;
+        let this: This = &OBJECT;
+        let get = method::<Get>(&OBJECT, 0x20);
+        let mut buffer = [0xAAu8; 32];
+        let mut used = 0;
+
+        for size in [0, 7, 15] {
+            assert_eq!(
+                get(this, size, buffer.as_mut_ptr(), &mut used),
+                E_NOT_SUFFICIENT_BUFFER,
+                "size {size} must fail with insufficient buffer"
+            );
+            assert_eq!(buffer[0], 0xAA, "buffer must remain untouched on failure");
+            assert_eq!(used, 0, "used must remain untouched on failure");
+        }
+
+        assert_eq!(get(this, 16, buffer.as_mut_ptr(), &mut used), S_OK);
+        assert_eq!(&buffer[..7], b"RETAIL\0");
+        assert_eq!(used, 7);
     }
 }
