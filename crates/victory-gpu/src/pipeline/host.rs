@@ -294,10 +294,7 @@ struct HostCreationTimer(std::time::Instant);
 #[cfg(feature = "diagnostics")]
 impl Drop for HostCreationTimer {
     fn drop(&mut self) {
-        tracing::debug!(
-            elapsed_us = self.0.elapsed().as_micros() as u64,
-            "host pipeline preparation and creation"
-        );
+        super::timing::HOST.record(self.0.elapsed().as_micros() as u64);
     }
 }
 
