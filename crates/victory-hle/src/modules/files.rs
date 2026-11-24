@@ -18,6 +18,7 @@ use std::os::windows::ffi::OsStrExt;
 use std::path::Path;
 use std::sync::{Mutex, MutexGuard};
 
+use windows_sys::Win32::Foundation::{GetLastError, SetLastError};
 use windows_sys::Win32::Globalization::{CP_ACP, MultiByteToWideChar};
 use windows_sys::Win32::Storage::FileSystem::GetLogicalDrives;
 
@@ -263,7 +264,7 @@ pub extern "system" fn CreateFileW(
     template: Handle,
 ) -> Handle {
     let p = wide(path);
-    host!("kernel32.dll", "CreateFileW": extern "system" fn(*const u16, u32, u32, *const c_void, u32, u32, Handle) -> Handle)(
+    let handle = host!("kernel32.dll", "CreateFileW": extern "system" fn(*const u16, u32, u32, *const c_void, u32, u32, Handle) -> Handle)(
         p.ptr(),
         access,
         share,
@@ -271,7 +272,17 @@ pub extern "system" fn CreateFileW(
         disposition,
         flags,
         template,
-    )
+    );
+    if p.1.is_some() {
+        // Releasing the translated path can change the thread's last error.
+        // SAFETY: both functions operate on the calling thread's error slot.
+        unsafe {
+            let error = GetLastError();
+            drop(p);
+            SetLastError(error);
+        }
+    }
+    handle
 }
 
 pub extern "system" fn CreateFileA(

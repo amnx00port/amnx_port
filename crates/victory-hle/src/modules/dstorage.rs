@@ -131,13 +131,13 @@ extern "system" fn open_file(_: Factory, path: *const u16, iid: *const Guid, out
         0,
         std::ptr::null_mut(),
     );
+    let error = (handle as isize == -1).then(std::io::Error::last_os_error);
     // SAFETY: the title passes a NUL-terminated path.
     let name = unsafe {
         let len = (0..).take_while(|&i| *path.add(i) != 0).count();
         String::from_utf16_lossy(std::slice::from_raw_parts(path, len))
     };
-    if handle as isize == -1 {
-        let error = std::io::Error::last_os_error();
+    if let Some(error) = error {
         tracing::warn!(path = name, %error, "dstorage: opening a file failed");
         return from_win32(&error);
     }
@@ -1034,6 +1034,28 @@ mod tests {
             S_OK
         );
         file
+    }
+
+    #[test]
+    fn open_file_preserves_win32_error() {
+        let dir = tempfile::tempdir().unwrap();
+        let factory = factory();
+        let open: extern "system" fn(*mut c_void, *const u16, *const Guid, Out) -> HRESULT =
+            call(factory, 0x20);
+
+        for (path, expected) in [
+            ("missing.bin", 0x8007_0002u32 as HRESULT),
+            ("missing-dir/missing.bin", 0x8007_0003u32 as HRESULT),
+        ] {
+            let path = dir.path().join(path);
+            let wide: Vec<u16> = path.as_os_str().encode_wide().chain([0]).collect();
+            let mut file = std::ptr::null_mut();
+            assert_eq!(
+                open(factory, wide.as_ptr(), std::ptr::null(), &mut file),
+                expected
+            );
+            assert!(file.is_null());
+        }
     }
 
     fn status_array(capacity: u32) -> *mut c_void {
