@@ -97,6 +97,9 @@ impl Hasher for Fx {
     }
 }
 
+/// Condition sets [`Bools::meet`] found no lane for, in sorted order.
+type Dead = HashSet<Vec<(Bool, bool)>, BuildHasherDefault<Fx>>;
+
 const TERMINAL: u32 = u32::MAX;
 const MAX_NODES: usize = 1 << 21;
 /// Case splits [`Bools::meet`] makes before it gives up.
@@ -228,22 +231,34 @@ impl Bools {
     /// too large to finish.
     pub fn meet(&self, all: &[(Bool, bool)]) -> bool {
         let mut budget = MAX_MEET;
-        self.meet_in(all.to_vec(), &mut budget)
+        self.meet_in(all.to_vec(), &mut budget, &mut Dead::default())
     }
 
-    fn meet_in(&self, mut all: Vec<(Bool, bool)>, budget: &mut usize) -> bool {
+    /// `dead` holds the condition sets already found to have no lane.
+    /// Assigning the variables in order reaches the same remaining
+    /// conditions along many paths (every assignment of variables they do
+    /// not tell apart), so a search that tried each path again ran out of
+    /// budget on conditions with few distinct remainders.
+    fn meet_in(&self, mut all: Vec<(Bool, bool)>, budget: &mut usize, dead: &mut Dead) -> bool {
         let fails = |&(b, holds): &(Bool, bool)| b == if holds { Bool::FALSE } else { Bool::TRUE };
         if all.iter().any(fails) {
             return false;
         }
         all.retain(|&(b, _)| b != Bool::FALSE && b != Bool::TRUE);
+        // One form per set of conditions; a node both held and not held
+        // (equal functions are equal nodes) ends the search.
+        all.sort_unstable();
+        all.dedup();
+        if all.windows(2).any(|w| w[0].0 == w[1].0) || dead.contains(&all) {
+            return false;
+        }
         if all.is_empty() || *budget == 0 {
             return true;
         }
         *budget -= 1;
         let top = |b: Bool| self.nodes[b.0 as usize].0;
         let v = all.iter().map(|&(b, _)| top(b)).min().expect("not empty");
-        [false, true].into_iter().any(|value| {
+        let met = [false, true].into_iter().any(|value| {
             let next = all
                 .iter()
                 .map(|&(b, holds)| {
@@ -251,8 +266,14 @@ impl Bools {
                     (if value { hi } else { lo }, holds)
                 })
                 .collect();
-            self.meet_in(next, budget)
-        })
+            self.meet_in(next, budget, dead)
+        });
+        // Only a finished search says no (out of budget is a yes), so a
+        // no is exact and can be kept.
+        if !met {
+            dead.insert(all);
+        }
+        met
     }
 
     fn implies(&mut self, a: Bool, b: Bool) -> bool {
@@ -1230,5 +1251,27 @@ mod tests {
         assert_eq!(p.blocks[0].exit.successors(), [2, 4]);
         assert_eq!(p.blocks[1].preds, [2]);
         assert!(structure(&p).is_ok());
+    }
+
+    #[test]
+    fn conditions_with_few_distinct_remainders_are_searched_to_the_end() {
+        // The parity of 40 compare results, the parity of the first 39,
+        // and the 40th: no lane holds all three. Whatever the first k
+        // results are, what is left of the conditions is one of two sets;
+        // trying them once for each of the 2^k assignments, the search ran
+        // out of budget and said yes.
+        let mut b = Bools::new();
+        let bits: Vec<Bool> = (0..40).map(|n| b.atom(Atom::Lane(Value(n)), 0)).collect();
+        let mut rest = Bool::FALSE;
+        for &x in &bits[..39] {
+            rest = b.xor(rest, x);
+        }
+        let all = b.xor(rest, bits[39]);
+        assert!(!b.meet(&[(all, true), (rest, true), (bits[39], true)]));
+        // Two of them, or the third's opposite, some lane does hold.
+        assert!(b.meet(&[(all, true), (rest, true)]));
+        assert!(b.meet(&[(all, false), (rest, true), (bits[39], true)]));
+        // A node held and not held needs no search.
+        assert!(!b.meet(&[(all, true), (all, false)]));
     }
 }
