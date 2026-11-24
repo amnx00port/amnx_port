@@ -5,25 +5,44 @@ on:
   push:
     branches: [main]
 
-permissions:
-  contents: read
+# No token permissions by default; the job grants only what it uses.
+permissions: {}
 
+# A newer push to a PR cancels its older run. Runs on main are never
+# cancelled: only main saves the rust-cache, so a cancelled main run would
+# leave PRs restoring a stale cache.
 concurrency:
   group: ci-${{ github.ref }}
-  cancel-in-progress: true
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
 
 env:
   CARGO_TERM_COLOR: always
 
 jobs:
+  # The name repeats the id, so the required check stays `check`.
   check:
+    name: check
     runs-on: windows-latest
+    # checkout only.
+    permissions:
+      contents: read
     timeout-minutes: 60
     steps:
-      - uses: actions/checkout@v5
+      # Actions are pinned to full commit SHAs (tag in the trailing comment):
+      # a tag can be moved to other code, a commit cannot. Bump both together.
+      # Nothing here pushes; keep the token out of .git/config.
+      - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5.1.0
+        with:
+          persist-credentials: false
       # The version and components pinned in rust-toolchain.toml.
-      - run: rustup toolchain install
-      - uses: Swatinem/rust-cache@v2
+      # --no-self-update: rustup would otherwise replace itself with whatever
+      # release is newest that day, unpinned and mid-job.
+      - run: rustup toolchain install --no-self-update
+      # Save the cache only from main: PR runs restore it but do not write
+      # their own entries, which would evict main's from the 10 GB quota.
+      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
+        with:
+          save-if: ${{ github.ref == 'refs/heads/main' }}
       - name: Clippy
         run: cargo clippy --workspace --all-targets --locked -- -D warnings
       - name: Clippy, diagnostics build

@@ -1,0 +1,1149 @@
+# Interim Linux CI for the crates that already build without Windows.
+# Superseded once full-workspace Linux CI lands; fold or delete then.
+#
+# Every step here passes on plain Linux with no Windows SDK, no cross target
+# and no game data. The PR that added this lists the same commands for local use.
+name: linux-subset
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+# No token permissions by default; each job grants only what it uses, so a
+# job added later starts with none instead of inheriting these.
+permissions: {}
+
+# The implicit default shell is plain `bash -e`, where a failing command on
+# the left of a pipe (e.g. the `echo ... | sha256sum -c -` checksum checks)
+# is ignored. Set it once so every `run:` script gets pipefail, plus nounset:
+# a misspelt or missing variable (say a renamed *_CRATES list) is an error
+# instead of expanding to nothing, which would e.g. run `cargo clippy` with
+# no -p flags on whatever the default members are. inherit_errexit makes
+# `set -e` apply inside command substitutions too, which Bash otherwise
+# resets there: a failing command in `x="$(a; b)"` stops the step instead
+# of letting `b` run on.
+defaults:
+  run:
+    shell: bash --noprofile --norc -O inherit_errexit -euo pipefail {0}
+
+# Actions are pinned to full commit SHAs (tag in the trailing comment): a tag
+# can be moved to other code, a commit cannot. Bump both together.
+
+# A newer push to a PR cancels its older run. Runs on main are never
+# cancelled: only main saves the rust-cache, so a cancelled main run would
+# leave PRs restoring a stale cache.
+concurrency:
+  group: linux-subset-${{ github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
+env:
+  CARGO_TERM_COLOR: always
+  CARGO_INCREMENTAL: 0
+  # A failing test or build script prints where it panicked.
+  RUST_BACKTRACE: 1
+  # Folded package lists are read into Bash arrays of Cargo arguments.
+  # Crates (plus xtask) that build, test and are clippy-clean on Linux today.
+  LINUX_CRATES: >-
+    -p victory-core -p victory-pe -p victory-formats -p victory-pipeline
+    -p victory-game -p victory-loader -p victory-shader -p xtask
+  # Crates that are clippy-clean for the Windows target today: every
+  # workspace member but xtask, which is host-only.
+  WINDOWS_CLIPPY_CRATES: >-
+    -p victory-core -p victory-pe -p victory-formats -p victory-pipeline
+    -p victory-game -p victory-loader -p victory-shader -p victory-gpu
+    -p victory-hle -p victory
+  # Packages that are rustfmt-clean today. The rest (victory-formats,
+  # victory-loader, victory-gpu, victory-hle) are not yet; add each one
+  # once it is, and switch to `cargo fmt --all --check` when all are.
+  RUSTFMT_CRATES: >-
+    -p victory-core -p victory-pe -p victory-pipeline -p victory-game
+    -p victory-shader -p victory -p xtask
+  # Crates whose rustdoc builds with no warnings on Linux (broken or private
+  # intra-doc links, bad code-block attributes, ...): LINUX_CRATES plus
+  # victory-gpu, whose docs build on Linux although its code does not.
+  RUSTDOC_CRATES: >-
+    -p victory-core -p victory-pe -p victory-formats -p victory-pipeline
+    -p victory-game -p victory-loader -p victory-shader -p victory-gpu
+    -p xtask
+  # Crates whose rustdoc builds with no warnings for the Windows target, where
+  # cfg(windows) items (all of victory-hle, apps/victory's host) exist and the
+  # Linux rustdoc step never sees them. Every workspace member but the
+  # host-only xtask, like WINDOWS_CLIPPY_CRATES.
+  WINDOWS_RUSTDOC_CRATES: >-
+    -p victory-core -p victory-pe -p victory-formats -p victory-pipeline
+    -p victory-game -p victory-loader -p victory-shader -p victory-gpu
+    -p victory-hle -p victory
+
+jobs:
+  # Each job's name repeats its id, so the check names that branch protection
+  # requires stay `linux` and `windows-target-check`; zizmor's auditor
+  # persona (below) flags unnamed jobs.
+  # Both jobs pin the runner image's Ubuntu release rather than
+  # `ubuntu-latest`, like the action and tool pins: the alias moves to a new
+  # release (new preinstalled rustup, curl, tar, coreutils, ...) under us, so
+  # a passing PR could fail on main with no change. Bump it deliberately.
+  linux:
+    name: linux
+    runs-on: ubuntu-24.04
+    # checkout, plus zizmor's online audits (impostor commits, advisories).
+    permissions:
+      contents: read
+    timeout-minutes: 30
+    steps:
+      # Nothing here pushes; keep the token out of .git/config.
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+        with:
+          persist-credentials: false
+
+      # Every step here, and the rust-cache key, trusts rust-toolchain.toml to
+      # name one exact release. A channel of `stable` (or `beta`, `nightly`,
+      # a bare `1.98`) still installs and passes, but floats to whatever is
+      # newest that day: new lints fail a PR that changed nothing, and main
+      # and a PR build with different compilers. A `path` toolchain is a
+      # local directory the runner does not have, and a legacy
+      # `rust-toolchain` file next to it would take precedence over the
+      # .toml in rustup. The pin must also be no older than the workspace's
+      # rust-version, or the msrv job checks with a compiler newer than the
+      # one every other step uses. Read with the runner's Python 3 tomllib
+      # (-I: no site packages, no cwd on sys.path) before rustup reads it.
+      - name: Toolchain pin is one exact release
+        run: |
+          python3 -I - <<'EOF'
+          import os, re, sys, tomllib
+
+          def load(path):
+              with open(path, "rb") as f:
+                  return tomllib.load(f)
+
+          failed = False
+          if os.path.lexists("rust-toolchain"):
+              print("::error file=rust-toolchain::legacy toolchain file overrides rust-toolchain.toml", file=sys.stderr)
+              failed = True
+          toolchain = load("rust-toolchain.toml").get("toolchain", {})
+          channel = toolchain.get("channel")
+          pin = re.fullmatch(r"(\d+)\.(\d+)\.(\d+)", channel) if isinstance(channel, str) else None
+          if pin is None:
+              print(f"::error file=rust-toolchain.toml::channel {channel!r} is not an exact release (MAJOR.MINOR.PATCH)", file=sys.stderr)
+              failed = True
+          if "path" in toolchain:
+              print("::error file=rust-toolchain.toml::toolchain names a local path", file=sys.stderr)
+              failed = True
+          msrv = load("Cargo.toml").get("workspace", {}).get("package", {}).get("rust-version", "")
+          floor = re.fullmatch(r"(\d+)\.(\d+)(?:\.(\d+))?", msrv) if isinstance(msrv, str) else None
+          if floor is None:
+              print(f"::error file=Cargo.toml::unexpected workspace rust-version {msrv!r}", file=sys.stderr)
+              failed = True
+          elif pin is not None:
+              have = tuple(int(g) for g in pin.groups())
+              need = tuple(int(g or 0) for g in floor.groups())
+              if have < need:
+                  print(f"::error file=rust-toolchain.toml::channel {channel} is older than the workspace rust-version {msrv}", file=sys.stderr)
+                  failed = True
+          if failed:
+              sys.exit(1)
+          print(f"Pinned toolchain {channel}, rust-version {msrv}")
+          EOF
+
+      # rustup is preinstalled; this installs the toolchain pinned in
+      # rust-toolchain.toml (with clippy and rustfmt). --no-self-update keeps
+      # the runner image's rustup as is: otherwise rustup replaces itself
+      # with whatever release is newest that day, unpinned and mid-job.
+      - name: Install pinned toolchain
+        run: rustup toolchain install --no-self-update
+
+      # Save the cache only from main: PR runs restore it but do not write
+      # their own entries, which would evict main's from the 10 GB quota.
+      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
+        with:
+          save-if: ${{ github.ref == 'refs/heads/main' }}
+
+      # Spelled out rather than the `cargo xtask` alias (`run --package xtask
+      # --`), which has no room for --locked: this is the job's first cargo
+      # command, and without it a Cargo.lock out of date with the manifests
+      # would be rewritten here, so every later `--locked` step would check
+      # against the rewritten file and pass.
+      - name: Asset policy
+        run: cargo run --locked --quiet --package xtask -- policy
+
+      # The crate lists above are written out by hand, so a workspace member
+      # added later would silently get no clippy or rustdoc at all. Fail
+      # instead: every member but the host-only xtask must be in both Windows
+      # lists (which say they hold every member but xtask), and xtask, which
+      # nothing else lints, must be in LINUX_CRATES. Every LINUX_CRATES crate
+      # must also be in RUSTDOC_CRATES (which says it holds them all), so one
+      # moved onto Linux CI gets its rustdoc lints too. Lists may still name
+      # fewer crates on purpose (LINUX_CRATES, RUSTFMT_CRATES, ...).
+      - name: Crate lists cover the workspace
+        run: |
+          metadata="$(cargo metadata --locked --no-deps --format-version 1)"
+          names="$(jq -r '.packages[].name' <<< "${metadata}")"
+          mapfile -t members <<< "${names}"
+          if [[ "${#members[@]}" -lt 2 ]]; then
+            echo "::error::cargo metadata listed no workspace members" >&2
+            exit 1
+          fi
+          declare -A linux=() clippy=() rustdoc=() linux_rustdoc=()
+          read -r -a args <<< "${LINUX_CRATES}"
+          for a in "${args[@]}"; do linux["${a}"]=1; done
+          read -r -a args <<< "${RUSTDOC_CRATES}"
+          for a in "${args[@]}"; do linux_rustdoc["${a}"]=1; done
+          read -r -a args <<< "${WINDOWS_CLIPPY_CRATES}"
+          for a in "${args[@]}"; do clippy["${a}"]=1; done
+          read -r -a args <<< "${WINDOWS_RUSTDOC_CRATES}"
+          for a in "${args[@]}"; do rustdoc["${a}"]=1; done
+          missing=0
+          read -r -a args <<< "${LINUX_CRATES}"
+          for c in "${args[@]}"; do
+            if [[ "${c}" != -p && ! -v linux_rustdoc["${c}"] ]]; then
+              echo "::error::LINUX_CRATES member ${c} is not in RUSTDOC_CRATES" >&2
+              missing=1
+            fi
+          done
+          for m in "${members[@]}"; do
+            if [[ "${m}" == xtask ]]; then
+              if [[ ! -v linux["${m}"] ]]; then
+                echo "::error::xtask is not in LINUX_CRATES" >&2
+                missing=1
+              fi
+              continue
+            fi
+            if [[ ! -v clippy["${m}"] ]]; then
+              echo "::error::workspace member ${m} is not in WINDOWS_CLIPPY_CRATES" >&2
+              missing=1
+            fi
+            if [[ ! -v rustdoc["${m}"] ]]; then
+              echo "::error::workspace member ${m} is not in WINDOWS_RUSTDOC_CRATES" >&2
+              missing=1
+            fi
+          done
+          if [[ "${missing}" -ne 0 ]]; then
+            exit 1
+          fi
+          printf 'Covered: %s\n' "${members[@]}"
+
+      # The clippy and rustdoc steps lint with whatever `[lints]` each crate
+      # declares, so a member added (or edited) without `[lints] workspace =
+      # true` silently drops `undocumented_unsafe_blocks`,
+      # `unsafe_op_in_unsafe_fn = deny`, ... and still passes. The hle-probe
+      # fixture is outside the workspace and repeats those lints by hand
+      # ("keep the two in step"); fail when the copies drift apart. cargo
+      # metadata does not report lints, so the manifests are read with the
+      # runner's Python 3 tomllib (-I: no site packages, no cwd on sys.path).
+      # The same goes for the [workspace.package] fields every member
+      # inherits today: a member that spells out its own `edition` (or
+      # `license`, `publish`) instead of `.workspace = true` drifts unseen
+      # when the root one is bumped, so each must be inherited, and the
+      # fixture's hand-written copies must match the root's.
+      - name: Workspace lints and package fields apply everywhere
+        run: |
+          metadata="$(cargo metadata --locked --no-deps --format-version 1)"
+          manifests="$(jq -r '.packages[].manifest_path' <<< "${metadata}")"
+          mapfile -t manifest_list <<< "${manifests}"
+          python3 -I - Cargo.toml tests/fixtures/hle-probe/Cargo.toml "${manifest_list[@]}" <<'EOF'
+          import sys, tomllib
+
+          def load(path):
+              with open(path, "rb") as f:
+                  return tomllib.load(f)
+
+          root, fixture, *members = sys.argv[1:]
+          want = load(root).get("workspace", {}).get("lints")
+          inherited = ("edition", "license", "publish")
+          root_package = load(root).get("workspace", {}).get("package", {})
+          failed = False
+          for key in inherited:
+              if key not in root_package:
+                  print(f"::error::root Cargo.toml has no [workspace.package] {key}", file=sys.stderr)
+                  failed = True
+          if not want:
+              print("::error::root Cargo.toml has no [workspace.lints]", file=sys.stderr)
+              failed = True
+          if len(members) < 2:
+              print("::error::cargo metadata listed no workspace members", file=sys.stderr)
+              failed = True
+          for m in members:
+              manifest = load(m)
+              if manifest.get("lints") != {"workspace": True}:
+                  print(f"::error file={m}::[lints] must be exactly `workspace = true`", file=sys.stderr)
+                  failed = True
+              package = manifest.get("package", {})
+              for key in inherited:
+                  if package.get(key) != {"workspace": True}:
+                      print(f"::error file={m}::[package] {key} must be `{key}.workspace = true`", file=sys.stderr)
+                      failed = True
+          fixture_manifest = load(fixture)
+          if fixture_manifest.get("lints") != want:
+              print(f"::error file={fixture}::[lints] differs from the root [workspace.lints]", file=sys.stderr)
+              failed = True
+          fixture_package = fixture_manifest.get("package", {})
+          for key in inherited:
+              if fixture_package.get(key) != root_package.get(key):
+                  print(f"::error file={fixture}::[package] {key} differs from the root [workspace.package] {key}", file=sys.stderr)
+                  failed = True
+          if failed:
+              sys.exit(1)
+          print(f"Workspace lints and {', '.join(inherited)} on {len(members)} members and the hle-probe fixture")
+          EOF
+
+      # Every dependency today is a checksummed crates.io release. A git
+      # dependency (or a `[patch]` pointing at one), a path dependency outside
+      # the repository, or a crate from another registry or a source
+      # replacement would build and pass every step here, while pulling code
+      # that is neither checksummed nor reviewable from Cargo.lock, so fail on
+      # one instead. Both lockfiles are read with tomllib, without the
+      # network: each package must either have no source and be a workspace
+      # member (the fixture's lock: the fixture itself), or come from the
+      # crates.io index with a checksum. The root manifest and the cargo
+      # config must not redirect sources with [patch], [replace], [source]
+      # or [registries].
+      - name: Dependencies come only from crates.io
+        run: |
+          metadata="$(cargo metadata --locked --no-deps --format-version 1)"
+          names="$(jq -r '.packages[].name' <<< "${metadata}")"
+          mapfile -t members <<< "${names}"
+          python3 -I - "${members[@]}" <<'EOF'
+          import sys, tomllib
+
+          def load(path):
+              with open(path, "rb") as f:
+                  return tomllib.load(f)
+
+          crates_io = {
+              "registry+https://github.com/rust-lang/crates.io-index",
+              "sparse+https://index.crates.io/",
+          }
+          members = set(sys.argv[1:])
+          failed = False
+          if len(members) < 2:
+              print("::error::cargo metadata listed no workspace members", file=sys.stderr)
+              failed = True
+          fixture = "tests/fixtures/hle-probe"
+          fixture_name = load(f"{fixture}/Cargo.toml")["package"]["name"]
+          counted = 0
+          for lock, local in (("Cargo.lock", members), (f"{fixture}/Cargo.lock", {fixture_name})):
+              packages = load(lock).get("package", [])
+              if not packages:
+                  print(f"::error file={lock}::no [[package]] entries", file=sys.stderr)
+                  failed = True
+              for p in packages:
+                  counted += 1
+                  name, source = p["name"], p.get("source")
+                  if source is None:
+                      if name not in local:
+                          print(f"::error file={lock}::{name} has no source but is not a workspace member (path dependency outside the workspace?)", file=sys.stderr)
+                          failed = True
+                  elif source not in crates_io:
+                      print(f"::error file={lock}::{name} comes from {source}, not crates.io", file=sys.stderr)
+                      failed = True
+                  elif not p.get("checksum"):
+                      print(f"::error file={lock}::{name} from crates.io has no checksum", file=sys.stderr)
+                      failed = True
+          for path, keys in (
+              ("Cargo.toml", ("patch", "replace")),
+              (f"{fixture}/Cargo.toml", ("patch", "replace")),
+              (".cargo/config.toml", ("patch", "source", "registries")),
+          ):
+              found = [k for k in keys if k in load(path)]
+              if found:
+                  print(f"::error file={path}::redirects dependency sources with [{'], ['.join(found)}]", file=sys.stderr)
+                  failed = True
+          if failed:
+              sys.exit(1)
+          print(f"{counted} locked packages: workspace members or checksummed crates.io releases")
+          EOF
+
+      # .gitattributes stores every text file with LF (`text=auto eol=lf`;
+      # *.cmd and *.ps1 get CRLF only in the working tree). That applies only
+      # when git normalises the file at `git add`: a file committed with
+      # core.autocrlf=false from a Windows editor, or one added before the
+      # attribute, keeps its CRLFs in the index, and every Linux checkout
+      # then shows it modified. Fail on any tracked file whose stored copy
+      # has CRLF or mixed endings (`git ls-files --eol`, index column).
+      # Merge-conflict markers left in a resolved file do not always break
+      # the build (a comment, a doc, a workflow, a fixture), so fail on those
+      # too: `<<<<<<< `, `||||||| ` or `>>>>>>> ` opening a line in any
+      # tracked text file. A bare `=======` is left alone; it is also a
+      # Markdown heading underline.
+      # Trailing spaces or tabs, and a last line with no newline, are clean
+      # everywhere on main too, but only the rustfmt-clean packages are
+      # checked by rustfmt; the rest (workflows, TOML, docs, the crates
+      # rustfmt skips) pick up whitespace-only diff noise unseen. Both are
+      # read from the index (`git grep --cached`, the `--eol` list), so a
+      # CRLF working-tree copy (*.cmd, *.ps1) cannot trip or hide either.
+      # A UTF-8 byte-order mark (U+FEFF, which Notepad and some Visual Studio
+      # setups write) is invisible in an editor and in a diff, but it is not
+      # whitespace to the check above: at the top of a file it hides a
+      # script's `#!` line (the kernel, the file-mode step below and the
+      # ShellCheck list all look for `#!` at byte 0) and shows as a mystery
+      # first-line change in review. Mid-file it is a stray zero-width
+      # character. Fail on it anywhere in a tracked text file; Rust source
+      # that needs the character can spell it `\u{feff}`.
+      - name: LF line endings, no conflict markers, no stray whitespace or BOMs
+        run: |
+          list="${RUNNER_TEMP}/eol"
+          git ls-files -z --eol > "${list}"
+          bad=()
+          no_final_newline=()
+          while IFS= read -r -d '' entry; do
+            index_eol="${entry%% *}"
+            path="${entry#*$'\t'}"
+            if [[ "${index_eol}" == i/crlf || "${index_eol}" == i/mixed ]]; then
+              bad+=("${path}")
+            fi
+            # i/-text is binary; an empty file has nothing to end.
+            if [[ "${index_eol}" != i/-text ]]; then
+              last="$(git cat-file blob ":${path}" | tail -c 1)"
+              if [[ -n "${last}" ]]; then
+                no_final_newline+=("${path}")
+              fi
+            fi
+          done < "${list}"
+          if [[ "${#bad[@]}" -ne 0 ]]; then
+            echo "::error::tracked files stored with CRLF line endings (re-add them with git add --renormalize)" >&2
+            printf '%s\n' "${bad[@]}" >&2
+            exit 1
+          fi
+          if [[ "${#no_final_newline[@]}" -ne 0 ]]; then
+            echo "::error::tracked text files whose last line has no newline" >&2
+            printf '%s\n' "${no_final_newline[@]}" >&2
+            exit 1
+          fi
+          # git grep exits 1 when nothing matches; any other failure stops.
+          trailing="$(git grep --cached -nIE -e '[[:blank:]]+$')" || [[ $? -eq 1 ]]
+          if [[ -n "${trailing}" ]]; then
+            echo "::error::trailing spaces or tabs in tracked files" >&2
+            printf '%s\n' "${trailing}" >&2
+            exit 1
+          fi
+          # git grep exits 1 when nothing matches; any other failure stops.
+          bom="$(git grep --cached -nIF -e $'\xEF\xBB\xBF')" || [[ $? -eq 1 ]]
+          if [[ -n "${bom}" ]]; then
+            echo "::error::UTF-8 byte-order marks (U+FEFF) in tracked text files" >&2
+            printf '%s\n' "${bom}" >&2
+            exit 1
+          fi
+          # git grep exits 1 when nothing matches; any other failure stops.
+          markers="$(git grep -nIE -e '^(<{7}|[|]{7}|>{7})( |$)')" || [[ $? -eq 1 ]]
+          if [[ -n "${markers}" ]]; then
+            echo "::error::merge-conflict markers in tracked files" >&2
+            printf '%s\n' "${markers}" >&2
+            exit 1
+          fi
+
+      # Git records two file modes that a Linux checkout honours and a Windows
+      # one does not. A symlink (mode 120000) is checked out on Windows, where
+      # core.symlinks is off by default, as a plain text file holding the
+      # target path, so the two platforms build different trees; nothing here
+      # needs one, so fail on any. An executable bit (100755) on a file that
+      # is not a script is usually an accident from a Linux, WSL or mounted-
+      # NTFS editor and shows as mode noise in every diff; fail on executable
+      # files that do not start with `#!`. Read from the index (`git ls-files
+      # -s`), not the checkout, so the runner's umask cannot hide either.
+      - name: Portable file modes
+        run: |
+          list="${RUNNER_TEMP}/modes"
+          git ls-files -z -s > "${list}"
+          links=()
+          stray_exec=()
+          while IFS= read -r -d '' entry; do
+            mode="${entry%% *}"
+            path="${entry#*$'\t'}"
+            case "${mode}" in
+              120000) links+=("${path}") ;;
+              100755)
+                magic="$(head -c 2 -- "${path}")"
+                if [[ "${magic}" != '#!' ]]; then
+                  stray_exec+=("${path}")
+                fi
+                ;;
+              *) ;;
+            esac
+          done < "${list}"
+          failed=0
+          if [[ "${#links[@]}" -ne 0 ]]; then
+            echo "::error::tracked symlinks (Windows checkouts get a text file instead)" >&2
+            printf '%s\n' "${links[@]}" >&2
+            failed=1
+          fi
+          if [[ "${#stray_exec[@]}" -ne 0 ]]; then
+            echo "::error::executable files without a #! line (git update-index --chmod=-x)" >&2
+            printf '%s\n' "${stray_exec[@]}" >&2
+            failed=1
+          fi
+          if [[ "${failed}" -ne 0 ]]; then
+            exit 1
+          fi
+
+      # Path names that a Linux checkout accepts and a Windows one cannot
+      # hold. NTFS is case-insensitive, so two tracked paths that differ only
+      # in case (`Foo.rs`, `foo.rs`) collapse into one file there and the
+      # checkout shows a permanent spurious change. Windows also refuses a
+      # path component that holds `< > : " | ? *`, a backslash or a control
+      # character, that ends in a dot or a space, or whose name before the
+      # first dot is a reserved device (CON, PRN, AUX, NUL, COM0-9, LPT0-9,
+      # any case): `git checkout` there fails outright. Read from the index,
+      # NUL-delimited, so no name can split; the comparison runs under the
+      # C locale so it folds ASCII case only, as the check is meant to.
+      - name: Portable file names
+        env:
+          LC_ALL: C
+        run: |
+          list="${RUNNER_TEMP}/names"
+          git ls-files -z > "${list}"
+          bad=()
+          declare -A seen=()
+          collide=()
+          reserved='^(con|prn|aux|nul|com[0-9]|lpt[0-9])$'
+          while IFS= read -r -d '' path; do
+            # Walk every prefix (each directory, then the file), so `Src/a`
+            # and `src/b` collide too, not only whole paths.
+            prefix=""
+            rest="${path}"
+            flagged=0
+            while [[ -n "${rest}" ]]; do
+              part="${rest%%/*}"
+              if [[ "${rest}" == */* ]]; then
+                rest="${rest#*/}"
+              else
+                rest=""
+              fi
+              prefix="${prefix:+${prefix}/}${part}"
+              lower="${prefix,,}"
+              if [[ -z "${seen[${lower}]+set}" ]]; then
+                seen["${lower}"]="${prefix}"
+              elif [[ "${seen[${lower}]}" != "${prefix}" ]]; then
+                collide+=("${seen[${lower}]} <-> ${prefix}")
+              fi
+              stem="${part%%.*}"
+              if [[ "${flagged}" -eq 0 ]] \
+                && { [[ "${part}" =~ [\<\>:\"\|?*\\[:cntrl:]] ]] \
+                  || [[ "${part}" == *. || "${part}" == *' ' ]] \
+                  || [[ "${stem,,}" =~ ${reserved} ]]; }; then
+                bad+=("${path}")
+                flagged=1
+              fi
+            done
+          done < "${list}"
+          failed=0
+          if [[ "${#collide[@]}" -ne 0 ]]; then
+            echo "::error::tracked paths that differ only in case (one file on Windows)" >&2
+            printf '%s\n' "${collide[@]}" | sort -u >&2
+            failed=1
+          fi
+          if [[ "${#bad[@]}" -ne 0 ]]; then
+            echo "::error::tracked paths Windows cannot check out (reserved name, character, or trailing dot or space)" >&2
+            printf '%s\n' "${bad[@]}" >&2
+            failed=1
+          fi
+          if [[ "${failed}" -ne 0 ]]; then
+            exit 1
+          fi
+      # Lints all workflows: expression and context typos, unknown keys, and
+      # (via ShellCheck) the `run:` scripts, which YAML parsing alone never
+      # checks. actionlint silently skips the shell checks when shellcheck is
+      # not on PATH, and the runner image's shellcheck changes version under
+      # us, so a pinned ShellCheck release is downloaded and passed explicitly
+      # instead: the same checks run on every runner image, and a missing
+      # binary fails the step rather than skipping the checks. Both releases
+      # are pinned and their checksums verified, like the actions above.
+      # Every download (here and in zizmor below) is HTTPS-only, redirects
+      # included (--proto =https), with TLS 1.2 or newer. Each attempt is
+      # capped (--connect-timeout, --max-time): a stalled release download
+      # fails and is retried within minutes instead of holding the job until
+      # its 30-minute timeout.
+      # pyflakes is off: no step runs Python.
+      # SHELLCHECK_OPTS turns on ShellCheck's optional checks (masked return
+      # codes, `set -e` suppressed in functions, unassigned uppercase vars,
+      # `[[ ]]` over `[ ]`, `${var}` over `$var`, useless `cat`, ...) for the
+      # `run:` scripts. Every optional check of the pinned release is listed
+      # and passes (`shellcheck --list-optional`); they are named rather than
+      # `--enable=all` so bumping ShellCheck cannot add one unseen.
+      # --norc: a `.shellcheckrc` (committed, or added by a PR) cannot
+      # quietly disable checks or drop these optional ones; disabling a check
+      # takes an inline `# shellcheck disable=` next to the code, in review.
+      # -config-file /dev/null does the same for actionlint's own config: a
+      # `.github/actionlint.yaml` (or .yml) can `ignore:` any error by regex,
+      # which actionlint otherwise picks up silently.
+      # actionlint only sees `run:` scripts, so the same ShellCheck (same
+      # SHELLCHECK_OPTS, which ShellCheck reads itself) then lints the
+      # standalone scripts too: the git hooks, any tracked *.sh / *.bash, and
+      # any tracked text file whose first line is a sh/bash/dash/ksh shebang
+      # (a script with no extension, e.g. under scripts/). The list comes
+      # from git, so a script added later is checked without editing this
+      # step; the step fails if the list is empty, rather than passing while
+      # checking nothing. File names are NUL-delimited end to end, so no name
+      # (spaces, newlines, a leading `-`) can split, glob or become a flag.
+      - name: actionlint + ShellCheck
+        env:
+          SHELLCHECK_OPTS: >-
+            --norc
+            --enable=add-default-case,avoid-negated-conditions,avoid-nullary-conditions,check-extra-masked-returns,check-set-e-suppressed,check-unassigned-uppercase,deprecate-which,quote-safe-variables,require-double-brackets,require-variable-braces,useless-use-of-cat
+          SHELLCHECK_VERSION: 0.11.0
+          SHELLCHECK_SHA256: 8c3be12b05d5c177a04c29e3c78ce89ac86f1595681cab149b65b97c4e227198
+          ACTIONLINT_VERSION: 1.7.12
+          ACTIONLINT_SHA256: 8aca8db96f1b94770f1b0d72b6dddcb1ebb8123cb3712530b08cc387b349a3d8
+        run: |
+          cd "${RUNNER_TEMP}"
+          sc_tarball="shellcheck-v${SHELLCHECK_VERSION}.linux.x86_64.tar.xz"
+          curl -sSfL --proto =https --tlsv1.2 --retry 3 --connect-timeout 20 --max-time 300 -O "https://github.com/koalaman/shellcheck/releases/download/v${SHELLCHECK_VERSION}/${sc_tarball}"
+          echo "${SHELLCHECK_SHA256}  ${sc_tarball}" | sha256sum -c -
+          tar xJf "${sc_tarball}" --strip-components=1 "shellcheck-v${SHELLCHECK_VERSION}/shellcheck"
+          shellcheck_bin="${RUNNER_TEMP}/shellcheck"
+          "${shellcheck_bin}" --version
+          tarball="actionlint_${ACTIONLINT_VERSION}_linux_amd64.tar.gz"
+          curl -sSfL --proto =https --tlsv1.2 --retry 3 --connect-timeout 20 --max-time 300 -O "https://github.com/rhysd/actionlint/releases/download/v${ACTIONLINT_VERSION}/${tarball}"
+          echo "${ACTIONLINT_SHA256}  ${tarball}" | sha256sum -c -
+          tar xzf "${tarball}" actionlint
+          cd "${GITHUB_WORKSPACE}"
+          "${RUNNER_TEMP}/actionlint" -color -config-file /dev/null -shellcheck="${shellcheck_bin}" -pyflakes=
+          list="${RUNNER_TEMP}/shell-scripts"
+          git ls-files -z -- '.githooks/*' '*.sh' '*.bash' > "${list}"
+          # git grep exits 1 when nothing matches; any other failure stops.
+          git grep -lzI -e '^#!' > "${list}.candidates" || [[ $? -eq 1 ]]
+          shebang_re='^#![[:space:]]*(/usr)?/bin/(env[[:space:]]+)?(ba|da|k)?sh([[:space:]]|$)'
+          while IFS= read -r -d '' f; do
+            first_line="$(head -n 1 -- "${f}")"
+            if [[ "${first_line}" =~ ${shebang_re} ]]; then
+              printf '%s\0' "${f}" >> "${list}"
+            fi
+          done < "${list}.candidates"
+          sort -zu -o "${list}" -- "${list}"
+          mapfile -d '' -t script_list < "${list}"
+          if [[ "${#script_list[@]}" -eq 0 ]]; then
+            echo "::error::no shell scripts found to check" >&2
+            exit 1
+          fi
+          printf 'ShellCheck: %s\n' "${script_list[@]}"
+          "${shellcheck_bin}" -- "${script_list[@]}"
+
+      # Security audit of the workflows, which actionlint does not do:
+      # template injection in `run:` scripts, credentials persisted by
+      # checkout, over-broad permissions, cache poisoning, unpinned actions.
+      # With the job's read-only token it also checks online that each pinned
+      # SHA really is a commit of the action's repository (impostor commits)
+      # and that no pinned version has a known advisory. Pinned and
+      # checksum-verified like actionlint; exits non-zero on any finding.
+      # The auditor persona runs every audit at every confidence: the
+      # code-quality ones the default persona hides (unnamed jobs, ...) and
+      # the low-confidence ones pedantic still drops. Every one passes today.
+      # --strict-collection fails on a workflow zizmor cannot parse, which it
+      # otherwise only warns about and skips, auditing nothing in it.
+      # --no-config: a `zizmor.yml` or `.github/zizmor.yml` (committed, or
+      # added by a PR) cannot disable audits or loosen the pin policy unseen;
+      # silencing a finding takes an inline `# zizmor: ignore[...]`, in review.
+      - name: zizmor
+        env:
+          ZIZMOR_VERSION: 1.32.0
+          ZIZMOR_SHA256: bb110cc765eca9cd7efb2e284a956be5974c60027b0970f16397d86208a9957b
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          tarball="zizmor-x86_64-unknown-linux-gnu.tar.gz"
+          cd "${RUNNER_TEMP}"
+          curl -sSfL --proto =https --tlsv1.2 --retry 3 --connect-timeout 20 --max-time 300 -O "https://github.com/zizmorcore/zizmor/releases/download/v${ZIZMOR_VERSION}/${tarball}"
+          echo "${ZIZMOR_SHA256}  ${tarball}" | sha256sum -c -
+          tar xzf "${tarball}" zizmor
+          cd "${GITHUB_WORKSPACE}"
+          "${RUNNER_TEMP}/zizmor" --color=always --persona=auditor --strict-collection --no-config .github/workflows
+
+      # Fast, needs no build: keep the clean packages clean. load_probe.rs is
+      # checked by itself, since the rest of victory-loader is not clean yet.
+      - name: rustfmt (clean packages)
+        run: |
+          read -r -a crates <<< "${RUSTFMT_CRATES}"
+          cargo fmt --check "${crates[@]}"
+          rustfmt --check --edition 2024 crates/victory-loader/tests/load_probe.rs
+
+      - name: clippy (all targets)
+        run: |
+          read -r -a crates <<< "${LINUX_CRATES}"
+          cargo clippy --all-targets --locked "${crates[@]}" -- -D warnings
+
+      # The steps above build default features only, so code behind the
+      # `diagnostics` (and victory-shader's `host`) features is never compiled.
+      # Lint it too. Both builds stay: some code is cfg(not(feature = ...)).
+      - name: clippy (all features)
+        run: |
+          read -r -a crates <<< "${LINUX_CRATES}"
+          cargo clippy --all-targets --all-features --locked "${crates[@]}" -- -D warnings
+
+      # Every step builds its crates together, so Cargo unifies their
+      # features: a crate that uses a dependency's feature (one of serde's,
+      # object's, windows-sys's, ...) without enabling it in its own
+      # Cargo.toml still builds, because a sibling enables it, and breaks only
+      # when built alone (`cargo test -p` it, or a downstream user). Check
+      # each crate by itself, with default features and with all of its own.
+      # Lints stay with clippy above; this only fails on build errors.
+      - name: cargo check (each crate on its own)
+        run: |
+          read -r -a crates <<< "${LINUX_CRATES}"
+          for ((i = 1; i < ${#crates[@]}; i += 2)); do
+            cargo check --locked --quiet --all-targets -p "${crates[i]}"
+            cargo check --locked --quiet --all-targets --all-features -p "${crates[i]}"
+          done
+
+      # Doc tests run under `cargo test` below, but rustdoc's own lints (a
+      # renamed item leaving a dangling [`link`], a public doc linking to a
+      # private item) only fire when the docs are built. Private items are
+      # documented too, so their doc comments (most of the code's) are linted
+      # as well; a public doc linking to a private item still fails. The
+      # second run turns every feature on, so the doc comments on `diagnostics`
+      # (and victory-shader's `host`) code are linted too.
+      - name: rustdoc (clean crates)
+        env:
+          RUSTDOCFLAGS: -D warnings
+        run: |
+          read -r -a crates <<< "${RUSTDOC_CRATES}"
+          cargo doc --no-deps --locked --document-private-items "${crates[@]}"
+          cargo doc --no-deps --locked --document-private-items --all-features "${crates[@]}"
+
+      # The skipped tests parse the test executable itself as a PE image, which
+      # is an ELF on Linux. They still run on Windows. Once the workspace's
+      # Linux gates land they are cfg(windows) and these --skip flags are no-ops.
+      # --no-fail-fast: report failures from every test binary, not the first.
+      # The second run turns every feature on, like the clippy and rustdoc
+      # steps: `diagnostics` changes what some code does (victory-core's log
+      # cap, victory-shader's loop limit read from the environment), so the
+      # tests must pass with it too, not only compile.
+      # Two more runs build the tests the way the game itself is built: the
+      # release profile (what ships), and the diag profile with every feature
+      # (the development build, `--profile diag --features diagnostics`). Both
+      # optimise and drop debug assertions and overflow checks, which the dev
+      # profile above keeps: an invariant held only by a debug_assert (the
+      # shader IR and bitcode writer have several), arithmetic that panics in
+      # debug but wraps in release, or unsafe code (the loader's, the PE
+      # parser's) whose undefined behaviour only shows once the optimiser
+      # relies on it would otherwise pass here and misbehave only in a real
+      # build. Each adds one optimised build of the crates, well under the
+      # job's timeout.
+      # The release run also uses --test-threads 1: the runner compiles with as
+      # many cores as cargo wants, but each test binary then runs one test at
+      # a time, so a test that races on a shared static, a temp file under
+      # TMPDIR, or an OS-global resource can still pass under the default
+      # parallel harness on a fast machine and fail under Wine or in a
+      # debugger, where timing differs. One ordered pass is enough; the other
+      # three runs keep the default threading so nothing only fails in release.
+      # All four runs get a fresh, empty TMPDIR (std::env::temp_dir() reads it), so
+      # a test that leaves scratch files behind fails here: the checkout check
+      # below never sees the temp dir, and on a contributor's machine the
+      # leftovers pile up in /tmp with every run. rustc and the linker clean
+      # up their own temp files there, so the directory must end up empty.
+      # HOME is a fresh, empty directory too, with the XDG base directories
+      # unset: victory-core's config falls back to $XDG_CACHE_HOME or
+      # ~/.cache for its cache and data, so a test that resolves the default
+      # config instead of passing its own paths would read a contributor's
+      # real cache (game data included) and write into it, passing there and
+      # nowhere else. Anything a test leaves in that HOME fails the step as
+      # well. rustup and cargo keep their own homes: both are pinned to where
+      # they were before HOME moves, so the toolchain and the registry cache
+      # are the ones the steps above used.
+      # Both directories sit under one whose name has a space and a non-ASCII
+      # letter, as a contributor's may ("/home/zoë/My Files"). The runner's
+      # own paths are plain ASCII with no spaces, so a test that splits a
+      # temp path on whitespace, passes it unquoted through a shell, or
+      # assumes it is ASCII would otherwise pass here and fail for them.
+      # All four also have no network: they run in a new network namespace
+      # (unshare, as the runner user, so permission checks still apply) that
+      # holds only a downed loopback, with CARGO_NET_OFFLINE set. A test or
+      # build script that downloads something (a fixture, a reference file)
+      # passes here only by luck of the network and fails for anyone offline
+      # or behind a proxy; this makes it fail every time instead. The steps
+      # above already fetched every dependency, all features included, into
+      # CARGO_HOME. Ubuntu 24.04 lets unprivileged users create user
+      # namespaces only after an AppArmor sysctl is lifted, so lift it first
+      # (on this throwaway runner) and fail loudly if unshare still cannot.
+      # All four also start from an empty environment (env -i) that keeps
+      # only what Cargo, rustup and the linker need, plus the settings above.
+      # The runner exports dozens of variables a contributor's shell never
+      # has (CI, GITHUB_*, RUNNER_*, ImageOS, a UTF-8 LANG), and a
+      # contributor's shell has ones the runner never does (VICTORY_LOG,
+      # RUST_LOG, VICTORY_CONFIG, LOCALAPPDATA, LC_ALL): a test that reads
+      # any of them, directly or through a default it resolves, passes in
+      # one place and fails in the other. With none of them set, a test sees
+      # the same environment here as under `env -i` locally. A kept variable
+      # that is unset becomes empty rather than going missing, which would
+      # change what Cargo and rustup do, so only set ones are passed on.
+      # LC_ALL=C is kept explicitly (the runner has a UTF-8 LANG, a contributor
+      # may have another): libc collation, character classes and strerror
+      # strings then match a POSIX locale everywhere.
+      # All four also run under umask 077, not the runner's 022, so every
+      # file and directory a test or build script makes is private to its
+      # owner, as on a contributor's machine set up that way (a hardened
+      # distro default, or a shared box). A test that has another process
+      # read back what it wrote as a different mode, compares the mode of a
+      # file it made against 0644 or 0755, or copies a file's permissions
+      # and expects group or world bits would otherwise pass here and fail
+      # there. The umask is inherited through unshare and env -i, and
+      # checked inside them, so the tests see exactly it.
+      # #[ignore] tests never run in the four runs above, nor anywhere else
+      # unless someone asks for them by name, so they rot unseen: a benchmark
+      # that unwraps an API it no longer matches still compiles and still
+      # "passes" by being skipped. The ones that need nothing from outside
+      # the repository (the synthetic benchmarks in IGNORED_HERMETIC) run
+      # here too, once, in the release profile they are written for; their
+      # timings are only printed, so a slow runner cannot fail them. The
+      # rest (IGNORED_EXTERNAL) read game data or reference files named by
+      # environment variables and cannot run here. Every ignored test in the
+      # Linux crates must be on exactly one of the two lists in all four
+      # build passes above (default, all-features, release, diag), so a
+      # cfg(feature) or profile-only benchmark cannot hide from the lists, a
+      # new one is either run or says why it cannot be, and a renamed or
+      # deleted one cannot leave a stale entry behind.
+      - name: cargo test
+        env:
+          IGNORED_HERMETIC: >-
+            bcpack::tests::bcpack_throughput
+            emit::bitcode::tests::bench_write
+          IGNORED_EXTERNAL: >-
+            bcpack::tests::reference_chunks
+            xma::tests::matches_a_reference_decoder
+            xma::tests::walks_saved_streams
+        run: |
+          userns=/proc/sys/kernel/apparmor_restrict_unprivileged_userns
+          if [[ -e "${userns}" && "$(< "${userns}")" != 0 ]]; then
+            sudo sysctl -q -w kernel.apparmor_restrict_unprivileged_userns=0
+          fi
+          umask 077
+          export CARGO_NET_OFFLINE=true
+          export CARGO_HOME="${CARGO_HOME:-${HOME}/.cargo}"
+          export RUSTUP_HOME="${RUSTUP_HOME:-${HOME}/.rustup}"
+          scratch="${RUNNER_TEMP}/cargo test ä"
+          export HOME="${scratch}/home"
+          mkdir -p "${HOME}"
+          unset XDG_CACHE_HOME XDG_CONFIG_HOME XDG_DATA_HOME XDG_STATE_HOME
+          export TMPDIR="${scratch}/tmp"
+          mkdir "${TMPDIR}"
+          export LC_ALL=C
+          keep=()
+          for name in PATH HOME TMPDIR CARGO_HOME RUSTUP_HOME CARGO_NET_OFFLINE \
+            CARGO_TERM_COLOR CARGO_INCREMENTAL RUST_BACKTRACE LC_ALL; do
+            if [[ -v "${name}" ]]; then
+              keep+=("${name}=${!name}")
+            fi
+          done
+          offline=(unshare --user --map-current-user --net -- env -i "${keep[@]}")
+          inner_uid="$("${offline[@]}" id -u)"
+          if [[ "${inner_uid}" != "${UID}" ]]; then
+            echo "::error::unshare did not keep the runner's user id" >&2
+            exit 1
+          fi
+          inner_umask="$("${offline[@]}" sh -c umask)"
+          if [[ "${inner_umask}" != 0077 ]]; then
+            echo "::error::the tests would run under umask ${inner_umask}, not 0077" >&2
+            exit 1
+          fi
+          # Fail if anything beyond the kept variables reaches the tests.
+          extra="$("${offline[@]}" env | cut -d= -f1 | grep -vxF -f <(printf '%s\n' "${keep[@]%%=*}") || true)"
+          if [[ -n "${extra}" ]]; then
+            echo "::error::the test environment is not empty beyond the kept variables" >&2
+            printf '%s\n' "${extra}" >&2
+            exit 1
+          fi
+          read -r -a crates <<< "${LINUX_CRATES}"
+          skips=(
+            --skip image::tests::parses_own_test_binary
+            --skip image::tests::rva_to_file_offset_maps_entry_point
+            --skip image::tests::rva_to_file_offset_rejects_offsets_past_4_gib
+            --skip image::tests::rejects_iat_outside_image
+            --skip prepare::tests::patches_own_test_binary
+            --skip prepare::tests::keeps_iat_slots_when_import_size_excludes_the_terminator
+            --skip prepare::tests::file_name_is_stable_per_build
+          )
+          "${offline[@]}" cargo test --locked --no-fail-fast "${crates[@]}" -- --exact "${skips[@]}"
+          "${offline[@]}" cargo test --locked --no-fail-fast --all-features "${crates[@]}" -- --exact "${skips[@]}"
+          "${offline[@]}" cargo test --locked --no-fail-fast --release "${crates[@]}" -- --exact --test-threads 1 "${skips[@]}"
+          "${offline[@]}" cargo test --locked --no-fail-fast --profile diag --all-features "${crates[@]}" -- --exact "${skips[@]}"
+          read -r -a hermetic <<< "${IGNORED_HERMETIC}"
+          read -r -a external <<< "${IGNORED_EXTERNAL}"
+          expected="${RUNNER_TEMP}/ignored-expected"
+          listed="${RUNNER_TEMP}/ignored-listed"
+          printf '%s\n' "${hermetic[@]}" "${external[@]}" | sort > "${expected}"
+          dups="$(uniq -d "${expected}")"
+          if [[ -n "${dups}" ]]; then
+            echo "::error::a test is listed twice in IGNORED_HERMETIC/IGNORED_EXTERNAL" >&2
+            printf '%s\n' "${dups}" >&2
+            exit 1
+          fi
+          for build in default --all-features --release "--profile diag --all-features"; do
+            case "${build}" in
+              default) flags=() ;;
+              --all-features) read -r -a flags <<< "--all-features" ;;
+              --release) read -r -a flags <<< "--release" ;;
+              *) read -r -a flags <<< "${build}" ;;
+            esac
+            "${offline[@]}" cargo test --locked -q "${flags[@]}" "${crates[@]}" -- --list --ignored --format terse > "${listed}.raw"
+            sed -n 's/: test$//p' "${listed}.raw" | sort -u > "${listed}"
+            if ! diff "${listed}" "${expected}" > "${listed}.diff"; then
+              echo "::error::ignored tests (cargo test ${build}) differ from IGNORED_HERMETIC + IGNORED_EXTERNAL (< listed, > expected)" >&2
+              cat "${listed}.diff" >&2
+              exit 1
+            fi
+          done
+          "${offline[@]}" cargo test --locked --no-fail-fast --release "${crates[@]}" -- --exact --ignored "${hermetic[@]}"
+          leftovers="$(find "${TMPDIR}" -mindepth 1 -maxdepth 2)"
+          if [[ -n "${leftovers}" ]]; then
+            echo "::error::cargo test left files in TMPDIR" >&2
+            printf '%s\n' "${leftovers}" >&2
+            exit 1
+          fi
+          leftovers="$(find "${HOME}" -mindepth 1 -maxdepth 3)"
+          if [[ -n "${leftovers}" ]]; then
+            echo "::error::cargo test wrote into HOME" >&2
+            printf '%s\n' "${leftovers}" >&2
+            exit 1
+          fi
+
+      # Builds, build scripts and tests must leave the checkout as they found
+      # it: a test writing scratch files into the source tree (instead of a
+      # temp dir), a build script regenerating a tracked file, or rustfmt or
+      # xtask rewriting something would otherwise pass here and dirty every
+      # contributor's tree. Untracked files count too, and so do ignored ones
+      # (a test's scratch.bin), except the build output in target/ and a
+      # fixture's target/. --locked already covers Cargo.lock.
+      - name: Checkout unchanged by the steps above
+        run: |
+          changes="$(git status --porcelain=v1 --untracked-files=all)"
+          if [[ -n "${changes}" ]]; then
+            echo "::error::the steps above modified or created files in the checkout" >&2
+            printf '%s\n' "${changes}" >&2
+            git diff --stat >&2
+            exit 1
+          fi
+          # .gitignore hides *.bin, *.dll, *.dat, ... from `git status`, so a
+          # scratch file of those kinds would pass the check above. List the
+          # ignored files too (whole ignored directories collapse to one
+          # entry) and allow only the build output directories.
+          list="${RUNNER_TEMP}/ignored-files"
+          git ls-files -z --others --ignored --exclude-standard --directory > "${list}"
+          mapfile -d '' -t ignored < "${list}"
+          stray=()
+          for f in "${ignored[@]}"; do
+            if [[ "${f}" != target/ && ! "${f}" =~ ^tests/fixtures/[^/]+/target/$ ]]; then
+              stray+=("${f}")
+            fi
+          done
+          if [[ "${#stray[@]}" -ne 0 ]]; then
+            echo "::error::the steps above created ignored files outside target/" >&2
+            printf '%s\n' "${stray[@]}" >&2
+            exit 1
+          fi
+
+  # Type-checks the Windows build from Linux: no MSVC, no linking, nothing runs.
+  # Catches compile errors in cfg(windows) code (most of victory-gpu,
+  # victory-hle and apps/victory, and the Windows-only tests) that the job
+  # above never compiles.
+  windows-target-check:
+    name: windows-target-check
+    runs-on: ubuntu-24.04
+    # checkout only.
+    permissions:
+      contents: read
+    timeout-minutes: 30
+    env:
+      # blake3's build script compiles C/assembly with MSVC tools for this
+      # target. Its build script reads this variable to select the pure-Rust
+      # implementation; nothing is linked here, so the choice has no effect.
+      CARGO_FEATURE_PURE: "1"
+      # rustc warnings (unused imports, dead code, ...) fail every step,
+      # including the workspace-wide `cargo check` ones. Set for the whole job
+      # so all steps share one build.
+      # Dependencies are unaffected: cargo caps their lints.
+      RUSTFLAGS: -D warnings
+    steps:
+      # Nothing here pushes; keep the token out of .git/config.
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+        with:
+          persist-credentials: false
+
+      # rust-toolchain.toml already lists the x86_64-pc-windows-msvc target.
+      # --no-self-update: as in the linux job.
+      - name: Install pinned toolchain
+        run: rustup toolchain install --no-self-update
+
+      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
+        with:
+          key: windows-target
+          save-if: ${{ github.ref == 'refs/heads/main' }}
+
+      - name: cargo check (workspace, all targets)
+        run: cargo check --locked --workspace --all-targets --target x86_64-pc-windows-msvc
+
+      - name: clippy (Windows target, clean crates)
+        run: |
+          read -r -a crates <<< "${WINDOWS_CLIPPY_CRATES}"
+          cargo clippy --locked --all-targets --target x86_64-pc-windows-msvc "${crates[@]}" -- -D warnings
+
+      # Same as the step above with every feature on, so the
+      # `diagnostics` code (frame capture, the host debug layer, scripted keys,
+      # mostly cfg(windows)) is compiled and linted too. Both builds stay: some
+      # code is cfg(not(feature = "diagnostics")).
+      - name: cargo check + clippy (Windows target, all features)
+        run: |
+          read -r -a crates <<< "${WINDOWS_CLIPPY_CRATES}"
+          cargo check --locked --workspace --all-targets --all-features --target x86_64-pc-windows-msvc
+          cargo clippy --locked --all-targets --all-features --target x86_64-pc-windows-msvc "${crates[@]}" -- -D warnings
+
+      # As the Linux job's per-crate step: the steps above unify features
+      # across the workspace, so a crate missing a feature it uses on a
+      # dependency (windows-sys's Win32_* features most of all) still builds.
+      # Check each one by itself. RUSTFLAGS above makes warnings fail too.
+      - name: cargo check (Windows target, each crate on its own)
+        run: |
+          read -r -a crates <<< "${WINDOWS_CLIPPY_CRATES}"
+          for ((i = 1; i < ${#crates[@]}; i += 2)); do
+            cargo check --locked --quiet --all-targets --target x86_64-pc-windows-msvc -p "${crates[i]}"
+            cargo check --locked --quiet --all-targets --all-features --target x86_64-pc-windows-msvc -p "${crates[i]}"
+          done
+
+      # The hle-probe fixture is outside the workspace (load_probe builds it on
+      # demand on Windows), so the steps above never compile it. It is
+      # Windows-only and needs no linker to check. It cannot inherit the
+      # workspace lints, so its Cargo.toml repeats them (SAFETY comments etc.).
+      - name: clippy (hle-probe fixture, Windows target)
+        run: >
+          cargo clippy --locked --all-targets --target x86_64-pc-windows-msvc
+          --manifest-path tests/fixtures/hle-probe/Cargo.toml -- -D warnings
+
+      # Same rustdoc lints as the Linux job (private items included), but for
+      # the Windows-only code it never compiles, plus the hle-probe fixture.
+      # Nothing is linked; RUSTFLAGS above is unchanged, so the dependency
+      # builds are shared with the steps above. The all-features run covers
+      # the docs on the `diagnostics` code, which is mostly cfg(windows).
+      - name: rustdoc (Windows target, clean crates)
+        env:
+          RUSTDOCFLAGS: -D warnings
+        run: |
+          read -r -a crates <<< "${WINDOWS_RUSTDOC_CRATES}"
+          cargo doc --no-deps --locked --document-private-items --target x86_64-pc-windows-msvc "${crates[@]}"
+          cargo doc --no-deps --locked --document-private-items --all-features --target x86_64-pc-windows-msvc "${crates[@]}"
+          cargo doc --no-deps --locked --document-private-items --target x86_64-pc-windows-msvc --manifest-path tests/fixtures/hle-probe/Cargo.toml
+
+      # The fixture is outside the workspace, so `cargo fmt --all` never reaches
+      # it. It is rustfmt-clean today; keep it that way. (The workspace itself
+      # is not rustfmt-clean on main yet, so it is not checked here.)
+      - name: rustfmt (hle-probe fixture)
+        run: cargo fmt --check --manifest-path tests/fixtures/hle-probe/Cargo.toml
+
+      # As in the linux job: the Windows-target builds (the workspace's and the
+      # hle-probe fixture's, build scripts included) must leave the checkout as
+      # they found it. Build output (target/, the fixture's target/) does not
+      # count; anything else, tracked, untracked or ignored, fails. The
+      # fixture's --locked steps already cover its own Cargo.lock.
+      - name: Checkout unchanged by the steps above
+        run: |
+          changes="$(git status --porcelain=v1 --untracked-files=all)"
+          if [[ -n "${changes}" ]]; then
+            echo "::error::the steps above modified or created files in the checkout" >&2
+            printf '%s\n' "${changes}" >&2
+            git diff --stat >&2
+            exit 1
+          fi
+          # .gitignore hides *.bin, *.dll, *.dat, ... from `git status`, so a
+          # scratch file of those kinds would pass the check above. List the
+          # ignored files too (whole ignored directories collapse to one
+          # entry) and allow only the build output directories.
+          list="${RUNNER_TEMP}/ignored-files"
+          git ls-files -z --others --ignored --exclude-standard --directory > "${list}"
+          mapfile -d '' -t ignored < "${list}"
+          stray=()
+          for f in "${ignored[@]}"; do
+            if [[ "${f}" != target/ && ! "${f}" =~ ^tests/fixtures/[^/]+/target/$ ]]; then
+              stray+=("${f}")
+            fi
+          done
+          if [[ "${#stray[@]}" -ne 0 ]]; then
+            echo "::error::the steps above created ignored files outside target/" >&2
+            printf '%s\n' "${stray[@]}" >&2
+            exit 1
+          fi
+
+  # Cargo.toml declares `rust-version` (the MSRV) for every member, but the
+  # jobs above build with the newer toolchain pinned in rust-toolchain.toml,
+  # so code using a newer language feature or std API, or a Cargo.lock bump
+  # to a dependency that needs a newer rustc, passed CI and broke anyone
+  # building with the declared version. Type-check with exactly that version
+  # (read from Cargo.toml, so the two cannot drift): the Linux crates and the
+  # whole workspace for the Windows target, default and all features, plus
+  # the hle-probe fixture, which load_probe builds with the same cargo that
+  # ran the test. Only `cargo check`: older rustc and clippy warn
+  # differently, so warnings are left to the pinned-toolchain jobs. Its own
+  # target dir in RUNNER_TEMP keeps a second compiler's output out of the
+  # rust-cache entries the other jobs share.
+  msrv:
+    name: msrv
+    runs-on: ubuntu-24.04
+    # checkout only.
+    permissions:
+      contents: read
+    timeout-minutes: 30
+    env:
+      # As in windows-target-check: blake3's build script picks its
+      # pure-Rust code instead of calling MSVC's tools. Nothing is linked.
+      CARGO_FEATURE_PURE: "1"
+    steps:
+      # Nothing here pushes; keep the token out of .git/config.
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+        with:
+          persist-credentials: false
+
+      # The root [workspace.package] rust-version is read with the runner's
+      # Python 3 tomllib (-I: no site packages, no cwd on sys.path), since
+      # cargo would first install the pinned toolchain. Every member must
+      # inherit it; one that declares its own would not be checked against
+      # the version it claims. --no-self-update: as in the linux job.
+      - name: Install the rust-version toolchain
+        run: |
+          msrv="$(python3 -I -c 'import tomllib; print(tomllib.load(open("Cargo.toml", "rb"))["workspace"]["package"]["rust-version"])')"
+          if [[ ! "${msrv}" =~ ^[0-9]+\.[0-9]+(\.[0-9]+)?$ ]]; then
+            echo "::error file=Cargo.toml::unexpected workspace rust-version '${msrv}'" >&2
+            exit 1
+          fi
+          rustup toolchain install "${msrv}" --profile minimal --target x86_64-pc-windows-msvc --no-self-update
+          metadata="$(cargo +"${msrv}" metadata --locked --no-deps --format-version 1)"
+          others="$(jq -r --arg v "${msrv}" '.packages[] | select(.rust_version != $v) | "\(.name) (\(.rust_version))"' <<< "${metadata}")"
+          if [[ -n "${others}" ]]; then
+            echo "::error::workspace members whose rust-version is not the workspace's ${msrv}:" >&2
+            printf '%s\n' "${others}" >&2
+            exit 1
+          fi
+          echo "MSRV=${msrv}" >> "${GITHUB_ENV}"
+          echo "CARGO_TARGET_DIR=${RUNNER_TEMP}/msrv-target" >> "${GITHUB_ENV}"
+
+      - name: cargo check (Linux crates)
+        run: |
+          read -r -a crates <<< "${LINUX_CRATES}"
+          cargo +"${MSRV}" check --locked --all-targets "${crates[@]}"
+          cargo +"${MSRV}" check --locked --all-targets --all-features "${crates[@]}"
+
+      - name: cargo check (Windows target, workspace and hle-probe fixture)
+        run: |
+          cargo +"${MSRV}" check --locked --workspace --all-targets --target x86_64-pc-windows-msvc
+          cargo +"${MSRV}" check --locked --workspace --all-targets --all-features --target x86_64-pc-windows-msvc
+          cargo +"${MSRV}" check --locked --all-targets --target x86_64-pc-windows-msvc --manifest-path tests/fixtures/hle-probe/Cargo.toml
+
+      # As in the linux and windows-target-check jobs: build scripts and the
+      # msrv checks must leave the checkout as they found it (output under
+      # CARGO_TARGET_DIR in RUNNER_TEMP, or target/, does not count).
+      - name: Checkout unchanged by the steps above
+        run: |
+          changes="$(git status --porcelain=v1 --untracked-files=all)"
+          if [[ -n "${changes}" ]]; then
+            echo "::error::the steps above modified or created files in the checkout" >&2
+            printf '%s\n' "${changes}" >&2
+            git diff --stat >&2
+            exit 1
+          fi
+          list="${RUNNER_TEMP}/ignored-files"
+          git ls-files -z --others --ignored --exclude-standard --directory > "${list}"
+          mapfile -d '' -t ignored < "${list}"
+          stray=()
+          for f in "${ignored[@]}"; do
+            if [[ "${f}" != target/ && ! "${f}" =~ ^tests/fixtures/[^/]+/target/$ ]]; then
+              stray+=("${f}")
+            fi
+          done
+          if [[ "${#stray[@]}" -ne 0 ]]; then
+            echo "::error::the steps above created ignored files outside target/" >&2
+            printf '%s\n' "${stray[@]}" >&2
+            exit 1
+          fi

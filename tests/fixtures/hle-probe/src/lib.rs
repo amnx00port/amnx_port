@@ -38,18 +38,21 @@ unsafe extern "system" {
 /// Console-only API, answered by the resolver's HLE implementation.
 #[unsafe(no_mangle)]
 pub extern "system" fn probe_xgameruntime_init() -> i32 {
+    // SAFETY: takes no arguments; victory-loader binds it to its HLE version.
     unsafe { XGameRuntimeInitialize() }
 }
 
 /// Exists on the host too, but the resolver overrides it.
 #[unsafe(no_mangle)]
 pub extern "system" fn probe_tick() -> u32 {
+    // SAFETY: takes no arguments and has no preconditions.
     unsafe { GetTickCount() }
 }
 
 /// Exists on the host and is passed through to it.
 #[unsafe(no_mangle)]
 pub extern "system" fn probe_pid() -> u32 {
+    // SAFETY: takes no arguments and has no preconditions.
     unsafe { GetCurrentProcessId() }
 }
 
@@ -61,18 +64,23 @@ pub extern "system" fn probe_title() -> u32 {
         .chain(Some(0))
         .collect();
     let mut handle = 0;
+    // SAFETY: `path` is a NUL-terminated UTF-16 string and `handle` a
+    // writable u32, both live for the call.
     unsafe { GetFileVersionInfoSizeW(path.as_ptr(), &mut handle) }
 }
 
 /// A delay-loaded console API.
 #[unsafe(no_mangle)]
 pub extern "system" fn probe_delayed() -> u32 {
+    // SAFETY: takes no arguments; the delay-load helper binds it on first call.
     unsafe { VIctoryProbeDelayed() }
 }
 
 /// Nobody implements this one: it must land in an unimplemented-import stub.
 #[unsafe(no_mangle)]
 pub extern "system" fn probe_missing() -> u64 {
+    // SAFETY: takes a plain integer; the loader binds it to a stub that
+    // reports the call, which is what the test checks.
     unsafe { VIctoryProbeNotImplemented(42) }
 }
 
@@ -96,6 +104,7 @@ static ON_THREAD: unsafe extern "system" fn(*mut c_void, u32, *mut c_void) = on_
 pub extern "system" fn DllMain(_: *mut c_void, reason: u32, _: *mut c_void) -> i32 {
     if reason == DLL_THREAD_ATTACH {
         MAIN_THREAD_STARTS.fetch_add(1, Ordering::Relaxed);
+        // SAFETY: takes no arguments and has no preconditions.
         unsafe { GetTickCount() };
     }
     if reason == DLL_PROCESS_DETACH {
