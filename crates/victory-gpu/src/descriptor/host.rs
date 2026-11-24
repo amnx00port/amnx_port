@@ -378,6 +378,62 @@ impl HostHeap {
         Some(view)
     }
 
+    /// Mirrors `count` consecutive slots starting at `first_index` (`first_handle`)
+    /// from `CopyDescriptorsSimple`, acquiring `VIEWS`, `made`, and `kept` once
+    /// for the entire range instead of per slot.
+    pub(crate) fn mirror_range(&self, first_index: u32, first_handle: u64, count: u32, step: u64) {
+        if count == 0 {
+            return;
+        }
+        if first_index >= self.count {
+            self.mirror(first_index, first_handle, false);
+            return;
+        }
+        let n = count.min(self.count - first_index) as usize;
+        let mut records = Vec::with_capacity(n);
+        for k in 0..n {
+            let handle = first_handle + k as u64 * step;
+            // SAFETY: each handle is a descriptor slot in title memory.
+            records.push(unsafe { (handle as *const [u32; 3]).read_unaligned() });
+        }
+        let resolved = super::views_at_batch(&records);
+        let mut made = self.made.lock().unwrap_or_else(|e| e.into_inner());
+        let mut kept = self.kept.lock().unwrap_or_else(|e| e.into_inner());
+        for (k, (&[_, i, generation], view)) in records.iter().zip(resolved).enumerate() {
+            let index = first_index + k as u32;
+            let Some(view) = view else {
+                if made[index as usize] != 0 {
+                    made[index as usize] = 0;
+                    if self.sampler {
+                        self.null_sampler(index);
+                    } else {
+                        null_view(self.cpu(index));
+                    }
+                    if let Some(slot) = kept.get_mut(index as usize) {
+                        *slot = None;
+                    }
+                }
+                continue;
+            };
+            let key = u64::from(generation) << 32 | u64::from(i);
+            if made[index as usize] != key {
+                let later = view.is_buffer();
+                made[index as usize] = if later { 0 } else { key };
+                let res = if later {
+                    None
+                } else {
+                    make(&view, self.cpu(index))
+                };
+                if res.is_none() && !self.sampler {
+                    null_for(&view, self.cpu(index));
+                }
+                if let Some(slot) = kept.get_mut(index as usize) {
+                    *slot = res.flatten();
+                }
+            }
+        }
+    }
+
     /// The view host slot `index` was made from, in a few words, with the
     /// title and host addresses of a buffer view (diagnostics). "null" for
     /// a slot never made or left null.
@@ -972,5 +1028,87 @@ mod tests {
         heap.release(a, 50);
         assert_eq!(heap.dynamic(50), Some(4));
         assert_eq!(heap.dynamic(40), Some(4 + heap.dynamic - 40));
+    }
+
+    #[test]
+    fn copy_simple_range_lock_matches_single_slot_mirroring() {
+        use crate::descriptor::{HeapDesc, copy_simple, create_cbv, create_heap, create_srv, heap};
+        use crate::object::{S_OK, This, guid, slot};
+        if host().is_none() {
+            return;
+        }
+        const HEAP_IID: crate::object::Iid = guid(
+            0x8efb471d,
+            0x616c,
+            0x4f49,
+            [0x90, 0xf7, 0x12, 0x7b, 0xb7, 0x63, 0xfa, 0x51],
+        );
+        const RES_IID: crate::object::Iid = guid(
+            0x696442be,
+            0xa72e,
+            0x4059,
+            [0xbc, 0x79, 0x5b, 0x5c, 0x98, 0x04, 0x0f, 0xad],
+        );
+        #[repr(C)]
+        struct Ext(HeapDesc, u64, u64);
+        let ext = Ext(
+            HeapDesc {
+                kind: 0,
+                count: 16,
+                flags: 1,
+                nodes: 0,
+            },
+            0,
+            0,
+        );
+        let mut h = std::ptr::null();
+        assert_eq!(create_heap(std::ptr::null(), &ext.0, &HEAP_IID, &mut h), S_OK);
+        let start = slot::<extern "system" fn(This) -> u64>(h, 0x48)(h);
+        let at = |i: u64| start + i * 32;
+
+        // Create a real host texture so non-buffer SRV mirroring creates a live host descriptor.
+        let tex_desc: [u32; 14] = [3, 0, 0, 0, 4, 0, 4, 0x0001_0001, 28, 1, 0, 0, 0, 0];
+        let heap_props: [u32; 5] = [1, 0, 0, 1, 1];
+        let mut tex = std::ptr::null();
+        assert_eq!(
+            crate::resource::create_committed(
+                std::ptr::null(),
+                heap_props.as_ptr().cast(),
+                0,
+                tex_desc.as_ptr().cast(),
+                0,
+                std::ptr::null(),
+                &RES_IID,
+                &mut tex,
+            ),
+            S_OK
+        );
+
+        // Populate source slots 0..4: texture SRV, CBV, texture SRV, empty null slot.
+        create_srv(std::ptr::null(), tex, std::ptr::null(), at(0));
+        create_cbv(std::ptr::null(), &[0x1000, 0, 256, 0], at(1));
+        create_srv(std::ptr::null(), tex, std::ptr::null(), at(2));
+
+        // Copy before host heap materialization (tests pending.extend path).
+        copy_simple(std::ptr::null(), 4, at(4), at(0), 0);
+        let host_heap = heap(h).host().unwrap();
+        let made_before: Vec<u64> = host_heap.made.lock().unwrap()[4..8].to_vec();
+        assert_ne!(made_before[0], 0, "texture SRV mirrored");
+        assert_eq!(made_before[1], 0, "CBV deferred until draw");
+        assert_eq!(made_before[2], made_before[0], "identical texture SRV key");
+        assert_eq!(made_before[3], 0, "empty slot stays null");
+
+        // Copy after host heap materialization (tests HostHeap::mirror_range path).
+        copy_simple(std::ptr::null(), 4, at(8), at(0), 0);
+        let made_after: Vec<u64> = host_heap.made.lock().unwrap()[8..12].to_vec();
+        assert_eq!(made_after, made_before);
+
+        // Overwrite slot 8 with empty slot 3 via range copy -> cleared back to 0.
+        copy_simple(std::ptr::null(), 1, at(8), at(3), 0);
+        assert_eq!(host_heap.made.lock().unwrap()[8], 0);
+
+        let release = |o: This| slot::<extern "system" fn(This) -> u32>(o, 0x10)(o);
+        assert_eq!(release(tex), 0);
+        assert_eq!(release(h), 0);
     }
 }

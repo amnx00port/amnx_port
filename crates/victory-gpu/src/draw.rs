@@ -79,6 +79,11 @@ pub(crate) struct State {
     dynamic: Vec<(usize, u32, u32)>,
     /// A fresh table of the stage being bound could not be made.
     table_failed: bool,
+    /// Reusable scratch buffers for `bind` and `tables` (avoiding per-draw heap allocations).
+    scratch_user_data: Vec<u32>,
+    scratch_fresh_slots: Vec<u8>,
+    scratch_made_tables: Vec<(u8, u32)>,
+    scratch_table_entries: Vec<usize>,
 }
 
 impl Drop for State {
@@ -168,8 +173,16 @@ fn set(roots: &mut Vec<Root>, slot: u32, root: Root) {
 
 impl State {
     pub(crate) fn reset(&mut self, pipeline: This) {
+        let scratch_user_data = std::mem::take(&mut self.scratch_user_data);
+        let scratch_fresh_slots = std::mem::take(&mut self.scratch_fresh_slots);
+        let scratch_made_tables = std::mem::take(&mut self.scratch_made_tables);
+        let scratch_table_entries = std::mem::take(&mut self.scratch_table_entries);
         *self = State::default();
         self.pipeline = pipeline as usize;
+        self.scratch_user_data = scratch_user_data;
+        self.scratch_fresh_slots = scratch_fresh_slots;
+        self.scratch_made_tables = scratch_made_tables;
+        self.scratch_table_entries = scratch_table_entries;
     }
 
     /// The title's topology; console-only ones become host lists (see
@@ -260,7 +273,8 @@ impl State {
             return;
         };
         self.targets.clear();
-        let mut rtvs = Vec::new();
+        let mut rtvs = [D3D12_CPU_DESCRIPTOR_HANDLE::default(); 8];
+        let mut n_rtvs = 0usize;
         for &h in handles {
             let Some(record) = crate::descriptor::rtv_record(h) else {
                 once!(
@@ -275,7 +289,10 @@ impl State {
             self.targets.push(record.resource as usize);
             #[cfg(feature = "diagnostics")]
             crate::capture::note_target(record.resource);
-            rtvs.push(host.rtv(texture, record.desc().as_ref()));
+            if n_rtvs < rtvs.len() {
+                rtvs[n_rtvs] = host.rtv(texture, record.desc().as_ref());
+                n_rtvs += 1;
+            }
         }
         self.depth = 0;
         let dsv = crate::descriptor::dsv_record(depth).and_then(|record| {
@@ -288,8 +305,8 @@ impl State {
         // SAFETY: an open list; the views were just made.
         unsafe {
             list.list.OMSetRenderTargets(
-                rtvs.len() as u32,
-                (!rtvs.is_empty()).then_some(rtvs.as_ptr()),
+                n_rtvs as u32,
+                (n_rtvs > 0).then_some(rtvs.as_ptr()),
                 false,
                 dsv.as_ref().map(std::ptr::from_ref),
             )
@@ -420,16 +437,19 @@ impl State {
         // Heaps first: a root signature with directly indexed heaps must be
         // set after them.
         if self.host_heaps != self.heaps {
-            let heaps: Vec<Option<ID3D12DescriptorHeap>> = self
-                .heaps
-                .iter()
-                .filter(|&&h| h != 0)
-                .filter_map(|&h| crate::descriptor::heap(h as This).host())
-                .map(|h| Some(h.heap.clone()))
-                .collect();
-            heaps.iter().flatten().for_each(|h| list.keep(h));
+            let mut heaps: [Option<ID3D12DescriptorHeap>; 2] = [None, None];
+            let mut n_heaps = 0usize;
+            for &h in &self.heaps {
+                if h != 0
+                    && let Some(host_heap) = crate::descriptor::heap(h as This).host()
+                {
+                    list.keep(&host_heap.heap);
+                    heaps[n_heaps] = Some(host_heap.heap.clone());
+                    n_heaps += 1;
+                }
+            }
             // SAFETY: an open list and shader-visible heaps.
-            unsafe { l.SetDescriptorHeaps(&heaps) };
+            unsafe { l.SetDescriptorHeaps(&heaps[..n_heaps]) };
             self.host_heaps = self.heaps;
             self.host_roots = [0; 2];
         }
@@ -459,7 +479,7 @@ impl State {
         for stage in &p.stages {
             let t = stage.translated();
             self.table_failed = false;
-            let made = self.tables(list, &t.used, compute);
+            self.tables(list, &t.used, compute);
             if self.table_failed {
                 static DROPPED_TABLES: AtomicU64 = AtomicU64::new(0);
                 let n = DROPPED_TABLES.fetch_add(1, Ordering::Relaxed) + 1;
@@ -472,13 +492,20 @@ impl State {
                 return false;
             }
             if let Some((param, dwords)) = stage.user_data {
-                let mut values = vec![0u32; dwords as usize];
+                let mut values = std::mem::take(&mut self.scratch_user_data);
+                values.clear();
+                values.resize(dwords as usize, 0);
                 for u in &t.host.user_data {
-                    let fresh = made
-                        .iter()
-                        .find(|m| m.0 == u.slot && u.root == RootType::Table);
+                    let fresh = if u.root == RootType::Table {
+                        self.scratch_made_tables
+                            .iter()
+                            .find(|m| m.0 == u.slot)
+                            .map(|&(_, offset)| offset)
+                    } else {
+                        None
+                    };
                     values[u.index as usize] = match fresh {
-                        Some(&(_, offset)) => offset,
+                        Some(offset) => offset,
                         None => self.user_value(compute, u.slot, u.root, u.dword),
                     };
                 }
@@ -490,6 +517,7 @@ impl State {
                         l.SetGraphicsRoot32BitConstants(param, dwords, values.as_ptr().cast(), 0);
                     }
                 }
+                self.scratch_user_data = values;
             }
             for (views, srv) in [(&stage.root_cbvs, false), (&stage.root_srvs, true)] {
                 for &(slot, param) in views {
@@ -542,6 +570,7 @@ impl State {
             DROPPED.fetch_add(1, Ordering::Relaxed);
             return;
         }
+        list.flush_barriers();
         #[cfg(feature = "diagnostics")]
         list.note_op(|| self.op_text(format!("dispatch {x}x{y}x{z}"), true));
         // SAFETY: an open list with everything set.
@@ -594,6 +623,7 @@ impl State {
         let ran = self.prepare_for(list, false, true)
             && match list.list.cast::<ID3D12GraphicsCommandList6>() {
                 Ok(l6) => {
+                    list.flush_barriers();
                     #[cfg(feature = "diagnostics")]
                     list.note_op(|| self.op_text(format!("mesh {x}"), false));
                     // SAFETY: an open list with everything set.
@@ -645,14 +675,17 @@ impl State {
     /// once: its constant data is copied at submission either way, and the
     /// big tables the world binds would otherwise take hundreds of slots per
     /// draw, wrapping the dynamic slots onto lists not yet submitted.
-    fn tables(&mut self, list: &HostList, used: &[UsedResource], compute: bool) -> Vec<(u8, u32)> {
+    /// Populates `self.scratch_made_tables` with each rebuilt table's `(slot,
+    /// byte_offset)`.
+    fn tables(&mut self, list: &HostList, used: &[UsedResource], compute: bool) {
         let tables = |u: &&UsedResource| u.root == RootType::Table;
-        let mut fresh: Vec<u8> = used
-            .iter()
-            .filter(tables)
-            .filter(|u| u.kind == ResourceType::Cbv)
-            .map(|u| u.slot)
-            .collect();
+        let mut fresh = std::mem::take(&mut self.scratch_fresh_slots);
+        fresh.clear();
+        for u in used.iter().filter(tables) {
+            if u.kind == ResourceType::Cbv {
+                fresh.push(u.slot);
+            }
+        }
         // Tables reaching past a host heap smaller than the title's (the
         // host's limit, 1,000,000 views on NVIDIA) are made afresh too: the
         // title's slots there have no host slot of their own.
@@ -681,16 +714,19 @@ impl State {
                 self.table_entry(list, u, compute);
             }
         }
-        let mut made = Vec::new();
-        for slot in fresh {
+        let mut made = std::mem::take(&mut self.scratch_made_tables);
+        made.clear();
+        let mut entries = std::mem::take(&mut self.scratch_table_entries);
+        for &slot in &fresh {
             let Some(&Root::Table(table)) = self.roots_ref(compute).get(usize::from(slot)) else {
                 continue;
             };
-            let entries: Vec<&UsedResource> = used
-                .iter()
-                .filter(tables)
-                .filter(|u| u.slot == slot)
-                .collect();
+            entries.clear();
+            for (idx, u) in used.iter().enumerate() {
+                if u.root == RootType::Table && u.slot == slot {
+                    entries.push(idx);
+                }
+            }
             let Some(heap) = self.heap_of(table) else {
                 continue;
             };
@@ -699,7 +735,7 @@ impl State {
             };
             let n = entries
                 .iter()
-                .map(|u| u.table_offset_dwords / 8 + 1)
+                .map(|&idx| used[idx].table_offset_dwords / 8 + 1)
                 .max()
                 .unwrap_or(1);
             // The table and what its entries hold (record words).
@@ -714,10 +750,13 @@ impl State {
                 (table, h.finish())
             };
             if let Some(&first) = self.fresh_tables.get(&key) {
-                for u in entries.iter().filter(|u| u.kind != ResourceType::Cbv) {
-                    let handle = table + u64::from(u.table_offset_dwords) * 4;
-                    if let Some(view) = crate::descriptor::view(handle) {
-                        readable(list, u, &view);
+                for &idx in &entries {
+                    let u = &used[idx];
+                    if u.kind != ResourceType::Cbv {
+                        let handle = table + u64::from(u.table_offset_dwords) * 4;
+                        if let Some(view) = crate::descriptor::view(handle) {
+                            readable(list, u, &view);
+                        }
                     }
                 }
                 made.push((slot, first * 32));
@@ -739,7 +778,10 @@ impl State {
             // used-resource list names (descriptor arrays).
             for k in 0..n {
                 let index = first + k;
-                let used = entries.iter().find(|u| u.table_offset_dwords / 8 == k);
+                let entry = entries
+                    .iter()
+                    .map(|&idx| &used[idx])
+                    .find(|u| u.table_offset_dwords / 8 == k);
                 match crate::descriptor::view(table + u64::from(k) * 32) {
                     Some(View::Constant(address, size)) => {
                         let Some((gpu, to)) = list.scratch(u64::from(size)) else {
@@ -751,13 +793,13 @@ impl State {
                     }
                     Some(view) => {
                         host.make_at(index, &view);
-                        if let Some(u) = used {
+                        if let Some(u) = entry {
                             readable(list, u, &view);
                         }
                     }
                     None => {
                         host.make_null(index);
-                        if used.is_some() {
+                        if entry.is_some() {
                             once!(slot, "a table entry without a view");
                         }
                     }
@@ -765,7 +807,9 @@ impl State {
             }
             made.push((slot, first * 32));
         }
-        made
+        self.scratch_fresh_slots = fresh;
+        self.scratch_made_tables = made;
+        self.scratch_table_entries = entries;
     }
 
     /// The first draws, at debug level: what they bind and read
@@ -847,6 +891,7 @@ impl State {
         let rects = self.topology == RECTANGLES;
         let ran = self.prepare(list, false) && (!rects || self.rectangles(list, vertices, first));
         if ran {
+            list.flush_barriers();
             // Rectangles were expanded into their own vertex buffers.
             let (count, from) = if rects {
                 (vertices / 3 * 6, 0)
@@ -940,6 +985,7 @@ impl State {
         }
         let ran = self.topology != RECTANGLES && self.prepare(list, true);
         if ran {
+            list.flush_barriers();
             #[cfg(feature = "diagnostics")]
             list.note_op(|| self.op_text(format!("indexed {indices}x{instances}"), false));
             // SAFETY: an open list with everything set.
@@ -1012,6 +1058,7 @@ impl State {
             s.refresh(list, *at, 4);
         }
         // Bounded first: the clamp binds a compute pipeline of its own.
+        list.flush_barriers();
         if !crate::indirect::bound(list, &args.buffer, args.gpu(arguments), (kind, stride, max)) {
             why("not bounded (no clamp, or arguments not 4-byte aligned)");
             return false;
@@ -1036,6 +1083,7 @@ impl State {
             }
             return false;
         }
+        list.flush_barriers();
         #[cfg(feature = "diagnostics")]
         list.note_op(|| {
             self.op_text(format!("indirect kind {kind} max {max} at {arguments:#x}"), kind == DISPATCH)
