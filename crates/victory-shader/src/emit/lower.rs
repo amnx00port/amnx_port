@@ -1468,7 +1468,12 @@ impl<'a> Lower<'a> {
 
     /// The median of three. With a NaN among them the hardware gives the
     /// minimum of the three instead (the host's minimum skips NaNs, so that
-    /// is the smallest number among them).
+    /// is the smallest number among them). Otherwise it is the middle one
+    /// under the hardware's order of floats, where -0 is below +0 (`v_med3_f32`
+    /// as the ISA defines it: `v_max_f32(v_min_f32(a, b), v_min_f32(
+    /// v_max_f32(a, b), c))`); DXIL's FMin/FMax give either zero for equal
+    /// zeros, so the zero taken here has the sign two of the three share: the
+    /// median of {-0, +0, +0} is +0, of {-0, -0, +0} it is -0.
     fn med3(&mut self, a: V, b: V, third: V) -> V {
         let c = self.cur;
         let lo = self.binary(36, a, b);
@@ -1476,6 +1481,24 @@ impl<'a> Lower<'a> {
         let t = self.binary(36, hi, third);
         let median = self.binary(35, lo, t);
         let least = self.binary(36, lo, third);
+        // Of three zeros the median is one of their signs, the one two of them
+        // share: AND keeps a bit where both operands have it, so the two pairs
+        // of a majority leave its sign bit through OR. (`max_min`, which
+        // orders the zeros of `v_min`/`v_max` the same way, cannot simply be
+        // used here: it would cost four times this.)
+        let (ia, ib, ic) = (self.as_int(a), self.as_int(b), self.as_int(third));
+        let ab = self.s.m.bin(c, Bin::And, ia, ib);
+        let a_or_b = self.s.m.bin(c, Bin::Or, ia, ib);
+        let c_and = self.s.m.bin(c, Bin::And, ic, a_or_b);
+        let majority = self.s.m.bin(c, Bin::Or, ab, c_and);
+        let sign = self.s.m.i32(0x8000_0000);
+        let majority = self.s.m.bin(c, Bin::And, majority, sign);
+        let signed = self.as_float(majority);
+        // The chain's result is one of the zeros when that is the median; a
+        // NaN compares unequal and keeps the NaN path below.
+        let zero = self.s.m.f32(0);
+        let is_zero = self.s.m.cmp(c, pred::OEQ, median, zero);
+        let median = self.s.m.select(c, is_zero, signed, median);
         let ab = self.s.m.cmp(c, pred::UNO, a, b);
         let nan3 = self.s.m.cmp(c, pred::UNO, third, third);
         let nan = self.s.m.bin(c, Bin::Or, ab, nan3);
@@ -7099,9 +7122,7 @@ mod tests {
             S_ENDPGM,
         ];
 
-        let code: Vec<u8> = words.iter()
-            .flat_map(|w| w.to_le_bytes())
-            .collect();
+        let code: Vec<u8> = words.iter().flat_map(|w| w.to_le_bytes()).collect();
 
         let native = NativeProgram {
             stage: HwStage::Cs,
@@ -7118,9 +7139,12 @@ mod tests {
 
         let p = ir::build(&native.code, false, 256).unwrap();
 
-        assert!(p.blocks.iter()
-            .flat_map(|b| &b.insts)
-            .any(|i| i.name() == "v_perm_b32"));
+        assert!(
+            p.blocks
+                .iter()
+                .flat_map(|b| &b.insts)
+                .any(|i| i.name() == "v_perm_b32")
+        );
 
         let st = structure::structure(&p).unwrap();
         let res = resource::track(&p, &native.layout, native.stage, Some(&st)).unwrap();
@@ -7137,13 +7161,12 @@ mod tests {
             outputs: vec![],
             prims: vec![],
             mesh_stride: 0,
-        }).unwrap();
+        })
+        .unwrap();
 
-        let container =
-            crate::Container::parse(&emitted.dxil).unwrap();
+        let container = crate::Container::parse(&emitted.dxil).unwrap();
 
-        let features =
-            container.part(crate::FourCC::SFI0).unwrap();
+        let features = container.part(crate::FourCC::SFI0).unwrap();
 
         u64::from_le_bytes(features.data.try_into().unwrap())
     }
