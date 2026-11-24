@@ -126,9 +126,9 @@ pub(crate) struct Binding {
 }
 
 pub(crate) struct Psv<'a> {
-    /// PSV shader kind: 0 pixel, 1 vertex, 5 compute.
+    /// PSV shader kind: 0 pixel, 1 vertex, 2 geometry, 5 compute, 13 mesh.
     pub stage: u8,
-    /// Vertex: writes `SV_Position`. Pixel: writes depth.
+    /// Vertex/geometry: writes `SV_Position`. Pixel: writes depth.
     pub flag: bool,
     pub inputs: &'a [SigElement],
     pub outputs: &'a [SigElement],
@@ -136,6 +136,8 @@ pub(crate) struct Psv<'a> {
     pub prims: &'a [SigElement],
     /// Mesh: its state and the group-shared bytes it declares.
     pub mesh: Option<(super::shader::Mesh, u32)>,
+    /// Geometry: input primitive, output topology, max vertices, stream mask.
+    pub geometry: Option<super::shader::Geometry>,
     pub bindings: &'a [Binding],
     /// Compute: thread-group size and required wave size.
     pub threads: [u32; 3],
@@ -188,6 +190,12 @@ pub(crate) fn psv(p: &Psv) -> Vec<u8> {
         info[26] = vectors(p.prims) as u8;
         info[27] = mesh.topology;
         info[30] = p.prims.len() as u8;
+    } else if let Some(gs) = p.geometry {
+        info[0..4].copy_from_slice(&gs.input_primitive.to_le_bytes());
+        info[4..8].copy_from_slice(&gs.output_topology.to_le_bytes());
+        info[8..12].copy_from_slice(&gs.stream_mask.to_le_bytes());
+        info[12] = u8::from(p.flag);
+        info[26..28].copy_from_slice(&(gs.max_vertices as u16).to_le_bytes());
     }
     out.extend(info);
     u32s(&mut out, &[p.bindings.len() as u32]);

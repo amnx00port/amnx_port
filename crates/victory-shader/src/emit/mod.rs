@@ -185,24 +185,27 @@ pub struct UserData {
     pub dword: u32,
 }
 
-/// Translates the vertex, pixel, compute or mesh program of a console
-/// shader container.
+/// Translates the vertex, geometry, pixel, compute or mesh program of a
+/// console shader container.
 pub fn translate(container: &[u8]) -> Result<HostShader, ShaderError> {
     let c = Container::parse(container)?;
     let dxil = c
         .part(FourCC::DXIL)
         .ok_or(ShaderError::Malformed("no DXIL part"))?;
-    let native = crate::native_programs(dxil.data)?
-        .into_iter()
+    let programs = crate::native_programs(dxil.data)?;
+    let native = programs
+        .iter()
         .find(|p| {
             matches!(
                 p.stage,
-                HwStage::Vs | HwStage::Ps | HwStage::Cs | HwStage::Ms
+                HwStage::Vs | HwStage::Ps | HwStage::Cs | HwStage::Ms | HwStage::Gs
             )
         })
+        .or_else(|| programs.iter().find(|p| p.stage == HwStage::Es))
+        .cloned()
         .ok_or(ShaderError::Unsupported {
             offset: 0,
-            what: "a container without a vertex, pixel, compute or mesh program",
+            what: "a container without a vertex, geometry, pixel, compute or mesh program",
         })?;
     let p = ir::build(&native.patched_code(), native.wave64, native.vgprs)?;
     // Structurisation first: tracing per-lane descriptors needs it (its
@@ -278,6 +281,23 @@ pub fn emit(
         }
         _ => 0,
     };
+    let geometry = match &native.io {
+        crate::native::StageIo::Gs(gs) => {
+            let psv = c.part(FourCC::PSV0).map(|p| p.data);
+            let psv_u32 = |off: usize| {
+                psv.filter(|d| crate::dxbc::u32_at(d, 0).is_ok_and(|n| n >= 16))
+                    .and_then(|d| crate::dxbc::u32_at(d, 4 + off).ok())
+            };
+            Some(shader::Geometry {
+                input_primitive: psv_u32(0).filter(|&v| v != 0).unwrap_or(3),
+                output_topology: psv_u32(4).filter(|&v| v != 0).unwrap_or(5),
+                stream_mask: psv_u32(8).filter(|&v| v != 0).unwrap_or(1),
+                max_vertices: gs.max_vertices.max(1),
+                invocations: gs.invocations.max(1),
+            })
+        }
+        _ => None,
+    };
     let l = lower::lower(&lower::Parts {
         native,
         p,
@@ -288,6 +308,7 @@ pub fn emit(
         outputs,
         prims,
         mesh_stride,
+        geometry,
     })?;
     Ok(HostShader {
         stage: native.stage,
@@ -745,5 +766,186 @@ mod tests {
         let io = crate::io::raise(&p, &native).unwrap();
         // Translated or refused with a reason; it must not panic.
         let _ = super::emit(&c, &native, &p, &st, &io, &res);
+    }
+
+    #[test]
+    #[cfg(windows)]
+    fn gs_shader_validates_and_builds_host_pipeline() {
+        // Synthetic merged GS: wave preamble (s3[15:8]), console GS table load
+        // at s[8:9]+0xb8, read SV_Position.xyzw for vertices 0..2 from ES->GS LDS,
+        // emit 3 vertices + cut + done.
+        let words: &[u32] = &[
+            0x9400_FF03,
+            0x0008_0008, // s_bfe_i32 s0, s3, 0x00080008
+            0x92FE_8000, // s_bfm_b64 exec, s0, 0
+            0xBF06_C000, // s_cmp_eq_u32 s0, 64
+            0x85FE_7EC1, // s_cselect_b64 exec, -1, exec
+            0x8701_FF09,
+            0x0000_00FF, // s_and_b32 s1, s9, 0xff
+            0xBE80_0308, // s_mov_b32 s0, s8
+            0xF400_0000,
+            0xFA00_00B8, // s_load_dword s0, s[0:1], 0xb8
+            0x3406_0082, // v_lshlrev_b32 v3, 2, v0
+            0x3402_0282, // v_lshlrev_b32 v1, 2, v1
+            0xBE81_0382, // s_mov_b32 s1, 2
+            0x3410_00F9,
+            0x0586_0601, // v_lshlrev_b32 v8, s1, v0 src1_sel:WORD_1
+            0x3614_06FF,
+            0x0003_FFFC, // v_and_b32 v10, 0x3fffc, v3 (vtx 0)
+            0x360C_02FF,
+            0x0003_FFFC, // v_and_b32 v6, 0x3fffc, v1  (vtx 2)
+            0xD8DC_0100,
+            0x0E00_000A, // ds_read2_b32 v[14:15], v10 offset1:1
+            0xD8DC_0302,
+            0x1000_000A, // ds_read2_b32 v[16:17], v10 offset0:2 offset1:3
+            0xD8DC_0100,
+            0x1200_0008, // ds_read2_b32 v[18:19], v8 offset1:1
+            0xD8DC_0302,
+            0x1400_0008, // ds_read2_b32 v[20:21], v8 offset0:2 offset1:3
+            0xD8DC_0100,
+            0x1600_0006, // ds_read2_b32 v[22:23], v6 offset1:1
+            0xD8DC_0302,
+            0x1800_0006, // ds_read2_b32 v[24:25], v6 offset0:2 offset1:3
+            0xD543_000C,
+            0x0002_04FF,
+            0x0000_0030, // v_mad_u32_u24 v12, 48, v2, s0 (12 dwords = 3 * 4)
+            0xD838_0100,
+            0x000F_0E0C, // ds_write2_b32 v12, v14, v15 offset1:1
+            0xD838_0302,
+            0x0011_100C, // ds_write2_b32 v12, v16, v17 offset0:2 offset1:3
+            0xBF90_0022, // emit 0
+            0xD838_0504,
+            0x0013_120C, // ds_write2_b32 v12, v18, v19 offset0:4 offset1:5
+            0xD838_0706,
+            0x0015_140C, // ds_write2_b32 v12, v20, v21 offset0:6 offset1:7
+            0xBF90_0022, // emit 0
+            0xD838_0908,
+            0x0017_160C, // ds_write2_b32 v12, v22, v23 offset0:8 offset1:9
+            0xD838_0B0A,
+            0x0019_180C, // ds_write2_b32 v12, v24, v25 offset0:10 offset1:11
+            0xBF90_0022, // emit 0
+            0xBF90_0012, // cut 0
+            0xBF90_0003, // done
+            0xBF81_0000, // s_endpgm
+        ];
+        let native = NativeProgram {
+            stage: HwStage::Gs,
+            wave64: true,
+            vgprs: 28,
+            layout: vec![],
+            used: vec![],
+            io: crate::native::StageIo::Gs(crate::native::GsIo {
+                outputs: vec![],
+                ring_dwords: 12,
+                invocations: 1,
+                max_vertices: 3,
+                vertex_dwords: 4,
+            }),
+            code: words.iter().flat_map(|w| w.to_le_bytes()).collect(),
+        };
+        let pos = SigElement {
+            name: "SV_Position".into(),
+            index: 0,
+            kind: 3,
+            comp: 9,
+            interp: 0,
+            row: Some(0),
+            col: 0,
+            cols: 4,
+            usage: 0,
+            half: false,
+        };
+        let isg1 = super::container::signature(std::slice::from_ref(&pos), true);
+        let osg1 = super::container::signature(&[pos], false);
+        let bytes = crate::dxbc::build(&[(FourCC::ISG1, &isg1), (FourCC::OSG1, &osg1)]);
+        let c = Container::parse(&bytes).unwrap();
+        let p = ir::build(&native.patched_code(), native.wave64, native.vgprs).unwrap();
+        let st = structure::structure(&p).unwrap();
+        let res = resource::track(&p, &native.layout, native.stage, Some(&st)).unwrap();
+        let io = io::raise(&p, &native).unwrap();
+        let mut gs = emit(&c, &native, &p, &st, &io, &res).unwrap();
+        assert_eq!(gs.stage, HwStage::Gs);
+        if let Ok(mut v) = super::validator::Validator::load(
+            super::validator::Validator::default_path().as_deref(),
+        ) {
+            v.validate(&mut gs.dxil).unwrap();
+        }
+        let _one = super::valu_tests::ONE_AT_A_TIME
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        if let Ok(host) = super::host::Host::new(false) {
+            let vs = super::host::stub_vs(&gs).unwrap();
+            let ps = super::host::stub_ps();
+            host.gs_pipeline(&vs, &gs, &ps).unwrap();
+        }
+    }
+
+    #[test]
+    #[cfg(windows)]
+    fn es_shader_validates_and_builds_host_pipeline() {
+        // Synthetic merged ES: wave preamble (s3[7:0]), convert SV_VertexID (v5)
+        // to float, write SV_Position to ES->GS LDS (stride 16 bytes = 4 dwords),
+        // s_barrier, s_setpc_b64 handover.
+        let words: &[u32] = &[
+            0x9417_FF03,
+            0x0008_0000, // s_bfe_i32 s23, s3, 0x00080000
+            0x92FE_8017, // s_bfm_b64 exec, s23, 0
+            0xBF06_C017, // s_cmp_eq_u32 s23, 64
+            0x85FE_7EC1, // s_cselect_b64 exec, -1, exec
+            0x7E0C_0D05, // v_cvt_f32_u32 v6, v5
+            0x7E0E_02F2, // v_mov_b32 v7, 1.0
+            0xD543_0008,
+            0x0019_2105, // v_mad_u32_u24 v8, v5, 16, s6
+            0xD938_0100,
+            0x0006_0608, // ds_write2_b64 v8, v[6:7], v[6:7] offset1:1
+            0xBF8A_0000, // s_barrier
+            0xBE80_2018, // s_setpc_b64 s[24:25]
+        ];
+        let native = NativeProgram {
+            stage: HwStage::Es,
+            wave64: true,
+            vgprs: 10,
+            layout: vec![],
+            used: vec![],
+            io: crate::native::StageIo::Es {
+                inputs: vec![],
+                outputs: vec![],
+                vertex_dwords: 4,
+            },
+            code: words.iter().flat_map(|w| w.to_le_bytes()).collect(),
+        };
+        let pos = SigElement {
+            name: "SV_Position".into(),
+            index: 0,
+            kind: 3,
+            comp: 9,
+            interp: 0,
+            row: Some(0),
+            col: 0,
+            cols: 4,
+            usage: 0,
+            half: false,
+        };
+        let osg1 = super::container::signature(&[pos], false);
+        let bytes = crate::dxbc::build(&[(FourCC::OSG1, &osg1)]);
+        let c = Container::parse(&bytes).unwrap();
+        let p = ir::build(&native.patched_code(), native.wave64, native.vgprs).unwrap();
+        let st = structure::structure(&p).unwrap();
+        let res = resource::track(&p, &native.layout, native.stage, Some(&st)).unwrap();
+        let io = io::raise(&p, &native).unwrap();
+        let mut es = emit(&c, &native, &p, &st, &io, &res).unwrap();
+        assert_eq!(es.stage, HwStage::Es);
+        if let Ok(mut v) = super::validator::Validator::load(
+            super::validator::Validator::default_path().as_deref(),
+        ) {
+            v.validate(&mut es.dxil).unwrap();
+        }
+        let _one = super::valu_tests::ONE_AT_A_TIME
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        if let Ok(host) = super::host::Host::new(false) {
+            let ps = super::host::stub_ps();
+            host.pipeline(&es, &ps).unwrap();
+        }
     }
 }
