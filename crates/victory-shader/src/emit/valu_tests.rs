@@ -57,6 +57,14 @@ const fn buffer_store_dword(vdata: u8, srsrc: u8, byte_off: u16) -> [u32; 2] {
     ]
 }
 
+/// MUBUF `buffer_store_short` / `buffer_store_short_d16_hi`.
+const fn buffer_store_short(vdata: u8, srsrc: u8, byte_off: u16, high: bool) -> [u32; 2] {
+    [
+        0x38 << 26 | (if high { 0x1B } else { 0x1A }) << 18 | (byte_off as u32 & 0xFFF),
+        0x80 << 24 | ((srsrc as u32 >> 2) & 0x1F) << 16 | (vdata as u32) << 8,
+    ]
+}
+
 const fn sgpr(n: u8) -> u16 {
     n as u16
 }
@@ -69,6 +77,17 @@ const fn vgpr(n: u8) -> u16 {
 /// 4 dwords of root constants in `s0..s3`, runs `body` (leaving its result in
 /// `v0`), and stores `v0` to dword 0 of the raw UAV at heap index 0.
 fn build_valu_cs(body: &[u32]) -> HostShader {
+    build_valu_cs_with_store(body, buffer_store_dword(0, 8, 0))
+}
+
+/// Builds a synthetic compute shader with a caller-selected final MUBUF store.
+fn build_valu_cs_with_store(body: &[u32], store: [u32; 2]) -> HostShader {
+    build_valu_cs_with_stores(body, &[store])
+}
+
+/// Builds and lowers a synthetic compute shader with an ordered sequence of
+/// caller-selected MUBUF stores.
+fn build_valu_cs_with_stores(body: &[u32], stores: &[[u32; 2]]) -> HostShader {
     let mut words = Vec::new();
     // s[4:5] = descriptor table address (heap index 0 -> byte offset 0).
     words.push(s_mov_b32(5, 0x80)); // inline constant 0
@@ -79,7 +98,9 @@ fn build_valu_cs(body: &[u32]) -> HostShader {
         words.push(vop1(0x001, i + 1, sgpr(i))); // v_mov_b32
     }
     words.extend_from_slice(body);
-    words.extend_from_slice(&buffer_store_dword(0, 8, 0));
+    for store in stores {
+        words.extend_from_slice(store);
+    }
     words.push(S_ENDPGM);
 
     let code: Vec<u8> = words.iter().flat_map(|w| w.to_le_bytes()).collect();
@@ -670,6 +691,53 @@ fn bfe_signed_and_unsigned_match_rdna2() {
             got, want,
             "{backend}: v_bfe_u32({:#010x}, {}, {}) = {got:#010x}, want {want:#010x}",
             inp[0], inp[1], inp[2],
+        );
+    });
+}
+
+
+#[test]
+fn buffer_store_short_preserves_the_adjacent_high_halfword() {
+    // Seed both halves, then replace only the low half. A widened dword store
+    // would clobber the high sentinel and fail this readback.
+    let stores = [
+        buffer_store_dword(1, 8, 0),
+        buffer_store_short(2, 8, 0, false),
+    ];
+    let shader = build_valu_cs_with_stores(&[], &stores);
+    let cases = &[
+        [0xaabb_ccdd, 0x1234_5678, 0, 0],
+        [0xfedc_ba98, 0xdead_beef, 0, 0],
+        [0x1357_9bdf, 0xffff_0001, 0, 0],
+    ];
+    run_cases(&shader, cases, |backend, i, inputs, result| {
+        let expected = (inputs[0] & 0xffff_0000) | (inputs[1] & 0xffff);
+        assert_eq!(
+            result, expected,
+            "{backend} case {i}: buffer_store_short must update only the low 16 bits"
+        );
+    });
+}
+
+#[test]
+fn buffer_store_short_d16_hi_preserves_the_adjacent_low_halfword() {
+    // Seed both halves, then replace only the high half. A widened dword store
+    // would clobber the low sentinel and fail this readback.
+    let stores = [
+        buffer_store_dword(1, 8, 0),
+        buffer_store_short(2, 8, 2, true),
+    ];
+    let shader = build_valu_cs_with_stores(&[], &stores);
+    let cases = &[
+        [0xaabb_ccdd, 0x1234_5678, 0, 0],
+        [0xfedc_ba98, 0xdead_beef, 0, 0],
+        [0x1357_9bdf, 0xffff_0001, 0, 0],
+    ];
+    run_cases(&shader, cases, |backend, i, inputs, result| {
+        let expected = (inputs[0] & 0x0000_ffff) | (inputs[1] & 0xffff_0000);
+        assert_eq!(
+            result, expected,
+            "{backend} case {i}: buffer_store_short_d16_hi must update only the high 16 bits"
         );
     });
 }
