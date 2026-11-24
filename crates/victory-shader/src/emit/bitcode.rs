@@ -33,6 +33,7 @@ pub(crate) enum V {
 }
 
 /// A global variable declaration (thread-group shared memory).
+#[cfg_attr(test, derive(Clone))]
 struct Global {
     name: String,
     ty: Ty,
@@ -178,6 +179,7 @@ pub(crate) enum Attr {
     NoDuplicate = 4,
 }
 
+#[cfg_attr(test, derive(Clone))]
 struct Func {
     name: String,
     ty: Ty,
@@ -189,6 +191,7 @@ struct Func {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) struct Md(u32);
 
+#[cfg_attr(test, derive(Clone))]
 enum MdDef {
     Str(String),
     Value(Ty, V),
@@ -196,6 +199,7 @@ enum MdDef {
 }
 
 #[derive(Default)]
+#[cfg_attr(test, derive(Clone))]
 pub(crate) struct Module {
     types: Vec<TypeDef>,
     type_ids: HashMap<TypeDef, u32>,
@@ -484,6 +488,76 @@ impl Module {
     }
     pub fn named_md(&mut self, name: &str, nodes: Vec<Md>) {
         self.named.push((name.into(), nodes));
+    }
+
+    #[cfg(test)]
+    pub(crate) fn eval_i32(&self, v: V) -> Option<u32> {
+        match v {
+            V::Const(i) => match self.consts.get(i as usize) {
+                Some((_, Const::Int(k))) => Some(*k as u32),
+                _ => None,
+            },
+            V::Inst(i) => match &self.insts.get(i as usize)?.op {
+                Op::Bin(op, a, b) => {
+                    let (a, b) = (self.eval_i32(*a)?, self.eval_i32(*b)?);
+                    Some(match op {
+                        Bin::Add => a.wrapping_add(b),
+                        Bin::Sub => a.wrapping_sub(b),
+                        Bin::Mul => a.wrapping_mul(b),
+                        Bin::And => a & b,
+                        Bin::Or => a | b,
+                        Bin::Xor => a ^ b,
+                        Bin::Shl => a.wrapping_shl(b),
+                        Bin::LShr => a.wrapping_shr(b),
+                        _ => return None,
+                    })
+                }
+                _ => None,
+            },
+            _ => None,
+        }
+    }
+
+    #[cfg(test)]
+    pub(crate) fn calls(&self, needle: &str) -> Vec<Vec<V>> {
+        self.insts
+            .iter()
+            .filter_map(|inst| match &inst.op {
+                Op::Call(f, args) if self.funcs[*f as usize].name.contains(needle) => {
+                    Some(args.clone())
+                }
+                _ => None,
+            })
+            .collect()
+    }
+
+    #[cfg(test)]
+    pub(crate) fn selects(&self) -> Vec<(V, V, V)> {
+        self.insts
+            .iter()
+            .filter_map(|inst| match inst.op {
+                Op::Select(c, t, f) => Some((c, t, f)),
+                _ => None,
+            })
+            .collect()
+    }
+
+    #[cfg(test)]
+    pub(crate) fn cmp_eq(&self, v: V) -> Option<(V, V)> {
+        let V::Inst(i) = v else { return None };
+        match self.insts.get(i as usize)?.op {
+            Op::Cmp(pred::EQ, a, b) => Some((a, b)),
+            _ => None,
+        }
+    }
+
+    #[cfg(test)]
+    pub(crate) fn is_lane_index(&self, v: V) -> bool {
+        let V::Inst(i) = v else { return false };
+        matches!(
+            &self.insts.get(i as usize).map(|inst| &inst.op),
+            Some(Op::Call(f, _)) if self.funcs[*f as usize].name.contains("waveGetLaneIndex")
+        )
     }
 
     /// The module as bitcode.

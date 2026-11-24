@@ -43,6 +43,8 @@ pub(crate) struct Lowered {
     /// Whether the program uses wave operations.
     #[cfg(test)]
     pub wave_ops: bool,
+    #[cfg(test)]
+    pub module: super::bitcode::Module,
 }
 
 pub(crate) struct Parts<'a> {
@@ -910,6 +912,8 @@ impl<'a> Lower<'a> {
             nonuniform_handles: self.s.nonuniform_handles,
             #[cfg(test)]
             wave_ops: self.s.flags & flags::WAVE_OPS != 0,
+            #[cfg(test)]
+            module: self.s.m.clone(),
             dxil: self.s.finish(),
             user_data,
             samplers: self.samplers,
@@ -2831,13 +2835,30 @@ impl<'a> Lower<'a> {
         let kind = self.used_kind(src);
         let c = self.cur;
         let (base, extra) = self.built_offset(src)?;
-        let offset = &((*offset as u32).wrapping_add(base) as i32);
-        let mut addr = self.s.m.i32(*offset as u32);
-        if let Some(x) = extra {
-            addr = self.s.m.bin(c, Bin::Add, addr, x);
-        }
+        let inst_off = (*offset as u32) & !3u32;
+        let mut addr = match extra {
+            Some(x) => {
+                let sbase = if base == 0 {
+                    x
+                } else {
+                    let b = self.s.m.i32(base);
+                    self.s.m.bin(c, Bin::Add, b, x)
+                };
+                let not3 = self.s.m.i32(!3u32);
+                let sbase = self.s.m.bin(c, Bin::And, sbase, not3);
+                if inst_off == 0 {
+                    sbase
+                } else {
+                    let io = self.s.m.i32(inst_off);
+                    self.s.m.bin(c, Bin::Add, sbase, io)
+                }
+            }
+            None => self.s.m.i32((base & !3u32).wrapping_add(inst_off)),
+        };
         if !matches!(soffset, Operand::Scalar { code: NULL, .. }) {
             let so = self.operand(inst, soffset)?;
+            let not3 = self.s.m.i32(!3u32);
+            let so = self.s.m.bin(c, Bin::And, so, not3);
             addr = self.s.m.bin(c, Bin::Add, addr, so);
         }
         if matches!(src, Source::Built { address, .. } if address.param == CODE) {
@@ -2876,7 +2897,7 @@ impl<'a> Lower<'a> {
             V::Const(_)
                 if matches!(soffset, Operand::Scalar { code: NULL, .. }) && extra.is_none() =>
             {
-                Some(*offset as u32)
+                Some((base & !3u32).wrapping_add(inst_off))
             }
             _ => None,
         };
@@ -4211,11 +4232,14 @@ impl<'a> Lower<'a> {
                 } else {
                     self.cross_lane(false)?;
                 }
+                let mask = self.s.m.i32(self.wave() - 1);
+                let lane = self.s.m.bin(c, Bin::And, lane, mask);
                 let r = self.read_lane(a, lane);
                 int(self, r)
             }
             "v_writelane_b32" => {
                 // The lane given takes the scalar; the others keep their value.
+                // On RDNA2 `v_writelane_b32` ignores `EXEC`, so write unconditionally.
                 let (a, lane) = (s(self, 0)?, s(self, 1)?);
                 let Some(Operand::Vector { reg, .. }) = v.dst else {
                     return Err("a lane write");
@@ -4225,10 +4249,12 @@ impl<'a> Lower<'a> {
                     None => self.s.m.i32(0),
                 };
                 self.cross_lane(false)?;
+                let mask = self.s.m.i32(self.wave() - 1);
+                let lane = self.s.m.bin(c, Bin::And, lane, mask);
                 let me = self.lane_index();
                 let is = self.s.m.cmp(c, pred::EQ, me, lane);
                 let r = self.s.m.select(c, is, a, old);
-                int(self, r)
+                self.write_i(inst, r, None)
             }
             "v_readfirstlane_b32"
                 if inst
@@ -7417,5 +7443,91 @@ mod tests {
         assert!(f10(0x3FF).is_nan());
         // A 16-bit float is a half already, sign included.
         assert_eq!(half(0xBC00 << half_shift(16)), -1.0);
+    }
+
+    #[test]
+    fn s_buffer_load_masks_each_offset_term_before_summing() {
+        // Root SRV at s[0:1]: base=3, soffset=3, offset=3 must each mask with
+        // `& !3` before summing (`0 + 0 + 0 == 0`, not `3 + 3 + 3 == 9`).
+        let words = [
+            0x8000_8300, // s_add_u32 s0, s0, 3
+            0xBE82_03C1, // s_mov_b32 s2, -1
+            0xBE83_03FF,
+            0x1101_4FAC, // s_mov_b32 s3, 0x11014fac
+            0xBE84_0383, // s_mov_b32 s4, 3
+            0xF420_0140,
+            0x0800_0003, // s_buffer_load_dword s5, s[0:3], s4 offset:3
+            0x7E00_0205, // v_mov_b32 v0, s5
+            0xD834_0000,
+            0x0000_0000, // ds_write_b32 v0, v0
+            S_ENDPGM,
+        ];
+        let used = vec![UsedResource {
+            kind: ResourceType::Srv,
+            root: RootType::Descriptor,
+            table_offset_dwords: 0,
+            lower_bound: 0,
+            stride: 4,
+            dwords: 4,
+            user_data: 0,
+            slot: 0,
+        }];
+        let l = lower_with(&words, vec![root(RootType::Descriptor, 0, 0)], used).unwrap();
+        let loads = l.module.calls("rawBufferLoad");
+        assert_eq!(loads.len(), 1);
+        assert_eq!(l.module.eval_i32(loads[0][2]), Some(0));
+    }
+
+    #[test]
+    fn readlane_and_writelane_mask_lane_index_by_wave_size() {
+        for (lane, wave64) in [(35u32, false), (67u32, true)] {
+            let words = [
+                0xD760_0000,
+                0x0001_FF00,
+                lane, // v_readlane_b32 s0, v0, <lane>
+                0xD761_0001,
+                0x0001_FE00,
+                lane, // v_writelane_b32 v1, s0, <lane>
+                0xD834_0000,
+                0x0000_0100, // ds_write_b32 v0, v1
+                S_ENDPGM,
+            ];
+            let l = lower_wave(&words, vec![], vec![], wave64).unwrap();
+            let reads = l.module.calls("waveReadLaneAt");
+            assert_eq!(reads.len(), 1);
+            assert_eq!(l.module.eval_i32(reads[0][2]), Some(3));
+            let matched = l.module.selects().iter().any(|&(cond, _, _)| {
+                l.module.cmp_eq(cond).is_some_and(|(a, b)| {
+                    l.module.is_lane_index(a) && l.module.eval_i32(b) == Some(3)
+                })
+            });
+            assert!(matched, "expected masked lane index 3 in wave64={wave64}");
+        }
+    }
+
+    #[test]
+    fn writelane_ignores_exec_guard() {
+        // `v_cmpx_eq_u32` narrows EXEC without a branch (leaving an EXEC
+        // guard on subsequent VALU instructions), yet `v_writelane_b32` writes
+        // the target lane unconditionally without wrapping in the EXEC guard.
+        let words = [
+            0x7DA4_0080, // v_cmpx_eq_u32 exec, 0, v0
+            0xD761_0001,
+            0x0001_0681, // v_writelane_b32 v1, 1, 3
+            0xD834_0000,
+            0x0000_0100, // ds_write_b32 v0, v1
+            S_ENDPGM,
+        ];
+        let l = lower_wave(&words, vec![], vec![], false).unwrap();
+        let selects = l.module.selects();
+        assert_eq!(
+            selects.len(),
+            1,
+            "unexpected extra EXEC guard select: {selects:?}"
+        );
+        let (cond, _, _) = selects[0];
+        let (a, b) = l.module.cmp_eq(cond).expect("lane == 3 compare");
+        assert!(l.module.is_lane_index(a));
+        assert_eq!(l.module.eval_i32(b), Some(3));
     }
 }

@@ -326,7 +326,7 @@ fn simulate(insts: &[Inst], wave: u32, saved: Value) -> HashMap<Value, Shape> {
             let x = lanes(src, &vec, &uni);
             if let Some(w) = inst.write(Reg::S(code)) {
                 let s = l
-                    .and_then(|l| x.get(l as usize).copied())
+                    .and_then(|l| x.get((l & (wave - 1)) as usize).copied())
                     .unwrap_or(Sym::Unknown);
                 uni.insert(w, s);
             }
@@ -675,5 +675,23 @@ mod tests {
             per_lane(&vec![red(u64::MAX); 64], u64::MAX),
             Some(Shape::Active(Op::AddU, x, m, 0))
         );
+    }
+
+    #[test]
+    fn readlane_masks_lane_index_to_wave_size() {
+        // Wave32 whole-wave section reading lane 35 (= lane 3 after `& 31`).
+        let words: [u32; 5] = [
+            0xBE8A_3DC1, // s_or_saveexec_b32 s10, -1
+            0xD760_0000,
+            0x0001_4700, // v_readlane_b32 s0, v0, 35
+            0xBEFE_030A, // s_mov_b32 exec_lo, s10
+            0xBF81_0000, // s_endpgm
+        ];
+        let code: Vec<u8> = words.iter().flat_map(|w| w.to_le_bytes()).collect();
+        let p = crate::ir::build(&code, false, 256).unwrap();
+        let v0 = p.inputs.iter().find(|i| i.0 == Reg::V(0)).unwrap().1;
+        let s0 = p.blocks[0].insts[1].write(Reg::S(0)).unwrap();
+        let secs = sections(&p, 0);
+        assert_eq!(secs[&0].shapes.get(&s0), Some(&Shape::Value(v0)));
     }
 }

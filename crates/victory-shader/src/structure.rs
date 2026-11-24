@@ -1003,20 +1003,21 @@ impl<'a> Lanes<'a> {
 
     /// The per-lane condition under which a block's closing branch is taken.
     fn branch(&mut self, inst: &Inst) -> Bool {
-        let exec = self.exec(inst);
         match inst.name() {
-            "s_cbranch_execz" => self.b.not(exec),
-            "s_cbranch_execnz" => exec,
+            "s_cbranch_execz" => {
+                let exec = self.exec(inst);
+                self.b.not(exec)
+            }
+            "s_cbranch_execnz" => self.exec(inst),
             n @ ("s_cbranch_vccz" | "s_cbranch_vccnz") => {
                 let vcc = match self.key(|r| inst.read(r), VCC) {
                     Some(k) => self.mask(k).0,
                     None => Bool::FALSE,
                 };
-                let any = self.b.and(vcc, exec);
                 if n.ends_with("nz") {
-                    any
+                    vcc
                 } else {
-                    self.b.not(any)
+                    self.b.not(vcc)
                 }
             }
             n => {
@@ -1230,5 +1231,49 @@ mod tests {
         assert_eq!(p.blocks[0].exit.successors(), [2, 4]);
         assert_eq!(p.blocks[1].preds, [2]);
         assert!(structure(&p).is_ok());
+    }
+
+    #[test]
+    fn cbranch_vcc_tests_raw_vcc_without_exec_masking() {
+        // Under narrowed EXEC (`v_cmpx_eq_u32`), an explicit scalar write to
+        // `vcc_lo` followed by `s_cbranch_vccnz` / `s_cbranch_vccz` tests raw
+        // `vcc` (`TRUE` for -1, `FALSE` for 0) rather than `vcc & exec`.
+        let p_nz = build(
+            &[
+                0x7DA4_0080, // v_cmpx_eq_u32 exec, 0, v0
+                0xBEEA_03C1, // s_mov_b32 vcc_lo, -1
+                0xBF87_0001, // s_cbranch_vccnz -> 16
+                0x7E02_0280, // v_mov_b32 v1, 0
+                S_ENDPGM,    // 16
+            ],
+            false,
+        );
+        let s_nz = structure(&p_nz).unwrap();
+        assert!(matches!(
+            s_nz.exits[0],
+            LaneExit::Branch {
+                when: Bool::TRUE,
+                ..
+            }
+        ));
+
+        let p_z = build(
+            &[
+                0x7DA4_0080, // v_cmpx_eq_u32 exec, 0, v0
+                0xBEEA_0380, // s_mov_b32 vcc_lo, 0
+                0xBF86_0001, // s_cbranch_vccz -> 16
+                0x7E02_0280, // v_mov_b32 v1, 0
+                S_ENDPGM,    // 16
+            ],
+            false,
+        );
+        let s_z = structure(&p_z).unwrap();
+        assert!(matches!(
+            s_z.exits[0],
+            LaneExit::Branch {
+                when: Bool::TRUE,
+                ..
+            }
+        ));
     }
 }
