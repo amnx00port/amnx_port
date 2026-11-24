@@ -1,0 +1,50 @@
+name: Asset Policy & Format
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+jobs:
+  policy-and-format:
+    name: Asset Policy and Code Style
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt
+
+      - name: Verify Asset Policy (Rule #1)
+        run: cargo xtask policy
+
+      - name: Verify Code Formatting on Pull Request
+        if: github.event_name == 'pull_request'
+        run: |
+          CHANGED=$(git diff --name-only --diff-filter=ACMR origin/main...HEAD -- '*.rs' || true)
+          if [ -n "$CHANGED" ]; then
+            echo "Checking formatting on changed files:"
+            echo "$CHANGED"
+            git diff -z --name-only --diff-filter=ACMR origin/main...HEAD -- '*.rs' | xargs -0 -r rustfmt --edition 2024 --check
+          else
+            echo "No Rust files modified in this PR."
+          fi
+
+      - name: Check Workspace Formatting on Main (Informational)
+        if: github.event_name == 'push'
+        continue-on-error: true
+        run: cargo fmt --all -- --check
