@@ -377,6 +377,7 @@ static FUNCTIONS: Table<160> = {
     f[27] = resource::create_committed as *const (); // 0xd8
     f[28] = resource::create_heap as *const (); // 0xe0
     f[29] = resource::create_placed as *const (); // 0xe8
+    f[35] = object::ignore as *const (); // 0x118 Evict: memory is never evicted
     f[36] = fence::create as *const (); // 0x120
     f[38] = resource::copyable_footprints as *const (); // 0x130
     f[39] = query::create as *const (); // 0x138
@@ -528,5 +529,13 @@ mod tests {
         assert_eq!(query(&levels, 0x18), (S_OK, 0xc100));
         assert_eq!(query(&levels, 0x10).0, E_INVALIDARG);
         assert_eq!(query(&levels[4..], 0x18).0, UNSUPPORTED);
+    }
+
+    #[test]
+    fn evict_succeeds_without_doing_anything() {
+        type Evict = extern "system" fn(This, u32, *const This) -> HRESULT;
+        let device = device();
+        let evict = slot::<Evict>(device, 0x118);
+        assert_eq!(evict(device, 0, std::ptr::null()), S_OK);
     }
 }
