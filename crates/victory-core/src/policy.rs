@@ -83,14 +83,31 @@ fn resolve(path: &Path) -> Result<PathBuf, PolicyError> {
             Ok(canon) => {
                 let mut out = canon;
                 for component in rest.iter().rev() {
-                    out.push(component);
+                    match component {
+                        Component::CurDir => {}
+                        Component::ParentDir => {
+                            out.pop();
+                        }
+                        Component::Normal(n) if *n == ".." => {
+                            out.pop();
+                        }
+                        Component::Normal(n) if *n == "." => {}
+                        c => out.push(c),
+                    }
                 }
-                return Ok(normalize(&out));
+                return Ok(out);
             }
-            Err(source) => match (existing.parent(), existing.file_name()) {
-                (Some(parent), Some(name)) => {
-                    rest.push(name.to_os_string());
-                    existing = parent;
+            Err(source) => match existing.components().next_back() {
+                Some(Component::Normal(name)) => {
+                    rest.push(Component::Normal(name));
+                    existing = existing.parent().unwrap_or(Path::new(""));
+                }
+                Some(Component::ParentDir) => {
+                    rest.push(Component::ParentDir);
+                    existing = existing.parent().unwrap_or(Path::new(""));
+                }
+                Some(Component::CurDir) => {
+                    existing = existing.parent().unwrap_or(Path::new(""));
                 }
                 _ => {
                     return Err(PolicyError::Io {
@@ -101,21 +118,6 @@ fn resolve(path: &Path) -> Result<PathBuf, PolicyError> {
             },
         }
     }
-}
-
-/// Removes `.` and resolves `..` lexically (only used on the non-existing tail).
-fn normalize(path: &Path) -> PathBuf {
-    let mut out = PathBuf::new();
-    for component in path.components() {
-        match component {
-            Component::CurDir => {}
-            Component::ParentDir => {
-                out.pop();
-            }
-            c => out.push(c),
-        }
-    }
-    out
 }
 
 #[cfg(test)]
@@ -155,5 +157,21 @@ mod tests {
     fn accepts_unrelated_directories() {
         let tmp = tempfile::tempdir().unwrap();
         ensure_outside_repo(&tmp.path().join("does").join("not").join("exist")).unwrap();
+    }
+
+    #[test]
+    fn handles_trailing_dotdot_and_curdir() {
+        let tmp = tempfile::tempdir().unwrap();
+        let p1 = tmp.path().join("does_not_exist").join("..");
+        assert!(ensure_outside_repo(&p1).is_ok());
+
+        let p2 = tmp.path().join("does_not_exist").join(".");
+        assert!(ensure_outside_repo(&p2).is_ok());
+
+        let p3 = compiled_workspace_root().join("does_not_exist").join("..");
+        assert!(matches!(
+            ensure_outside_repo(&p3),
+            Err(PolicyError::InsideRepo { .. })
+        ));
     }
 }
