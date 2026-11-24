@@ -136,6 +136,15 @@ extern "system" fn register_progress(
     put(out, token())
 }
 
+extern "system" fn unregister_progress(
+    _: This,
+    _monitor: *const c_void,
+    _token: u64,
+    _wait: bool,
+) -> bool {
+    true
+}
+
 /// 0: ready.
 // shortcut: every selector counts as installed, including ones the
 // package's layout does not have (the console answers those with an
@@ -152,6 +161,20 @@ extern "system" fn find_availability(
         return NO_PACKAGE;
     }
     put(out, 0)
+}
+
+extern "system" fn enumerate_chunk_availability(
+    _: This,
+    id: *const c_char,
+    _selector_count: u32,
+    _selectors: *const c_void,
+    _context: *mut c_void,
+    _callback: *const c_void,
+) -> HRESULT {
+    if !is_ours(id) {
+        return NO_PACKAGE;
+    }
+    S_OK
 }
 
 extern "system" fn change_order(
@@ -279,11 +302,11 @@ static VTABLE: Methods<40> = Methods([
     progress as *const (),              // 0x38
     missing::<8> as *const (),          // 0x40 update a monitor
     register_progress as *const (),     // 0x48
-    missing::<10> as *const (),         // 0x50 unregister it
+    unregister_progress as *const (),   // 0x50 unregister it
     missing::<11> as *const (),         // 0x58 user locale
-    find_availability as *const (),     // 0x60
-    missing::<13> as *const (),         // 0x68 enumerate chunk availability
-    change_order as *const (),          // 0x70
+    find_availability as *const (),             // 0x60
+    enumerate_chunk_availability as *const (),  // 0x68 enumerate chunk availability
+    change_order as *const (),                  // 0x70
     missing::<15> as *const (),         // 0x78 install chunks
     install_chunks_async as *const (),  // 0x80
     install_chunks_result as *const (), // 0x88
@@ -344,6 +367,38 @@ mod tests {
             NO_PACKAGE
         );
 
+        type EnumerateChunk = extern "system" fn(
+            This,
+            *const c_char,
+            u32,
+            *const c_void,
+            *mut c_void,
+            *const c_void,
+        ) -> HRESULT;
+        let enumerate_chunks = method::<EnumerateChunk>(&OBJECT, 0x68);
+        assert_eq!(
+            enumerate_chunks(
+                this,
+                ours.as_ptr().cast(),
+                0,
+                none,
+                std::ptr::null_mut(),
+                std::ptr::null(),
+            ),
+            S_OK
+        );
+        assert_eq!(
+            enumerate_chunks(
+                this,
+                c"dlc".as_ptr(),
+                0,
+                none,
+                std::ptr::null_mut(),
+                std::ptr::null(),
+            ),
+            NO_PACKAGE
+        );
+
         type Progress_ = extern "system" fn(This, *const c_void, *mut Progress);
         let mut p = Progress {
             total_bytes: 1,
@@ -354,6 +409,35 @@ mod tests {
         };
         method::<Progress_>(&OBJECT, 0x38)(this, monitor(), &mut p);
         assert!(p.completed && p.launchable && p.installed_bytes == p.total_bytes);
+
+        type RegisterProgress = extern "system" fn(
+            This,
+            *const c_void,
+            *mut c_void,
+            *const c_void,
+            *mut u64,
+        ) -> HRESULT;
+        let mut token_val = 0u64;
+        assert_eq!(
+            method::<RegisterProgress>(&OBJECT, 0x48)(
+                this,
+                monitor(),
+                std::ptr::null_mut(),
+                std::ptr::null(),
+                &mut token_val,
+            ),
+            S_OK
+        );
+        assert_ne!(token_val, 0);
+
+        type UnregisterProgress =
+            extern "system" fn(This, *const c_void, u64, bool) -> bool;
+        assert!(method::<UnregisterProgress>(&OBJECT, 0x50)(
+            this,
+            monitor(),
+            token_val,
+            true,
+        ));
 
         type Mount = extern "system" fn(This, *const c_char, *mut AsyncBlock) -> HRESULT;
         let mut block = AsyncBlock {
