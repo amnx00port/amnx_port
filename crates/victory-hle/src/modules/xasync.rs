@@ -489,6 +489,12 @@ impl Call {
 /// Calls by block address.
 static CALLS: LazyLock<Mutex<HashMap<usize, Arc<Call>>>> = LazyLock::new(Default::default);
 
+/// Notified each time a status is published. A failed call leaves `CALLS`
+/// before its status is set (its cleanup runs first), so a waiter that
+/// finds no call while the status is still pending waits here instead.
+static PUBLISHED: Condvar = Condvar::new();
+static PUBLISHING: Mutex<()> = Mutex::new(());
+
 fn call(block: *mut AsyncBlock) -> Option<Arc<Call>> {
     lock(&CALLS).get(&(block as usize)).cloned()
 }
@@ -602,6 +608,10 @@ pub fn XAsyncComplete(block: *mut AsyncBlock, result: HRESULT, required_size: us
     *done = true;
     call.finished.notify_all();
     drop(done);
+    {
+        let _published = lock(&PUBLISHING);
+        PUBLISHED.notify_all();
+    }
     if routine.is_some() {
         let task = Task::new(block.cast(), complete);
         match queue(handle) {
@@ -615,9 +625,19 @@ pub fn XAsyncGetStatus(block: *mut AsyncBlock, wait: bool) -> HRESULT {
     if block.is_null() {
         return E_INVALIDARG;
     }
-    if wait && let Some(call) = call(block) {
-        let done = lock(&call.done);
-        drop(call.finished.wait_while(done, |d| !*d));
+    if wait {
+        match call(block) {
+            Some(call) => {
+                let done = lock(&call.done);
+                drop(call.finished.wait_while(done, |d| !*d));
+            }
+            None => {
+                let mut published = lock(&PUBLISHING);
+                while status(block) == E_PENDING && call(block).is_none() {
+                    published = PUBLISHED.wait(published).unwrap_or_else(|e| e.into_inner());
+                }
+            }
+        }
     }
     status(block)
 }
@@ -1207,5 +1227,41 @@ mod tests {
             E_ABORT
         );
         XTaskQueueCloseHandle(q);
+    }
+
+    /// A failed call's cleanup runs before its status is published; a
+    /// thread waiting on the block meanwhile still waits for the status.
+    #[test]
+    fn a_wait_during_a_failed_calls_cleanup_sees_the_failure() {
+        static WAITER: Mutex<Option<std::thread::JoinHandle<HRESULT>>> = Mutex::new(None);
+        static BLOCK: AtomicUsize = AtomicUsize::new(0);
+        extern "system" fn provider(op: u32, _: *const ProviderData) -> HRESULT {
+            if op == OP_CLEANUP {
+                let (tx, rx) = std::sync::mpsc::channel();
+                let waiter = std::thread::spawn(move || {
+                    let block = BLOCK.load(Ordering::SeqCst) as *mut AsyncBlock;
+                    tx.send(()).unwrap();
+                    XAsyncGetStatus(block, true)
+                });
+                rx.recv().unwrap();
+                // Give the waiter time to find the call gone.
+                std::thread::sleep(Duration::from_millis(100));
+                *WAITER.lock().unwrap() = Some(waiter);
+            }
+            S_OK
+        }
+        let mut block = AsyncBlock {
+            queue: std::ptr::null(),
+            context: std::ptr::null_mut(),
+            callback: None,
+            internal: [0; 4],
+        };
+        BLOCK.store(&raw mut block as usize, Ordering::SeqCst);
+        let none = std::ptr::null();
+        let begun = XAsyncBegin(&mut block, std::ptr::null_mut(), none, none.cast(), Some(provider));
+        assert_eq!(begun, S_OK);
+        XAsyncComplete(&mut block, E_ABORT, 0);
+        let waiter = WAITER.lock().unwrap().take().unwrap();
+        assert_eq!(waiter.join().unwrap(), E_ABORT);
     }
 }
