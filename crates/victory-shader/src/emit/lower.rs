@@ -6508,6 +6508,22 @@ impl<'a> Lower<'a> {
 
     fn fill_phis(&mut self) -> Result<(), Stop> {
         let p = self.x.p;
+        // A phi read only by another phi is read too: follow incoming phi
+        // dependencies from the phis actual readers mark, so a missing
+        // incoming value cannot be replaced by zero on its way to a live
+        // read (a dead phi keeps the zero substitution).
+        let mut read = self.read_phis.clone();
+        let mut work: Vec<Value> = read.iter().copied().collect();
+        while let Some(v) = work.pop() {
+            let Some(&(b, i)) = self.phi_at.get(&v) else {
+                continue;
+            };
+            for &arg in &p.blocks[b].phis[i].args {
+                if read.insert(arg) {
+                    work.push(arg);
+                }
+            }
+        }
         for (v, b, i) in std::mem::take(&mut self.data_phis) {
             let phi = &p.blocks[b].phis[i];
             let bit = phi.reg == Reg::Scc;
@@ -6518,13 +6534,13 @@ impl<'a> Lower<'a> {
                 let arg = phi.args[n];
                 let x = match (self.vals.get(&arg).copied(), bit) {
                     (Some(Val::I32(x)), false) | (Some(Val::Bit(x)), true) => x,
-                    (Some(Val::Bit(_)), false) if self.read_phis.contains(&phi.value) => {
+                    (Some(Val::Bit(_)), false) if read.contains(&phi.value) => {
                         return Err(Stop::Retry(phi.value, "an SCC joined with SGPR values"));
                     }
-                    (Some(Val::Missing(why)), _) if self.read_phis.contains(&phi.value) => {
+                    (Some(Val::Missing(why)), _) if read.contains(&phi.value) => {
                         return Err(Stop::Retry(phi.value, why));
                     }
-                    _ if self.read_phis.contains(&phi.value) => {
+                    _ if read.contains(&phi.value) => {
                         return Err(Stop::Retry(phi.value, "a join of mismatched values"));
                     }
                     _ if bit => self.s.m.bool(false),
@@ -6565,8 +6581,8 @@ mod tests {
 
     const S_ENDPGM: u32 = 0xBF81_0000;
 
-    /// Lowers a compute program of constants: whether it translates.
-    fn lowers(words: &[u32]) -> Result<(), crate::ShaderError> {
+    /// Whether a synthetic compute program translates with these input registers.
+    fn lowers(words: &[u32], rsrc2: u32) -> Result<(), crate::ShaderError> {
         let code: Vec<u8> = words.iter().flat_map(|w| w.to_le_bytes()).collect();
         let native = NativeProgram {
             stage: HwStage::Cs,
@@ -6575,7 +6591,7 @@ mod tests {
             layout: vec![],
             used: vec![],
             io: StageIo::Cs(ComputeIo {
-                rsrc2: 0,
+                rsrc2,
                 threads: [1, 1, 1],
             }),
             code,
@@ -6626,8 +6642,37 @@ mod tests {
             S_ENDPGM,
         ];
         for words in [add, sub] {
-            lowers(&words).unwrap();
+            lowers(&words, 0).unwrap();
         }
+    }
+
+    #[test]
+    fn a_missing_value_stays_missing_through_two_live_joins() {
+        let mut words = [
+            0xF490_0180,
+            0,           // s_memtime s[6:7]
+            0xBF06_8000, // s_cmp_eq_u32 s0, 0 (s0 = group id X)
+            0xBF85_0001, // skip the first overwrite
+            0xBE86_0380, // s_mov_b32 s6, 0
+            0xBF06_8101, // s_cmp_eq_u32 s1, 1 (s1 = group id Y)
+            0xBF85_0001, // skip the second overwrite
+            0xBE86_0381, // s_mov_b32 s6, 1
+            0xBF07_8006, // s_cmp_lg_u32 s6, 0
+            0xBF85_0001, // use the result to branch
+            0xBE83_0380,
+            S_ENDPGM,
+        ];
+        let group_ids_xy = 3 << 7;
+        // Compare to a direct read so future timestamp support works in both cases.
+        let refusal = |code: &[u32]| match lowers(code, group_ids_xy) {
+            Ok(()) => None,
+            Err(crate::ShaderError::Unsupported { what, .. }) => Some(what),
+            Err(error) => panic!("{error}"),
+        };
+        let direct = [&words[..2], &words[8..]].concat();
+        assert_eq!(refusal(&words), refusal(&direct));
+        words[8] = 0xBF07_8000; // read the group id instead; the timestamp is dead
+        lowers(&words, group_ids_xy).expect("dead timestamp");
     }
 
     #[test]

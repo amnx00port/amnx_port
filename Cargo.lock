@@ -714,6 +714,7 @@ dependencies = [
  "victory-pe",
  "windows",
  "windows-core",
+ "windows-future",
  "windows-sys",
 ]
 
