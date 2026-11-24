@@ -12,8 +12,10 @@ use std::io::{Seek, SeekFrom, Write};
 use std::path::Path;
 use std::time::{Duration, Instant};
 
+use windows::Win32::Foundation::{CloseHandle, HANDLE, WAIT_OBJECT_0};
 use windows::Win32::Media::Audio::{
-    AUDCLNT_BUFFERFLAGS_DATA_DISCONTINUITY, AUDCLNT_BUFFERFLAGS_SILENT, AUDCLNT_SHAREMODE_SHARED,
+    AUDCLNT_BUFFERFLAGS_DATA_DISCONTINUITY, AUDCLNT_BUFFERFLAGS_SILENT,
+    AUDCLNT_BUFFERFLAGS_TIMESTAMP_ERROR, AUDCLNT_SHAREMODE_SHARED,
     AUDCLNT_STREAMFLAGS_AUTOCONVERTPCM, AUDCLNT_STREAMFLAGS_LOOPBACK,
     AUDIOCLIENT_ACTIVATION_PARAMS, AUDIOCLIENT_ACTIVATION_PARAMS_0,
     AUDIOCLIENT_ACTIVATION_TYPE_PROCESS_LOOPBACK, AUDIOCLIENT_PROCESS_LOOPBACK_PARAMS,
@@ -23,7 +25,6 @@ use windows::Win32::Media::Audio::{
     VIRTUAL_AUDIO_DEVICE_PROCESS_LOOPBACK, WAVE_FORMAT_PCM, WAVEFORMATEX,
 };
 use windows::Win32::System::Com::{COINIT_MULTITHREADED, CoInitializeEx};
-use windows::Win32::Foundation::WAIT_OBJECT_0;
 use windows::Win32::System::Threading::{
     OpenProcess, PROCESS_SYNCHRONIZE, Sleep, WaitForSingleObject,
 };
@@ -31,6 +32,16 @@ use windows::core::{HRESULT, IUnknown, Interface, Ref, implement};
 
 const RATE: u32 = 48_000;
 const FRAME_BYTES: usize = 4;
+const MAX_WAV_DATA: u32 = u32::MAX - 36;
+
+struct ProcessHandle(HANDLE);
+
+impl Drop for ProcessHandle {
+    fn drop(&mut self) {
+        // SAFETY: owned process handle opened by `OpenProcess`.
+        let _ = unsafe { CloseHandle(self.0) };
+    }
+}
 
 /// Activation completes asynchronously; the recording thread polls for it.
 #[implement(IActivateAudioInterfaceCompletionHandler)]
@@ -66,7 +77,7 @@ pub fn start() {
                 }
             });
     }
-    if std::env::var_os("VICTORY_AUDIO_CAPTURE").is_some()
+    if std::env::var_os("VICTORY_AUDIO_CAPTURE").is_some_and(|v| !v.is_empty())
         && let Err(e) = std::env::current_exe().and_then(|exe| {
             std::process::Command::new(exe)
                 .env(TARGET, std::process::id().to_string())
@@ -82,7 +93,7 @@ pub fn start() {
 pub fn child() -> bool {
     let (Some(pid), Some(path)) = (
         std::env::var(TARGET).ok().and_then(|p| p.parse().ok()),
-        std::env::var_os("VICTORY_AUDIO_CAPTURE"),
+        std::env::var_os("VICTORY_AUDIO_CAPTURE").filter(|v| !v.is_empty()),
     ) else {
         return false;
     };
@@ -93,7 +104,9 @@ pub fn child() -> bool {
 }
 
 fn header(frames: u64) -> [u8; 44] {
-    let data = u32::try_from(frames * FRAME_BYTES as u64).unwrap_or(u32::MAX - 36);
+    let data = u32::try_from(frames.saturating_mul(FRAME_BYTES as u64))
+        .unwrap_or(MAX_WAV_DATA)
+        .min(MAX_WAV_DATA);
     let mut h = [0u8; 44];
     let fields: [(&[u8], usize); 11] = [
         (b"RIFF", 0),
@@ -115,12 +128,37 @@ fn header(frames: u64) -> [u8; 44] {
     h
 }
 
+/// Computes the target frame offset from a 100 ns QPC timestamp without
+/// underflowing on retrograde timestamps or overflowing `u64` multiplication.
+fn packet_frame_offset(qpc: u64, first: &mut Option<u64>, timestamp_error: bool, written: u64) -> u64 {
+    if timestamp_error {
+        return written;
+    }
+    let start = *first.get_or_insert(qpc);
+    let delta = qpc.saturating_sub(start);
+    let frames = (u128::from(delta) * u128::from(RATE)) / 10_000_000;
+    u64::try_from(frames).unwrap_or(u64::MAX)
+}
+
+/// Writes `frames` silent stereo 16-bit frames in fixed-size chunks so long
+/// idle gaps never trigger large heap allocations.
+fn write_silence(writer: &mut impl Write, mut frames: u64) -> std::io::Result<()> {
+    const CHUNK_FRAMES: usize = 1024;
+    const ZEROS: [u8; CHUNK_FRAMES * FRAME_BYTES] = [0u8; CHUNK_FRAMES * FRAME_BYTES];
+    while frames > 0 {
+        let take = frames.min(CHUNK_FRAMES as u64) as usize;
+        writer.write_all(&ZEROS[..take * FRAME_BYTES])?;
+        frames -= take as u64;
+    }
+    Ok(())
+}
+
 fn record(pid: u32, path: &Path) -> Result<(), Box<dyn std::error::Error>> {
     // SAFETY: COM calls with parameters built here; buffers are used only
     // between `GetBuffer` and `ReleaseBuffer`.
     unsafe {
         CoInitializeEx(None, COINIT_MULTITHREADED).ok()?;
-        let target = OpenProcess(PROCESS_SYNCHRONIZE, false, pid)?;
+        let target = ProcessHandle(OpenProcess(PROCESS_SYNCHRONIZE, false, pid)?);
         let params = AUDIOCLIENT_ACTIVATION_PARAMS {
             ActivationType: AUDIOCLIENT_ACTIVATION_TYPE_PROCESS_LOOPBACK,
             Anonymous: AUDIOCLIENT_ACTIVATION_PARAMS_0 {
@@ -158,6 +196,9 @@ fn record(pid: u32, path: &Path) -> Result<(), Box<dyn std::error::Error>> {
                 hr.ok()?;
                 break client.ok_or("no audio client")?.cast::<IAudioClient>()?;
             }
+            if WaitForSingleObject(target.0, 0) == WAIT_OBJECT_0 {
+                return Ok(());
+            }
             std::thread::sleep(Duration::from_millis(10));
         };
         let format = WAVEFORMATEX {
@@ -187,31 +228,33 @@ fn record(pid: u32, path: &Path) -> Result<(), Box<dyn std::error::Error>> {
         let mut patched = Instant::now();
         loop {
             std::thread::sleep(Duration::from_millis(10));
-            let ended = WaitForSingleObject(target, 0) == WAIT_OBJECT_0;
+            let ended = WaitForSingleObject(target.0, 0) == WAIT_OBJECT_0;
             while capture.GetNextPacketSize()? > 0 {
                 let (mut data, mut frames, mut flags, mut qpc) = (std::ptr::null_mut(), 0, 0, 0);
                 capture.GetBuffer(&mut data, &mut frames, &mut flags, None, Some(&mut qpc))?;
                 // Where this packet belongs, from its time stamp (100 ns).
-                let at = (qpc - *first.get_or_insert(qpc)) * u64::from(RATE) / 10_000_000;
-                if at > written + u64::from(RATE / 500) {
+                let ts_error = flags & AUDCLNT_BUFFERFLAGS_TIMESTAMP_ERROR.0 as u32 != 0;
+                let at = packet_frame_offset(qpc, &mut first, ts_error, written);
+                if at > written.saturating_add(u64::from(RATE / 500)) {
                     tracing::debug!(
                         ms = (at - written) * 1000 / u64::from(RATE),
                         "audio capture: nothing played"
                     );
-                    let silence = vec![0u8; (at - written) as usize * FRAME_BYTES];
-                    file.write_all(&silence)?;
+                    write_silence(&mut file, at - written)?;
                     written = at;
                 }
-                let bytes = frames as usize * FRAME_BYTES;
-                if flags & AUDCLNT_BUFFERFLAGS_SILENT.0 as u32 != 0 {
-                    file.write_all(&vec![0u8; bytes])?;
-                } else {
-                    file.write_all(std::slice::from_raw_parts(data, bytes))?;
+                if frames > 0 {
+                    if flags & AUDCLNT_BUFFERFLAGS_SILENT.0 as u32 != 0 || data.is_null() {
+                        write_silence(&mut file, u64::from(frames))?;
+                    } else {
+                        let bytes = frames as usize * FRAME_BYTES;
+                        file.write_all(std::slice::from_raw_parts(data, bytes))?;
+                    }
                 }
                 if flags & AUDCLNT_BUFFERFLAGS_DATA_DISCONTINUITY.0 as u32 != 0 && written > 0 {
                     tracing::debug!("audio capture: discontinuity");
                 }
-                written += u64::from(frames);
+                written = written.saturating_add(u64::from(frames));
                 capture.ReleaseBuffer(frames)?;
             }
             if ended || patched.elapsed() >= Duration::from_secs(1) {
@@ -225,5 +268,102 @@ fn record(pid: u32, path: &Path) -> Result<(), Box<dyn std::error::Error>> {
                 return Ok(());
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn wav_header_encodes_48khz_stereo_16bit_pcm() {
+        let h = header(100);
+        assert_eq!(&h[0..4], b"RIFF");
+        assert_eq!(u32::from_le_bytes(h[4..8].try_into().unwrap()), 36 + 400);
+        assert_eq!(&h[8..16], b"WAVEfmt ");
+        assert_eq!(u32::from_le_bytes(h[16..20].try_into().unwrap()), 16);
+        assert_eq!(u16::from_le_bytes(h[20..22].try_into().unwrap()), 1); // PCM
+        assert_eq!(u16::from_le_bytes(h[22..24].try_into().unwrap()), 2); // stereo
+        assert_eq!(u32::from_le_bytes(h[24..28].try_into().unwrap()), 48_000);
+        assert_eq!(
+            u32::from_le_bytes(h[28..32].try_into().unwrap()),
+            48_000 * 4
+        );
+        assert_eq!(u16::from_le_bytes(h[32..34].try_into().unwrap()), 4);
+        assert_eq!(u16::from_le_bytes(h[34..36].try_into().unwrap()), 16);
+        assert_eq!(&h[36..40], b"data");
+        assert_eq!(u32::from_le_bytes(h[40..44].try_into().unwrap()), 400);
+    }
+
+    #[test]
+    fn wav_header_clamps_near_u32_max_without_overflow() {
+        // Previously `frames * 4` fit in `u32` (u32::MAX - 31) and `36 + data` overflowed.
+        let near_max_frames = u64::from(u32::MAX - 31) / FRAME_BYTES as u64;
+        for frames in [near_max_frames, u64::from(u32::MAX), u64::MAX] {
+            let h = header(frames);
+            let riff = u32::from_le_bytes(h[4..8].try_into().unwrap());
+            let data = u32::from_le_bytes(h[40..44].try_into().unwrap());
+            assert_eq!(data, MAX_WAV_DATA);
+            assert_eq!(riff, u32::MAX);
+        }
+    }
+
+    #[test]
+    fn packet_frame_offset_handles_monotonic_retrograde_and_large_qpc() {
+        let mut first = None;
+        // First timestamp establishes origin (0 frames).
+        assert_eq!(packet_frame_offset(10_000_000, &mut first, false, 0), 0);
+        assert_eq!(first, Some(10_000_000));
+
+        // 1 second (10_000_000 * 100 ns) later -> 48_000 frames.
+        assert_eq!(
+            packet_frame_offset(20_000_000, &mut first, false, 480),
+            48_000
+        );
+
+        // Retrograde QPC timestamp saturates to 0 instead of underflowing.
+        assert_eq!(packet_frame_offset(5_000_000, &mut first, false, 48_000), 0);
+
+        // Large delta that would overflow `delta * 48_000` in u64 still computes accurately.
+        let huge_delta: u64 = 500_000_000_000_000;
+        let expected = ((u128::from(huge_delta) * u128::from(RATE)) / 10_000_000) as u64;
+        assert_eq!(
+            packet_frame_offset(10_000_000 + huge_delta, &mut first, false, 0),
+            expected
+        );
+    }
+
+    #[test]
+    fn packet_frame_offset_ignores_timestamp_error_flag() {
+        let mut first = None;
+        // Error on first packet must not poison `first` and keeps current written offset.
+        assert_eq!(packet_frame_offset(0, &mut first, true, 123), 123);
+        assert_eq!(first, None);
+
+        assert_eq!(packet_frame_offset(50_000_000, &mut first, false, 123), 0);
+        assert_eq!(packet_frame_offset(0, &mut first, true, 999), 999);
+    }
+
+    #[test]
+    fn write_silence_handles_zero_single_and_multi_chunk_spans() {
+        let mut buf = Vec::new();
+        write_silence(&mut buf, 0).unwrap();
+        assert!(buf.is_empty());
+
+        write_silence(&mut buf, 1).unwrap();
+        assert_eq!(buf.len(), FRAME_BYTES);
+        assert!(buf.iter().all(|&b| b == 0));
+
+        // Span multiple 1024-frame chunks plus a partial remainder.
+        buf.clear();
+        let frames = 2500u64;
+        write_silence(&mut buf, frames).unwrap();
+        assert_eq!(buf.len(), frames as usize * FRAME_BYTES);
+        assert!(buf.iter().all(|&b| b == 0));
+    }
+
+    #[test]
+    fn child_returns_false_without_capture_env() {
+        assert!(!child());
     }
 }
