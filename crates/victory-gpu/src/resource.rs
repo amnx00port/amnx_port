@@ -329,7 +329,48 @@ impl PlacedFootprint {
         let (element, block) = element(self.format)?;
         let lines = u64::from(self.height).div_ceil(block) * u64::from(self.depth);
         let last = u64::from(self.width).div_ceil(block) * element;
-        Some(u64::from(self.row_pitch) * lines.saturating_sub(1) + last)
+        u64::from(self.row_pitch)
+            .checked_mul(lines.saturating_sub(1))?
+            .checked_add(last)
+    }
+
+    /// The enclosing byte span and exact row byte ranges read by `source_box`
+    /// (or the whole footprint when `None`), relative to `self.offset`.
+    pub(crate) fn box_reads(
+        &self,
+        source_box: Option<[u32; 6]>,
+    ) -> Option<(
+        std::ops::Range<u64>,
+        impl Iterator<Item = std::ops::Range<u64>>,
+    )> {
+        let [left, top, front, right, bottom, back] =
+            source_box.unwrap_or([0, 0, 0, self.width, self.height, self.depth]);
+        if left >= right
+            || top >= bottom
+            || front >= back
+            || right > self.width
+            || bottom > self.height
+            || back > self.depth
+        {
+            return None;
+        }
+        let (element, block) = element(self.format)?;
+        self.bytes()?;
+        let pitch = u64::from(self.row_pitch);
+        let slice = pitch.checked_mul(u64::from(self.height).div_ceil(block))?;
+        let first_row = u64::from(top) / block;
+        let end_row = u64::from(bottom).div_ceil(block);
+        let left_byte = u64::from(left) / block * element;
+        let right_byte = u64::from(right).div_ceil(block) * element;
+        let start = u64::from(front) * slice + first_row * pitch + left_byte;
+        let end = u64::from(back - 1) * slice + (end_row - 1) * pitch + right_byte;
+        let rows = (front..back).flat_map(move |z| {
+            (first_row..end_row).map(move |row| {
+                let at = u64::from(z) * slice + row * pitch;
+                at + left_byte..at + right_byte
+            })
+        });
+        Some((start..end, rows))
     }
 }
 const _: () = assert!(size_of::<PlacedFootprint>() == 32);
@@ -1558,6 +1599,38 @@ mod tests {
         );
         allocation_info(&mut info, std::ptr::null(), 0, 1, &texture(1, 1, 999, 1));
         assert_eq!(info.size, u64::MAX);
+    }
+
+    #[test]
+    fn boxed_footprints_cover_block_rows_and_volume_slices() {
+        let compressed = PlacedFootprint {
+            offset: 512,
+            format: 71,
+            width: 10,
+            height: 9,
+            depth: 1,
+            row_pitch: 256,
+        };
+        let (span, rows) = compressed.box_reads(Some([4, 4, 0, 10, 9, 1])).unwrap();
+        assert_eq!(span, 264..536);
+        assert_eq!(rows.collect::<Vec<_>>(), [264..280, 520..536]);
+        assert!(compressed.box_reads(Some([4, 4, 0, 4, 9, 1])).is_none());
+        assert!(compressed.box_reads(Some([0, 0, 0, 11, 9, 1])).is_none());
+
+        let volume = PlacedFootprint {
+            offset: 512,
+            format: 28,
+            width: 4,
+            height: 3,
+            depth: 3,
+            row_pitch: 256,
+        };
+        let (span, rows) = volume.box_reads(Some([1, 1, 1, 3, 3, 3])).unwrap();
+        assert_eq!(span, 1028..2060);
+        assert_eq!(
+            rows.collect::<Vec<_>>(),
+            [1028..1036, 1284..1292, 1796..1804, 2052..2060]
+        );
     }
 
     #[test]
