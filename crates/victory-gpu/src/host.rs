@@ -276,6 +276,100 @@ mod tests {
             desc.Flags & DXGI_ADAPTER_FLAG_SOFTWARE.0 as u32 != 0,
         );
     }
+
+    #[test]
+    fn duplicate_list_in_submission_runs_without_clobbering_prelude() {
+        let Ok(host) = create() else { return };
+        // SAFETY: valid default heap and 2D texture descriptor on a live D3D12 device.
+        let tex: ID3D12Resource = unsafe {
+            let heap = D3D12_HEAP_PROPERTIES {
+                Type: D3D12_HEAP_TYPE_DEFAULT,
+                ..Default::default()
+            };
+            let desc = D3D12_RESOURCE_DESC {
+                Dimension: D3D12_RESOURCE_DIMENSION_TEXTURE2D,
+                Width: 4,
+                Height: 4,
+                DepthOrArraySize: 1,
+                MipLevels: 1,
+                Format: windows::Win32::Graphics::Dxgi::Common::DXGI_FORMAT_R8G8B8A8_UNORM,
+                SampleDesc: windows::Win32::Graphics::Dxgi::Common::DXGI_SAMPLE_DESC {
+                    Count: 1,
+                    Quality: 0,
+                },
+                Flags: D3D12_RESOURCE_FLAG_ALLOW_RENDER_TARGET,
+                ..Default::default()
+            };
+            let mut out: Option<ID3D12Resource> = None;
+            host.device
+                .CreateCommittedResource(
+                    &heap,
+                    D3D12_HEAP_FLAG_NONE,
+                    &desc,
+                    D3D12_RESOURCE_STATE_COMMON,
+                    None,
+                    &mut out,
+                )
+                .unwrap();
+            out.unwrap()
+        };
+        let copy = std::sync::Arc::new(crate::resource::HostTexture {
+            texture: tex,
+            state: AtomicU32::new(D3D12_RESOURCE_STATE_COMMON.0 as u32),
+        });
+        let key = std::sync::Arc::as_ptr(&copy) as usize;
+
+        let list_a = host.new_list().unwrap();
+        let list_b = host.new_list().unwrap();
+        // SAFETY: `list_a` and `list_b` are open command lists and `copy.texture` is live.
+        unsafe {
+            list_a.list.ResourceBarrier(&[transition(
+                &copy.texture,
+                D3D12_RESOURCE_STATE_COPY_DEST,
+                D3D12_RESOURCE_STATE_RENDER_TARGET,
+            )]);
+            list_a.list.Close().unwrap();
+
+            list_b.list.ResourceBarrier(&[transition(
+                &copy.texture,
+                D3D12_RESOURCE_STATE_RENDER_TARGET,
+                D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE,
+            )]);
+            list_b.list.Close().unwrap();
+        }
+        list_a.states.lock().unwrap().insert(
+            key,
+            (
+                D3D12_RESOURCE_STATE_COPY_DEST.0 as u32,
+                D3D12_RESOURCE_STATE_RENDER_TARGET.0 as u32,
+                copy.clone(),
+            ),
+        );
+        list_b.states.lock().unwrap().insert(
+            key,
+            (
+                D3D12_RESOURCE_STATE_RENDER_TARGET.0 as u32,
+                D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE.0 as u32,
+                copy.clone(),
+            ),
+        );
+
+        host.execute(&[&list_a, &list_b, &list_a]);
+        // SAFETY: plain COM query on a live D3D12 device.
+        assert!(unsafe { host.device.GetDeviceRemovedReason() }.is_ok());
+        assert_eq!(
+            copy.state.load(Ordering::Relaxed),
+            D3D12_RESOURCE_STATE_RENDER_TARGET.0 as u32
+        );
+
+        host.execute(&[&list_a, &list_b, &list_a]);
+        // SAFETY: plain COM query on a live D3D12 device.
+        assert!(unsafe { host.device.GetDeviceRemovedReason() }.is_ok());
+        assert_eq!(
+            copy.state.load(Ordering::Relaxed),
+            D3D12_RESOURCE_STATE_RENDER_TARGET.0 as u32
+        );
+    }
 }
 
 /// A host command list and its allocator, always used together.
@@ -490,6 +584,9 @@ impl Host {
     }
 
     /// Runs closed lists and waits for them.
+    /// Splits `runs` whenever a `HostList` repeats so neither its single
+    /// `prelude` command list nor the D3D12 command list itself is reused
+    /// within the same `ExecuteCommandLists` batch.
     pub(crate) fn execute(&self, runs: &[&HostList]) {
         // One submission at a time from preparation to copy-back: snapshots
         // and the ranges shaders write are per host copy, not per submission.
@@ -497,63 +594,84 @@ impl Host {
         let started = std::time::Instant::now();
         #[cfg(feature = "diagnostics")]
         crate::copystat::add(crate::copystat::C::Submissions, 1);
-        let mut lists: Vec<Option<ID3D12CommandList>> = Vec::with_capacity(2 * runs.len());
-        // Where each run's lists start in `lists`.
-        let mut firsts = Vec::with_capacity(runs.len());
         let mut batch = Batch::default();
         for list in runs {
             list.run_deferred(&mut batch);
-            firsts.push(lists.len());
-            if let Some(prelude) = list.prelude() {
-                lists.push(Some(prelude));
-            }
-            lists.push(list.list.cast().ok());
         }
         batch.flush();
         let prepared = std::time::Instant::now();
-        // Diagnostics: each list on its own, timed (`VICTORY_GPU_TIMING`).
-        #[cfg(feature = "diagnostics")]
-        let groups: Vec<&[Option<ID3D12CommandList>]> = if timing() {
-            firsts
-                .iter()
-                .zip(firsts.iter().skip(1).chain([&lists.len()]))
-                .map(|(&a, &b)| &lists[a..b])
-                .collect()
-        } else {
-            vec![&lists[..]]
-        };
-        #[cfg(not(feature = "diagnostics"))]
-        let groups = [&lists[..]];
-        for (i, group) in groups.iter().enumerate() {
-            *submitted += 1;
-            let started = std::time::Instant::now();
-            // SAFETY: closed lists; the fence and event are ours.
-            unsafe {
-                self.queue.ExecuteCommandLists(group);
-                let waited = self
-                    .queue
-                    .Signal(&self.fence, *submitted)
-                    .and_then(|()| self.fence.SetEventOnCompletion(*submitted, self.event));
-                match waited {
-                    Ok(()) => {
-                        WaitForSingleObject(self.event, INFINITE);
-                    }
-                    Err(e) => tracing::warn!(error = %e, "host submission not waited for"),
-                }
+
+        let mut start = 0usize;
+        while start < runs.len() {
+            let mut end = start;
+            while end < runs.len()
+                && !runs[start..end]
+                    .iter()
+                    .any(|&seen| std::ptr::eq(seen, runs[end]))
+            {
+                end += 1;
             }
+            let slice = &runs[start..end];
+            start = end;
+
+            let mut lists: Vec<Option<ID3D12CommandList>> = Vec::with_capacity(2 * slice.len());
+            // Where each run's lists start in `lists`.
+            let mut firsts = Vec::with_capacity(slice.len());
+            for list in slice {
+                firsts.push(lists.len());
+                if let Some(prelude) = list.prelude() {
+                    lists.push(Some(prelude));
+                }
+                lists.push(list.list.cast().ok());
+            }
+            // Diagnostics: each list on its own, timed (`VICTORY_GPU_TIMING`).
             #[cfg(feature = "diagnostics")]
-            if groups.len() > 1 && started.elapsed() > std::time::Duration::from_millis(50) {
-                // SAFETY: a plain query.
-                let frequency = unsafe { self.queue.GetTimestampFrequency() }.unwrap_or(1);
-                let commands = runs[i].notes.lock().unwrap_or_else(|e| e.into_inner()).len();
-                tracing::warn!(ms = started.elapsed().as_millis(), commands, "slow host list");
-                for (ms, op) in runs[i].slowest(frequency, 6) {
-                    tracing::warn!("slow list command, {ms:.1} ms: {op}");
+            let groups: Vec<&[Option<ID3D12CommandList>]> = if timing() {
+                firsts
+                    .iter()
+                    .zip(firsts.iter().skip(1).chain([&lists.len()]))
+                    .map(|(&a, &b)| &lists[a..b])
+                    .collect()
+            } else {
+                vec![&lists[..]]
+            };
+            #[cfg(not(feature = "diagnostics"))]
+            let groups = [&lists[..]];
+            for (i, group) in groups.iter().enumerate() {
+                *submitted += 1;
+                let started = std::time::Instant::now();
+                // SAFETY: closed lists; the fence and event are ours.
+                unsafe {
+                    self.queue.ExecuteCommandLists(group);
+                    let waited = self
+                        .queue
+                        .Signal(&self.fence, *submitted)
+                        .and_then(|()| self.fence.SetEventOnCompletion(*submitted, self.event));
+                    match waited {
+                        Ok(()) => {
+                            WaitForSingleObject(self.event, INFINITE);
+                        }
+                        Err(e) => tracing::warn!(error = %e, "host submission not waited for"),
+                    }
                 }
+                #[cfg(feature = "diagnostics")]
+                if groups.len() > 1 && started.elapsed() > std::time::Duration::from_millis(50) {
+                    // SAFETY: a plain query.
+                    let frequency = unsafe { self.queue.GetTimestampFrequency() }.unwrap_or(1);
+                    let commands = slice[i]
+                        .notes
+                        .lock()
+                        .unwrap_or_else(|e| e.into_inner())
+                        .len();
+                    tracing::warn!(ms = started.elapsed().as_millis(), commands, "slow host list");
+                    for (ms, op) in slice[i].slowest(frequency, 6) {
+                        tracing::warn!("slow list command, {ms:.1} ms: {op}");
+                    }
+                }
+                let _ = (i, started);
             }
-            let _ = (i, started);
+            let _ = &firsts;
         }
-        let _ = &firsts;
         let gpu = prepared.elapsed();
         SUBMISSION_US[0].fetch_add((prepared - started).as_micros() as u64, Ordering::Relaxed);
         SUBMISSION_US[1].fetch_add(gpu.as_micros() as u64, Ordering::Relaxed);
