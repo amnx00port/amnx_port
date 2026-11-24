@@ -520,6 +520,90 @@ mod tests {
         }
     }
 
+    /// A wave32 compute program with 64-bit atomics on a 2D image (an
+    /// R32G32 view, two data dwords): a max without the old value, a
+    /// compare-exchange returning it, and a swap of that returned value.
+    fn image_atomic_64_cs() -> NativeProgram {
+        const fn vop1(vdst: u32, src0: u32) -> u32 {
+            0x7E00_0000 | vdst << 17 | 0x01 << 9 | src0
+        }
+        /// MIMG `op data, v[0:1], s[8:15] dim:2D` with `dmask`.
+        const fn atomic(op: u32, data: u32, dmask: u32, glc: bool) -> [u32; 2] {
+            [
+                0x3C << 26 | op << 18 | dmask << 8 | 1 << 3 | (glc as u32) << 13,
+                2 << 16 | data << 8, // s[8:15]
+            ]
+        }
+        let mut words = vec![0xBE81_0380u32]; // s_mov_b32 s1, 0
+        // s_load_dwordx8 s[8:15], s[0:1], 0
+        words.extend([0x3D << 26 | 0x03 << 18 | 8 << 6, 125 << 25]);
+        words.push(vop1(1, 0x80)); // v_mov_b32 v1, 0
+        words.push(vop1(3, 256)); // v_mov_b32 v3, v0
+        words.push(vop1(4, 0x81)); // v_mov_b32 v4, 1
+        words.extend(atomic(0x17, 3, 0x3, false)); // image_atomic_umax v[3:4]
+        words.push(vop1(5, 0x87)); // v_mov_b32 v5, 7
+        words.push(vop1(6, 0x80)); // v_mov_b32 v6, 0
+        words.extend(atomic(0x10, 3, 0xF, true)); // image_atomic_cmpswap v[3:6] glc
+        words.extend(atomic(0x0F, 3, 0x3, false)); // image_atomic_swap v[3:4]
+        words.push(0xBF81_0000); // s_endpgm
+        NativeProgram {
+            stage: HwStage::Cs,
+            wave64: false,
+            vgprs: 8,
+            layout: vec![crate::native::RootParam {
+                root: crate::native::RootType::Table,
+                table_offset_dwords: 0,
+                sgprs: 1,
+                base_register: 0,
+                user_data: 0,
+                slot: 0,
+            }],
+            used: vec![crate::native::UsedResource {
+                kind: crate::native::ResourceType::Uav,
+                root: crate::native::RootType::Table,
+                table_offset_dwords: 0,
+                lower_bound: 0,
+                stride: 0,
+                dwords: 8,
+                user_data: 0,
+                slot: 0,
+            }],
+            io: StageIo::Cs(ComputeIo {
+                rsrc2: 1 << 1, // one user SGPR: s0
+                threads: [32, 1, 1],
+            }),
+            code: words.iter().flat_map(|w| w.to_le_bytes()).collect(),
+        }
+    }
+
+    /// 64-bit image atomics become DXIL's 64-bit atomics on a U64 texture
+    /// and declare the 64-bit atomic features, instead of failing the
+    /// translation.
+    #[test]
+    fn a_64_bit_image_atomic_is_a_64_bit_atomic() {
+        let native = image_atomic_64_cs();
+        let p = ir::build(&native.patched_code(), native.wave64, native.vgprs).unwrap();
+        let st = structure::structure(&p).unwrap();
+        let res = resource::track(&p, &native.layout, native.stage, Some(&st)).unwrap();
+        let io = io::raise(&p, &native).unwrap();
+        let container = crate::dxbc::build(&[]);
+        let c = Container::parse(&container).unwrap();
+        let out = emit(&c, &native, &p, &st, &io, &res).unwrap();
+        #[cfg(windows)]
+        if let Ok(mut v) = super::validator::Validator::load(
+            super::validator::Validator::default_path().as_deref(),
+        ) {
+            v.validate(&mut out.dxil.clone()).unwrap();
+        }
+        let host = Container::parse(&out.dxil).unwrap();
+        let sfi0 = host.part(FourCC::SFI0).unwrap().data;
+        let features = u64::from_le_bytes(sfi0.try_into().unwrap());
+        // Int64Ops, AtomicInt64OnTypedResource, AtomicInt64OnHeapResource.
+        for bit in [0x8000, 0x40_0000, 0x1000_0000] {
+            assert_ne!(features & bit, 0, "SFI0 {features:#x}: no {bit:#x}");
+        }
+    }
+
     /// A pixel shader writing a constant colour.
     #[cfg(windows)]
     fn constant_color() -> Vec<u8> {
