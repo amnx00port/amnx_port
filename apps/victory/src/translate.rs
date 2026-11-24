@@ -7,8 +7,81 @@ use std::sync::Mutex;
 use std::sync::atomic::{AtomicUsize, Ordering};
 
 use anyhow::Result;
+#[cfg(windows)]
 use victory_shader::emit::host::{self, Host};
-use victory_shader::emit::{self, validator::Validator};
+#[cfg(windows)]
+use victory_shader::emit::validator::Validator;
+use victory_shader::emit;
+
+/// A no-op validator for hosts without the Windows DLL: every call fails,
+/// so the CLI reports it skipped.
+#[cfg(not(windows))]
+mod validator_stub {
+    /// An `IDxcValidator` stand-in; see the module note.
+    pub struct Validator;
+
+    impl Validator {
+        /// Where `dxil.dll` is looked for (only matters on Windows).
+        pub fn default_path() -> Option<std::path::PathBuf> {
+            None
+        }
+
+        /// Loads `path`'s validator; always fails without the Windows DLL.
+        pub fn load(_path: Option<&std::path::Path>) -> Result<Self, String> {
+            Err("validator is only available on Windows".into())
+        }
+
+        /// Validates, re-signs and reports; the stub always fails.
+        pub fn validate(&mut self, _container: &mut [u8]) -> Result<(), String> {
+            Err("validator is only available on Windows".into())
+        }
+    }
+}
+
+#[cfg(not(windows))]
+use validator_stub::Validator;
+#[cfg(not(windows))]
+use host::Host;
+
+/// A host that cannot check anything, for hosts where the host pipeline
+/// check does not exist (any host without a D3D12 host device). Every
+/// method reports the same error, so all callers treat the checks as
+/// skipped.
+#[cfg(not(windows))]
+mod host {
+    use victory_shader::emit::HostShader;
+
+    /// A so-called host; see the module note.
+    pub struct Host;
+
+    impl Host {
+        pub fn new(_warp: bool) -> Result<Self, String> {
+            Err("host pipeline checks are available on Windows only".into())
+        }
+
+        pub fn pipeline(&self, _vs: &HostShader, _ps: &HostShader) -> Result<(), String> {
+            Err("host pipeline checks are available on Windows only".into())
+        }
+
+        pub fn mesh_pipeline(&self, _vs: &HostShader, _ps: &HostShader) -> Result<(), String> {
+            Err("host pipeline checks are available on Windows only".into())
+        }
+
+        pub fn compute_pipeline(&self, _cs: &HostShader) -> Result<(), String> {
+            Err("host pipeline checks are available on Windows only".into())
+        }
+    }
+
+    /// A shader that needs the Windows host to build; never called.
+    pub fn stub_ps() -> HostShader {
+        unreachable!("host checks are available on Windows only")
+    }
+
+    /// A pipeline check on the Windows host; never called.
+    pub fn stub_vs(_ps: &HostShader) -> Result<HostShader, String> {
+        unreachable!("host checks are available on Windows only")
+    }
+}
 use victory_shader::structure::{self, Atom, LaneExit};
 use victory_shader::{
     Container, FourCC, HwStage, NativeProgram, RootType, ShaderError, ir, native_programs,
@@ -160,6 +233,12 @@ pub fn run(
     jobs: Option<usize>,
 ) -> Result<()> {
     let paths = crate::default_paths(paths)?;
+    // The validator and the host checks are Windows-only; on other hosts
+    // they are skipped with a note instead of failing.
+    let validate_requested = validate;
+    let pipelines_requested = pipelines;
+    let validate = validate && cfg!(windows);
+    let pipelines = pipelines && cfg!(windows);
     let dll = validate.then(Validator::default_path).flatten();
     if validate {
         Validator::load(dll.as_deref()).map_err(anyhow::Error::msg)?;
@@ -168,9 +247,13 @@ pub fn run(
             dll.as_ref()
                 .map_or("dxil.dll".into(), |p| p.display().to_string())
         );
+    } else if validate_requested {
+        println!("validator    skipped (Windows only)");
     }
     if pipelines {
         Host::new(false).map_err(anyhow::Error::msg)?;
+    } else if pipelines_requested {
+        println!("host pipelines skipped (Windows only)");
     }
     let pairs: Vec<(String, String)> = std::env::var("VICTORY_PAIRS")
         .unwrap_or_default()
@@ -271,22 +354,29 @@ pub fn run(
         t.ms_emitted, t.ms_programs, t.ms_validated, t.ms_pipelines
     );
     if !pairs.is_empty() {
-        let host = Host::new(false).map_err(anyhow::Error::msg)?;
-        let kept = lock(&kept);
-        let find = |name: &str| kept.iter().find(|(l, _)| l.contains(name));
-        for (v, p) in &pairs {
-            let made = match (find(v), find(p)) {
-                (Some((_, vs)), Some((_, ps))) => if vs.stage == HwStage::Ms {
-                    host.mesh_pipeline(vs, ps)
-                } else {
-                    host.pipeline(vs, ps)
-                }
-                .map(|_| "pipeline created".to_owned())
-                .unwrap_or_else(|e| e),
-                _ => "not emitted".to_owned(),
-            };
-            println!("pair {v} + {p}: {made}");
+        // The host check is Windows-only: without a host device the
+        // pairs are not checked at all.
+        #[cfg(windows)]
+        {
+            let host = Host::new(false).map_err(anyhow::Error::msg)?;
+            let kept = lock(&kept);
+            let find = |name: &str| kept.iter().find(|(l, _)| l.contains(name));
+            for (v, p) in &pairs {
+                let made = match (find(v), find(p)) {
+                    (Some((_, vs)), Some((_, ps))) => if vs.stage == HwStage::Ms {
+                        host.mesh_pipeline(vs, ps)
+                    } else {
+                        host.pipeline(vs, ps)
+                    }
+                    .map(|_| "pipeline created".to_owned())
+                    .unwrap_or_else(|e| e),
+                    _ => "not emitted".to_owned(),
+                };
+                println!("pair {v} + {p}: {made}");
+            }
         }
+        #[cfg(not(windows))]
+        println!("host pipelines skipped (Windows only)");
     }
     let mut lines = t.lines;
     lines.sort();

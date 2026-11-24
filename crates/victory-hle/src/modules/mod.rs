@@ -45,7 +45,7 @@ pub mod xuser;
 use crate::HleModule;
 
 pub(crate) fn all() -> Vec<HleModule> {
-    let mut all = vec![
+    vec![
         kernel::module(),
         xgameruntime::module(),
         gameinput::module(),
@@ -53,22 +53,21 @@ pub(crate) fn all() -> Vec<HleModule> {
         audio::module(),
         dsp::module(),
         xg::module(),
-    ];
-    #[cfg(windows)]
-    all.push(apu::module());
-    #[cfg(windows)]
-    all.push(media::module());
-    #[cfg(windows)]
-    all.push(dstorage::module());
-    #[cfg(windows)]
-    all.push(files::module());
-    #[cfg(windows)]
-    all.push(lifecycle::module());
-    #[cfg(windows)]
-    all.push(net::module());
-    #[cfg(windows)]
-    all.push(xmem::module());
-    #[cfg(windows)]
-    all.push(xsystem::module());
-    all
+        #[cfg(windows)]
+        apu::module(),
+        #[cfg(windows)]
+        media::module(),
+        #[cfg(windows)]
+        dstorage::module(),
+        #[cfg(windows)]
+        files::module(),
+        #[cfg(windows)]
+        lifecycle::module(),
+        #[cfg(windows)]
+        net::module(),
+        #[cfg(windows)]
+        xmem::module(),
+        #[cfg(windows)]
+        xsystem::module(),
+    ]
 }
