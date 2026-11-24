@@ -89,20 +89,112 @@ mod tests {
     use super::*;
     use crate::{HleResolver, HostPolicy};
     use victory_loader::ImportResolver;
+    use victory_loader::Provenance;
     use victory_loader::Resolution;
     use victory_pe::ImportSymbol;
 
+    fn symbol(name: &str) -> ImportSymbol {
+        ImportSymbol::Name {
+            hint: 0,
+            name: name.into(),
+        }
+    }
+
     #[test]
     fn the_interface_id_import_is_bound_to_data() {
-        let symbol = ImportSymbol::Name {
-            hint: 0,
-            name: "IID_ID3D12Device".into(),
-        };
         let r = HleResolver::new(HostPolicy::none());
-        let Resolution::Found { address, .. } = r.resolve("d3d12_xs.dll", &symbol) else {
+        let Resolution::Found { address, .. } =
+            r.resolve("d3d12_xs.dll", &symbol("IID_ID3D12Device"))
+        else {
             panic!("not bound");
         };
         // SAFETY: the address is our static id.
         assert_eq!(unsafe { *(address as *const [u8; 16]) }, device::IID);
+    }
+
+    #[test]
+    fn module_serves_the_console_d3d12_dll() {
+        let m = module();
+        assert_eq!(m.name, "d3d12x");
+        assert!(m.serves("d3d12_xs.dll"));
+        assert!(m.serves("D3D12_XS.DLL"), "DLL names are case-insensitive");
+        assert!(!m.serves("d3d12.dll"));
+        assert!(!m.serves("dxgi.dll"));
+    }
+
+    #[test]
+    fn exports_are_the_console_entry_points() {
+        let m = module();
+        let mut names: Vec<&str> = m.exports.iter().map(|e| e.name).collect();
+        names.sort_unstable();
+        let mut expected = [
+            "D3D12ConfigureVirtualMemoryX",
+            "D3D12CreateRootSignatureDeserializer",
+            "D3D12SerializeRootSignature",
+            "D3D12SerializeVersionedRootSignature",
+            "D3D12XboxCreateDevice",
+            "IID_ID3D12Device",
+        ];
+        expected.sort_unstable();
+        assert_eq!(names, expected, "exactly the console's entry points");
+        for export in &m.exports {
+            assert_ne!(export.address, 0, "{} has no address", export.name);
+        }
+    }
+
+    #[test]
+    fn every_export_resolves_as_hle_from_the_dll() {
+        let resolver = HleResolver::new(HostPolicy::none());
+        for export in module().exports {
+            match resolver.resolve("d3d12_xs.dll", &symbol(export.name)) {
+                Resolution::Found {
+                    address,
+                    provenance,
+                } => {
+                    assert_eq!(provenance, Provenance::Hle, "{}", export.name);
+                    assert_eq!(address, export.address, "{}", export.name);
+                }
+                Resolution::Missing => panic!("{} is not bound", export.name),
+            }
+        }
+    }
+
+    #[test]
+    fn the_interface_id_export_points_at_the_device_iid() {
+        let export = module()
+            .exports
+            .into_iter()
+            .find(|e| e.name == "IID_ID3D12Device")
+            .expect("the interface id is exported as data");
+        assert_eq!(export.address, (&raw const device::IID) as usize);
+        // SAFETY: the export is the address of our static interface id.
+        assert_eq!(unsafe { *(export.address as *const [u8; 16]) }, device::IID);
+    }
+
+    #[test]
+    fn device_creation_rejects_null_arguments() {
+        // E_INVALIDARG, the host's error for a missing argument.
+        const E_INVALIDARG: i32 = 0x8007_0057u32 as i32;
+        let version: u32 = 0x0002_0004;
+        // No device parameters.
+        assert_eq!(
+            create_device(
+                std::ptr::null(),
+                std::ptr::null(),
+                &device::IID,
+                std::ptr::null_mut(),
+            ),
+            E_INVALIDARG
+        );
+        // No interface id.
+        assert_eq!(
+            create_device(
+                std::ptr::null(),
+                &version,
+                std::ptr::null(),
+                std::ptr::null_mut(),
+            ),
+            E_INVALIDARG
+        );
     }
 }
