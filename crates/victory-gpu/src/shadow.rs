@@ -401,24 +401,37 @@ pub(crate) fn unregister(resource: usize, start: u64) {
     buffers().remove(&(start, resource));
 }
 
+/// The copy of the innermost registered title buffer holding `[address,
+/// address + len)`, made on first use. Never falls back to a loose copy of
+/// arbitrary title memory, so callers scheduling [`Shadow::gpu_writes`]
+/// cannot copy GPU stores back over unrelated title CPU objects.
+pub(crate) fn find_buffer(address: u64, len: u64) -> Option<Arc<Shadow>> {
+    if address < 0x10000 {
+        return None;
+    }
+    let end = address.checked_add(len.max(1))?;
+    find_registered(address, end)
+}
+
 /// The copy of the innermost title buffer holding `[address, address +
-/// len)`, made on first use.
+/// len)`, made on first use, falling back to a loose copy of committed
+/// title memory outside any registered buffer.
 pub(crate) fn find(address: u64, len: u64) -> Option<Arc<Shadow>> {
     if address < 0x10000 {
         return None;
     }
     let end = address.checked_add(len.max(1))?;
+    find_registered(address, end).or_else(|| loose(address, end))
+}
+
+fn find_registered(address: u64, end: u64) -> Option<Arc<Shadow>> {
     let mut map = buffers();
     let key = map
         .range(..=(address, usize::MAX))
         .rev()
         .take(64)
         .find(|(_, e)| e.end >= end)
-        .map(|(k, _)| *k);
-    let Some(key) = key else {
-        drop(map);
-        return loose(address, end);
-    };
+        .map(|(k, _)| *k)?;
     let entry = map.get_mut(&key)?;
     if entry.shadow.is_none() {
         let len = entry.end - key.0;

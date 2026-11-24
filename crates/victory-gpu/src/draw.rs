@@ -178,7 +178,14 @@ fn root_view(list: &HostList, address: u64, kind: RootView) -> Option<u64> {
     if address == 0 {
         return None;
     }
-    let shadow = crate::shadow::find(address, 1)?;
+    // Root UAVs schedule write-back to title memory, so resolve them only
+    // against registered title buffers; an unregistered address must fall
+    // back to the writable sink buffer rather than creating a loose copy
+    // whose copy-back could overwrite arbitrary title CPU memory.
+    let shadow = match kind {
+        RootView::Uav => crate::shadow::find_buffer(address, 1)?,
+        RootView::Cbv | RootView::Srv => crate::shadow::find(address, 1)?,
+    };
     let gpu = shadow.gpu(address);
     match kind {
         RootView::Cbv => {
@@ -1757,6 +1764,54 @@ mod tests {
         crate::shadow::unregister(srv_buf.ptr as usize, srv_buf.addr());
         crate::shadow::unregister(uav_buf.ptr as usize, uav_buf.addr());
         crate::shadow::unregister(cbv_buf.ptr as usize, cbv_buf.addr());
+        let release = crate::object::slot::<extern "system" fn(This) -> u32>(pso, 0x10);
+        assert_eq!(release(pso), 0);
+    }
+
+    #[test]
+    fn root_uav_on_unregistered_loose_memory_uses_fallback_without_copy_back() {
+        let Some(host) = crate::host::host() else {
+            return;
+        };
+        let len = 2 << 20;
+        let off = 0x18_0000usize; // +1.5 MiB (where `build_root_view_cs` writes)
+        // Committed title CPU memory that was NEVER registered as a GPU buffer.
+        let loose_cpu = Allocation::watched(len);
+        let sentinel = 0x1122_3344u32;
+        // SAFETY: `off` lies within the 2 MiB committed allocation.
+        unsafe {
+            loose_cpu.ptr.add(off).cast::<u32>().write(sentinel);
+        }
+
+        let list = host.new_list().expect("new_list");
+        // Read-only root views may still resolve committed memory via `loose()`.
+        assert!(root_view(&list, loose_cpu.addr(), RootView::Cbv).is_some());
+        assert!(root_view(&list, loose_cpu.addr(), RootView::Srv).is_some());
+        // Even with a loose shadow now present, a Root UAV must refuse it and
+        // return `None` so dispatch binds the sink fallback without scheduling
+        // `gpu_writes` copy-back into title CPU memory.
+        assert!(crate::shadow::find_buffer(loose_cpu.addr(), 1).is_none());
+        assert!(root_view(&list, loose_cpu.addr(), RootView::Uav).is_none());
+        list.close();
+        host.execute(&[&list]);
+
+        let (shader, used) = build_root_view_cs();
+        let pso = crate::pipeline::test_compute_pipeline(shader, used);
+        list.reset();
+        let mut state = State::default();
+        state.set_pipeline(pso);
+        state.set_view(true, 2, loose_cpu.addr());
+        state.dispatch(&list, 1, 1, 1);
+        list.close();
+        host.execute(&[&list]);
+
+        // SAFETY: reading back the sentinel at `+1.5 MiB` in title CPU memory.
+        let after = unsafe { loose_cpu.ptr.add(off).cast::<u32>().read() };
+        assert_eq!(
+            after, sentinel,
+            "unregistered title CPU memory must never be overwritten by root UAV copy-back"
+        );
+
         let release = crate::object::slot::<extern "system" fn(This) -> u32>(pso, 0x10);
         assert_eq!(release(pso), 0);
     }
