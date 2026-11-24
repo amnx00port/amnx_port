@@ -415,24 +415,47 @@ impl State {
     /// descriptors its tables hold.
     /// False if the draw or dispatch must not run: a table it reads could
     /// not be made.
+    /// Updates the host list's descriptor heaps whenever the resolved host COM
+    /// heap pointers differ from what was last bound (avoiding pointer-reuse
+    /// ABA if the title releases a heap and allocates another at the same
+    /// address, since `list.keep` retains the previous host heap).
+    fn sync_heaps(
+        &mut self,
+        list: &HostList,
+        resolved: [Option<ID3D12DescriptorHeap>; 2],
+    ) -> bool {
+        let mut wanted = [0usize; 2];
+        for (slot, heap) in wanted.iter_mut().zip(&resolved) {
+            if let Some(h) = heap {
+                *slot = h.as_raw() as usize;
+            }
+        }
+        if self.host_heaps == wanted {
+            return false;
+        }
+        let heaps: Vec<Option<ID3D12DescriptorHeap>> =
+            resolved.into_iter().filter(Option::is_some).collect();
+        heaps.iter().flatten().for_each(|h| list.keep(h));
+        // SAFETY: an open list and shader-visible heaps.
+        unsafe { list.list.SetDescriptorHeaps(&heaps) };
+        self.host_heaps = wanted;
+        self.host_roots = [0; 2];
+        true
+    }
+
     fn bind(&mut self, list: &HostList, p: &HostPipeline, compute: bool) -> bool {
         let l = &list.list;
         // Heaps first: a root signature with directly indexed heaps must be
         // set after them.
-        if self.host_heaps != self.heaps {
-            let heaps: Vec<Option<ID3D12DescriptorHeap>> = self
-                .heaps
-                .iter()
-                .filter(|&&h| h != 0)
-                .filter_map(|&h| crate::descriptor::heap(h as This).host())
-                .map(|h| Some(h.heap.clone()))
-                .collect();
-            heaps.iter().flatten().for_each(|h| list.keep(h));
-            // SAFETY: an open list and shader-visible heaps.
-            unsafe { l.SetDescriptorHeaps(&heaps) };
-            self.host_heaps = self.heaps;
-            self.host_roots = [0; 2];
+        let mut resolved: [Option<ID3D12DescriptorHeap>; 2] = [None, None];
+        for (slot, &h) in resolved.iter_mut().zip(&self.heaps) {
+            if h != 0
+                && let Some(host) = crate::descriptor::heap(h as This).host()
+            {
+                *slot = Some(host.heap.clone());
+            }
         }
+        self.sync_heaps(list, resolved);
         let root = p.root.as_raw() as usize;
         if self.host_roots[usize::from(compute)] != root {
             // SAFETY: an open list and a live root signature.
@@ -1214,4 +1237,51 @@ pub(crate) fn blend_factor(list: &HostList, factor: Option<&[f32; 4]>) {
 pub(crate) fn stencil_ref(list: &HostList, reference: u32) {
     // SAFETY: an open list.
     unsafe { list.list.OMSetStencilRef(reference) };
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn sync_heaps_detects_new_host_heap_at_same_title_address() {
+        let Some(host) = crate::host::host() else {
+            return;
+        };
+        let list = host.new_list().expect("open host list");
+        let make_heap = || -> ID3D12DescriptorHeap {
+            let desc = D3D12_DESCRIPTOR_HEAP_DESC {
+                Type: D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV,
+                NumDescriptors: 4,
+                Flags: D3D12_DESCRIPTOR_HEAP_FLAG_SHADER_VISIBLE,
+                NodeMask: 0,
+            };
+            // SAFETY: valid descriptor heap description on a live device.
+            unsafe { host.device.CreateDescriptorHeap(&desc) }.expect("descriptor heap")
+        };
+
+        let heap1 = make_heap();
+        let heap2 = make_heap();
+        assert_ne!(heap1.as_raw(), heap2.as_raw());
+
+        let mut state = State::default();
+        // Same title heap pointer recorded across both bindings (simulating ABA reuse).
+        state.heaps = [0x1000, 0];
+        state.host_roots = [0xAAAA, 0xBBBB];
+
+        assert!(state.sync_heaps(&list, [Some(heap1.clone()), None]));
+        assert_eq!(state.host_heaps, [heap1.as_raw() as usize, 0]);
+        assert_eq!(state.host_roots, [0, 0]);
+
+        // Re-binding the exact same host heap is a no-op and preserves bound roots.
+        state.host_roots = [0x1111, 0x2222];
+        assert!(!state.sync_heaps(&list, [Some(heap1.clone()), None]));
+        assert_eq!(state.host_roots, [0x1111, 0x2222]);
+
+        // Re-binding a new host heap at the same title pointer triggers SetDescriptorHeaps
+        // and clears cached host_roots.
+        assert!(state.sync_heaps(&list, [Some(heap2.clone()), None]));
+        assert_eq!(state.host_heaps, [heap2.as_raw() as usize, 0]);
+        assert_eq!(state.host_roots, [0, 0]);
+    }
 }
