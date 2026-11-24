@@ -68,16 +68,30 @@ impl Host {
         let warp = warp || std::env::var("VICTORY_WARP").is_ok_and(|v| v == "1");
         // SAFETY: plain D3D12/DXGI calls with valid out pointers.
         unsafe {
-            let mut device: Option<ID3D12Device> = None;
-            if warp {
+            let adapter: Option<IDXGIAdapter> = if warp {
                 let factory: IDXGIFactory4 =
                     CreateDXGIFactory2(DXGI_CREATE_FACTORY_FLAGS(0)).map_err(err)?;
-                let adapter: IDXGIAdapter = factory.EnumWarpAdapter().map_err(err)?;
-                D3D12CreateDevice(&adapter, D3D_FEATURE_LEVEL_12_0, &mut device).map_err(err)?;
+                Some(factory.EnumWarpAdapter().map_err(err)?)
             } else {
-                D3D12CreateDevice(None, D3D_FEATURE_LEVEL_12_0, &mut device).map_err(err)?;
-            }
-            let device = device.ok_or("no device")?;
+                None
+            };
+            let device = match super::agility::Factory::load()? {
+                Some(agility) => agility.create_device(adapter.as_ref()).map_err(err)?,
+                None => {
+                    let mut device: Option<ID3D12Device> = None;
+                    match &adapter {
+                        Some(a) => {
+                            D3D12CreateDevice(a, D3D_FEATURE_LEVEL_12_0, &mut device)
+                                .map_err(err)?;
+                        }
+                        None => {
+                            D3D12CreateDevice(None, D3D_FEATURE_LEVEL_12_0, &mut device)
+                                .map_err(err)?;
+                        }
+                    }
+                    device.ok_or("no device")?
+                }
+            };
             let mut sm = D3D12_FEATURE_DATA_SHADER_MODEL {
                 HighestShaderModel: D3D_SHADER_MODEL_6_6,
             };
@@ -197,8 +211,13 @@ impl Host {
         unsafe {
             let mut blob = None;
             let mut error = None;
-            D3D12SerializeVersionedRootSignature(&desc, &mut blob, Some(&mut error))
-                .map_err(err)?;
+            super::agility::serialize_versioned_root_signature(
+                &self.device,
+                &desc,
+                &mut blob,
+                Some(&mut error),
+            )
+            .map_err(err)?;
             let blob: ID3DBlob = blob.ok_or("no root signature blob")?;
             let bytes = std::slice::from_raw_parts(
                 blob.GetBufferPointer().cast::<u8>(),
