@@ -255,6 +255,107 @@ impl Bools {
         })
     }
 
+    /// The `Bool` representing `atom` if it exists in this table.
+    pub(crate) fn var_bool(&self, atom: Atom) -> Option<Bool> {
+        let &v = self.ids.get(&atom)?;
+        self.unique.get(&(v, Bool::FALSE, Bool::TRUE)).copied()
+    }
+
+    /// Whether some lane can satisfy every `(b, holds)` of `all` at once,
+    /// enforcing equivalence groups over atoms (`(atom, group, inverted)`)
+    /// and checking `leaf_ok` on any surviving leaf assignment.
+    pub(crate) fn meet_with_facts(
+        &self,
+        all: &[(Bool, bool)],
+        equiv: &[(Atom, usize, bool)],
+        groups_len: usize,
+        leaf_ok: impl Fn(&[(Atom, bool)]) -> bool,
+    ) -> bool {
+        let mut var_equiv = Map::default();
+        for &(atom, group, inv) in equiv {
+            if let Some(&v) = self.ids.get(&atom) {
+                var_equiv.insert(v, (group, inv));
+            }
+        }
+        let mut budget = MAX_MEET;
+        let mut groups = vec![None; groups_len];
+        let mut assigned = Vec::new();
+        self.meet_facts_in(
+            all.to_vec(),
+            &mut budget,
+            &var_equiv,
+            &mut groups,
+            &mut assigned,
+            &leaf_ok,
+        )
+    }
+
+    fn meet_facts_in<F: Fn(&[(Atom, bool)]) -> bool>(
+        &self,
+        mut all: Vec<(Bool, bool)>,
+        budget: &mut usize,
+        var_equiv: &Map<u32, (usize, bool)>,
+        groups: &mut [Option<bool>],
+        assigned: &mut Vec<(Atom, bool)>,
+        leaf_ok: &F,
+    ) -> bool {
+        let fails = |&(b, holds): &(Bool, bool)| b == if holds { Bool::FALSE } else { Bool::TRUE };
+        if all.iter().any(fails) {
+            return false;
+        }
+        all.retain(|&(b, _)| b != Bool::FALSE && b != Bool::TRUE);
+        if *budget == 0 {
+            return true;
+        }
+        if all.is_empty() {
+            return leaf_ok(assigned);
+        }
+        *budget -= 1;
+        let top = |b: Bool| self.nodes[b.0 as usize].0;
+        let v = all.iter().map(|&(b, _)| top(b)).min().expect("not empty");
+        let atom = self.atoms[v as usize];
+        let track_atom = matches!(atom, Atom::Lane(_));
+
+        let values = match var_equiv.get(&v).copied() {
+            Some((g, inv)) => match groups[g] {
+                Some(gval) => [Some(gval ^ inv), None],
+                None => [Some(false), Some(true)],
+            },
+            None => [Some(false), Some(true)],
+        };
+
+        for value in values.into_iter().flatten() {
+            let set_group = match var_equiv.get(&v).copied() {
+                Some((g, inv)) if groups[g].is_none() => {
+                    groups[g] = Some(value ^ inv);
+                    Some(g)
+                }
+                _ => None,
+            };
+            let next = all
+                .iter()
+                .map(|&(b, holds)| {
+                    let (lo, hi) = self.split(b, v);
+                    (if value { hi } else { lo }, holds)
+                })
+                .collect();
+            if track_atom {
+                assigned.push((atom, value));
+            }
+            let ok = self.meet_facts_in(next, budget, var_equiv, groups, assigned, leaf_ok);
+            if track_atom {
+                assigned.pop();
+            }
+            if let Some(g) = set_group {
+                groups[g] = None;
+            }
+            if ok {
+                return true;
+            }
+        }
+        false
+    }
+
     fn implies(&mut self, a: Bool, b: Bool) -> bool {
         let nb = self.not(b);
         self.and(a, nb) == Bool::FALSE
