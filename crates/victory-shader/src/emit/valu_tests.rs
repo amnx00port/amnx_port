@@ -937,3 +937,512 @@ fn v_cmp_class_f16_matches_rdna2() {
         );
     });
 }
+
+/// SMEM load (`op`: `0x00` `s_load_dword`, `0x01` `x2`, `0x02` `x4`, `0x03` `x8`,
+/// `0x08` `s_buffer_load_dword`, `0x09` `s_buffer_load_dwordx2`).
+const fn smem_load(op: u8, sdst: u8, sbase: u8, soffset: u8, imm_off: u32) -> [u32; 2] {
+    [
+        0x3D << 26 | (op as u32) << 18 | (sdst as u32) << 6 | (sbase as u32 >> 1),
+        (soffset as u32) << 25 | (imm_off & 0x1F_FFFF),
+    ]
+}
+
+/// MIMG `image_load v[vdata], v[vaddr:vaddr+1], s[srsrc:srsrc+7] dmask:0x1 dim:SQ_RSRC_IMG_2D`.
+const fn image_load_2d_r(vdata: u8, vaddr: u8, srsrc: u8) -> [u32; 2] {
+    [
+        0x3C << 26 | 0x1 << 8 | 0x1 << 3,
+        ((srsrc as u32 >> 2) & 0x1F) << 16 | (vdata as u32) << 8 | (vaddr as u32),
+    ]
+}
+
+fn build_and_validate_cs(native: &NativeProgram) -> Result<HostShader, crate::ShaderError> {
+    let p = ir::build(&native.code, native.wave64, native.vgprs)?;
+    let st = structure::structure(&p)?;
+    let res = resource::track(&p, &native.layout, native.stage, Some(&st))?;
+    let io = io::raise(&p, native)?;
+    let lowered = lower::lower(&lower::Parts {
+        native,
+        p: &p,
+        st: &st,
+        io: &io,
+        res: &res,
+        inputs: Vec::new(),
+        outputs: Vec::new(),
+        prims: Vec::new(),
+        mesh_stride: 0,
+    })?;
+    let shader = HostShader {
+        stage: HwStage::Cs,
+        dxil: lowered.dxil,
+        user_data: lowered.user_data,
+        samplers: lowered.samplers,
+        static_samplers: Vec::new(),
+        root_cbvs: lowered.root_cbvs,
+        root_srvs: lowered.root_srvs,
+    };
+    if let Ok(mut v) = validator::Validator::load(validator::Validator::default_path().as_deref()) {
+        let mut copy = shader.dxil.clone();
+        let ours = copy[4..20].to_vec();
+        v.validate(&mut copy).expect("DXIL validation failed");
+        assert_eq!(copy[4..20], ours[..], "container hash mismatch");
+    }
+    Ok(shader)
+}
+
+#[test]
+fn s_buffer_load_and_multi_descriptor_data_execute() {
+    use super::host::Stride;
+
+    // One `s_load_dwordx16 s[8:23], s[0:1], 0` loads two 32-byte heap slots at once:
+    // - s[8:11]  (first=0, heap[0]): StructuredBuffer (stride=16, 3 records = 12 dwords)
+    // - s[16:19] (first=8, heap[1]): RawUav (5 dwords = 20 bytes)
+    // Reads s10 (num_records=3), s9>>16 (stride=16), s_buffer_load_dwordx2 from
+    // record 2 (offset 0x20), and s18 (UAV byte size = 20).
+    let mut words = vec![s_mov_b32(1, 0x80)];
+    words.extend_from_slice(&smem_load(0x04, 8, 0, 125, 0)); // s_load_dwordx16 s[8:23], s[0:1], 0
+    words.push(sop2(0x20, 24, 9, 0x90)); // s_lshr_b32 s24, s9, 16 (stride)
+    words.extend_from_slice(&smem_load(0x09, 26, 8, 125, 0x20)); // s_buffer_load_dwordx2 s[26:27], s[8:11], 0x20
+    for (k, sreg) in [10u8, 24, 26, 27, 18].into_iter().enumerate() {
+        words.push(vop1(0x001, k as u8, sgpr(sreg)));
+        words.extend_from_slice(&buffer_store_dword(k as u8, 16, (k * 4) as u16));
+    }
+    words.push(S_ENDPGM);
+
+    let native = NativeProgram {
+        stage: HwStage::Cs,
+        wave64: false,
+        vgprs: 8,
+        layout: vec![RootParam {
+            root: RootType::Table,
+            table_offset_dwords: 0,
+            sgprs: 1,
+            base_register: 0,
+            user_data: 0,
+            slot: 0,
+        }],
+        used: vec![
+            UsedResource {
+                kind: ResourceType::Srv,
+                root: RootType::Table,
+                table_offset_dwords: 0,
+                lower_bound: 0,
+                stride: 16,
+                dwords: 4,
+                user_data: 0,
+                slot: 0,
+            },
+            UsedResource {
+                kind: ResourceType::Uav,
+                root: RootType::Table,
+                table_offset_dwords: 8,
+                lower_bound: 0,
+                stride: 0,
+                dwords: 4,
+                user_data: 0,
+                slot: 0,
+            },
+        ],
+        io: StageIo::Cs(ComputeIo {
+            rsrc2: 1 << 1,
+            threads: [1, 1, 1],
+        }),
+        code: words.iter().flat_map(|w| w.to_le_bytes()).collect(),
+    };
+
+    let shader = build_and_validate_cs(&native).expect("lower structured s_buffer_load + x8 data");
+    let sb_data: [u32; 12] = [1, 2, 3, 4, 5, 6, 7, 8, 0xCAFE_1234, 0xBEEF_5678, 11, 12];
+    let _one = ONE_AT_A_TIME.lock().unwrap_or_else(|e| e.into_inner());
+    let mut ran = 0;
+    for (label, warp) in [("hardware", false), ("warp", true)] {
+        let Ok(host) = Host::new(warp) else { continue };
+        let (root, pso) = host.compute_pipeline(&shader).expect(label);
+        let ud = vec![0u32; shader.user_data_dwords().max(1) as usize];
+        let out = host
+            .dispatch(
+                &root,
+                &pso,
+                &Dispatch {
+                    roots: vec![(0, Root::Constants(ud))],
+                    views: &[
+                        View::Buffer {
+                            data: &sb_data,
+                            stride: Stride::Structured(16),
+                        },
+                        View::RawUav(5),
+                    ],
+                    samplers: &[],
+                    groups: [1, 1, 1],
+                },
+            )
+            .expect(label);
+        assert_eq!(
+            out[0],
+            vec![3, 16, 0xCAFE_1234, 0xBEEF_5678, 20],
+            "{label}: unexpected structured descriptor/s_buffer_load output"
+        );
+        ran += 1;
+    }
+    assert!(ran > 0);
+}
+
+#[test]
+fn root_descriptor_scalar_loads_execute() {
+    // s0 = dynamic dword index into Root SRV; s[2:3] = Root CBV (slot 1);
+    // s[4:5] = Root SRV (slot 2); s6 = Table (slot 3) with RawUav(2).
+    let mut words = vec![s_mov_b32(7, 0x80), sop2(0x1E, 16, 0, 0x82)]; // s16 = s0 << 2
+    words.extend_from_slice(&smem_load(0x02, 8, 6, 125, 0)); // s_load_dwordx4 s[8:11], s[6:7], 0
+    words.extend_from_slice(&smem_load(0x01, 12, 2, 125, 0x10)); // s_load_dwordx2 s[12:13], s[2:3], 0x10 (Root CBV)
+    words.extend_from_slice(&smem_load(0x00, 14, 4, 16, 0x04)); // s_load_dword s14, s[4:5], s16 + 0x04 (Root SRV)
+    words.push(sop2(0x00, 15, 12, 13)); // s_add_u32 s15, s12, s13
+    words.push(vop1(0x001, 0, sgpr(15)));
+    words.push(vop1(0x001, 1, sgpr(14)));
+    words.extend_from_slice(&buffer_store_dword(0, 8, 0));
+    words.extend_from_slice(&buffer_store_dword(1, 8, 4));
+    words.push(S_ENDPGM);
+
+    let native = NativeProgram {
+        stage: HwStage::Cs,
+        wave64: false,
+        vgprs: 4,
+        layout: vec![
+            RootParam {
+                root: RootType::Constants,
+                table_offset_dwords: 0,
+                sgprs: 1,
+                base_register: 0,
+                user_data: 0,
+                slot: 0,
+            },
+            RootParam {
+                root: RootType::Descriptor,
+                table_offset_dwords: 0,
+                sgprs: 2,
+                base_register: 1,
+                user_data: 2,
+                slot: 1,
+            },
+            RootParam {
+                root: RootType::Descriptor,
+                table_offset_dwords: 0,
+                sgprs: 2,
+                base_register: 0,
+                user_data: 4,
+                slot: 2,
+            },
+            RootParam {
+                root: RootType::Table,
+                table_offset_dwords: 0,
+                sgprs: 1,
+                base_register: 0,
+                user_data: 6,
+                slot: 3,
+            },
+        ],
+        used: vec![
+            UsedResource {
+                kind: ResourceType::Cbv,
+                root: RootType::Descriptor,
+                table_offset_dwords: 0,
+                lower_bound: 1,
+                stride: 0,
+                dwords: 2,
+                user_data: 2,
+                slot: 1,
+            },
+            UsedResource {
+                kind: ResourceType::Srv,
+                root: RootType::Descriptor,
+                table_offset_dwords: 0,
+                lower_bound: 0,
+                stride: 0,
+                dwords: 2,
+                user_data: 4,
+                slot: 2,
+            },
+            UsedResource {
+                kind: ResourceType::Uav,
+                root: RootType::Table,
+                table_offset_dwords: 0,
+                lower_bound: 0,
+                stride: 0,
+                dwords: 4,
+                user_data: 6,
+                slot: 3,
+            },
+        ],
+        io: StageIo::Cs(ComputeIo {
+            rsrc2: 7 << 1,
+            threads: [1, 1, 1],
+        }),
+        code: words.iter().flat_map(|w| w.to_le_bytes()).collect(),
+    };
+
+    let shader = build_and_validate_cs(&native).expect("lower root CBV/SRV scalar loads");
+    assert_eq!(shader.root_cbvs, vec![1]);
+    assert_eq!(shader.root_srvs, vec![2]);
+
+    let cbv_words = [10u32, 20, 30, 40, 100, 250, 0, 0];
+    let srv_words = [9u32, 8, 7, 0x1234_5678, 0x9ABC_DEF0];
+    let _one = ONE_AT_A_TIME.lock().unwrap_or_else(|e| e.into_inner());
+    let mut ran = 0;
+    for (label, warp) in [("hardware", false), ("warp", true)] {
+        let Ok(host) = Host::new(warp) else { continue };
+        let (root, pso) = host.compute_pipeline(&shader).expect(label);
+        let mut ud = vec![0u32; shader.user_data_dwords().max(1) as usize];
+        for u in &shader.user_data {
+            ud[u.index as usize] = match (u.root, u.slot) {
+                (RootType::Constants, 0) => 3, // (3 << 2) + 4 = 16 -> srv_words[4]
+                (RootType::Table, 3) => 0,
+                other => panic!("unexpected user data {other:?}"),
+            };
+        }
+        let out = host
+            .dispatch(
+                &root,
+                &pso,
+                &Dispatch {
+                    // Stage user data is root param 0; root_cbvs=[1] is param 1; root_srvs=[2] is param 2.
+                    roots: vec![
+                        (0, Root::Constants(ud)),
+                        (
+                            1,
+                            Root::View {
+                                srv: false,
+                                data: cbv_words.to_vec(),
+                            },
+                        ),
+                        (
+                            2,
+                            Root::View {
+                                srv: true,
+                                data: srv_words.to_vec(),
+                            },
+                        ),
+                    ],
+                    views: &[View::RawUav(2)],
+                    samplers: &[],
+                    groups: [1, 1, 1],
+                },
+            )
+            .expect(label);
+        assert_eq!(
+            out[0],
+            vec![350, 0x9ABC_DEF0],
+            "{label}: root SMEM mismatch"
+        );
+        ran += 1;
+    }
+    assert!(ran > 0);
+}
+
+#[test]
+fn twin_descriptor_loads_used_metadata_and_dead_desc_phi_edges() {
+    use super::host::Stride;
+
+    // 1. Twin bindless `s_load_dwordx8` from ResourceHeap (heap index 1 = 4x2 Texture2D),
+    //    plus descriptor-only `s_load_dwordx4` on a Table StructuredBuffer (stride=8, 5 records),
+    //    plus a dead descriptor-dword phi edge where physical SGPR s24 holds a real scalar (77)
+    //    on the taken path and a clobbered descriptor address dword on the untaken path.
+    // s0 = flag (1), s1 = bindless heap index (2), s2 = ResourceHeap base, s3 = Table base.
+    let mut words = vec![
+        s_mov_b32(4, 2),    // s4 = ResourceHeap base lo
+        s_mov_b32(5, 0x80), // s5 = 0
+        s_mov_b32(6, 3),    // s6 = Table base lo
+        s_mov_b32(7, 0x80), // s7 = 0
+    ];
+    words.extend_from_slice(&smem_load(0x02, 28, 6, 125, 0)); // s[28:31] = UAV at table offset 0
+
+    // Twin load #1 via v_readfirstlane_b32: reads ONLY image width/height from dwords 1..2!
+    words.push(vop1(0x001, 1, sgpr(1))); // v1 = s1 (heap index 1)
+    words.push(0x7E00_0000 | (8 << 17) | (0x002 << 9) | vgpr(1) as u32); // v_readfirstlane_b32 s8, v1
+    words.push(sop2(0x1E, 8, 8, 0x85)); // s_lshl_b32 s8, s8, 5 (heap byte offset)
+    words.extend_from_slice(&smem_load(0x03, 12, 4, 8, 0)); // s_load_dwordx8 s[12:19], s[4:5], s8
+    // Extract height - 1 from s14 bits 29:14 -> height - 1 = 1 (for 4x2 texture)
+    words.push(sop2(0x20, 20, 14, 0x8E)); // s_lshr_b32 s20, s14, 14
+
+    // Twin load #2 via a separate v_readfirstlane_b32 of v1: performs `image_load`!
+    words.push(0x7E00_0000 | (9 << 17) | (0x002 << 9) | vgpr(1) as u32); // v_readfirstlane_b32 s9, v1
+    words.push(sop2(0x1E, 9, 9, 0x85)); // s_lshl_b32 s9, s9, 5
+    words.extend_from_slice(&smem_load(0x03, 32, 4, 9, 0)); // s_load_dwordx8 s[32:39], s[4:5], s9
+    words.push(vop1(0x001, 2, 0x80)); // v2 = 0
+    words.push(vop1(0x001, 3, 0x80)); // v3 = 0
+    words.extend_from_slice(&image_load_2d_r(4, 2, 32)); // image_load v4, v[2:3], s[32:39]
+
+    // Branch testing dead descriptor-dword phi edge on s24 + descriptor-only UsedResource load:
+    // s24 = 77; if (s0 == 0) { s_load_dwordx4 s[24:27], s[6:7], 0x20 }
+    words.push(s_mov_b32(24, 0xC1)); // placeholder; set s24 = 77 via literal:
+    *words.last_mut().unwrap() = 0xBE80_03FF | (24 << 16);
+    words.push(77);
+    words.push(0xBF06_8000); // s_cmp_eq_u32 s0, 0
+    words.push(0xBF84_0002); // s_cbranch_scc0 +2 (skip 2-dword s_load_dwordx4)
+    words.extend_from_slice(&smem_load(0x02, 24, 6, 125, 0x20)); // clobbers s24 with Missing(OTHER) on untaken branch!
+    // Join block: also do descriptor-only load into s[40:43] to read UsedResource record count (5) & stride (8)
+    words.extend_from_slice(&smem_load(0x02, 40, 6, 125, 0x20));
+    words.push(sop2(0x20, 44, 41, 0x90)); // s_lshr_b32 s44, s41, 16 (stride = 8)
+
+    // Store [s20 (height-1 = 1), v4 (texel R bits), s24 (77), s42 (records = 5), s44 (stride = 8)]
+    words.push(vop1(0x001, 0, sgpr(20)));
+    words.extend_from_slice(&buffer_store_dword(0, 28, 0));
+    words.extend_from_slice(&buffer_store_dword(4, 28, 4));
+    words.push(vop1(0x001, 0, sgpr(24)));
+    words.extend_from_slice(&buffer_store_dword(0, 28, 8));
+    words.push(vop1(0x001, 0, sgpr(42)));
+    words.extend_from_slice(&buffer_store_dword(0, 28, 12));
+    words.push(vop1(0x001, 0, sgpr(44)));
+    words.extend_from_slice(&buffer_store_dword(0, 28, 16));
+    words.push(S_ENDPGM);
+
+    let native = NativeProgram {
+        stage: HwStage::Cs,
+        wave64: false,
+        vgprs: 8,
+        layout: vec![
+            RootParam {
+                root: RootType::Constants,
+                table_offset_dwords: 0,
+                sgprs: 2,
+                base_register: 0,
+                user_data: 0,
+                slot: 0,
+            },
+            RootParam {
+                root: RootType::ResourceHeap,
+                table_offset_dwords: 0,
+                sgprs: 1,
+                base_register: 0,
+                user_data: 2,
+                slot: 1,
+            },
+            RootParam {
+                root: RootType::Table,
+                table_offset_dwords: 0,
+                sgprs: 1,
+                base_register: 0,
+                user_data: 3,
+                slot: 2,
+            },
+        ],
+        used: vec![
+            UsedResource {
+                kind: ResourceType::Uav,
+                root: RootType::Table,
+                table_offset_dwords: 0,
+                lower_bound: 0,
+                stride: 0,
+                dwords: 4,
+                user_data: 3,
+                slot: 2,
+            },
+            UsedResource {
+                kind: ResourceType::Srv,
+                root: RootType::Table,
+                table_offset_dwords: 8,
+                lower_bound: 0,
+                stride: 8,
+                dwords: 4,
+                user_data: 3,
+                slot: 2,
+            },
+        ],
+        io: StageIo::Cs(ComputeIo {
+            rsrc2: 4 << 1,
+            threads: [1, 1, 1],
+        }),
+        code: words.iter().flat_map(|w| w.to_le_bytes()).collect(),
+    };
+
+    let shader = build_and_validate_cs(&native).expect("lower twin + used + dead-phi-edge");
+    let texels = [[3.5f32, 0.0, 0.0, 1.0]; 8]; // 4x2 texture -> width=4, height=2
+    let sb_words = [0u32; 10]; // 10 dwords = 40 bytes -> 5 records of stride 8
+    let _one = ONE_AT_A_TIME.lock().unwrap_or_else(|e| e.into_inner());
+    let mut ran = 0;
+    for (label, warp) in [("hardware", false), ("warp", true)] {
+        let Ok(host) = Host::new(warp) else { continue };
+        let (root, pso) = host.compute_pipeline(&shader).expect(label);
+        let mut ud = vec![0u32; shader.user_data_dwords().max(1) as usize];
+        for u in &shader.user_data {
+            ud[u.index as usize] = match (u.root, u.slot, u.dword) {
+                (RootType::Constants, 0, 0) => 1, // s0 = 1 (skip untaken clobber)
+                (RootType::Constants, 0, 1) => 1, // s1 = heap index 1 (Texture2D)
+                (RootType::Table, 2, _) => 0, // table starts at heap index 0 (UAV=0, SB=2 -> offset 0x40? Wait: 0x20 bytes = heap index 1! Put Texture at index 2!)
+                other => panic!("unexpected user data {other:?}"),
+            };
+        }
+        // Fix heap layout: Table base = 0 -> offset 0x00 is heap[0] (RawUav), offset 0x20 is heap[1] (SB stride 8);
+        // heap[2] is the bindless 4x2 Texture2D, so pass s1 = 2!
+        for u in &shader.user_data {
+            if (u.root, u.slot, u.dword) == (RootType::Constants, 0, 1) {
+                ud[u.index as usize] = 2;
+            }
+        }
+        let out = host
+            .dispatch(
+                &root,
+                &pso,
+                &Dispatch {
+                    roots: vec![(0, Root::Constants(ud))],
+                    views: &[
+                        View::RawUav(5),
+                        View::Buffer {
+                            data: &sb_words,
+                            stride: Stride::Structured(8),
+                        },
+                        View::Texture(4, 2, &texels),
+                    ],
+                    samplers: &[],
+                    groups: [1, 1, 1],
+                },
+            )
+            .expect(label);
+        assert_eq!(
+            out[0],
+            vec![1, 3.5f32.to_bits(), 77, 5, 8],
+            "{label}: twin/used/phi mismatch"
+        );
+        ran += 1;
+    }
+    assert!(ran > 0);
+
+    // 2. Reading a descriptor's raw base-address dword (dword 0) unconditionally still fails.
+    let bad_words = [
+        s_mov_b32(1, 0x80),
+        smem_load(0x02, 4, 0, 125, 0)[0],
+        smem_load(0x02, 4, 0, 125, 0)[1],
+        vop1(0x001, 0, sgpr(4)), // v0 = s4 (dword 0: raw GPU VA!)
+        buffer_store_dword(0, 4, 0)[0],
+        buffer_store_dword(0, 4, 0)[1],
+        S_ENDPGM,
+    ];
+    let mut bad_native = native.clone();
+    bad_native.layout = vec![RootParam {
+        root: RootType::Table,
+        table_offset_dwords: 0,
+        sgprs: 1,
+        base_register: 0,
+        user_data: 0,
+        slot: 0,
+    }];
+    bad_native.used = vec![UsedResource {
+        kind: ResourceType::Uav,
+        root: RootType::Table,
+        table_offset_dwords: 0,
+        lower_bound: 0,
+        stride: 0,
+        dwords: 4,
+        user_data: 0,
+        slot: 0,
+    }];
+    bad_native.io = StageIo::Cs(ComputeIo {
+        rsrc2: 1 << 1,
+        threads: [1, 1, 1],
+    });
+    bad_native.code = bad_words.iter().flat_map(|w| w.to_le_bytes()).collect();
+    let err = build_and_validate_cs(&bad_native).expect_err("raw descriptor address must fail");
+    assert_eq!(
+        err,
+        crate::ShaderError::Unsupported {
+            offset: 16,
+            what: "a descriptor's address or format read as data",
+        }
+    );
+}
