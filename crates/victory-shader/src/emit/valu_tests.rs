@@ -937,3 +937,68 @@ fn v_cmp_class_f16_matches_rdna2() {
         );
     });
 }
+
+#[test]
+fn v_swaprel_and_movrelsd_match_rdna2_on_host() {
+    // Tests v_swaprel_b32 with overlapping register spans (sreg <= dreg).
+    // Inputs in s0..s3: v1=17, v2=34, v3=51, s3=M0.
+    let swap_check_v1 = build_valu_cs(&[
+        s_mov_b32(124, 3),       // s_mov_b32 m0, s3
+        vop1(0x068, 2, vgpr(1)), // v_swaprel_b32 v2, v1
+        vop1(0x001, 0, vgpr(1)), // v_mov_b32 v0, v1
+    ]);
+    let swap_check_v2 = build_valu_cs(&[
+        s_mov_b32(124, 3),       // s_mov_b32 m0, s3
+        vop1(0x068, 2, vgpr(1)), // v_swaprel_b32 v2, v1
+        vop1(0x001, 0, vgpr(2)), // v_mov_b32 v0, v2
+    ]);
+    let swap_check_v3 = build_valu_cs(&[
+        s_mov_b32(124, 3),       // s_mov_b32 m0, s3
+        vop1(0x068, 2, vgpr(1)), // v_swaprel_b32 v2, v1
+        vop1(0x001, 0, vgpr(3)), // v_mov_b32 v0, v3
+    ]);
+
+    // Case 1: M0 = 0 -> swaps v1 and v2. v1 becomes 34, v2 becomes 17, v3 stays 51.
+    let inp_m0_0 = [[17, 34, 51, 0]];
+    run_cases(&swap_check_v1, &inp_m0_0, |b, _, _, got| {
+        assert_eq!(got, 34, "{b}: v1 after M0=0 swap")
+    });
+    run_cases(&swap_check_v2, &inp_m0_0, |b, _, _, got| {
+        assert_eq!(got, 17, "{b}: v2 after M0=0 swap")
+    });
+    run_cases(&swap_check_v3, &inp_m0_0, |b, _, _, got| {
+        assert_eq!(got, 51, "{b}: v3 after M0=0 swap")
+    });
+
+    // Case 2: M0 = 0x0001_0000 -> dst_off=1 (v3), src_off=0 (v1).
+    // Swaps v1 and v3. v1 becomes 51, v3 becomes 17, v2 stays 34.
+    let inp_m0_1 = [[17, 34, 51, 0x0001_0000]];
+    run_cases(&swap_check_v1, &inp_m0_1, |b, _, _, got| {
+        assert_eq!(got, 51, "{b}: v1 after M0=0x10000 swap")
+    });
+    run_cases(&swap_check_v2, &inp_m0_1, |b, _, _, got| {
+        assert_eq!(got, 34, "{b}: v2 after M0=0x10000 swap")
+    });
+    run_cases(&swap_check_v3, &inp_m0_1, |b, _, _, got| {
+        assert_eq!(got, 17, "{b}: v3 after M0=0x10000 swap")
+    });
+
+    // v_movrelsd_2_b32 v2, v1 with M0 = 0x0001_0000:
+    // v3 = v1 = 17, v2 remains 34.
+    let movrelsd_check_v3 = build_valu_cs(&[
+        s_mov_b32(124, 3),       // s_mov_b32 m0, s3
+        vop1(0x048, 2, vgpr(1)), // v_movrelsd_2_b32 v2, v1
+        vop1(0x001, 0, vgpr(3)), // v_mov_b32 v0, v3
+    ]);
+    let movrelsd_check_v2 = build_valu_cs(&[
+        s_mov_b32(124, 3),       // s_mov_b32 m0, s3
+        vop1(0x048, 2, vgpr(1)), // v_movrelsd_2_b32 v2, v1
+        vop1(0x001, 0, vgpr(2)), // v_mov_b32 v0, v2
+    ]);
+    run_cases(&movrelsd_check_v3, &inp_m0_1, |b, _, _, got| {
+        assert_eq!(got, 17, "{b}: v3 after v_movrelsd_2")
+    });
+    run_cases(&movrelsd_check_v2, &inp_m0_1, |b, _, _, got| {
+        assert_eq!(got, 34, "{b}: v2 after v_movrelsd_2")
+    });
+}

@@ -2341,6 +2341,56 @@ impl<'a> Lower<'a> {
             // vertex fetch call, whose results arrive as inputs.
             return Err("a register the emitter does not model");
         }
+        // s_movrelsd_2_b32: SGPR[D.addr + M0[25:16]] = SGPR[S0.addr + M0[9:0]].
+        // One move with separate source and destination offsets.
+        if name == "s_movrelsd_2_b32" {
+            const SGPRS: u8 = 106;
+            let c = self.cur;
+            let m0 = self.i32_of(inst.read(Reg::S(crate::ir::M0)).ok_or("M0")?)?;
+            let mask_3ff = self.s.m.i32(0x3FF);
+            let src_off = self.s.m.bin(c, Bin::And, m0, mask_3ff);
+            let k16 = self.s.m.i32(16);
+            let dst_off = self.s.m.bin(c, Bin::LShr, m0, k16);
+            let dst_off = self.s.m.bin(c, Bin::And, dst_off, mask_3ff);
+
+            let src_base = match src.first() {
+                Some(&Operand::Scalar { code, .. }) if code < SGPRS => code,
+                _ => return Err("s_movrelsd_2_b32 src operand"),
+            };
+            let dst_base = dst_code.ok_or("s_movrelsd_2_b32 dst operand")?;
+            if dst_base >= SGPRS {
+                return Err("s_movrelsd_2_b32 dst out of range");
+            }
+
+            // Build the value read from s[src_base + src_off] via a select chain.
+            let mut val = self.s.m.i32(0);
+            for k in 0..SGPRS.saturating_sub(src_base) {
+                let Some(x) = inst.read(Reg::S(src_base + k)) else {
+                    break;
+                };
+                let x = self.i32_of(x)?;
+                let kk = self.s.m.i32(u32::from(k));
+                let is = self.s.m.cmp(c, pred::EQ, src_off, kk);
+                val = self.s.m.select(c, is, x, val);
+            }
+
+            // Scatter val into s[dst_base + dst_off].
+            for k in 0..SGPRS.saturating_sub(dst_base) {
+                let slot = Reg::S(dst_base + k);
+                let Some(slot_write) = inst.write(slot) else {
+                    break;
+                };
+                let old_slot = match inst.read(slot) {
+                    Some(v) => self.i32_of(v)?,
+                    None => self.s.m.i32(0),
+                };
+                let kk = self.s.m.i32(u32::from(k));
+                let is = self.s.m.cmp(c, pred::EQ, dst_off, kk);
+                let new_slot = self.s.m.select(c, is, val, old_slot);
+                self.set(Some(slot_write), Val::I32(new_slot));
+            }
+            return Ok(());
+        }
         let c = self.cur;
         let src32 = |l: &mut Self, k: usize| -> Result<V, Why> {
             // SOPK arithmetic reads its destination as the first source.
@@ -3865,6 +3915,121 @@ impl<'a> Lower<'a> {
                     let kk = self.s.m.i32(u32::from(k));
                     let is = self.s.m.cmp(c, pred::EQ, m0, kk);
                     let x = self.s.m.select(c, is, value, old);
+                    self.write_placed(inst, Reg::V(dreg + k), x, guard);
+                }
+                Ok(())
+            }
+            "v_swaprel_b32" => {
+                // Atomically swaps v[dst + M0[25:16]] ↔ v[src + M0[9:0]].
+                // Both sides are M0-indexed; IR already tracks all reachable
+                // VGPRs for both reads and writes on this instruction.
+                let m0 = self.i32_of(inst.read(Reg::S(crate::ir::M0)).ok_or("M0")?)?;
+                let (
+                    Some(&Operand::Vector { reg: sreg, .. }),
+                    Some(Operand::Vector { reg: dreg, .. }),
+                ) = (v.src.first(), v.dst)
+                else {
+                    return Err("v_swaprel_b32 operands");
+                };
+                let mask_3ff = self.s.m.i32(0x3FF);
+                let src_off = self.s.m.bin(c, Bin::And, m0, mask_3ff);
+                let k16 = self.s.m.i32(16);
+                let dst_off = self.s.m.bin(c, Bin::LShr, m0, k16);
+                let dst_off = self.s.m.bin(c, Bin::And, dst_off, mask_3ff);
+
+                // Build the value selected from v[src + src_off].
+                let mut src_val = self.s.m.i32(0);
+                for k in 0..=255u8.saturating_sub(sreg) {
+                    let Some(x) = inst.read(Reg::V(sreg + k)) else {
+                        break;
+                    };
+                    let x = self.i32_of(x)?;
+                    let kk = self.s.m.i32(u32::from(k));
+                    let is = self.s.m.cmp(c, pred::EQ, src_off, kk);
+                    src_val = self.s.m.select(c, is, x, src_val);
+                }
+                // Build the value selected from v[dst + dst_off].
+                let mut dst_val = self.s.m.i32(0);
+                for k in 0..=255u8.saturating_sub(dreg) {
+                    let Some(x) = inst.read(Reg::V(dreg + k)) else {
+                        break;
+                    };
+                    let x = self.i32_of(x)?;
+                    let kk = self.s.m.i32(u32::from(k));
+                    let is = self.s.m.cmp(c, pred::EQ, dst_off, kk);
+                    dst_val = self.s.m.select(c, is, x, dst_val);
+                }
+                // Write src_val → v[dst + dst_off] (scatter) and dst_val → v[src + src_off].
+                // Handle the union of both register spans in a single pass so overlapping
+                // ranges (e.g. sreg <= dreg) do not overwrite each other.
+                let min_reg = sreg.min(dreg);
+                for r in min_reg..=255 {
+                    let Some(_) = inst.write(Reg::V(r)) else {
+                        break;
+                    };
+                    let old = match inst.read(Reg::V(r)) {
+                        Some(o) => self.i32_of(o)?,
+                        None => self.s.m.i32(0),
+                    };
+                    let is_dst = if r >= dreg {
+                        let k = self.s.m.i32(u32::from(r - dreg));
+                        self.s.m.cmp(c, pred::EQ, dst_off, k)
+                    } else {
+                        self.s.m.bool(false)
+                    };
+                    let is_src = if r >= sreg {
+                        let k = self.s.m.i32(u32::from(r - sreg));
+                        self.s.m.cmp(c, pred::EQ, src_off, k)
+                    } else {
+                        self.s.m.bool(false)
+                    };
+                    let x = self.s.m.select(c, is_dst, src_val, old);
+                    let x = self.s.m.select(c, is_src, dst_val, x);
+                    self.write_placed(inst, Reg::V(r), x, guard);
+                }
+                Ok(())
+            }
+            "v_movrelsd_2_b32" => {
+                // GFX10.3 relative move with dual offsets from M0:
+                //   VGPR[D.addr + M0[25:16]] = VGPR[S0.addr + M0[9:0]]
+                let m0 = self.i32_of(inst.read(Reg::S(crate::ir::M0)).ok_or("M0")?)?;
+                let (
+                    Some(&Operand::Vector { reg: sreg, .. }),
+                    Some(Operand::Vector { reg: dreg, .. }),
+                ) = (v.src.first(), v.dst)
+                else {
+                    return Err("v_movrelsd_2_b32 operands");
+                };
+                let mask_3ff = self.s.m.i32(0x3FF);
+                let src_off = self.s.m.bin(c, Bin::And, m0, mask_3ff);
+                let k16 = self.s.m.i32(16);
+                let dst_off = self.s.m.bin(c, Bin::LShr, m0, k16);
+                let dst_off = self.s.m.bin(c, Bin::And, dst_off, mask_3ff);
+
+                // Build the value read from v[sreg + src_off] via a select chain.
+                let mut val = self.s.m.i32(0);
+                for k in 0..=255u8.saturating_sub(sreg) {
+                    let Some(x) = inst.read(Reg::V(sreg + k)) else {
+                        break;
+                    };
+                    let x = self.i32_of(x)?;
+                    let kk = self.s.m.i32(u32::from(k));
+                    let is = self.s.m.cmp(c, pred::EQ, src_off, kk);
+                    val = self.s.m.select(c, is, x, val);
+                }
+
+                // Scatter val into v[dreg + dst_off].
+                for k in 0..=255u8.saturating_sub(dreg) {
+                    let Some(_) = inst.write(Reg::V(dreg + k)) else {
+                        break;
+                    };
+                    let kk = self.s.m.i32(u32::from(k));
+                    let is = self.s.m.cmp(c, pred::EQ, dst_off, kk);
+                    let old = match inst.read(Reg::V(dreg + k)) {
+                        Some(o) => self.i32_of(o)?,
+                        None => self.s.m.i32(0),
+                    };
+                    let x = self.s.m.select(c, is, val, old);
                     self.write_placed(inst, Reg::V(dreg + k), x, guard);
                 }
                 Ok(())
@@ -7099,9 +7264,7 @@ mod tests {
             S_ENDPGM,
         ];
 
-        let code: Vec<u8> = words.iter()
-            .flat_map(|w| w.to_le_bytes())
-            .collect();
+        let code: Vec<u8> = words.iter().flat_map(|w| w.to_le_bytes()).collect();
 
         let native = NativeProgram {
             stage: HwStage::Cs,
@@ -7118,9 +7281,12 @@ mod tests {
 
         let p = ir::build(&native.code, false, 256).unwrap();
 
-        assert!(p.blocks.iter()
-            .flat_map(|b| &b.insts)
-            .any(|i| i.name() == "v_perm_b32"));
+        assert!(
+            p.blocks
+                .iter()
+                .flat_map(|b| &b.insts)
+                .any(|i| i.name() == "v_perm_b32")
+        );
 
         let st = structure::structure(&p).unwrap();
         let res = resource::track(&p, &native.layout, native.stage, Some(&st)).unwrap();
@@ -7137,13 +7303,12 @@ mod tests {
             outputs: vec![],
             prims: vec![],
             mesh_stride: 0,
-        }).unwrap();
+        })
+        .unwrap();
 
-        let container =
-            crate::Container::parse(&emitted.dxil).unwrap();
+        let container = crate::Container::parse(&emitted.dxil).unwrap();
 
-        let features =
-            container.part(crate::FourCC::SFI0).unwrap();
+        let features = container.part(crate::FourCC::SFI0).unwrap();
 
         u64::from_le_bytes(features.data.try_into().unwrap())
     }
@@ -7417,5 +7582,62 @@ mod tests {
         assert!(f10(0x3FF).is_nan());
         // A 16-bit float is a half already, sign included.
         assert_eq!(half(0xBC00 << half_shift(16)), -1.0);
+    }
+
+    #[test]
+    fn v_movrelsd_2_b32_lowers_cleanly() {
+        // v_movrelsd_2_b32 v2, v1: VGPR[2 + M0[25:16]] = VGPR[1 + M0[9:0]]
+        lowers(
+            &[
+                0xBEFC_0380, // s_mov_b32 m0, 0
+                0x7E04_9101, // v_movrelsd_2_b32 v2, v1
+                S_ENDPGM,
+            ],
+            0,
+        )
+        .expect("v_movrelsd_2_b32 must lower");
+    }
+
+    #[test]
+    fn v_swaprel_b32_lowers_through_select_chains() {
+        // v_swaprel_b32 v2, v4: swaps v[2 + M0[25:16]] ↔ v[4 + M0[9:0]]
+        lowers(
+            &[
+                0xBEFC_0380, // s_mov_b32 m0, 0
+                0x7E04_D104, // v_swaprel_b32 v2, v4: swaps v[2+m0] ↔ v[4+m0]
+                S_ENDPGM,
+            ],
+            0,
+        )
+        .expect("v_swaprel_b32 must lower");
+    }
+
+    #[test]
+    fn s_movrelsd_2_b32_lowers_cleanly() {
+        // s_movrelsd_2_b32 s0, s2: SGPR[0 + M0[25:16]] = SGPR[2 + M0[9:0]]
+        lowers(
+            &[
+                0xBEFC_0380, // s_mov_b32 m0, 0
+                0xBE80_4902, // s_movrelsd_2_b32 s0, s2
+                S_ENDPGM,
+            ],
+            0,
+        )
+        .expect("s_movrelsd_2_b32 must lower");
+    }
+
+    #[test]
+    fn v_movrels_and_movreld_round_trip_through_dxil() {
+        // v_movrels_b32 (src indexed) and v_movreld_b32 (dst indexed).
+        lowers(
+            &[
+                0xBEFC_0380, // s_mov_b32 m0, 0
+                0x7E00_8704, // v_movrels_b32 v0, v4   (src-indexed read)
+                0x7E04_8501, // v_movreld_b32 v2, v1   (dst-indexed write)
+                S_ENDPGM,
+            ],
+            0,
+        )
+        .expect("v_movrels_b32 and v_movreld_b32 must lower");
     }
 }

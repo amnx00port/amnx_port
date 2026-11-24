@@ -186,12 +186,24 @@ pub fn build(code: &[u8], wave64: bool, vgprs: u16) -> Result<Program, ShaderErr
             };
         }
         if let Some((reads, writes)) = effects(&machine, &fields, name, lanes, vgprs)? {
+            let mut dedup_reads = Vec::with_capacity(reads.len());
+            for r in reads {
+                if !dedup_reads.contains(&r) {
+                    dedup_reads.push(r);
+                }
+            }
+            let mut dedup_writes = Vec::with_capacity(writes.len());
+            for w in writes {
+                if !dedup_writes.contains(&w) {
+                    dedup_writes.push(w);
+                }
+            }
             let unset = |regs: Vec<Reg>| regs.into_iter().map(|r| (r, NONE)).collect();
             blocks[b].insts.push(Inst {
                 machine,
                 fields,
-                reads: unset(reads),
-                writes: unset(writes),
+                reads: unset(dedup_reads),
+                writes: unset(dedup_writes),
             });
         }
     }
@@ -692,37 +704,62 @@ fn effects(
     );
     match fields {
         Fields::Sop { dst, src, .. } => {
-            if name.starts_with("s_movrel")
+            // s_movrelsd_2_b32: SGPR[D.addr + M0[25:16]] = SGPR[S0.addr + M0[9:0]].
+            // One move with separate source and destination offsets.
+            if name == "s_movrelsd_2_b32" {
+                const SGPRS: u8 = 106;
+                let indexed_sgpr = |op: &Operand, out: &mut Vec<Reg>| match *op {
+                    Operand::Scalar { code, .. } if code < SGPRS => {
+                        out.extend((code..SGPRS).map(Reg::S));
+                        Ok(())
+                    }
+                    _ => Err(ShaderError::Isa {
+                        offset: inst.offset,
+                        reason: "relative SGPR base outside the SGPR range",
+                    }),
+                };
+                // src[0] is the indexed read base.
+                if let Some(s0) = src.first() {
+                    indexed_sgpr(s0, &mut r)?;
+                }
+                // dst is the indexed write base.
+                if let Some(d) = dst {
+                    indexed_sgpr(d, &mut w)?;
+                }
+                // M0 is an implicit read.
+                r.push(Reg::S(M0));
+            } else if name.starts_with("s_movrel")
                 || name.starts_with("s_subvector_loop")
                 || matches!(name, "s_call_b64" | "s_rfe_b64")
             {
                 return Err(unsupported());
-            }
-            for s in src {
-                regs(s, &mut r)?;
-            }
-            if let Some(d) = dst {
-                regs(d, &mut w)?;
-                // These change (or may keep) the destination's old value.
-                if name.starts_with("s_bitset")
-                    || name.starts_with("s_cmov")
-                    || matches!(name, "s_addk_i32" | "s_mulk_i32")
-                {
-                    regs(d, &mut r)?;
+            } else {
+                for s in src {
+                    regs(s, &mut r)?;
                 }
-            }
-            if matches!(name, "s_addc_u32" | "s_subb_u32" | "s_cmovk_i32")
-                || name.starts_with("s_cselect_")
-                || name.starts_with("s_cmov_")
-            {
-                r.push(Reg::Scc);
-            }
-            if name.contains("saveexec") || name.contains("wrexec") {
-                r.extend(mask(EXEC));
-                w.extend(mask(EXEC));
-            }
-            if writes_scc(inst.encoding, name) {
-                w.push(Reg::Scc);
+                if let Some(d) = dst {
+                    regs(d, &mut w)?;
+                    // These change (or may keep) the destination's old value.
+                    if name.starts_with("s_bitset")
+                        || name.starts_with("s_cmov")
+                        || matches!(name, "s_addk_i32" | "s_mulk_i32")
+                    {
+                        regs(d, &mut r)?;
+                    }
+                }
+                if matches!(name, "s_addc_u32" | "s_subb_u32" | "s_cmovk_i32")
+                    || name.starts_with("s_cselect_")
+                    || name.starts_with("s_cmov_")
+                {
+                    r.push(Reg::Scc);
+                }
+                if name.contains("saveexec") || name.contains("wrexec") {
+                    r.extend(mask(EXEC));
+                    w.extend(mask(EXEC));
+                }
+                if writes_scc(inst.encoding, name) {
+                    w.push(Reg::Scc);
+                }
             }
         }
         Fields::Sopp { .. } => match name {
@@ -1223,5 +1260,60 @@ mod tests {
         assert_eq!(vgprs(&movrels.reads), [4, 5, 0]);
         assert_eq!(movrels.read(Reg::V(4)), movreld.write(Reg::V(4)));
         assert!(build(&code, false, 4).is_err(), "v4 is past 4 VGPRs");
+    }
+
+    #[test]
+    fn v_swaprel_tracks_both_indexed_reads_and_writes() {
+        // v_swaprel_b32 v2, v4: swaps v[2 + M0[25:16]] ↔ v[4 + M0[9:0]].
+        // Both src and dst sides are indexed, so both ranges get read AND written.
+        let code: Vec<u8> = [
+            0x7E04_D104_u32, // v_swaprel_b32 v2, v4
+            S_ENDPGM,
+        ]
+        .iter()
+        .flat_map(|w| w.to_le_bytes())
+        .collect();
+        let p = build(&code, false, 6).unwrap();
+        let swaprel = &p.blocks[0].insts[0];
+        assert_eq!(swaprel.name(), "v_swaprel_b32");
+        // Both v[2..6] and v[4..6] should be in reads and writes.
+        for r in 2..6 {
+            assert!(swaprel.read(Reg::V(r)).is_some(), "v{r} should be read");
+            assert!(swaprel.write(Reg::V(r)).is_some(), "v{r} should be written");
+        }
+        // M0 must be listed as a read dependency.
+        assert!(swaprel.read(Reg::S(M0)).is_some());
+    }
+
+    #[test]
+    fn s_movrelsd_2_tracks_dual_indexed_sgpr_effects() {
+        // s_movrelsd_2_b32 s4, s2: SGPR[4 + M0[25:16]] = SGPR[2 + M0[9:0]].
+        // SOP1 opcode 0x049 for GFX10; encoding: 0xBE84_4902
+        //   SSRC0 = 2  (s2), SDST = 4  (s4), op = 0x49.
+        let code: Vec<u8> = [0xBE84_4902_u32, S_ENDPGM]
+            .iter()
+            .flat_map(|w| w.to_le_bytes())
+            .collect();
+        let p = build(&code, false, 256).unwrap();
+        let inst = &p.blocks[0].insts[0];
+        assert_eq!(inst.name(), "s_movrelsd_2_b32");
+        // Destination range s[4..105] must be in writes.
+        assert!(inst.write(Reg::S(4)).is_some(), "sdst s4 must be written");
+        assert!(
+            inst.write(Reg::S(105)).is_some(),
+            "sdst s105 must be written"
+        );
+        // Source range s[2..105] and M0 must be in reads.
+        assert!(inst.read(Reg::S(2)).is_some(), "indexed s2 must be read");
+        assert!(
+            inst.read(Reg::S(105)).is_some(),
+            "indexed s105 must be read"
+        );
+        assert!(inst.read(Reg::S(M0)).is_some(), "M0 must be read");
+        // s0..s3 are not in writes, s0..s1 are not in reads.
+        assert!(inst.write(Reg::S(0)).is_none());
+        assert!(inst.write(Reg::S(2)).is_none());
+        assert!(inst.read(Reg::S(0)).is_none());
+        assert!(inst.read(Reg::S(1)).is_none());
     }
 }
