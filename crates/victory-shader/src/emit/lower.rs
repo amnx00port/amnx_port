@@ -43,6 +43,9 @@ pub(crate) struct Lowered {
     /// Whether the program uses wave operations.
     #[cfg(test)]
     pub wave_ops: bool,
+    /// Total incoming edges placed on loop-iteration counter phis.
+    #[cfg(test)]
+    pub counter_edges: usize,
 }
 
 pub(crate) struct Parts<'a> {
@@ -220,6 +223,8 @@ struct Lower<'a> {
     /// Loop headers' iteration counters (see [`LOOP_LIMIT`]): the phi by
     /// IR block, and its incoming (value, DXIL block) pairs.
     counters: HashMap<usize, (V, Vec<(V, usize)>)>,
+    #[cfg(test)]
+    counter_edges: usize,
     /// The block a loop stopped by [`LOOP_LIMIT`] leaves the program from.
     abort: Option<usize>,
 }
@@ -514,6 +519,8 @@ impl<'a> Lower<'a> {
             section_out: HashSet::new(),
             code_table: None,
             counters: HashMap::new(),
+            #[cfg(test)]
+            counter_edges: 0,
             abort: None,
         }
     }
@@ -910,6 +917,8 @@ impl<'a> Lower<'a> {
             nonuniform_handles: self.s.nonuniform_handles,
             #[cfg(test)]
             wave_ops: self.s.flags & flags::WAVE_OPS != 0,
+            #[cfg(test)]
+            counter_edges: self.counter_edges,
             dxil: self.s.finish(),
             user_data,
             samplers: self.samplers,
@@ -6777,32 +6786,58 @@ impl<'a> Lower<'a> {
                 // A back edge is taken only below the iteration limit.
                 let back =
                     |l: &Self, to: usize| l.counters.contains_key(&to) && l.rpo[to] <= l.rpo[b];
-                // (No `xor` of a compare: a loop exit testing one hung the
-                // AMD driver.)
-                let cond = if back(self, taken) {
-                    let ok = self.count_iteration(taken, pred::IULT);
-                    self.s.m.bin(self.cur, Bin::And, cond, ok)
-                } else if back(self, not_taken) {
-                    let stop = self.count_iteration(not_taken, pred::IUGE);
-                    self.s.m.bin(self.cur, Bin::Or, cond, stop)
-                } else {
-                    cond
-                };
-                // Critical edges get a block of their own, so loops have
-                // dedicated exits and preheaders as DXC emits them.
-                let (t, f) = (self.edge(b, taken), self.edge(b, not_taken));
-                for (to, via) in [(taken, t), (not_taken, f)] {
-                    if !back(self, to) {
-                        // From an edge block, or from here.
-                        let from = if Some(via) == self.block[to] {
-                            self.cur
-                        } else {
-                            via
+                if back(self, taken) && back(self, not_taken) {
+                    if taken == not_taken {
+                        let ok = self.count_iteration_from(self.cur, taken, pred::IULT);
+                        let abort = self.abort_block();
+                        Term::CondBr(ok, self.block[taken].expect("reachable"), abort)
+                    } else {
+                        // Both arms are back edges (e.g. an inner latch
+                        // returning to either the inner or outer loop header):
+                        // guard each edge in its own block so both headers get
+                        // their counter phi incoming edge and iteration limit.
+                        let abort = self.abort_block();
+                        let mut guard_back = |to: usize| {
+                            let edge = self.s.m.new_block();
+                            let ok = self.count_iteration_from(edge, to, pred::IULT);
+                            self.s.m.terminate(
+                                edge,
+                                Term::CondBr(ok, self.block[to].expect("reachable"), abort),
+                            );
+                            self.edges.insert((b, to), edge);
+                            edge
                         };
-                        self.enter_loop(b, to, from);
+                        let (t, f) = (guard_back(taken), guard_back(not_taken));
+                        Term::CondBr(cond, t, f)
                     }
+                } else {
+                    // (No `xor` of a compare: a loop exit testing one hung the
+                    // AMD driver.)
+                    let cond = if back(self, taken) {
+                        let ok = self.count_iteration(taken, pred::IULT);
+                        self.s.m.bin(self.cur, Bin::And, cond, ok)
+                    } else if back(self, not_taken) {
+                        let stop = self.count_iteration(not_taken, pred::IUGE);
+                        self.s.m.bin(self.cur, Bin::Or, cond, stop)
+                    } else {
+                        cond
+                    };
+                    // Critical edges get a block of their own, so loops have
+                    // dedicated exits and preheaders as DXC emits them.
+                    let (t, f) = (self.edge(b, taken), self.edge(b, not_taken));
+                    for (to, via) in [(taken, t), (not_taken, f)] {
+                        if !back(self, to) {
+                            // From an edge block, or from here.
+                            let from = if Some(via) == self.block[to] {
+                                self.cur
+                            } else {
+                                via
+                            };
+                            self.enter_loop(b, to, from);
+                        }
+                    }
+                    Term::CondBr(cond, t, f)
                 }
-                Term::CondBr(cond, t, f)
             }
             LaneExit::End => {
                 if self.s.pixel && !self.exported[b] && !self.has_done_export(b) {
@@ -6833,7 +6868,10 @@ impl<'a> Lower<'a> {
     /// critical-edge block): the count goes up; the result compares it with
     /// [`LOOP_LIMIT`] by `p` (below: go on; at or above: stop).
     fn count_iteration(&mut self, to: usize, p: u8) -> V {
-        let c = self.cur;
+        self.count_iteration_from(self.cur, to, p)
+    }
+
+    fn count_iteration_from(&mut self, c: usize, to: usize, p: u8) -> V {
         let (phi, _) = self.counters[&to];
         let one = self.s.m.i32(1);
         let next = self.s.m.bin(c, Bin::Add, phi, one);
@@ -6923,6 +6961,10 @@ impl<'a> Lower<'a> {
             self.s.m.set_phi(v, incoming);
         }
         for (phi, incoming) in std::mem::take(&mut self.counters).into_values() {
+            #[cfg(test)]
+            {
+                self.counter_edges += incoming.len();
+            }
             self.s.m.set_phi(phi, incoming);
         }
         while let Some((v, b, i)) = self.pending_masks.pop() {
@@ -7417,5 +7459,36 @@ mod tests {
         assert!(f10(0x3FF).is_nan());
         // A 16-bit float is a half already, sign included.
         assert_eq!(half(0xBC00 << half_shift(16)), -1.0);
+    }
+
+    #[test]
+    fn dual_back_edge_branch_counts_both_loop_headers() {
+        // Nested loop where the inner loop's conditional branch jumps back to
+        // `inner` when s1 != 2 and falls straight back into `outer` when s1 == 2,
+        // making both arms of the same `LaneExit::Branch` back edges.
+        let words = [
+            0xBE80_0380, // 0  entry: s_mov_b32 s0, 0
+            0xBF82_0003, // 1         s_branch -> 5 (outer)
+            0x8001_8101, // 2  inner: s_add_u32 s1, s1, 1
+            0xBF06_8201, // 3         s_cmp_eq_u32 s1, 2
+            0xBF84_FFFD, // 4         s_cbranch_scc0 -> 2 (inner); fallthrough -> 5 (outer)
+            0x8000_8100, // 5  outer: s_add_u32 s0, s0, 1
+            0xBF06_8200, // 6         s_cmp_eq_u32 s0, 2
+            0xBF85_0002, // 7         s_cbranch_scc1 -> 10 (exit)
+            0xBE81_0380, // 8  pre:   s_mov_b32 s1, 0
+            0xBF82_FFF8, // 9         s_branch -> 2 (inner)
+            S_ENDPGM,    // 10 exit:  s_endpgm
+        ];
+        let emitted = lower_with(&words, vec![], vec![]).unwrap();
+        // Both `outer` (entry + inner fallthrough) and `inner` (pre + self)
+        // must have both of their counter-phi incoming edges populated.
+        assert_eq!(emitted.counter_edges, 4);
+        #[cfg(windows)]
+        if let Ok(mut v) = super::super::validator::Validator::load(
+            super::super::validator::Validator::default_path().as_deref(),
+        ) {
+            v.validate(&mut emitted.dxil.clone())
+                .expect("DXIL validation failed");
+        }
     }
 }
