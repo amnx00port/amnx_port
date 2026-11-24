@@ -937,3 +937,193 @@ fn v_cmp_class_f16_matches_rdna2() {
         );
     });
 }
+
+/// The same class test for f32: bit k of src1 names class k of the first
+/// operand, in the same order as the binary16 one. The class comes from the
+/// operand's bits alone, subnormals included, because the lowering bitcasts
+/// the source to i32 instead of converting it.
+#[test]
+fn v_cmp_class_f32_matches_rdna2() {
+    // v_cmp_class_f32_e64 s20, v1, v2 (VOPC 0x088 in VOP3);
+    // v_cndmask_b32_e64 v0, 0, 1, s20 (VOP3 0x101)
+    let mut body = vop3(0x088, 20, vgpr(1), vgpr(2), 0x80).to_vec();
+    body.extend_from_slice(&vop3(0x101, 0, 0x80, 0x81, sgpr(20)));
+    let shader = build_valu_cs(&body);
+
+    // All 10 IEEE-754 binary32 classes: bit k corresponds to class k. The
+    // sign of a NaN does not change its class.
+    let (inf, ninf) = (f32::INFINITY.to_bits(), f32::NEG_INFINITY.to_bits());
+    let classes: &[(u32, u32)] = &[
+        (0x7F80_0001, 0), // +sNaN (quiet bit 0x0040_0000 clear)
+        (0xFF80_0001, 0), // -sNaN
+        (0x7FC0_0000, 1), // +qNaN
+        (0xFFC0_0001, 1), // -qNaN
+        (ninf, 2),        // -inf
+        (f32::to_bits(-1.0), 3),
+        (0x8080_0000, 3), // -(2^-126): the largest negative normal
+        (0x8000_0001, 4), // the smallest-magnitude negative subnormal
+        (0x807F_FFFF, 4), // the largest-magnitude one
+        (0x8000_0000, 5), // -0.0
+        (0x0000_0000, 6), // +0.0
+        (0x0000_0001, 7),
+        (0x007F_FFFF, 7),
+        (0x0080_0000, 8), // +2^-126: the smallest positive normal
+        (f32::to_bits(1.0), 8),
+        (inf, 9), // +inf
+    ];
+    let mut cases = Vec::new();
+    for &(bits, cls) in classes {
+        // Each class bit on its own: 1 for the operand's own class only.
+        for b in 0..10u32 {
+            cases.push(([bits, 1 << b, 0, 0], u32::from(b == cls)));
+        }
+        // Masks that combine classes (finite, zero, NaN) answer for their
+        // members; the empty mask and bits above the tenth select nothing.
+        for mask in [0x1F8u32, 0x060, 0x003, 0x000, 0xFFFF_FC00] {
+            cases.push(([bits, mask, 0, 0], (mask >> cls) & 1));
+        }
+    }
+
+    let inputs: Vec<[u32; 4]> = cases.iter().map(|c| c.0).collect();
+    run_cases(&shader, &inputs, |backend, i, inp, got| {
+        let want = cases[i].1;
+        assert_eq!(
+            got, want,
+            "{backend}: v_cmp_class_f32({:#010x}, {:#08x}) = {got}, want {want}",
+            inp[0], inp[1],
+        );
+    });
+}
+
+/// The smallest, largest or middle of three, by the signed or the unsigned
+/// order of the same words.
+fn int3_reference(v: [u32; 3], signed: bool, op: &str) -> u32 {
+    let mut sorted = v;
+    if signed {
+        sorted.sort_by_key(|&x| x as i32);
+    } else {
+        sorted.sort_unstable();
+    }
+    match op {
+        "min3" => sorted[0],
+        "max3" => sorted[2],
+        _ => sorted[1],
+    }
+}
+
+/// The integer three-way minimums, maximums and medians: each compares by its
+/// own order, so the same three words give different answers signed and
+/// unsigned, and the median is the middle value even with repeats.
+#[test]
+fn v_min3_max3_med3_integers_match_rdna2() {
+    let (min, max) = (i32::MIN as u32, i32::MAX as u32);
+    // Triples that separate the two orders, plus ones with repeated values.
+    let triplets: &[[u32; 3]] = &[
+        [min, 0xFFFF_FFFF, max], // i32: MIN, -1, MAX; u32: 2^31, 2^32-1, 2^31-1
+        [min, 0, max],           // u32: 2^31, 0, 2^31-1
+        [0xFFFF_FFFB, 0, 5],     // i32: -5, 0, 5; u32: 2^32-5, 0, 5
+        [max, 5, 0xFFFF_FFFB],
+        [0xFFFF_FFFB, min, 0],
+        [1, 0xFFFF_FFFF, min],
+        [0xFFFF_FFFB, 0xFFFF_FFFB, 5],
+        [0xFFFF_FFFB, 0, 0],
+    ];
+    let mut inputs: Vec<[u32; 4]> = Vec::new();
+    // Every ordering of each triple picks a different pair first.
+    for t in triplets {
+        for p in [
+            [0, 1, 2],
+            [0, 2, 1],
+            [1, 0, 2],
+            [1, 2, 0],
+            [2, 0, 1],
+            [2, 1, 0],
+        ] {
+            inputs.push([t[p[0]], t[p[1]], t[p[2]], 0]);
+        }
+    }
+    for [a, b] in [[min, 1u32], [0xFFFF_FFFF, max], [5, 0xFFFF_FFFB]] {
+        for t in [[a, a, b], [a, b, a], [b, a, a], [a, a, a]] {
+            inputs.push([t[0], t[1], t[2], 0]);
+        }
+    }
+
+    for (name, op, signed) in [
+        ("v_min3_i32", 0x152u16, true),
+        ("v_min3_u32", 0x153, false),
+        ("v_max3_i32", 0x155, true),
+        ("v_max3_u32", 0x156, false),
+        ("v_med3_i32", 0x158, true),
+        ("v_med3_u32", 0x159, false),
+    ] {
+        let shader = build_valu_cs(&vop3(op, 0, vgpr(1), vgpr(2), vgpr(3)));
+        let kind = &name[2..6];
+        run_cases(&shader, &inputs, |backend, _, inp, got| {
+            let want = int3_reference([inp[0], inp[1], inp[2]], signed, kind);
+            assert_eq!(
+                got, want,
+                "{backend}: {name}({:#010x}, {:#010x}, {:#010x}) = {got:#010x}, want {want:#010x}",
+                inp[0], inp[1], inp[2],
+            );
+        });
+    }
+}
+
+/// RDNA2's f16 maximums and minimums order -0 below +0 as the f32 ones do,
+/// and read the low half of each VGPR only.
+#[test]
+fn max_and_min_f16_order_negative_zero_below_positive_zero() {
+    let (pz, nz) = (0x0000u32, 0x8000u32);
+    // Every order of -0 and +0, and the same words with junk in the high
+    // halves, which the f16 operations never read.
+    let pairs: &[[u32; 4]] = &[
+        [nz, pz, 0, 0],
+        [pz, nz, 0, 0],
+        [0xABCD_8000, 0x1234_0000, 0, 0],
+        [0x1234_0000, 0xABCD_8000, 0, 0],
+    ];
+    let triples: &[[u32; 4]] = &[
+        [nz, nz, pz, 0],
+        [nz, pz, nz, 0],
+        [pz, nz, nz, 0],
+        [pz, pz, nz, 0],
+        [pz, nz, pz, 0],
+        [nz, pz, pz, 0],
+        [0xABCD_8000, 0xFFFF_8000, 0x1234_0000, 0],
+        [0x1234_0000, 0xABCD_8000, 0xFFFF_8000, 0],
+        [0xABCD_8000, 0x8000_8000, 0xFFFF_8000, 0],
+        [nz, nz, nz, 0],
+        [pz, pz, pz, 0],
+    ];
+    // -0 is the lesser zero: a maximum is +0 as soon as one operand is +0
+    // and a minimum is -0 as soon as one operand is -0.
+    let zeros = |operands: &[u32], max: bool| -> u16 {
+        let has = |h: u32| operands.iter().any(|&x| u32::from(x as u16) == h);
+        match (max, has(pz), has(nz)) {
+            (true, true, _) => 0x0000,   // a maximum holding a +0 is +0
+            (true, false, _) => 0x8000,  // only -0s: the maximum is -0
+            (false, _, true) => 0x8000,  // a minimum holding a -0 is -0
+            (false, _, false) => 0x0000, // only +0s: the minimum is +0
+        }
+    };
+    // VOP3 encodes the VOP2 forms at 0x100 + the VOP2 opcode: v_max_f16 is
+    // VOP2 0x039 and v_min_f16 0x03a, so 0x139 and 0x13a here. (0x111 is
+    // v_min_i32 in this encoding and 0x10e does not decode at all.)
+    for (name, op, three, max) in [
+        ("v_max_f16", 0x139u16, false, true),
+        ("v_min_f16", 0x13A, false, false),
+        ("v_max3_f16", 0x354, true, true),
+        ("v_min3_f16", 0x351, true, false),
+    ] {
+        let shader = build_valu_cs(&vop3(op, 0, vgpr(1), vgpr(2), vgpr(3)));
+        let (cases, operands) = if three { (triples, 3) } else { (pairs, 2) };
+        run_cases(&shader, cases, |backend, _, inp, got| {
+            let want = zeros(&inp[..operands], max);
+            let got_h = got as u16;
+            assert_eq!(
+                got_h, want,
+                "{backend}: {name}({inp:x?}) = {got_h:#06x}, want {want:#06x}",
+            );
+        });
+    }
+}
