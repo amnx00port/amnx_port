@@ -38,8 +38,8 @@ pub(crate) fn counts() -> (u64, u64) {
 
 /// What identifies this build: the BLAKE3 of our executable file and of
 /// the translation settings it runs with (the loop limit, which a
-/// diagnostics build can change at run time, and the host's view heap
-/// cap).
+/// diagnostics build can change at run time, the host's view heap cap and
+/// its widest wave).
 fn build() -> &'static [u8; 32] {
     static BUILD: OnceLock<[u8; 32]> = OnceLock::new();
     BUILD.get_or_init(|| {
@@ -59,6 +59,10 @@ fn build() -> &'static [u8; 32] {
                 bytes.extend_from_slice(&limit.to_le_bytes());
                 if cap != 0 {
                     bytes.extend_from_slice(&cap.to_le_bytes());
+                }
+                let lanes = victory_shader::emit::host_wave_max();
+                if lanes < 64 {
+                    bytes.extend_from_slice(&lanes.to_le_bytes());
                 }
                 *blake3::hash(&bytes).as_bytes()
             }
