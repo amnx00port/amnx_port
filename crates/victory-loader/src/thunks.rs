@@ -50,7 +50,7 @@ pub fn unimplemented_call_count() -> u64 {
     UNIMPLEMENTED_CALLS.load(Ordering::Relaxed)
 }
 
-extern "system" fn unimplemented_import(site: &'static ImportSite) -> u64 {
+extern "win64" fn unimplemented_import(site: &'static ImportSite) -> u64 {
     UNIMPLEMENTED_CALLS.fetch_add(1, Ordering::Relaxed);
     let previous = site.calls.fetch_add(1, Ordering::Relaxed);
     match site.policy {
@@ -117,7 +117,7 @@ impl ThunkBlock {
         code[0..2].copy_from_slice(&[0x48, 0xB9]);
         code[2..10].copy_from_slice(&(site as *const ImportSite as u64).to_le_bytes());
         code[10..12].copy_from_slice(&[0x48, 0xB8]);
-        let handler = unimplemented_import as extern "system" fn(&'static ImportSite) -> u64;
+        let handler = unimplemented_import as extern "win64" fn(&'static ImportSite) -> u64;
         code[12..20].copy_from_slice(&(handler as *const () as u64).to_le_bytes());
         code[20..22].copy_from_slice(&[0xFF, 0xE0]);
         // SAFETY: `used + THUNK_SIZE <= len`, and the block is still writable.

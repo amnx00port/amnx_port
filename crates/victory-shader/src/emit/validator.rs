@@ -31,7 +31,7 @@ const IID_IDXC_VALIDATOR: Guid = Guid(
 const IN_PLACE_EDIT: u32 = 1;
 
 type CreateInstance =
-    unsafe extern "system" fn(*const Guid, *const Guid, *mut *mut c_void) -> Hresult;
+    unsafe extern "win64" fn(*const Guid, *const Guid, *mut *mut c_void) -> Hresult;
 
 /// COM object: a pointer to a table of method pointers.
 type Object = *mut *const usize;
@@ -44,7 +44,7 @@ unsafe fn method<F: Copy>(obj: Object, slot: usize) -> F {
 unsafe fn release(obj: Object) {
     if !obj.is_null() {
         // SAFETY: slot 2 of every COM interface is Release.
-        unsafe { method::<unsafe extern "system" fn(Object) -> u32>(obj, 2)(obj) };
+        unsafe { method::<unsafe extern "win64" fn(Object) -> u32>(obj, 2)(obj) };
     }
 }
 
@@ -63,7 +63,7 @@ const IDXC_BLOB: [u8; 16] = [
     0x08, 0xfb, 0xa5, 0x8b, 0x95, 0x51, 0xe2, 0x40, 0xac, 0x58, 0x0d, 0x98, 0x9c, 0x3a, 0x01, 0x02,
 ];
 
-unsafe extern "system" fn blob_qi(
+unsafe extern "win64" fn blob_qi(
     this: *mut Blob,
     iid: *const [u8; 16],
     out: *mut *mut c_void,
@@ -79,25 +79,25 @@ unsafe extern "system" fn blob_qi(
         }
     }
 }
-unsafe extern "system" fn blob_ref(_: *mut Blob) -> u32 {
+unsafe extern "win64" fn blob_ref(_: *mut Blob) -> u32 {
     1
 }
-unsafe extern "system" fn blob_ptr(this: *mut Blob) -> *mut u8 {
+unsafe extern "win64" fn blob_ptr(this: *mut Blob) -> *mut u8 {
     // SAFETY: `this` is our blob.
     unsafe { (*this).data }
 }
-unsafe extern "system" fn blob_len(this: *mut Blob) -> usize {
+unsafe extern "win64" fn blob_len(this: *mut Blob) -> usize {
     // SAFETY: `this` is our blob.
     unsafe { (*this).len }
 }
 
 #[repr(C)]
 struct BlobVtable {
-    qi: unsafe extern "system" fn(*mut Blob, *const [u8; 16], *mut *mut c_void) -> Hresult,
-    add_ref: unsafe extern "system" fn(*mut Blob) -> u32,
-    release: unsafe extern "system" fn(*mut Blob) -> u32,
-    ptr: unsafe extern "system" fn(*mut Blob) -> *mut u8,
-    len: unsafe extern "system" fn(*mut Blob) -> usize,
+    qi: unsafe extern "win64" fn(*mut Blob, *const [u8; 16], *mut *mut c_void) -> Hresult,
+    add_ref: unsafe extern "win64" fn(*mut Blob) -> u32,
+    release: unsafe extern "win64" fn(*mut Blob) -> u32,
+    ptr: unsafe extern "win64" fn(*mut Blob) -> *mut u8,
+    len: unsafe extern "win64" fn(*mut Blob) -> usize,
 }
 
 static BLOB_VTABLE: BlobVtable = BlobVtable {
@@ -174,7 +174,7 @@ impl Validator {
         // IDxcBlob GetBufferPointer (3) / GetBufferSize (4).
         unsafe {
             let mut result: Object = std::ptr::null_mut();
-            let validate: unsafe extern "system" fn(
+            let validate: unsafe extern "win64" fn(
                 Object,
                 *mut Blob,
                 u32,
@@ -185,17 +185,17 @@ impl Validator {
                 return Err(format!("Validate failed: {hr:#x}"));
             }
             let mut status = 0;
-            let get_status: unsafe extern "system" fn(Object, *mut Hresult) -> Hresult =
+            let get_status: unsafe extern "win64" fn(Object, *mut Hresult) -> Hresult =
                 method(result, 3);
             get_status(result, &mut status);
             let mut text = String::new();
             if status < 0 {
                 let mut errors: Object = std::ptr::null_mut();
-                let get_errors: unsafe extern "system" fn(Object, *mut Object) -> Hresult =
+                let get_errors: unsafe extern "win64" fn(Object, *mut Object) -> Hresult =
                     method(result, 5);
                 if get_errors(result, &mut errors) >= 0 && !errors.is_null() {
-                    let ptr: unsafe extern "system" fn(Object) -> *const u8 = method(errors, 3);
-                    let len: unsafe extern "system" fn(Object) -> usize = method(errors, 4);
+                    let ptr: unsafe extern "win64" fn(Object) -> *const u8 = method(errors, 3);
+                    let len: unsafe extern "win64" fn(Object) -> usize = method(errors, 4);
                     let bytes = std::slice::from_raw_parts(ptr(errors), len(errors));
                     text = String::from_utf8_lossy(bytes)
                         .trim_end_matches('\0')

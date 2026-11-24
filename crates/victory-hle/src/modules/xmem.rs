@@ -84,7 +84,7 @@ fn address_range(flags: u64) -> (usize, usize) {
     (1 << 32, (1 << bits) - 1)
 }
 
-pub extern "system" fn XMemVirtualAlloc(
+pub extern "win64" fn XMemVirtualAlloc(
     base: *mut c_void,
     size: usize,
     kind: u32,
@@ -179,7 +179,7 @@ pub struct BasicInformation {
 // all of it is GPU-reachable here (Grand Theft Auto VI's BVH builder, the
 // only caller, wants graphics memory); remember the flags of
 // `XMemVirtualAlloc` regions if a title tells CPU-only memory apart.
-pub extern "system" fn XMemVirtualQuery(
+pub extern "win64" fn XMemVirtualQuery(
     process: HANDLE,
     address: *const c_void,
     out: *mut BasicInformation,
@@ -217,8 +217,8 @@ fn layout(size: usize, attributes: u64) -> Option<Layout> {
     Layout::from_size_align(size.checked_add(align)?, align).ok()
 }
 
-type AllocRoutine = extern "system" fn(usize, u64) -> *mut c_void;
-type FreeRoutine = extern "system" fn(*mut c_void, u64);
+type AllocRoutine = extern "win64" fn(usize, u64) -> *mut c_void;
+type FreeRoutine = extern "win64" fn(*mut c_void, u64);
 
 /// The allocation and free routines the title's exe exports as
 /// `__XMemAllocationHooks__` (Grand Theft Auto VI does): `XMemAlloc` and
@@ -252,7 +252,7 @@ fn hooks() -> [usize; 2] {
 
 /// The title's general allocator, for middleware too: its hook if it has
 /// one, else [`XMemAllocDefault`].
-pub extern "system" fn XMemAlloc(size: usize, attributes: u64) -> *mut c_void {
+pub extern "win64" fn XMemAlloc(size: usize, attributes: u64) -> *mut c_void {
     match hooks()[0] {
         0 => XMemAllocDefault(size, attributes),
         hook => {
@@ -264,7 +264,7 @@ pub extern "system" fn XMemAlloc(size: usize, attributes: u64) -> *mut c_void {
 }
 
 /// See [`XMemAlloc`].
-pub extern "system" fn XMemFree(address: *mut c_void, attributes: u64) {
+pub extern "win64" fn XMemFree(address: *mut c_void, attributes: u64) {
     match hooks()[1] {
         0 => XMemFreeDefault(address, attributes),
         hook => {
@@ -276,7 +276,7 @@ pub extern "system" fn XMemFree(address: *mut c_void, attributes: u64) {
 }
 
 /// The system allocator behind [`XMemAlloc`].
-pub extern "system" fn XMemAllocDefault(size: usize, attributes: u64) -> *mut c_void {
+pub extern "win64" fn XMemAllocDefault(size: usize, attributes: u64) -> *mut c_void {
     if attributes & ALLOC_32BIT != 0 {
         return XMemVirtualAlloc(
             std::ptr::null_mut(),
@@ -310,7 +310,7 @@ pub extern "system" fn XMemAllocDefault(size: usize, attributes: u64) -> *mut c_
 }
 
 /// Frees what [`XMemAllocDefault`] returned, given the same attributes.
-pub extern "system" fn XMemFreeDefault(address: *mut c_void, attributes: u64) {
+pub extern "win64" fn XMemFreeDefault(address: *mut c_void, attributes: u64) {
     if address.is_null() {
         return;
     }
@@ -331,7 +331,7 @@ pub extern "system" fn XMemFreeDefault(address: *mut c_void, attributes: u64) {
 }
 
 /// A retail console has no tools memory.
-pub extern "system" fn XMemIsToolsMemAvailable() -> BOOL {
+pub extern "win64" fn XMemIsToolsMemAvailable() -> BOOL {
     0
 }
 
@@ -385,7 +385,7 @@ fn physical() -> MutexGuard<'static, Physical> {
 }
 
 /// `count` is in and out (pages wanted, pages given); all or nothing here.
-pub extern "system" fn XMemAllocatePhysicalPages(
+pub extern "win64" fn XMemAllocatePhysicalPages(
     flags: u64,
     count: *mut usize,
     pages: *mut usize,
@@ -451,7 +451,7 @@ pub extern "system" fn XMemAllocatePhysicalPages(
 const FRAMES: usize = PAGE >> 12;
 
 /// Pages still mapped stay readable through their views until unmapped.
-pub extern "system" fn XMemFreePhysicalPages(n: usize, pages: *const usize) -> BOOL {
+pub extern "win64" fn XMemFreePhysicalPages(n: usize, pages: *const usize) -> BOOL {
     if pages.is_null() {
         return 0;
     }
@@ -589,7 +589,7 @@ pub(crate) fn page_window(pages: &[usize], offset: usize, len: usize) -> Option<
 
 /// Maps `n` pages at `address`, in place of what is mapped there; null
 /// `pages` unmaps. Returns `address`, or null if a page or the host fails.
-pub extern "system" fn XMemMapPhysicalPages(
+pub extern "win64" fn XMemMapPhysicalPages(
     address: *mut c_void,
     n: usize,
     pages: *const usize,
@@ -628,7 +628,7 @@ pub extern "system" fn XMemMapPhysicalPages(
 
 /// One page at each address; null `pages`, or a page number 0, unmaps
 /// (Grand Theft Auto VI passes 0 for addresses to clear).
-pub extern "system" fn XMemMapPhysicalPagesScatter(
+pub extern "win64" fn XMemMapPhysicalPagesScatter(
     addresses: *const *mut c_void,
     n: usize,
     pages: *const usize,
@@ -843,7 +843,7 @@ pub struct WorkingSet {
 // shortcut: all fields are filled whatever the flags ask for, and use is
 // not split by bandwidth class (GPU-optimal use reads 0); track
 // allocations per class if a title budgets from that field.
-pub extern "system" fn XMemGetWorkingSetStatistics(_which: u32, out: *mut WorkingSet) -> BOOL {
+pub extern "win64" fn XMemGetWorkingSetStatistics(_which: u32, out: *mut WorkingSet) -> BOOL {
     if out.is_null() {
         return 0;
     }
@@ -867,7 +867,7 @@ pub extern "system" fn XMemGetWorkingSetStatistics(_which: u32, out: *mut Workin
 
 /// Hands title memory (standard, in 2 MiB pages) to the system. The other
 /// transfers involve tools memory, which a retail console has none of.
-pub extern "system" fn XMemTransferMemory(kind: u32, size: usize) -> BOOL {
+pub extern "win64" fn XMemTransferMemory(kind: u32, size: usize) -> BOOL {
     const TITLE_TO_SYSTEM: u32 = 0;
     tracing::info!(kind, size, "XMemTransferMemory");
     if size == 0 {

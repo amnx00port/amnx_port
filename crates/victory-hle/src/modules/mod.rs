@@ -1,7 +1,9 @@
 //! Implementations, one module per area of the console API.
 //!
-//! Adding an API: write an `extern "system"` function named exactly like
+//! Adding an API: write an `extern "win64"` function named exactly like
 //! the import, then list it with `hle_export!` in the module's `module()`.
+//! Title code calls with the Windows x64 convention on every host;
+//! `"system"` is only for callbacks we hand to the host's own APIs.
 //! Run `victory census` over your titles to see what is still missing.
 //!
 //! Planned areas (driven by census results, not by completeness):

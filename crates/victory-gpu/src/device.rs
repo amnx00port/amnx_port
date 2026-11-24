@@ -124,7 +124,7 @@ pub(crate) fn device() -> This {
 /// Device creation: `(adapter, parameters, iid, out)`. The parameters start
 /// with the interface version; the rest (ring and scratch sizes, features
 /// to leave out) does not matter to us yet.
-pub extern "system" fn create(
+pub extern "win64" fn create(
     _adapter: *const c_void,
     parameters: *const u32,
     iid: *const Iid,
@@ -168,7 +168,7 @@ pub(crate) fn newer() -> bool {
 }
 
 /// The device, or its DXGI side.
-extern "system" fn query_interface(this: This, iid: *const Iid, out: *mut This) -> HRESULT {
+extern "win64" fn query_interface(this: This, iid: *const Iid, out: *mut This) -> HRESULT {
     let found = if is_device(iid) {
         Some(this)
     } else if object::is(iid, &dxgi::DEVICE_IIDS) {
@@ -196,7 +196,7 @@ const _: () = assert!(size_of::<VirtualMemory>() == 0x20);
 /// `d3d12_xs!D3D12ConfigureVirtualMemoryX`, called before any graphics
 /// allocation. The inputs size console structures we do not have; the
 /// range out is all of user space, since GPU addresses are CPU addresses.
-pub extern "system" fn configure_virtual_memory(config: *mut VirtualMemory) -> HRESULT {
+pub extern "win64" fn configure_virtual_memory(config: *mut VirtualMemory) -> HRESULT {
     // SAFETY: the title passes its configuration (null is tolerated).
     let Some(config) = (unsafe { config.as_mut() }) else {
         return E_INVALIDARG;
@@ -228,7 +228,7 @@ fn user_space() -> (u64, u64) {
     (0x1_0000, 0x7fff_fffe_ffff)
 }
 
-extern "system" fn node_count(_: This) -> u32 {
+extern "win64" fn node_count(_: This) -> u32 {
     1
 }
 
@@ -261,7 +261,7 @@ const OPTIONS: [u32; 16] = [
     2,  // resource heap tier
 ];
 
-extern "system" fn check_feature_support(
+extern "win64" fn check_feature_support(
     _: This,
     feature: u32,
     data: *mut c_void,
@@ -425,10 +425,10 @@ mod tests {
         assert_ne!(unsafe { device.cast::<u8>().add(0x18).read() }, 0);
         assert_eq!(create_as(&[0; 16]).0, E_NOINTERFACE);
         assert_eq!(
-            slot::<extern "system" fn(This) -> u32>(device, 0x38)(device),
+            slot::<extern "win64" fn(This) -> u32>(device, 0x38)(device),
             1
         );
-        let missing = slot::<extern "system" fn() -> HRESULT>(device, 0xf0);
+        let missing = slot::<extern "win64" fn() -> HRESULT>(device, 0xf0);
         assert_eq!(missing(), E_NOTIMPL);
     }
 
@@ -441,7 +441,7 @@ mod tests {
         assert_eq!(query_interface(device, &LEVEL_IIDS[4], &mut same), S_OK);
         assert_eq!(same, device);
         // A Device8 method we have not written fails without crashing.
-        let missing = slot::<extern "system" fn() -> HRESULT>(device, 0x3a0);
+        let missing = slot::<extern "win64" fn() -> HRESULT>(device, 0x3a0);
         assert_eq!(missing(), E_NOTIMPL);
     }
 
@@ -463,7 +463,7 @@ mod tests {
 
     #[test]
     fn feature_levels_pick_the_highest_supported() {
-        type Check = extern "system" fn(This, u32, *mut c_void, u32) -> HRESULT;
+        type Check = extern "win64" fn(This, u32, *mut c_void, u32) -> HRESULT;
         let device = device();
         let check = slot::<Check>(device, 0x68);
         let query = |levels: &[u32], size| {
