@@ -25,6 +25,32 @@ pub(crate) struct SigElement {
 }
 
 impl SigElement {
+    /// Canonical DXIL semantic name for system values (`kind != 0`), matching
+    /// what `dxil.dll` writes when regenerating `ISG1`/`OSG1` during validation.
+    fn canonical_name(&self) -> &str {
+        match self.kind {
+            1 => "SV_VertexID",
+            2 => "SV_InstanceID",
+            3 => "SV_Position",
+            4 => "SV_RenderTargetArrayIndex",
+            5 => "SV_ViewportArrayIndex",
+            6 => "SV_ClipDistance",
+            7 => "SV_CullDistance",
+            10 => "SV_PrimitiveID",
+            12 => "SV_SampleIndex",
+            13 => "SV_IsFrontFace",
+            14 => "SV_Coverage",
+            15 => "SV_InnerCoverage",
+            16 => "SV_Target",
+            17 => "SV_Depth",
+            18 => "SV_DepthLessEqual",
+            19 => "SV_DepthGreaterEqual",
+            20 => "SV_StencilRef",
+            30 => "SV_CullPrimitive",
+            _ => &self.name,
+        }
+    }
+
     fn system_value(&self) -> u32 {
         match self.kind {
             1 => 6,  // vertex id
@@ -82,9 +108,10 @@ pub(crate) fn signature(elements: &[SigElement], input: bool) -> Vec<u8> {
         match shared {
             Some(j) => offsets.push(offsets[j]),
             None => {
+                let name = e.canonical_name();
                 offsets.push(next);
-                next += e.name.len() as u32 + 1;
-                names.push(&e.name);
+                next += name.len() as u32 + 1;
+                names.push(name);
             }
         }
     }
