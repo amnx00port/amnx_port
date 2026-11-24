@@ -2,7 +2,7 @@
   <img width="600" src="https://github.com/user-attachments/assets/8a24d014-b308-486d-8767-627cf1ba7ef9" alt="AMNX" />
 </p>
 
-# amnx
+# AMNX
 
 Runs Grand Theft Auto VI (Xbox Series X|S) natively on Windows, from files the user supplies.
 
