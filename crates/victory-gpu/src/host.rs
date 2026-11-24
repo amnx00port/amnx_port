@@ -184,6 +184,10 @@ fn create() -> windows::core::Result<Host> {
             D3D12CreateDevice(None, D3D_FEATURE_LEVEL_12_0, &mut device)?;
         }
         let device = device.ok_or_else(windows::core::Error::empty)?;
+        if let Some(cap) = crate::descriptor::host::view_heap_cap(&device) {
+            victory_shader::emit::set_view_heap_limit(cap);
+            tracing::info!(cap, "host view heaps capped: translated shaders keep their view indices below the cap");
+        }
         let messages = debug
             .then(|| device.cast::<ID3D12InfoQueue>().ok())
             .flatten();
