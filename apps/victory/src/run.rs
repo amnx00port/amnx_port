@@ -101,7 +101,9 @@ pub fn run(
         return Ok(());
     }
     victory_loader::report_crashes();
+    victory_loader::on_crash(victory_hle::modules::gameinput::reset_hardware);
     victory_loader::log_crashes_to(temp.with_file_name("crashes.log"));
+    victory_hle::modules::gameinput::configure(cfg.input.clone());
     victory_hle::runtime::use_console_timers();
     #[cfg(feature = "diagnostics")]
     diagnostics(&image, &cfg);
@@ -121,6 +123,7 @@ pub fn run(
     let code = main
         .join()
         .map_err(|_| anyhow::anyhow!("title main thread panicked"))??;
+    victory_hle::modules::gameinput::reset_hardware();
     println!("title exited with {code}");
     Ok(())
 }

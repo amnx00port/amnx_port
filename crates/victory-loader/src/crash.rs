@@ -42,6 +42,24 @@ pub fn save_on_crash(ranges: Vec<(usize, usize, std::path::PathBuf)>) {
     let _ = SAVE.set(ranges);
 }
 
+/// Lock-free hardware cleanup callback invoked on panics and fatal crashes
+/// (e.g. releasing DualSense adaptive trigger tension).
+static CRASH_HOOK: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+
+/// Registers a lock-free cleanup function invoked on fatal crashes and panics.
+pub fn on_crash(hook: fn()) {
+    CRASH_HOOK.store(hook as usize, std::sync::atomic::Ordering::Release);
+}
+
+fn run_crash_hook() {
+    let raw = CRASH_HOOK.load(std::sync::atomic::Ordering::Acquire);
+    if raw != 0 {
+        // SAFETY: `on_crash` stores only valid `fn()` pointers.
+        let hook: fn() = unsafe { std::mem::transmute(raw) };
+        hook();
+    }
+}
+
 /// The file crash reports are appended to, besides being printed.
 static LOG: std::sync::OnceLock<std::path::PathBuf> = std::sync::OnceLock::new();
 
@@ -51,6 +69,7 @@ pub fn log_crashes_to(file: std::path::PathBuf) {
     if LOG.set(file).is_ok() {
         let print = std::panic::take_hook();
         std::panic::set_hook(Box::new(move |info| {
+            run_crash_hook();
             print(info);
             append_to_log(&format!(
                 "VIctory: panic on thread {:?}: {info}\n{}",
@@ -64,6 +83,7 @@ pub fn log_crashes_to(file: std::path::PathBuf) {
 /// Appends a failure that is not an exception (the host GPU's) to the crash
 /// log, with the title's last debug output, and prints it.
 pub fn log_crash(text: &str) {
+    run_crash_hook();
     let text = format!("{text}
 {}", title_output());
     eprint!("{text}");
@@ -375,6 +395,7 @@ unsafe extern "system" fn handler(info: *mut EXCEPTION_POINTERS) -> i32 {
 /// # Safety
 /// `info` comes from the system, for an exception being dispatched.
 pub unsafe fn report_unhandled(info: *const EXCEPTION_POINTERS) {
+    run_crash_hook();
     // SAFETY: forwarded from the caller.
     unsafe { report("unhandled exception", info, true) };
 }
