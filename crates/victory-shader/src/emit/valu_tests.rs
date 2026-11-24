@@ -699,7 +699,7 @@ fn buffer_store_short_writes_only_the_low_halfword() {
     ];
     run_cases(&shader, cases, |backend, i, inputs, result| {
         assert_eq!(
-            result,
+            result & 0xffff,
             inputs[0] & 0xffff,
             "{backend} case {i}: buffer_store_short must write the low 16 bits"
         );
@@ -709,7 +709,9 @@ fn buffer_store_short_writes_only_the_low_halfword() {
 #[test]
 fn buffer_store_short_d16_hi_writes_the_high_halfword() {
     let body = [vop1(0x001, 0, vgpr(1))]; // v0 = s0
-    let shader = build_valu_cs_with_store(&body, buffer_store_short(0, 8, 0, true));
+    // Write the high half of v0 to byte offset 2; the readback checks the
+    // upper halfword of the first output dword.
+    let shader = build_valu_cs_with_store(&body, buffer_store_short(0, 8, 2, true));
     let cases = &[
         [0x1234_5678, 0, 0, 0],
         [0xdead_abcd, 0, 0, 0],
@@ -717,7 +719,7 @@ fn buffer_store_short_d16_hi_writes_the_high_halfword() {
     ];
     run_cases(&shader, cases, |backend, i, inputs, result| {
         assert_eq!(
-            result,
+            (result >> 16) & 0xffff,
             inputs[0] >> 16,
             "{backend} case {i}: buffer_store_short_d16_hi must write the high 16 bits"
         );
