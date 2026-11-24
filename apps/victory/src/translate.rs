@@ -74,6 +74,7 @@ struct Tally {
     /// With `--list`: one line per program and outcome.
     list: bool,
     lines: Vec<String>,
+    descriptor_failures: Option<BTreeMap<resource::DescriptorFailure, usize>>,
 }
 
 impl Tally {
@@ -134,6 +135,13 @@ impl Tally {
             *self.exports.entry(k).or_default() += n;
         }
         self.lines.extend(other.lines);
+        if let (Some(total), Some(failures)) =
+            (&mut self.descriptor_failures, other.descriptor_failures)
+        {
+            for (failure, count) in failures {
+                *total.entry(failure).or_default() += count;
+            }
+        }
         for (reason, (n, example)) in other.failed {
             self.failed.entry(reason).or_insert((0, example)).0 += n;
         }
@@ -157,6 +165,7 @@ pub fn run(
     validate: bool,
     pipelines: bool,
     list: bool,
+    descriptor_failures: bool,
     jobs: Option<usize>,
 ) -> Result<()> {
     let paths = crate::default_paths(paths)?;
@@ -182,7 +191,10 @@ pub fn run(
     let threads =
         jobs.unwrap_or_else(|| std::thread::available_parallelism().map_or(4, |n| n.get()));
     let seen = Mutex::new(HashSet::new());
-    let total = Mutex::new(Tally::default());
+    let total = Mutex::new(Tally {
+        descriptor_failures: descriptor_failures.then(BTreeMap::new),
+        ..Tally::default()
+    });
     for root in &paths {
         for entry in walkdir::WalkDir::new(root)
             .into_iter()
@@ -201,6 +213,7 @@ pub fn run(
                     s.spawn(|| {
                         let mut t = Tally {
                             list,
+                            descriptor_failures: descriptor_failures.then(BTreeMap::new),
                             ..Tally::default()
                         };
                         let mut checks = Checks {
@@ -222,6 +235,19 @@ pub fn run(
         }
     }
     let t = total.into_inner().unwrap_or_else(|e| e.into_inner());
+    if let Some(failures) = t.descriptor_failures {
+        println!("programs checked for descriptor failures: {}", t.translated);
+        println!("    count  first varying opcode  all varying opcodes  descriptor word sources");
+        for (failure, count) in failures {
+            println!(
+                "  {count:>7}  {}  {}  {}",
+                failure.opcode,
+                failure.varying_opcodes.join(","),
+                failure.sources.join(",")
+            );
+        }
+        return Ok(());
+    }
     println!(
         "containers   {} ({} duplicates skipped)",
         t.containers, t.duplicates
@@ -337,6 +363,15 @@ fn translate(
                 // failure is listed after the resources' and I/O's.
                 let structured = structure::structure(&program);
                 let lanes = structured.as_ref().ok();
+                if let Some(failures) = &mut t.descriptor_failures {
+                    let (_, failure) = resource::track_with_descriptor_failure(
+                        &program, &p.layout, p.stage, lanes,
+                    );
+                    if let Some(failure) = failure {
+                        *failures.entry(failure).or_default() += 1;
+                    }
+                    continue;
+                }
                 let res = match resource::track(&program, &p.layout, p.stage, lanes) {
                     Ok(r) => {
                         tally_resources(&p, &r, t);
