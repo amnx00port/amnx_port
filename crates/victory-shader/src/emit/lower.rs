@@ -6487,7 +6487,10 @@ impl<'a> Lower<'a> {
             .exports
             .get(&(b, i))
             .ok_or("an export I/O raising did not see")?;
-        if e.compressed {
+        // Two f16 channels per source dword: only the pixel color and
+        // depth targets unpack them, and only into an output element the
+        // host declares a 32-bit float; the rest stay refused.
+        if e.compressed && !matches!(e.target, Target::Color(_) | Target::Depth) {
             return Err("a compressed export");
         }
         let guard = self.guard(b, i)?;
@@ -6613,7 +6616,16 @@ impl<'a> Lower<'a> {
                 Target::Primitive => return Err("a primitive export"),
             };
             if let Some((id, col)) = found {
-                stores.push((id, col, value, None));
+                // Two f16 channels per dword: an odd channel the high half.
+                let half = e.compressed.then_some(ch % 2 == 1);
+                // The halves are f16 values. An element the host does not
+                // declare a 32-bit float would store their f32 bits as an
+                // integer (a uint `SV_Target`, or the stencil of `mrtz`),
+                // so those stay refused.
+                if half.is_some() && outputs[id].comp != 9 {
+                    return Err("a compressed export");
+                }
+                stores.push((id, col, value, half));
             }
         }
         fn elements<'l>(l: &'l mut Lower, primitive: bool) -> &'l mut Vec<SigElement> {
@@ -7047,6 +7059,140 @@ mod tests {
             user_data,
             slot,
         }
+    }
+
+    /// Lowers a pixel program with one float `SV_Target0`: whether it
+    /// translates.
+    fn lowers_ps(words: &[u32]) -> Result<(), crate::ShaderError> {
+        let target = crate::emit::container::SigElement {
+            name: "SV_Target".into(),
+            index: 0,
+            kind: 16,
+            comp: 9,
+            interp: 0,
+            row: Some(0),
+            col: 0,
+            cols: 4,
+            usage: 0,
+            half: false,
+        };
+        lowers_ps_with(words, vec![target])
+    }
+
+    /// [`lowers_ps`] with the output elements `outputs`.
+    fn lowers_ps_with(
+        words: &[u32],
+        outputs: Vec<crate::emit::container::SigElement>,
+    ) -> Result<(), crate::ShaderError> {
+        let code: Vec<u8> = words.iter().flat_map(|w| w.to_le_bytes()).collect();
+        let native = NativeProgram {
+            stage: HwStage::Ps,
+            wave64: false,
+            vgprs: 4,
+            layout: vec![],
+            used: vec![],
+            io: StageIo::Ps {
+                inputs: vec![],
+                input_addr: 0,
+                db_shader_control: 0,
+                patches: vec![],
+            },
+            code,
+        };
+        let p = ir::build(&native.code, false, 4).unwrap();
+        let st = structure::structure(&p).unwrap();
+        let res = resource::track(&p, &native.layout, native.stage, Some(&st)).unwrap();
+        let io = io::raise(&p, &native).unwrap();
+        lower(&Parts {
+            native: &native,
+            p: &p,
+            st: &st,
+            io: &io,
+            res: &res,
+            inputs: vec![],
+            outputs,
+            prims: vec![],
+            mesh_stride: 0,
+        })
+        .map(|_| ())
+    }
+
+    #[test]
+    fn a_compressed_export_unpacks_two_f16_channels_per_dword() {
+        // A compr export: each source dword packs two f16 channels, the
+        // low half first, so four channels come from two VGPRs.
+        let words = [
+            0x7E00_0282, // v_mov_b32 v0, 2
+            0x7E02_0282, // v_mov_b32 v1, 2
+            0xF800_0C0F,
+            0x0000_0100, // exp mrt0, v0, v0, v1, v1 done compr
+            S_ENDPGM,
+        ];
+        lowers_ps(&words).unwrap();
+    }
+
+    #[test]
+    fn a_compressed_export_to_a_uint_target_stays_refused() {
+        // The halves of a compr dword are f16 values: a uint target would
+        // store their f32 bits as integers, so the export stays refused.
+        let words = [
+            0x7E00_0282, // v_mov_b32 v0, 2
+            0x7E02_0282, // v_mov_b32 v1, 2
+            0xF800_0C0F,
+            0x0000_0100, // exp mrt0, v0, v0, v1, v1 done compr
+            S_ENDPGM,
+        ];
+        let target = crate::emit::container::SigElement {
+            name: "SV_Target".into(),
+            index: 0,
+            kind: 16,
+            comp: 5,
+            interp: 0,
+            row: Some(0),
+            col: 0,
+            cols: 4,
+            usage: 0,
+            half: false,
+        };
+        assert!(matches!(
+            lowers_ps_with(&words, vec![target]),
+            Err(crate::ShaderError::Unsupported {
+                what: "a compressed export",
+                ..
+            })
+        ));
+    }
+
+    #[test]
+    fn a_compressed_depth_export_with_stencil_stays_refused() {
+        // `exp mrtz` compr packs the depth and the stencil into one dword.
+        // The stencil half is an integer, so the export stays refused.
+        let words = [
+            0x7E00_0282, // v_mov_b32 v0, 2
+            0xF800_0C8F,
+            0x0000_0000, // exp mrtz, v0, v0 done compr
+            S_ENDPGM,
+        ];
+        let element = |name: &str, kind: u8, comp: u8| crate::emit::container::SigElement {
+            name: name.into(),
+            index: 0,
+            kind,
+            comp,
+            interp: 0,
+            row: None,
+            col: 0,
+            cols: 1,
+            usage: 0,
+            half: false,
+        };
+        let outputs = vec![element("SV_Depth", 17, 9), element("SV_StencilRef", 20, 5)];
+        assert!(matches!(
+            lowers_ps_with(&words, outputs),
+            Err(crate::ShaderError::Unsupported {
+                what: "a compressed export",
+                ..
+            })
+        ));
     }
 
     #[test]
