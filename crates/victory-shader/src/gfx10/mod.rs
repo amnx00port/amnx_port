@@ -54,14 +54,28 @@ pub struct Instruction {
     pub offset: usize,
     pub encoding: Encoding,
     pub opcode: u16,
-    /// Every dword of the instruction, including literals and extra dwords.
-    pub words: Vec<u32>,
+    /// Every dword of the instruction, including literals and extra dwords;
+    /// `len` of them. The longest instruction here is an MIMG with its three
+    /// extra address dwords, five in all, so they live inline: a heap vector
+    /// per instruction was one allocation and one cache miss for a word or
+    /// two of data.
+    words: [u32; Instruction::MAX_WORDS],
+    len: u8,
 }
 
 impl Instruction {
+    /// The most dwords an instruction here has: an MIMG with its three extra
+    /// address dwords.
+    pub const MAX_WORDS: usize = 5;
+
     /// AMD's name for the opcode, if it is in our table.
     pub fn name(&self) -> Option<&'static str> {
         name(self.encoding, self.opcode)
+    }
+
+    /// Every dword of the instruction, including literals and extra dwords.
+    pub fn words(&self) -> &[u32] {
+        &self.words[..usize::from(self.len)]
     }
 }
 
@@ -75,7 +89,7 @@ pub fn decode(code: &[u8]) -> Result<Vec<Instruction>, ShaderError> {
     while let Some(mut offset) = pending.pop() {
         while !found.contains_key(&offset) {
             let inst = instruction(code, offset)?;
-            let next = offset + 4 * inst.words.len();
+            let next = offset + 4 * inst.words().len();
             let flow = control(&inst, code.len(), |at| {
                 found.range(..at).next_back().map(|(_, i)| i)
             })?;
@@ -94,7 +108,7 @@ pub fn decode(code: &[u8]) -> Result<Vec<Instruction>, ShaderError> {
     let list: Vec<Instruction> = found.into_values().collect();
     if let Some(w) = list
         .windows(2)
-        .find(|w| w[0].offset + 4 * w[0].words.len() > w[1].offset)
+        .find(|w| w[0].offset + 4 * w[0].words().len() > w[1].offset)
     {
         return Err(isa(w[1].offset, "a branch lands inside an instruction"));
     }
@@ -119,7 +133,7 @@ pub(crate) fn control<'a>(
     len: usize,
     before: impl Fn(usize) -> Option<&'a Instruction>,
 ) -> Result<Flow, ShaderError> {
-    Ok(match flow(inst, inst.offset + 4 * inst.words.len(), len)? {
+    Ok(match flow(inst, inst.offset + 4 * inst.words().len(), len)? {
         Flow::Stop if inst.name() == Some("s_setpc_b64") => {
             far_jump(before, inst, len)?.map_or(Flow::Stop, Flow::Jump)
         }
@@ -129,7 +143,7 @@ pub(crate) fn control<'a>(
 
 fn flow(inst: &Instruction, next: usize, len: usize) -> Result<Flow, ShaderError> {
     let target = || {
-        let delta = 4 * i64::from(inst.words[0] as u16 as i16);
+        let delta = 4 * i64::from(inst.words()[0] as u16 as i16);
         usize::try_from(next as i64 + delta)
             .ok()
             .filter(|&t| t < len)
@@ -159,17 +173,17 @@ fn far_jump<'a>(
     setpc: &Instruction,
     len: usize,
 ) -> Result<Option<usize>, ShaderError> {
-    let n = setpc.words[0] & 0xFF;
+    let n = setpc.words()[0] & 0xFF;
     let mut delta = None;
     let mut at = setpc.offset;
     for _ in 0..4 {
         let Some(prev) = before(at) else {
             break;
         };
-        if prev.offset + 4 * prev.words.len() != at {
+        if prev.offset + 4 * prev.words().len() != at {
             break;
         }
-        let w = prev.words[0];
+        let w = prev.words()[0];
         let (sdst, ssrc0, ssrc1) = ((w >> 16) & 0x7F, w & 0xFF, (w >> 8) & 0xFF);
         match (prev.encoding, prev.name()) {
             (Encoding::Sop2, Some(op @ ("s_add_u32" | "s_sub_u32")))
@@ -177,7 +191,7 @@ fn far_jump<'a>(
             {
                 // The low dword of a signed 64-bit offset: a backward jump
                 // adds a negative one (its high dword is -1).
-                let literal = i64::from(prev.words[1] as i32);
+                let literal = i64::from(prev.words()[1] as i32);
                 delta = Some(if op == "s_add_u32" { literal } else { -literal });
             }
             (Encoding::Sop1, Some("s_getpc_b64")) if sdst == n => {
@@ -282,11 +296,19 @@ fn instruction(code: &[u8], offset: usize) -> Result<Instruction, ShaderError> {
             _ => return Err(isa(offset, "unknown encoding")),
         }
     };
+    if len > Instruction::MAX_WORDS {
+        return Err(isa(offset, "instruction longer than the decoder's budget"));
+    }
+    let mut words = [0u32; Instruction::MAX_WORDS];
+    for (i, w) in words.iter_mut().enumerate().take(len) {
+        *w = word(i)?;
+    }
     Ok(Instruction {
         offset,
         encoding,
         opcode: opcode as u16,
-        words: (0..len).map(word).collect::<Result<_, _>>()?,
+        words,
+        len: len as u8,
     })
 }
 
@@ -348,7 +370,7 @@ mod tests {
         decode(&bytes(code))
             .unwrap()
             .iter()
-            .map(|i| (i.offset, i.words.len(), i.name().unwrap_or("?")))
+            .map(|i| (i.offset, i.words().len(), i.name().unwrap_or("?")))
             .collect()
     }
 
