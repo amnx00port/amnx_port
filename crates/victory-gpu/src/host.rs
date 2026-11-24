@@ -7,7 +7,7 @@
 use std::sync::atomic::{AtomicU32, Ordering};
 use std::sync::{Mutex, OnceLock};
 
-use windows::Win32::Foundation::{HANDLE, HWND, LPARAM, LRESULT, RECT, WPARAM};
+use windows::Win32::Foundation::{E_FAIL, HANDLE, HWND, LPARAM, LRESULT, RECT, WPARAM};
 use windows::Win32::Graphics::Direct3D::D3D_FEATURE_LEVEL_12_0;
 use windows::Win32::Graphics::Direct3D12::*;
 use windows::Win32::Graphics::Dxgi::Common::*;
@@ -87,6 +87,10 @@ pub(crate) static PREPARING: [std::sync::atomic::AtomicU64; 4] = [
 /// draws nothing at seconds per frame.
 static ON_FAILURE: OnceLock<fn(&str) -> !> = OnceLock::new();
 
+/// The first host-device error, retained so the CLI can stop before a title
+/// starts issuing commands that can never be drawn.
+static HOST_ERROR: OnceLock<Option<String>> = OnceLock::new();
+
 /// Sets what a host GPU failure does (the runtime's crash report).
 pub fn on_failure(report: fn(&str) -> !) {
     let _ = ON_FAILURE.set(report);
@@ -124,11 +128,24 @@ pub(crate) fn host() -> Option<&'static Host> {
     HOST.get_or_init(|| match create() {
         Ok(host) => Some(host),
         Err(e) => {
+            let _ = HOST_ERROR.set(Some(e.to_string()));
             tracing::warn!(error = %e, "no host D3D12 device; command lists will not run");
             None
         }
     })
     .as_ref()
+}
+
+/// Verifies that the host device is usable before starting a title.
+pub fn ensure_ready() -> Result<(), String> {
+    if host().is_some() {
+        Ok(())
+    } else {
+        Err(HOST_ERROR
+            .get()
+            .and_then(Clone::clone)
+            .unwrap_or_else(|| "host D3D12 device is unavailable".to_owned()))
+    }
 }
 
 fn create() -> windows::core::Result<Host> {
@@ -184,6 +201,28 @@ fn create() -> windows::core::Result<Host> {
             D3D12CreateDevice(None, D3D_FEATURE_LEVEL_12_0, &mut device)?;
         }
         let device = device.ok_or_else(windows::core::Error::empty)?;
+        let mut model = D3D12_FEATURE_DATA_SHADER_MODEL {
+            HighestShaderModel: D3D_SHADER_MODEL_6_6,
+        };
+        let shader_model_ok = device
+            .CheckFeatureSupport(
+                D3D12_FEATURE_SHADER_MODEL,
+                (&raw mut model).cast(),
+                size_of_val(&model) as u32,
+            )
+            .is_ok()
+            && model.HighestShaderModel.0 >= D3D_SHADER_MODEL_6_6.0;
+        if !shader_model_ok {
+            return Err(windows::core::Error::new(
+                E_FAIL,
+                format!(
+                    "host D3D12 runtime lacks shader model 6.6 (reports {:#x}); \
+                     on Windows 10 build victory with `--features agility` and run \
+                     `cargo xtask agility`",
+                    model.HighestShaderModel.0
+                ),
+            ));
+        }
         let messages = debug
             .then(|| device.cast::<ID3D12InfoQueue>().ok())
             .flatten();

@@ -49,6 +49,11 @@ pub fn use_shader_cache(dir: std::path::PathBuf) {
     let _ = dir;
 }
 
+/// Checks the host device before a title is allowed to start.
+pub fn ensure_host() -> Result<(), String> {
+    victory_gpu::host_ready()
+}
+
 pub(crate) fn module() -> HleModule {
     HleModule {
         name: "d3d12x",

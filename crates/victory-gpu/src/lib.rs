@@ -53,6 +53,12 @@ mod texture;
 mod watch;
 
 #[cfg(windows)]
+pub use host::ensure_ready as host_ready;
+#[cfg(windows)]
 pub use host::on_failure;
+#[cfg(not(windows))]
+pub fn host_ready() -> Result<(), String> {
+    Ok(())
+}
 #[cfg(windows)]
 pub use watch::{title_memory_remapped, writing as kernel_will_write};

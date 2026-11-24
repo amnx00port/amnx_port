@@ -29,6 +29,11 @@ pub fn run(
 
     let images = cfg.cache_subdir("images")?;
     victory_hle::modules::d3d12x::use_shader_cache(cfg.cache_subdir("shaders")?);
+    if execute {
+        victory_hle::modules::d3d12x::ensure_host().map_err(|e| {
+            anyhow::anyhow!("cannot start title: host D3D12 device is unavailable: {e}")
+        })?;
+    }
     let image = victory_loader::load(&prepared, &images)?;
     victory_hle::runtime::set_main_image(image.base());
     victory_hle::runtime::set_image_path(image.base(), exe);
