@@ -706,7 +706,9 @@ version = "0.1.0"
 dependencies = [
  "miniz_oxide",
  "opus-pure",
+ "serde",
  "tempfile",
+ "toml",
  "tracing",
  "victory-formats",
  "victory-gpu",
