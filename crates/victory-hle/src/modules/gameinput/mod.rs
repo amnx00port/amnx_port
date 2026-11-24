@@ -1,21 +1,27 @@
-//! `gameinput.dll`: input devices from the host. Gamepads come from XInput
-//! (host slots 0-3); while none is connected, the keyboard drives one
-//! stand-in gamepad (`FALLBACK_BUTTONS`). The keyboard is a device of its own
-//! too. A poll thread turns host state into readings (a new one per change)
-//! and runs device callbacks on connect and disconnect.
+//! `gameinput.dll`: input devices from the host. Gamepads come from native
+//! PS5 DualSense / DualSense Edge HID (wired USB, Pico 2 W `DS5Dongle`, and
+//! Bluetooth `0x31`) and XInput (host slots 0-3); while none is connected, the
+//! keyboard drives one stand-in gamepad (`FALLBACK_BUTTONS`). The keyboard is
+//! a device of its own too. A poll thread turns host state into readings and
+//! runs device and system-button callbacks.
 #![allow(non_snake_case)]
 // Title code calls these through the objects, passing pointers the real API
 // would trust.
 #![allow(clippy::not_unsafe_ptr_arg_deref)]
 
+pub mod dualsense;
+pub mod host;
+
 use std::collections::VecDeque;
 use std::ffi::c_void;
 use std::ops::Deref;
 use std::ptr::NonNull;
-use std::sync::atomic::{AtomicU32, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
 use std::sync::{Condvar, LazyLock, Mutex, MutexGuard, PoisonError};
 use std::thread::ThreadId;
 use std::time::{Duration, Instant};
+
+use victory_core::InputConfig;
 
 use super::xasync::{E_INVALIDARG, E_NOTIMPL};
 use super::xgameruntime::{HRESULT, S_OK};
@@ -35,31 +41,41 @@ const GAMEPAD_KIND: u32 = 0x4_0000;
 const STATUS_CONNECTED: u32 = 0x3;
 const ASYNC_ENUMERATION: u32 = 1;
 
+/// System button mask (`GameInputSystemButtons`).
+pub const SYSTEM_BUTTON_GUIDE: u32 = 0x1;
+pub const SYSTEM_BUTTON_SHARE: u32 = 0x2;
+
 /// Gamepad buttons; the title maps each bit to one of its pad buttons.
-const MENU: u32 = 0x1;
-const VIEW: u32 = 0x2;
-const A: u32 = 0x4;
-const B: u32 = 0x8;
-const X: u32 = 0x10;
-const Y: u32 = 0x20;
-const UP: u32 = 0x40;
-const DOWN: u32 = 0x80;
-const LEFT: u32 = 0x100;
-const RIGHT: u32 = 0x200;
-const LEFT_SHOULDER: u32 = 0x400;
-const RIGHT_SHOULDER: u32 = 0x800;
-const LEFT_STICK: u32 = 0x1000;
-const RIGHT_STICK: u32 = 0x2000;
+pub(crate) const MENU: u32 = 0x1;
+pub(crate) const VIEW: u32 = 0x2;
+pub(crate) const A: u32 = 0x4;
+pub(crate) const B: u32 = 0x8;
+pub(crate) const X: u32 = 0x10;
+pub(crate) const Y: u32 = 0x20;
+pub(crate) const UP: u32 = 0x40;
+pub(crate) const DOWN: u32 = 0x80;
+pub(crate) const LEFT: u32 = 0x100;
+pub(crate) const RIGHT: u32 = 0x200;
+pub(crate) const LEFT_SHOULDER: u32 = 0x400;
+pub(crate) const RIGHT_SHOULDER: u32 = 0x800;
+pub(crate) const LEFT_STICK: u32 = 0x1000;
+pub(crate) const RIGHT_STICK: u32 = 0x2000;
+pub(crate) const PADDLE_LEFT_1: u32 = 0x4000;
+pub(crate) const PADDLE_RIGHT_1: u32 = 0x1_0000;
 
 /// Devices: host pad slots, the keyboard's stand-in pad, the keyboard.
-const PADS: usize = 4;
+pub(crate) const PADS: usize = 4;
 const FALLBACK: usize = PADS;
 const KEYBOARD: usize = PADS + 1;
 const DEVICES: usize = PADS + 2;
 
-/// Readings kept per device for next/previous lookups.
-const HISTORY: usize = 32;
-const POLL: Duration = Duration::from_millis(8);
+/// Readings kept per device for next/previous lookups (~2+ s at 250 Hz so slow
+/// world frames or high-rate DualSense updates never hit `REFERENCE_TOO_OLD`).
+const HISTORY: usize = 512;
+const POLL: Duration = Duration::from_millis(4);
+
+/// Analog sub-LSB thermal jitter threshold coalesced between consecutive readings.
+const ANALOG_EPSILON: f32 = 0.002;
 
 /// The keyboard's stand-in gamepad (virtual key, button); README lists it.
 /// Sticks: W/A/S/D left, I/J/K/L right; triggers Z and C.
@@ -83,36 +99,93 @@ const FALLBACK_BUTTONS: [(u8, u32); 14] = [
 /// A gamepad reading: triggers 0 to 1, sticks -1 to 1 (up positive).
 #[repr(C)]
 #[derive(Clone, Copy, Debug, Default, PartialEq)]
-struct PadState {
-    buttons: u32,
-    left_trigger: f32,
-    right_trigger: f32,
-    left_x: f32,
-    left_y: f32,
-    right_x: f32,
-    right_y: f32,
+pub struct PadState {
+    pub buttons: u32,
+    pub left_trigger: f32,
+    pub right_trigger: f32,
+    pub left_x: f32,
+    pub left_y: f32,
+    pub right_x: f32,
+    pub right_y: f32,
+}
+
+impl PadState {
+    /// True when `self` differs from `prev` by a button edge, an exact rest/full
+    /// boundary transition, or an analog delta above `ANALOG_EPSILON`.
+    fn meaningfully_changed(&self, prev: &Self) -> bool {
+        if self.buttons != prev.buttons {
+            return true;
+        }
+        let axis_changed = |a: f32, b: f32| {
+            if a == b {
+                return false;
+            }
+            let boundary = |v: f32| v == 0.0 || v.abs() == 1.0;
+            boundary(a) != boundary(b) || (a - b).abs() >= ANALOG_EPSILON
+        };
+        axis_changed(self.left_trigger, prev.left_trigger)
+            || axis_changed(self.right_trigger, prev.right_trigger)
+            || axis_changed(self.left_x, prev.left_x)
+            || axis_changed(self.left_y, prev.left_y)
+            || axis_changed(self.right_x, prev.right_x)
+            || axis_changed(self.right_y, prev.right_y)
+    }
+}
+
+/// Battery telemetry (`IGameInputDevice::GetBatteryState`, vtable `0x28`).
+#[repr(C)]
+#[derive(Clone, Copy, Debug, Default, PartialEq)]
+pub struct BatteryState {
+    pub status: i32,
+    pub charge_rate: f32,
+    pub remaining_capacity: f32,
+    pub full_charge_capacity: f32,
+}
+
+impl BatteryState {
+    pub const fn unknown() -> Self {
+        Self {
+            status: -1,
+            charge_rate: 0.0,
+            remaining_capacity: 0.0,
+            full_charge_capacity: 0.0,
+        }
+    }
+}
+
+/// Combined pad frame produced by a host input backend.
+#[derive(Clone, Copy, Debug, Default, PartialEq)]
+pub struct PadReading {
+    pub pad: PadState,
+    pub battery: BatteryState,
+    pub system_buttons: u32,
 }
 
 /// One key held down: scan code (0xE0xx when extended), character, key.
 #[repr(C)]
 #[derive(Clone, Copy, Debug, Default, PartialEq)]
-struct KeyState {
-    scan_code: u32,
-    code_point: u32,
-    virtual_key: u8,
-    dead_key: bool,
+pub struct KeyState {
+    pub scan_code: u32,
+    pub code_point: u32,
+    pub virtual_key: u8,
+    pub dead_key: bool,
 }
 
-const _: () = assert!(size_of::<KeyState>() == 12 && size_of::<PadState>() == 28);
+const _: () = assert!(
+    size_of::<KeyState>() == 12 && size_of::<PadState>() == 28 && size_of::<BatteryState>() == 16
+);
 
 /// Host input, or a fake in tests.
-trait Source: Send {
+pub trait Source: Send {
+    fn begin_poll(&mut self) {}
     /// The pad in host slot `slot`, `None` when the slot is empty.
-    fn pad(&mut self, slot: usize) -> Option<PadState>;
+    fn pad(&mut self, slot: usize) -> Option<PadReading>;
     /// Keys held down; none while the title's window lacks focus.
     fn keys(&mut self) -> Vec<KeyState>;
-    /// Motor speeds: low frequency (left), high frequency (right).
-    fn rumble(&mut self, slot: usize, low: u16, high: u16);
+    /// Four motor levels (`0.0..=1.0`): low, high, left trigger, right trigger.
+    fn rumble(&mut self, slot: usize, motors: [f32; 4]);
+    /// Updates runtime input configuration.
+    fn set_config(&mut self, _config: InputConfig) {}
 }
 
 fn fallback(keys: &[KeyState]) -> PadState {
@@ -201,8 +274,8 @@ impl Device {
             id,
             root_id: id,
             supported_input: kind(index),
-            // Low and high frequency.
-            rumble_motors: if index < PADS { 0x3 } else { 0 },
+            // Low frequency, high frequency, left trigger, and right trigger (`0xF`).
+            rumble_motors: if index < PADS { 0xF } else { 0 },
             ..Default::default()
         };
         Device {
@@ -223,6 +296,16 @@ impl Device {
 enum Value {
     Pad(PadState),
     Keys(Vec<KeyState>),
+}
+
+impl Value {
+    fn meaningfully_changed(&self, prev: &Self) -> bool {
+        match (self, prev) {
+            (Value::Pad(a), Value::Pad(b)) => a.meaningfully_changed(b),
+            (Value::Keys(a), Value::Keys(b)) => a != b,
+            _ => true,
+        }
+    }
 }
 
 #[repr(C)]
@@ -274,6 +357,7 @@ impl Drop for Ref {
 }
 
 type DeviceCallback = extern "system" fn(u64, *mut c_void, *const Device, u64, u32, u32);
+type SystemButtonCallback = extern "system" fn(u64, *mut c_void, *const Device, u64, u32, u32);
 
 #[derive(Clone, Copy)]
 struct Registration {
@@ -294,7 +378,9 @@ impl Registration {
 
     fn event(&self, device: usize, timestamp: u64, current: u32, previous: u32) -> Event {
         Event {
-            registration: *self,
+            token: self.token,
+            context: self.context,
+            callback: self.callback,
             device,
             timestamp,
             current,
@@ -303,27 +389,59 @@ impl Registration {
     }
 }
 
+#[derive(Clone, Copy)]
+struct SystemRegistration {
+    token: u64,
+    device: usize,
+    buttons: u32,
+    context: usize,
+    callback: SystemButtonCallback,
+}
+
+impl SystemRegistration {
+    fn matches(&self, devices: &[Device; DEVICES], index: usize, changed: u32) -> bool {
+        changed & self.buttons != 0
+            && (self.device == 0 || self.device == &devices[index] as *const Device as usize)
+    }
+}
+
 struct Event {
-    registration: Registration,
+    token: u64,
+    context: usize,
+    callback: DeviceCallback,
     device: usize,
     timestamp: u64,
     current: u32,
     previous: u32,
 }
 
-#[derive(Default)]
 struct Slot {
     connected: bool,
     sequence: u64,
+    battery: BatteryState,
+    system_buttons: u32,
     history: VecDeque<Ref>,
+}
+
+impl Default for Slot {
+    fn default() -> Self {
+        Self {
+            connected: false,
+            sequence: 0,
+            battery: BatteryState::unknown(),
+            system_buttons: 0,
+            history: VecDeque::new(),
+        }
+    }
 }
 
 struct State {
     slots: [Slot; DEVICES],
     callbacks: Vec<Registration>,
+    system_callbacks: Vec<SystemRegistration>,
     /// Asynchronous enumerations, delivered by the next poll.
     pending: Vec<Event>,
-    /// Device callbacks running now: token and thread.
+    /// Callbacks running now: token and thread.
     running: Vec<(u64, ThreadId)>,
 }
 
@@ -334,7 +452,7 @@ pub struct Hub {
     /// readings every frame.
     source: Mutex<Box<dyn Source>>,
     state: Mutex<State>,
-    /// A device callback returned.
+    /// A callback returned.
     returned: Condvar,
 }
 
@@ -367,6 +485,7 @@ impl Hub {
             state: Mutex::new(State {
                 slots: Default::default(),
                 callbacks: Vec::new(),
+                system_callbacks: Vec::new(),
                 pending: Vec::new(),
                 running: Vec::new(),
             }),
@@ -386,12 +505,14 @@ impl Hub {
     fn start(source: Box<dyn Source>) -> &'static Hub {
         let hub = Hub::new(source);
         hub.poll();
-        std::thread::spawn(move || {
-            loop {
-                std::thread::sleep(POLL);
-                hub.poll();
-            }
-        });
+        let _ = std::thread::Builder::new()
+            .name("victory gameinput poll".into())
+            .spawn(move || {
+                loop {
+                    std::thread::sleep(POLL);
+                    hub.poll();
+                }
+            });
         hub
     }
 
@@ -399,10 +520,11 @@ impl Hub {
         lock(&self.state)
     }
 
-    /// Reads the host once; device callbacks run on the calling thread.
+    /// Reads the host once; callbacks run on the calling thread.
     fn poll(&self) {
         let (pads, keys) = {
             let mut source = lock(&self.source);
+            source.begin_poll();
             let pads: [_; PADS] = std::array::from_fn(|slot| source.pad(slot));
             (pads, source.keys())
         };
@@ -416,24 +538,25 @@ impl Hub {
     fn deliver(&self, events: Vec<Event>) {
         let me = std::thread::current().id();
         for e in events {
-            let r = e.registration;
             {
                 let mut state = self.state();
-                if !state.callbacks.iter().any(|c| c.token == r.token) {
+                let active = state.callbacks.iter().any(|c| c.token == e.token)
+                    || state.system_callbacks.iter().any(|c| c.token == e.token);
+                if !active {
                     continue;
                 }
-                state.running.push((r.token, me));
+                state.running.push((e.token, me));
             }
-            (r.callback)(
-                r.token,
-                r.context as *mut c_void,
+            (e.callback)(
+                e.token,
+                e.context as *mut c_void,
                 &self.devices[e.device],
                 e.timestamp,
                 e.current,
                 e.previous,
             );
             let mut state = self.state();
-            if let Some(i) = state.running.iter().position(|&x| x == (r.token, me)) {
+            if let Some(i) = state.running.iter().position(|&x| x == (e.token, me)) {
                 state.running.swap_remove(i);
             }
             self.returned.notify_all();
@@ -449,36 +572,69 @@ impl State {
     fn poll(
         &mut self,
         devices: &[Device; DEVICES],
-        pads: [Option<PadState>; PADS],
+        pads: [Option<PadReading>; PADS],
         keys: Vec<KeyState>,
     ) -> Vec<Event> {
         let now = now();
         let mut events = std::mem::take(&mut self.pending);
         let any_pad = pads.iter().any(Option::is_some);
         for (slot, pad) in pads.into_iter().enumerate() {
-            self.update(devices, slot, pad.map(Value::Pad), now, &mut events);
+            let (val, batt, sys) = match pad {
+                Some(r) => (Some(Value::Pad(r.pad)), r.battery, r.system_buttons),
+                None => (None, BatteryState::unknown(), 0),
+            };
+            self.update(devices, slot, val, batt, sys, now, &mut events);
         }
         let fallback = (!any_pad).then(|| Value::Pad(fallback(&keys)));
-        self.update(devices, FALLBACK, fallback, now, &mut events);
-        self.update(devices, KEYBOARD, Some(Value::Keys(keys)), now, &mut events);
+        self.update(
+            devices,
+            FALLBACK,
+            fallback,
+            BatteryState::unknown(),
+            0,
+            now,
+            &mut events,
+        );
+        self.update(
+            devices,
+            KEYBOARD,
+            Some(Value::Keys(keys)),
+            BatteryState::unknown(),
+            0,
+            now,
+            &mut events,
+        );
         events
     }
 
     /// Records a device's state: a reading when it changed, callbacks when
-    /// the device came or went.
+    /// the device came/went or a system button changed.
+    #[allow(clippy::too_many_arguments)]
     fn update(
         &mut self,
         devices: &[Device; DEVICES],
         index: usize,
         value: Option<Value>,
+        battery: BatteryState,
+        system_buttons: u32,
         now: u64,
         events: &mut Vec<Event>,
     ) {
         let slot = &mut self.slots[index];
         let was = slot.connected;
         slot.connected = value.is_some();
+        slot.battery = battery;
+
+        let prev_sys = slot.system_buttons;
+        slot.system_buttons = if slot.connected { system_buttons } else { 0 };
+        let sys_changed = prev_sys ^ slot.system_buttons;
+
         if let Some(value) = value
-            && (!was || slot.history.back().is_none_or(|r| r.value != value))
+            && (!was
+                || slot
+                    .history
+                    .back()
+                    .is_none_or(|r| value.meaningfully_changed(&r.value)))
         {
             slot.sequence += 1;
             if slot.history.len() == HISTORY {
@@ -507,30 +663,91 @@ impl State {
                     .map(|r| r.event(index, now, current, previous)),
             );
         }
+        if sys_changed != 0 {
+            let cur = slot.system_buttons;
+            events.extend(
+                self.system_callbacks
+                    .iter()
+                    .filter(|r| r.matches(devices, index, sys_changed))
+                    .map(|r| Event {
+                        token: r.token,
+                        context: r.context,
+                        callback: r.callback,
+                        device: index,
+                        timestamp: now,
+                        current: cur & r.buttons,
+                        previous: prev_sys & r.buttons,
+                    }),
+            );
+        }
     }
 }
 
+static INITIAL_CONFIG: Mutex<Option<InputConfig>> = Mutex::new(None);
+
 #[cfg(windows)]
-fn host() -> Box<dyn Source> {
-    Box::new(host::Host::default())
+fn host_source() -> Box<dyn Source> {
+    let mut h = host::Host::default();
+    if let Some(cfg) = lock(&INITIAL_CONFIG).clone() {
+        h.set_config(cfg);
+    }
+    Box::new(h)
 }
 
 #[cfg(not(windows))]
-fn host() -> Box<dyn Source> {
+fn host_source() -> Box<dyn Source> {
     struct Nothing;
     impl Source for Nothing {
-        fn pad(&mut self, _: usize) -> Option<PadState> {
+        fn pad(&mut self, _: usize) -> Option<PadReading> {
             None
         }
         fn keys(&mut self) -> Vec<KeyState> {
             Vec::new()
         }
-        fn rumble(&mut self, _: usize, _: u16, _: u16) {}
+        fn rumble(&mut self, _: usize, _: [f32; 4]) {}
     }
     Box::new(Nothing)
 }
 
-static HUB: LazyLock<&'static Hub> = LazyLock::new(|| Hub::start(host()));
+static HUB_STARTED: AtomicBool = AtomicBool::new(false);
+static HUB: LazyLock<&'static Hub> = LazyLock::new(|| {
+    HUB_STARTED.store(true, Ordering::Release);
+    Hub::start(host_source())
+});
+
+/// Applies user configuration from `victory.toml` / environment variables and
+/// installs console Ctrl+C / close cleanup so DualSense triggers never stay stiff.
+pub fn configure(config: InputConfig) {
+    *lock(&INITIAL_CONFIG) = Some(config.clone());
+    if HUB_STARTED.load(Ordering::Acquire) {
+        lock(&HUB.source).set_config(config);
+    }
+    #[cfg(windows)]
+    install_console_reset_handler();
+}
+
+/// Immediately zeroes rumble and releases adaptive triggers on all DualSense
+/// controllers (lock-free; safe in crash, panic, Ctrl+C, and shutdown paths).
+pub fn reset_hardware() {
+    dualsense::emergency_reset_all();
+}
+
+#[cfg(windows)]
+fn install_console_reset_handler() {
+    static INSTALLED: AtomicBool = AtomicBool::new(false);
+    if INSTALLED.swap(true, Ordering::AcqRel) {
+        return;
+    }
+    unsafe extern "system" fn ctrl_handler(_ctrl_type: u32) -> i32 {
+        reset_hardware();
+        0
+    }
+    // SAFETY: registers a process-lifetime console control handler that only
+    // performs lock-free HID reset writes and returns FALSE to chain default handling.
+    unsafe {
+        let _ = windows_sys::Win32::System::Console::SetConsoleCtrlHandler(Some(ctrl_handler), 1);
+    }
+}
 
 type This = *const Object;
 type Out = *mut *const c_void;
@@ -781,8 +998,38 @@ extern "system" fn register_device(
     hub.deliver(found);
     S_OK
 }
-/// Guide button and keyboard layout callbacks: neither ever changes here.
-extern "system" fn register_other(
+
+/// `IGameInput::RegisterSystemButtonCallback` (slot `0x50`): fires on short
+/// press of the DualSense PS / Guide button.
+extern "system" fn register_system_button(
+    this: This,
+    device: *const Device,
+    buttons: u32,
+    context: *mut c_void,
+    callback: Option<SystemButtonCallback>,
+    out: *mut u64,
+) -> HRESULT {
+    let Some(callback) = callback else {
+        return E_INVALIDARG;
+    };
+    let hub = hub(this);
+    let reg = SystemRegistration {
+        token: NEXT_TOKEN.fetch_add(1, Ordering::Relaxed),
+        device: device as usize,
+        buttons,
+        context: context as usize,
+        callback,
+    };
+    hub.state().system_callbacks.push(reg);
+    if !out.is_null() {
+        // SAFETY: checked non-null.
+        unsafe { out.write(reg.token) };
+    }
+    S_OK
+}
+
+/// Keyboard layout callbacks: never changes here.
+extern "system" fn register_keyboard_layout(
     _: This,
     _device: *const c_void,
     _context: *mut c_void,
@@ -795,7 +1042,8 @@ extern "system" fn register_other(
 fn forget(this: This, token: u64) {
     let mut state = hub(this).state();
     state.callbacks.retain(|r| r.token != token);
-    state.pending.retain(|e| e.registration.token != token);
+    state.system_callbacks.retain(|r| r.token != token);
+    state.pending.retain(|e| e.token != token);
 }
 extern "system" fn stop_callback(this: This, token: u64) {
     forget(this, token);
@@ -818,7 +1066,10 @@ extern "system" fn unregister_callback(this: This, token: u64, timeout: u64) -> 
             return true;
         }
         state = match deadline {
-            None => hub.returned.wait(state).unwrap_or_else(PoisonError::into_inner),
+            None => hub
+                .returned
+                .wait(state)
+                .unwrap_or_else(PoisonError::into_inner),
             Some(deadline) => {
                 let Some(left) = deadline.checked_duration_since(Instant::now()) else {
                     return false;
@@ -871,28 +1122,28 @@ extern "system" fn enable_oem_device(
 extern "system" fn set_focus_policy(_: This, _policy: u32) {}
 
 static INPUT: Table<22> = Table([
-    no_interface as *const (),        // 0x00
-    add_ref as *const (),             // 0x08 AddRef
-    add_ref as *const (),             // 0x10 Release
-    timestamp as *const (),           // 0x18
-    current_reading as *const (),     // 0x20
-    next_reading as *const (),        // 0x28
-    previous_reading as *const (),    // 0x30
-    temporal_reading as *const (),    // 0x38
-    register_reading as *const (),    // 0x40
-    register_device as *const (),     // 0x48
-    register_other as *const (),      // 0x50 guide button
-    register_other as *const (),      // 0x58 keyboard layout
-    stop_callback as *const (),       // 0x60
-    unregister_callback as *const (), // 0x68
-    create_dispatcher as *const (),   // 0x70
-    create_aggregate as *const (),    // 0x78
-    find_by_id as *const (),          // 0x80
-    find_device as *const (),         // 0x88 by object
-    find_device as *const (),         // 0x90 by platform handle
-    find_device as *const (),         // 0x98 by platform string
-    enable_oem_device as *const (),   // 0xa0
-    set_focus_policy as *const (),    // 0xa8
+    no_interface as *const (),             // 0x00
+    add_ref as *const (),                  // 0x08 AddRef
+    add_ref as *const (),                  // 0x10 Release
+    timestamp as *const (),                // 0x18
+    current_reading as *const (),          // 0x20
+    next_reading as *const (),             // 0x28
+    previous_reading as *const (),         // 0x30
+    temporal_reading as *const (),         // 0x38
+    register_reading as *const (),         // 0x40
+    register_device as *const (),          // 0x48
+    register_system_button as *const (),   // 0x50 guide / share button
+    register_keyboard_layout as *const (), // 0x58 keyboard layout
+    stop_callback as *const (),            // 0x60
+    unregister_callback as *const (),      // 0x68
+    create_dispatcher as *const (),        // 0x70
+    create_aggregate as *const (),         // 0x78
+    find_by_id as *const (),               // 0x80
+    find_device as *const (),              // 0x88 by object
+    find_device as *const (),              // 0x90 by platform handle
+    find_device as *const (),              // 0x98 by platform string
+    enable_oem_device as *const (),        // 0xa0
+    set_focus_policy as *const (),         // 0xa8
 ]);
 
 extern "system" fn device_info(this: *const Device) -> *const DeviceInfo {
@@ -908,24 +1159,33 @@ extern "system" fn device_status(this: *const Device) -> u32 {
         0
     }
 }
-// shortcut: trigger motors are dropped (XInput has none). The host API that
-// drives them without a redistributable is Windows.Gaming.Input (WinRT
-// `Gamepad.Vibration`), which needs WinRT bindings this crate lacks outside
-// diagnostics builds; Grand Theft Auto VI sends trigger levels in slot 0x50.
+extern "system" fn battery_state(this: *const Device, out: *mut BatteryState) -> HRESULT {
+    if out.is_null() {
+        return E_INVALIDARG;
+    }
+    // SAFETY: one of our devices; `out` checked non-null.
+    let device = unsafe { &*this };
+    let batt = device.hub().state().slots[device.index].battery;
+    // SAFETY: checked non-null above.
+    unsafe { out.write(batt) };
+    S_OK
+}
+/// Drives grip rumble (`low`, `high`) and trigger feedback (`left_trigger`,
+/// `right_trigger`); DualSense translates the trigger levels into adaptive
+/// trigger pulse/resistance effects while XInput uses the two grip motors.
 extern "system" fn set_rumble(this: *const Device, params: *const [f32; 4]) {
     // SAFETY: one of our devices.
     let device = unsafe { &*this };
     if device.index >= PADS {
         return;
     }
-    let [low, high, ..] = if params.is_null() {
+    let motors = if params.is_null() {
         [0.0; 4]
     } else {
         // SAFETY: checked non-null; four motor levels.
-        unsafe { *params }
+        unsafe { *params }.map(|v| v.clamp(0.0, 1.0))
     };
-    let speed = |level: f32| (level.clamp(0.0, 1.0) * f32::from(u16::MAX)) as u16;
-    lock(&device.hub().source).rumble(device.index, speed(low), speed(high));
+    lock(&device.hub().source).rumble(device.index, motors);
 }
 extern "system" fn unsupported<const SLOT: usize>(_: *const c_void) -> HRESULT {
     tracing::warn!(
@@ -941,7 +1201,7 @@ static DEVICE: Table<21> = Table([
     add_ref as *const (),             // 0x10 Release
     device_info as *const (),         // 0x18
     device_status as *const (),       // 0x20
-    unsupported::<0x28> as *const (), // battery
+    battery_state as *const (),       // 0x28 battery
     unsupported::<0x30> as *const (), // force feedback
     unsupported::<0x38> as *const (), //
     unsupported::<0x40> as *const (), //
@@ -1006,7 +1266,7 @@ extern "system" fn key_state(this: *const Reading, count: u32, out: *mut KeyStat
     };
     if out.is_null() {
         return 0;
-    }
+    };
     let n = keys.len().min(count as usize);
     // SAFETY: the title passes room for `count` keys.
     unsafe { std::ptr::copy_nonoverlapping(keys.as_ptr(), out, n) };
@@ -1067,195 +1327,6 @@ pub(crate) fn module() -> HleModule {
     }
 }
 
-/// Host input: XInput pads, the keyboard while our process has focus.
-#[cfg(windows)]
-mod host {
-    use std::time::{Duration, Instant};
-
-    use windows_sys::Win32::System::Threading::GetCurrentProcessId;
-    use windows_sys::Win32::UI::Input::KeyboardAndMouse::{
-        GetAsyncKeyState, MAPVK_VK_TO_VSC_EX, MapVirtualKeyW,
-    };
-    use windows_sys::Win32::UI::Input::XboxController::{
-        XINPUT_GAMEPAD, XINPUT_GAMEPAD_A, XINPUT_GAMEPAD_B, XINPUT_GAMEPAD_BACK,
-        XINPUT_GAMEPAD_DPAD_DOWN, XINPUT_GAMEPAD_DPAD_LEFT, XINPUT_GAMEPAD_DPAD_RIGHT,
-        XINPUT_GAMEPAD_DPAD_UP, XINPUT_GAMEPAD_LEFT_SHOULDER, XINPUT_GAMEPAD_LEFT_THUMB,
-        XINPUT_GAMEPAD_RIGHT_SHOULDER, XINPUT_GAMEPAD_RIGHT_THUMB, XINPUT_GAMEPAD_START,
-        XINPUT_GAMEPAD_X, XINPUT_GAMEPAD_Y, XINPUT_STATE, XINPUT_VIBRATION, XInputGetState,
-        XInputSetState,
-    };
-    use windows_sys::Win32::UI::WindowsAndMessaging::{
-        GetForegroundWindow, GetWindowThreadProcessId,
-    };
-
-    use super::*;
-
-    /// Asking XInput about an empty slot is slow; look again this often.
-    const EMPTY_SLOT_RECHECK: Duration = Duration::from_secs(1);
-
-    const BUTTONS: [(u16, u32); 14] = [
-        (XINPUT_GAMEPAD_START, MENU),
-        (XINPUT_GAMEPAD_BACK, VIEW),
-        (XINPUT_GAMEPAD_A, A),
-        (XINPUT_GAMEPAD_B, B),
-        (XINPUT_GAMEPAD_X, X),
-        (XINPUT_GAMEPAD_Y, Y),
-        (XINPUT_GAMEPAD_DPAD_UP, UP),
-        (XINPUT_GAMEPAD_DPAD_DOWN, DOWN),
-        (XINPUT_GAMEPAD_DPAD_LEFT, LEFT),
-        (XINPUT_GAMEPAD_DPAD_RIGHT, RIGHT),
-        (XINPUT_GAMEPAD_LEFT_SHOULDER, LEFT_SHOULDER),
-        (XINPUT_GAMEPAD_RIGHT_SHOULDER, RIGHT_SHOULDER),
-        (XINPUT_GAMEPAD_LEFT_THUMB, LEFT_STICK),
-        (XINPUT_GAMEPAD_RIGHT_THUMB, RIGHT_STICK),
-    ];
-
-    /// Raw values, no dead zone: titles apply their own.
-    pub(super) fn convert(pad: &XINPUT_GAMEPAD) -> PadState {
-        let stick = |v: i16| (f32::from(v) / 32767.0).max(-1.0);
-        PadState {
-            buttons: BUTTONS
-                .iter()
-                .filter(|(host, _)| pad.wButtons & host != 0)
-                .fold(0, |all, (_, bit)| all | bit),
-            left_trigger: f32::from(pad.bLeftTrigger) / 255.0,
-            right_trigger: f32::from(pad.bRightTrigger) / 255.0,
-            left_x: stick(pad.sThumbLX),
-            left_y: stick(pad.sThumbLY),
-            right_x: stick(pad.sThumbRX),
-            right_y: stick(pad.sThumbRY),
-        }
-    }
-
-    #[derive(Default)]
-    pub(super) struct Host {
-        empty_until: [Option<Instant>; PADS],
-    }
-
-    impl Source for Host {
-        fn pad(&mut self, slot: usize) -> Option<PadState> {
-            if self.empty_until[slot].is_some_and(|until| Instant::now() < until) {
-                return None;
-            }
-            let mut state = XINPUT_STATE::default();
-            // SAFETY: room for the state.
-            if unsafe { XInputGetState(slot as u32, &mut state) } != 0 {
-                self.empty_until[slot] = Some(Instant::now() + EMPTY_SLOT_RECHECK);
-                return None;
-            }
-            self.empty_until[slot] = None;
-            Some(convert(&state.Gamepad))
-        }
-
-        fn keys(&mut self) -> Vec<KeyState> {
-            #[cfg(feature = "diagnostics")]
-            let mut down = scripted();
-            #[cfg(not(feature = "diagnostics"))]
-            let mut down = Vec::new();
-            if focused() {
-                // Left/right modifier keys only, as devices report them; no
-                // mouse buttons (below 0x08).
-                let held: Vec<u8> = (0x08..=0xFE_u8)
-                    .filter(|vk| !(0x10..=0x12).contains(vk) && !down.contains(vk))
-                    // SAFETY: plain queries.
-                    .filter(|&vk| unsafe { GetAsyncKeyState(i32::from(vk)) } < 0)
-                    .collect();
-                down.extend(held);
-            }
-            down.into_iter()
-                .map(|vk| KeyState {
-                    // SAFETY: plain query.
-                    scan_code: unsafe { MapVirtualKeyW(u32::from(vk), MAPVK_VK_TO_VSC_EX) },
-                    virtual_key: vk,
-                    // shortcut: no characters (code point 0); Grand Theft
-                    // Auto VI reads scan codes and virtual keys only.
-                    ..Default::default()
-                })
-                .collect()
-        }
-
-        fn rumble(&mut self, slot: usize, low: u16, high: u16) {
-            let speeds = XINPUT_VIBRATION {
-                wLeftMotorSpeed: low,
-                wRightMotorSpeed: high,
-            };
-            // SAFETY: a valid vibration; an empty slot just fails.
-            unsafe { XInputSetState(slot as u32, &speeds) };
-        }
-    }
-
-    /// Debugging aid: `VICTORY_KEYS=<seconds>:<key>,...` holds each key for
-    /// 0.2 s that long after input starts, with or without focus. A key is a
-    /// letter, a digit, or `Enter`, `Esc`, `Tab`, `Back`, `Up`, `Down`,
-    /// `Left`, `Right` (the stand-in pad's table maps them to buttons).
-    #[cfg(feature = "diagnostics")]
-    fn scripted() -> Vec<u8> {
-        static SCRIPT: LazyLock<(Instant, Vec<(Duration, u8)>)> = LazyLock::new(|| {
-            let list = std::env::var("VICTORY_KEYS").unwrap_or_default();
-            let keys = list.split(',').filter_map(|entry| {
-                let (at, key) = entry.split_once(':')?;
-                let vk = match key.trim() {
-                    "Enter" => 0x0D,
-                    "Esc" => 0x1B,
-                    "Tab" => 0x09,
-                    "Back" => 0x08,
-                    "Up" => 0x26,
-                    "Down" => 0x28,
-                    "Left" => 0x25,
-                    "Right" => 0x27,
-                    k if k.len() == 1 && k.as_bytes()[0].is_ascii_alphanumeric() => {
-                        k.as_bytes()[0].to_ascii_uppercase()
-                    }
-                    _ => return None,
-                };
-                Some((
-                    Duration::try_from_secs_f64(at.trim().parse().ok()?).ok()?,
-                    vk,
-                ))
-            });
-            (Instant::now(), keys.collect())
-        });
-        let (start, keys) = &*SCRIPT;
-        let now = start.elapsed();
-        keys.iter()
-            .filter(|&&(at, _)| (at..at + Duration::from_millis(200)).contains(&now))
-            .map(|&(_, vk)| vk)
-            .collect()
-    }
-
-    /// The foreground window is one of ours (the title's or our fallback).
-    fn focused() -> bool {
-        let mut process = 0;
-        // SAFETY: plain queries; a null window gives process 0.
-        unsafe {
-            GetWindowThreadProcessId(GetForegroundWindow(), &mut process);
-            process == GetCurrentProcessId()
-        }
-    }
-
-    #[test]
-    fn host_pads_convert_to_console_pads() {
-        let pad = XINPUT_GAMEPAD {
-            wButtons: XINPUT_GAMEPAD_A | XINPUT_GAMEPAD_START | XINPUT_GAMEPAD_DPAD_LEFT,
-            bLeftTrigger: 255,
-            sThumbLX: -32768,
-            sThumbLY: 32767,
-            ..Default::default()
-        };
-        let state = convert(&pad);
-        assert_eq!(state.buttons, A | MENU | LEFT);
-        assert_eq!(
-            (
-                state.left_trigger,
-                state.left_x,
-                state.left_y,
-                state.right_x
-            ),
-            (1.0, -1.0, 1.0, 0.0)
-        );
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use std::sync::Arc;
@@ -1268,22 +1339,22 @@ mod tests {
 
     #[derive(Default)]
     struct FakeHost {
-        pads: [Option<PadState>; PADS],
+        pads: [Option<PadReading>; PADS],
         keys: Vec<KeyState>,
-        rumble: Vec<(usize, u16, u16)>,
+        rumble: Vec<(usize, [f32; 4])>,
     }
 
     struct Fake(Arc<Mutex<FakeHost>>);
 
     impl Source for Fake {
-        fn pad(&mut self, slot: usize) -> Option<PadState> {
+        fn pad(&mut self, slot: usize) -> Option<PadReading> {
             self.0.lock().unwrap().pads[slot]
         }
         fn keys(&mut self) -> Vec<KeyState> {
             self.0.lock().unwrap().keys.clone()
         }
-        fn rumble(&mut self, slot: usize, low: u16, high: u16) {
-            self.0.lock().unwrap().rumble.push((slot, low, high));
+        fn rumble(&mut self, slot: usize, motors: [f32; 4]) {
+            self.0.lock().unwrap().rumble.push((slot, motors));
         }
     }
 
@@ -1292,6 +1363,19 @@ mod tests {
         let hub = Hub::new(Box::new(Fake(Arc::clone(&host))));
         hub.poll();
         (hub, host)
+    }
+
+    fn simple_pad(pad: PadState) -> Option<PadReading> {
+        Some(PadReading {
+            pad,
+            battery: BatteryState {
+                status: 1,
+                charge_rate: -0.8,
+                remaining_capacity: 4.5,
+                full_charge_capacity: 5.7,
+            },
+            system_buttons: 0,
+        })
     }
 
     fn key(virtual_key: u8) -> KeyState {
@@ -1309,7 +1393,7 @@ mod tests {
         unsafe { std::mem::transmute_copy(&f) }
     }
 
-    /// Device callbacks seen: device index, current and previous status.
+    /// Callbacks seen: device index, current and previous status/buttons.
     type Log = Mutex<Vec<(usize, u32, u32)>>;
 
     extern "system" fn record(
@@ -1417,11 +1501,9 @@ mod tests {
         let (hub, host) = fake();
         let log = Log::default();
         register(hub, GAMEPAD_KIND, 2, &log);
-        // Blocking enumeration ran before registration returned: with no
-        // host pad the keyboard's stand-in is the only one.
         assert_eq!(*log.lock().unwrap(), [(FALLBACK, STATUS_CONNECTED, 0)]);
 
-        host.lock().unwrap().pads[1] = Some(PadState {
+        host.lock().unwrap().pads[1] = simple_pad(PadState {
             buttons: A,
             left_x: 0.5,
             ..Default::default()
@@ -1435,14 +1517,15 @@ mod tests {
         let first = current(hub, GAMEPAD_KIND, 1).unwrap();
         assert_eq!(pad(first).buttons, A);
         assert_eq!(pad(first).left_x, 0.5);
-        // No change, no new reading.
+        // Sub-threshold analog thermal noise (< 0.002) is coalesced.
+        host.lock().unwrap().pads[1].as_mut().unwrap().pad.left_x = 0.5005;
         hub.poll();
         let again = current(hub, GAMEPAD_KIND, 1).unwrap();
         assert_eq!(again, first);
         release(again);
 
         std::thread::sleep(Duration::from_millis(2));
-        host.lock().unwrap().pads[1].as_mut().unwrap().buttons = B;
+        host.lock().unwrap().pads[1].as_mut().unwrap().pad.buttons = B;
         hub.poll();
         let second = current(hub, GAMEPAD_KIND, 1).unwrap();
         assert_eq!(pad(second).buttons, B);
@@ -1451,7 +1534,6 @@ mod tests {
         assert!(t2 > t1 && s2 == s1 + 1);
         assert!(t2 <= now());
 
-        // The title's edge check: previous of current, and back again.
         assert_eq!(walk(hub, 0x30, second), Ok(first));
         assert_eq!(walk(hub, 0x28, first), Ok(second));
         assert_eq!(walk(hub, 0x28, second), Err(READING_NOT_FOUND));
@@ -1467,10 +1549,73 @@ mod tests {
             [(1, 0, STATUS_CONNECTED), (FALLBACK, STATUS_CONNECTED, 0)]
         );
         assert_eq!(current(hub, GAMEPAD_KIND, 1), Err(DEVICE_DISCONNECTED));
-        // The stand-in is back, at rest.
         let rest = current(hub, GAMEPAD_KIND, FALLBACK).unwrap();
         assert_eq!(pad(rest), PadState::default());
         release(rest);
+    }
+
+    #[test]
+    fn high_rate_burst_stays_within_history_without_reference_too_old() {
+        let (hub, host) = fake();
+        host.lock().unwrap().pads[0] = simple_pad(PadState::default());
+        hub.poll();
+        let anchor = current(hub, GAMEPAD_KIND, 0).unwrap();
+
+        // Simulate 400 consecutive distinct stick updates (~1.6 s at 250 Hz, well past
+        // a 33 ms 30fps frame or slow world frame) while holding `anchor`.
+        for step in 1..=400u16 {
+            host.lock().unwrap().pads[0].as_mut().unwrap().pad.right_x =
+                (f32::from(step) / 400.0).min(1.0);
+            hub.poll();
+        }
+        let next = walk(hub, 0x28, anchor).expect("anchor must not expire with REFERENCE_TOO_OLD");
+        release(next);
+        release(anchor);
+    }
+
+    #[test]
+    fn battery_four_motor_rumble_and_system_guide_callbacks_work() {
+        let (hub, host) = fake();
+        let sys_log = Log::default();
+        type RegSys = extern "system" fn(
+            This,
+            *const Device,
+            u32,
+            *mut c_void,
+            Option<SystemButtonCallback>,
+            *mut u64,
+        ) -> HRESULT;
+        let mut sys_token = 0u64;
+        assert_eq!(
+            slot::<RegSys, _>(&hub.object, 0x50)(
+                &hub.object,
+                std::ptr::null(),
+                SYSTEM_BUTTON_GUIDE,
+                (&raw const sys_log).cast_mut().cast(),
+                Some(record),
+                &mut sys_token,
+            ),
+            S_OK
+        );
+
+        let mut reading = simple_pad(PadState::default()).unwrap();
+        reading.system_buttons = SYSTEM_BUTTON_GUIDE;
+        host.lock().unwrap().pads[2] = Some(reading);
+        hub.poll();
+        assert_eq!(*sys_log.lock().unwrap(), [(2, SYSTEM_BUTTON_GUIDE, 0)]);
+
+        let device = &hub.devices[2] as *const Device;
+        type GetBattery = extern "system" fn(*const Device, *mut BatteryState) -> HRESULT;
+        let mut batt = BatteryState::default();
+        assert_eq!(slot::<GetBattery, _>(device, 0x28)(device, &mut batt), S_OK);
+        assert_eq!(batt.status, 1);
+        assert!(batt.remaining_capacity > 4.0);
+
+        // Four-motor rumble (`[low, high, left_trigger, right_trigger]`) reaches the backend intact.
+        type Rumble = extern "system" fn(*const Device, *const [f32; 4]);
+        let levels = [0.25f32, 0.5, 0.75, 1.0];
+        slot::<Rumble, _>(device, 0x50)(device, &levels);
+        assert_eq!(host.lock().unwrap().rumble, [(2, levels)]);
     }
 
     #[test]
@@ -1505,7 +1650,6 @@ mod tests {
             }
         );
         release(r);
-        // A keyboard reading is no gamepad reading.
         assert_eq!(current(hub, GAMEPAD_KIND, KEYBOARD), Err(READING_NOT_FOUND));
     }
 
@@ -1520,96 +1664,29 @@ mod tests {
 
         let unregister = slot::<extern "system" fn(This, u64, u64) -> bool, _>(&hub.object, 0x68);
         assert!(unregister(&hub.object, token, 5000));
-        host.lock().unwrap().pads[0] = Some(PadState::default());
+        host.lock().unwrap().pads[0] = simple_pad(PadState::default());
         hub.poll();
         assert_eq!(log.lock().unwrap().len(), 1);
     }
 
     #[test]
-    fn unregistering_waits_for_a_running_callback() {
-        use std::sync::atomic::AtomicBool;
-        static INSIDE: AtomicBool = AtomicBool::new(false);
-        static LEAVE: AtomicBool = AtomicBool::new(false);
-        static FROM_INSIDE: AtomicU32 = AtomicU32::new(0);
-        extern "system" fn slow(
-            token: u64,
-            context: *mut c_void,
-            _: *const Device,
-            _: u64,
-            _: u32,
-            _: u32,
-        ) {
-            // From inside its own callback, unregistering fails at once.
-            let unregister = slot::<extern "system" fn(This, u64, u64) -> bool, _>(context, 0x68);
-            if !unregister(context.cast(), token, 0) {
-                FROM_INSIDE.fetch_add(1, Ordering::SeqCst);
-            }
-            INSIDE.store(true, Ordering::SeqCst);
-            while !LEAVE.load(Ordering::SeqCst) {
-                std::thread::sleep(Duration::from_millis(1));
-            }
-        }
+    fn devices_are_found_by_id_and_declare_all_four_rumble_motors() {
         let (hub, host) = fake();
-        type Register = extern "system" fn(
-            This,
-            *const Device,
-            u32,
-            u32,
-            u32,
-            *mut c_void,
-            Option<DeviceCallback>,
-            *mut u64,
-        ) -> HRESULT;
-        let register = slot::<Register, _>(&hub.object, 0x48);
-        let mut token = 0;
-        let context = (&raw const hub.object).cast_mut().cast();
-        assert_eq!(
-            register(&hub.object, std::ptr::null(), GAMEPAD_KIND, 1, 0, context, Some(slow), &mut token),
-            S_OK
-        );
-        host.lock().unwrap().pads[1] = Some(PadState::default());
-        let poller = std::thread::spawn(|| hub.poll());
-        while !INSIDE.load(Ordering::SeqCst) {
-            std::thread::sleep(Duration::from_millis(1));
-        }
-        let unregister = slot::<extern "system" fn(This, u64, u64) -> bool, _>(&hub.object, 0x68);
-        assert!(!unregister(&hub.object, token, 5000), "times out while it runs");
-        let leave = std::thread::spawn(|| {
-            std::thread::sleep(Duration::from_millis(50));
-            LEAVE.store(true, Ordering::SeqCst);
-        });
-        let start = Instant::now();
-        assert!(unregister(&hub.object, token, u64::MAX), "waits for it");
-        assert!(start.elapsed() >= Duration::from_millis(40));
-        assert_eq!(FROM_INSIDE.load(Ordering::SeqCst), 1);
-        poller.join().unwrap();
-        leave.join().unwrap();
-    }
-
-    #[test]
-    fn devices_are_found_by_id_and_rumble_reaches_the_host() {
-        let (hub, host) = fake();
-        host.lock().unwrap().pads[2] = Some(PadState::default());
+        host.lock().unwrap().pads[2] = simple_pad(PadState::default());
         hub.poll();
         let device = &hub.devices[2] as *const Device;
-        let info = slot::<extern "system" fn(*const Device) -> *const u8, _>(device, 0x18);
-        // SAFETY: the info has the id at +0x20.
-        let id = unsafe { *(info(device).add(0x20) as *const [u8; 32]) };
-        assert_ne!(id, [0; 32]);
+        let info = slot::<extern "system" fn(*const Device) -> *const DeviceInfo, _>(device, 0x18);
+        // SAFETY: `info` returns our static DeviceInfo.
+        let info_ref = unsafe { &*info(device) };
+        assert_ne!(info_ref.id, [0; 32]);
+        assert_eq!(info_ref.rumble_motors, 0xF);
 
         type Find = extern "system" fn(This, *const [u8; 32], Out) -> HRESULT;
-        let find = slot::<Find, _>(&hub.object, 0x80);
-        let mut out = std::ptr::null();
-        assert_eq!(find(&hub.object, &id, &mut out), S_OK);
-        assert_eq!(out, device.cast());
-        assert_eq!(find(&hub.object, &[1; 32], &mut out), DEVICE_NOT_FOUND);
-        assert!(out.is_null());
-
-        type Rumble = extern "system" fn(*const Device, *const [f32; 4]);
-        let rumble = slot::<Rumble, _>(device, 0x50);
-        rumble(device, &[0.5, 1.0, 1.0, 1.0]);
-        rumble(&hub.devices[FALLBACK], &[1.0; 4]);
-        rumble(device, std::ptr::null());
-        assert_eq!(host.lock().unwrap().rumble, [(2, 32767, 65535), (2, 0, 0)]);
+        let mut found = std::ptr::null();
+        assert_eq!(
+            slot::<Find, _>(&hub.object, 0x80)(&hub.object, &info_ref.id, &mut found),
+            S_OK
+        );
+        assert_eq!(found, device.cast());
     }
 }

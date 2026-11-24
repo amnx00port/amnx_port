@@ -17,3 +17,51 @@ game_dir = 'D:\victory-data\game'
 # Other Xbox Series titles used to test platform-level code.
 # env: VICTORY_TEST_TITLES (separated by ';')
 test_titles = []
+
+[input]
+# Suppress duplicate virtual XInput pads (e.g. Steam Input 0x28DE) while a
+# DualSense HID controller is active: "auto" | "always" | "never".
+# env: VICTORY_SUPPRESS_VIRTUAL_XINPUT
+suppress_virtual_xinput = "auto"
+
+# Pause gamepad input and release rumble/triggers while unfocused.
+# env: VICTORY_MUTE_UNFOCUSED
+mute_unfocused = true
+
+[input.dualsense]
+# Native PS5 DualSense / DualSense Edge support (wired USB, Pico 2 W DS5Dongle,
+# and Bluetooth 0x31 fallback).   env: VICTORY_DUALSENSE
+enabled = true
+
+# Voice-coil haptics & rumble: "hid" | "audio_4ch" | "hybrid" | "off".
+# env: VICTORY_DUALSENSE_HAPTICS
+haptics_mode = "hid"
+
+# Mirror game audio to the DualSense speaker / 3.5mm headset jack when
+# haptics_mode is "audio_4ch" or "hybrid".   env: VICTORY_DUALSENSE_SPEAKER_MIRROR
+speaker_mirror = false
+
+# Xbox impulse trigger -> DualSense adaptive trigger mode:
+# "vibration" | "hybrid" | "off".   env: VICTORY_DUALSENSE_TRIGGERS
+adaptive_triggers = "vibration"
+trigger_strength = 1.0
+
+# Touchpad click mapping: "split" (left=View, right=Menu) | "view".
+touchpad_click = "split"
+
+# DualSense Edge back paddles: "hardware" (onboard profile) | "custom".
+edge_paddles = "hardware"
+edge_left_paddle = "paddle_left1"
+edge_right_paddle = "paddle_right1"
+
+# 6-axis gyro aiming mapped onto the right stick:
+# "ads_or_touch" | "ads" | "touch" | "always" | "off".   env: VICTORY_DUALSENSE_GYRO
+gyro_mode = "ads_or_touch"
+# Horizontal gyro space: "player_space" | "yaw" | "roll".
+gyro_space = "player_space"
+gyro_sensitivity = 1.0
+gyro_deadzone_floor = 0.12
+
+# Lightbar 6-digit RGB hex and LED brightness ("high" | "medium" | "low" | "off").
+lightbar_color = "0040FF"
+led_brightness = "medium"

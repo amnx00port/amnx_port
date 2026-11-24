@@ -201,6 +201,7 @@ pub(crate) fn end_title(why: &'static str, then: Box<dyn FnOnce() + Send>) {
     if ENDING.swap(true, Ordering::SeqCst) {
         return;
     }
+    super::gameinput::reset_hardware();
     let suspend = routines().clone();
     tracing::info!(routines = suspend.len(), "{why}: suspending the title");
     // Whoever comes first (the routines or the deadline) runs `then`; the

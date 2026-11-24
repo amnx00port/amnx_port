@@ -184,6 +184,17 @@ fn show_config() -> Result<()> {
     for t in &cfg.test_titles {
         println!("test_title  : {}", status(&Some(t.clone())));
     }
+    println!(
+        "dualsense   : {} (haptics {:?}, triggers {:?}, gyro {:?})",
+        if cfg.input.dualsense.enabled {
+            "enabled"
+        } else {
+            "disabled"
+        },
+        cfg.input.dualsense.haptics_mode,
+        cfg.input.dualsense.adaptive_triggers,
+        cfg.input.dualsense.gyro_mode,
+    );
     for p in cfg
         .game_dir
         .iter()
