@@ -1229,8 +1229,35 @@ impl HostList {
     }
 }
 
-/// A submission's refreshes not done yet, merged per buffer copy into the
-/// range that covers them: done before a step that writes title memory or
+/// Adjacent or nearby refreshes on the same shadow buffer within one 64 KiB
+/// guard block are merged into one `shadow.update`; wider gaps stay separate
+/// so small buffers at opposite ends of a large shared heap do not force
+/// refreshing the megabytes between them.
+const COALESCE_GAP: usize = 64 << 10;
+
+/// Sorts and merges `[from, to)` ranges that overlap or lie within `gap` bytes
+/// of each other, dropping empty ranges.
+fn coalesce_ranges(ranges: &mut Vec<(usize, usize)>, gap: usize) {
+    ranges.retain(|&(from, to)| from < to);
+    if ranges.len() <= 1 {
+        return;
+    }
+    ranges.sort_unstable_by_key(|&(from, _)| from);
+    let mut out = 0;
+    for i in 1..ranges.len() {
+        let (from, to) = ranges[i];
+        if from <= ranges[out].1.saturating_add(gap) {
+            ranges[out].1 = ranges[out].1.max(to);
+        } else {
+            out += 1;
+            ranges[out] = (from, to);
+        }
+    }
+    ranges.truncate(out + 1);
+}
+
+/// A submission's refreshes not done yet, coalesced per buffer copy into
+/// non-overlapping spans: done before a step that writes title memory or
 /// gives a range to shaders, and before the lists run.
 ///
 /// Also the textures brought up to date in the submission so far: most
@@ -1239,21 +1266,24 @@ impl HostList {
 /// once, it is checked again only after a step that writes title memory.
 #[derive(Default)]
 struct Batch {
-    refreshes: Vec<(std::sync::Arc<crate::shadow::Shadow>, usize, usize)>,
+    refreshes: Vec<(std::sync::Arc<crate::shadow::Shadow>, Vec<(usize, usize)>)>,
     /// Staging buffers (by address) refreshed since the last title write.
     textures: std::collections::HashSet<usize>,
 }
 
 impl Batch {
     fn add(&mut self, shadow: &std::sync::Arc<crate::shadow::Shadow>, address: usize, len: usize) {
-        let end = address + len;
+        if len == 0 {
+            return;
+        }
+        let end = address.saturating_add(len);
         match self
             .refreshes
             .iter_mut()
-            .find(|(s, ..)| std::sync::Arc::ptr_eq(s, shadow))
+            .find(|(s, _)| std::sync::Arc::ptr_eq(s, shadow))
         {
-            Some((_, from, to)) => (*from, *to) = ((*from).min(address), (*to).max(end)),
-            None => self.refreshes.push((shadow.clone(), address, end)),
+            Some((_, ranges)) => ranges.push((address, end)),
+            None => self.refreshes.push((shadow.clone(), vec![(address, end)])),
         }
     }
 
@@ -1271,14 +1301,17 @@ impl Batch {
     }
 
     fn flush(&mut self) {
-        for (shadow, from, to) in self.refreshes.drain(..) {
-            let started = std::time::Instant::now();
-            let copied = shadow.update(from, to - from);
-            let us = started.elapsed().as_micros() as u64;
-            #[cfg(feature = "diagnostics")]
-            crate::copystat::range(from, to - from, us, 0);
-            PREPARING[0].fetch_add(us, Ordering::Relaxed);
-            PREPARING[1].fetch_add(copied as u64, Ordering::Relaxed);
+        for (shadow, mut ranges) in self.refreshes.drain(..) {
+            coalesce_ranges(&mut ranges, COALESCE_GAP);
+            for (from, to) in ranges {
+                let started = std::time::Instant::now();
+                let copied = shadow.update(from, to - from);
+                let us = started.elapsed().as_micros() as u64;
+                #[cfg(feature = "diagnostics")]
+                crate::copystat::range(from, to - from, us, 0);
+                PREPARING[0].fetch_add(us, Ordering::Relaxed);
+                PREPARING[1].fetch_add(copied as u64, Ordering::Relaxed);
+            }
         }
     }
 }
@@ -2012,6 +2045,33 @@ mod batch {   // Batch::texture_due lives here; `mod tests` is already taken at 
         // A fresh submission starts over.
         let mut next = Batch::default();
         assert!(next.texture_due(&a));
+    }
+
+    #[test]
+    fn coalesce_ranges_merges_nearby_but_keeps_distant_ranges_separate() {
+        // Two 4 KiB buffers at opposite ends of a 174 MiB heap must stay two
+        // tiny refreshes instead of spanning the 174 MiB between them.
+        let mut distant = vec![(0x0AD0_0000, 0x0AD0_1000), (0x1000, 0x2000)];
+        coalesce_ranges(&mut distant, COALESCE_GAP);
+        assert_eq!(distant, vec![(0x1000, 0x2000), (0x0AD0_0000, 0x0AD0_1000)]);
+
+        // Overlapping, adjacent, and within-COALESCE_GAP ranges merge cleanly;
+        // empty ranges are dropped.
+        let mut mixed = vec![
+            (0x20000, 0x20000),
+            (0x10000, 0x11000),
+            (0x12000, 0x13000),
+            (0x10800, 0x11800),
+            (0x500000, 0x500100),
+            (0x500100, 0x500200),
+        ];
+        coalesce_ranges(&mut mixed, COALESCE_GAP);
+        assert_eq!(mixed, vec![(0x10000, 0x13000), (0x500000, 0x500200)]);
+
+        // Saturation near usize::MAX does not overflow.
+        let mut high = vec![(usize::MAX - 16, usize::MAX), (usize::MAX - 32, usize::MAX - 16)];
+        coalesce_ranges(&mut high, COALESCE_GAP);
+        assert_eq!(high, vec![(usize::MAX - 32, usize::MAX)]);
     }
 
     /// The hashing a submission does for textures in physical-page memory,
