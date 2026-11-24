@@ -79,6 +79,12 @@ pub(crate) struct State {
     dynamic: Vec<(usize, u32, u32)>,
     /// A fresh table of the stage being bound could not be made.
     table_failed: bool,
+    /// `(host_heap_ptr, generation, forgotten_epoch)` last refreshed for
+    /// bindless heap reads in this list.
+    heap_refreshed: Option<(usize, u64, u64)>,
+    /// Non-title-written SRV resources in the bound view heap that may be
+    /// transitioned between draws and need `SHADER_RESOURCE` checks.
+    mutable_heap_srvs: Vec<usize>,
 }
 
 impl Drop for State {
@@ -456,8 +462,20 @@ impl State {
             list.keep(&p.pso);
             list.keep(&p.root);
         }
+        let uses_heap = p.stages.iter().any(|s| {
+            s.translated()
+                .used
+                .iter()
+                .any(|u| u.root == RootType::ResourceHeap)
+        });
+        if uses_heap {
+            self.refresh_heap(list, compute);
+        }
         for stage in &p.stages {
             let t = stage.translated();
+            for u in t.used.iter().filter(|u| u.root == RootType::ResourceHeap) {
+                self.heap_entry(list, u);
+            }
             self.table_failed = false;
             let made = self.tables(list, &t.used, compute);
             if self.table_failed {
@@ -631,6 +649,76 @@ impl State {
         };
         if let Some(view) = host.mirror(index, handle, true) {
             readable(list, u, &view);
+        }
+    }
+
+    fn heap_entry(&self, list: &HostList, u: &UsedResource) {
+        if self.heaps[0] == 0 {
+            return;
+        }
+        let heap = crate::descriptor::heap(self.heaps[0] as This);
+        let handle = heap.start + u64::from(u.table_offset_dwords) * 4;
+        let (Some(host), Some(index)) = (heap.host(), heap.index(handle)) else {
+            return;
+        };
+        if let Some(view) = host.mirror(index, handle, true) {
+            readable(list, u, &view);
+        }
+    }
+
+    /// Brings resources in the bound view heap up to date for bindless
+    /// (`ResourceDescriptorHeap[]`) reads. Runs the full sweep once per
+    /// heap generation per list, and keeps mutable SRVs in `SHADER_RESOURCE`.
+    fn refresh_heap(&mut self, list: &HostList, compute: bool) {
+        if self.heaps[0] == 0 {
+            return;
+        }
+        let heap = crate::descriptor::heap(self.heaps[0] as This);
+        let Some(host) = heap.host() else {
+            return;
+        };
+        let host_ptr = host.heap.as_raw() as usize;
+        let generation = host.generation();
+        let forgotten = crate::descriptor::forgotten_epoch();
+        if self.heap_refreshed != Some((host_ptr, generation, forgotten)) {
+            self.mutable_heap_srvs.clear();
+            for index in host.live_slots() {
+                let handle = heap.start + u64::from(index) * 32;
+                let Some(view) = host.mirror(index, handle, true) else {
+                    continue;
+                };
+                let placed = crate::descriptor::host::placed_texture(&view);
+                let v = placed.as_ref().unwrap_or(&view);
+                if !matches!(v, View::Shader(..) | View::Unordered(..)) {
+                    continue;
+                }
+                if let Some((address, len)) = crate::descriptor::host::buffer_range(v)
+                    && len > 0
+                    && let Some(shadow) = crate::shadow::find(address, len)
+                {
+                    shadow.refresh(list, address, len);
+                }
+                if let View::Shader(resource, _) = v
+                    && let Some(t) = crate::resource::host_resource(*resource as This)
+                {
+                    if crate::texture::title_written(t) {
+                        const SHADER_RESOURCE: u32 = 0x40 | 0x80;
+                        crate::texture::upload(list, *resource as This, t);
+                        crate::list::ensure_state(list, *resource as This, SHADER_RESOURCE);
+                    } else {
+                        self.mutable_heap_srvs.push(*resource);
+                    }
+                }
+            }
+            self.mutable_heap_srvs.sort_unstable();
+            self.mutable_heap_srvs.dedup();
+            self.heap_refreshed = Some((host_ptr, host.generation(), forgotten));
+        }
+        const SHADER_RESOURCE: u32 = 0x40 | 0x80;
+        for &resource in &self.mutable_heap_srvs {
+            if compute || (!self.targets.contains(&resource) && self.depth != resource) {
+                crate::list::ensure_state(list, resource as This, SHADER_RESOURCE);
+            }
         }
     }
 
