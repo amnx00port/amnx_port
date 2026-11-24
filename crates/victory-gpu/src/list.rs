@@ -507,8 +507,7 @@ extern "system" fn copy_texture_region(
             return;
         };
         let Some(to) = crate::resource::host_resource(dst.resource) else {
-            static ONCE: std::sync::Once = std::sync::Once::new();
-            ONCE.call_once(|| tracing::warn!("texture to buffer copies not implemented"));
+            read_back_texture(&list, dst, (x, y, z), src, source_box);
             return;
         };
         let mut from = src;
@@ -590,6 +589,70 @@ extern "system" fn copy_texture_region(
     }
     #[cfg(not(windows))]
     let _ = (this, dst, x, y, z, src, source_box);
+}
+
+/// Texture to buffer (read back): the texture is copied on the GPU into a
+/// read-back buffer of the list's, and from there into the title's buffer
+/// once the list has run.
+#[cfg(windows)]
+fn read_back_texture(
+    list: &crate::host::HostList,
+    dst: CopyLocation,
+    at: (u32, u32, u32),
+    src: CopyLocation,
+    source_box: *const [u32; 6],
+) {
+    use windows::Win32::Graphics::Direct3D12::D3D12_BOX;
+    use windows::core::Interface;
+    const FOOTPRINT: u32 = 1;
+    static UNSUPPORTED: std::sync::Once = std::sync::Once::new();
+    let (true, false) = (dst.kind == FOOTPRINT, src.kind == FOOTPRINT) else {
+        UNSUPPORTED.call_once(|| {
+            tracing::warn!(dst = dst.kind, src = src.kind, "copy to a buffer that is no texture read-back")
+        });
+        return;
+    };
+    let (Some(host), Some(bytes), Some(texture)) = (
+        crate::host::host(),
+        dst.footprint.bytes(),
+        crate::resource::host_resource(src.resource),
+    ) else {
+        UNSUPPORTED.call_once(|| tracing::warn!("texture read-back without a host texture or a known format"));
+        return;
+    };
+    let Some(target) = buffer_range(dst.resource, dst.footprint.offset, bytes) else {
+        return;
+    };
+    let Some(buffer) = list.read_back(host, bytes, target) else {
+        return;
+    };
+    static FIRST: std::sync::Once = std::sync::Once::new();
+    FIRST.call_once(|| tracing::info!(bytes, footprint = ?dst.footprint, "first texture read-back"));
+    if crate::texture::title_written(texture) {
+        crate::texture::upload(list, src.resource, texture);
+    }
+    ensure_state(list, src.resource, COPY_SOURCE);
+    let mut to = dst;
+    to.resource = buffer.as_raw().cast_const().cast();
+    to.footprint.offset = 0;
+    let mut from = src;
+    from.resource = texture.as_raw().cast_const().cast();
+    let host_box = (!source_box.is_null()).then(|| source_box.cast::<D3D12_BOX>());
+    #[cfg(feature = "diagnostics")]
+    list.note_op(|| format!("read back {:?} into {:?} {:?}", src.resource, dst.resource, dst.footprint));
+    // SAFETY: an open list; both locations in the host's layout, naming a
+    // live texture and the read-back buffer the list keeps; the box is the
+    // title's (same layout).
+    unsafe {
+        list.list.CopyTextureRegion(
+            (&raw const to).cast(),
+            at.0,
+            at.1,
+            at.2,
+            (&raw const from).cast(),
+            host_box,
+        )
+    };
 }
 
 #[allow(clippy::too_many_arguments)] // the method's own arguments
