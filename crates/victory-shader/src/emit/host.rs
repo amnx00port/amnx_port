@@ -78,6 +78,13 @@ impl Host {
                 D3D12CreateDevice(None, D3D_FEATURE_LEVEL_12_0, &mut device).map_err(err)?;
             }
             let device = device.ok_or("no device")?;
+            Self::check_sm66(device)
+        }
+    }
+
+    fn check_sm66(device: ID3D12Device) -> Result<Self, String> {
+        // SAFETY: `sm` is a valid feature-query struct for `device`.
+        unsafe {
             let mut sm = D3D12_FEATURE_DATA_SHADER_MODEL {
                 HighestShaderModel: D3D_SHADER_MODEL_6_6,
             };
@@ -95,6 +102,79 @@ impl Host {
                 ));
             }
             Ok(Host { device })
+        }
+    }
+
+    /// Every SM 6.6 hardware adapter and WARP, with its name.
+    #[cfg(test)]
+    pub fn adapters() -> Vec<(String, Self)> {
+        let mut out = Vec::new();
+        if std::env::var("VICTORY_WARP").is_ok_and(|v| v == "1") {
+            if let Ok(h) = Self::new(true) {
+                out.push(("WARP".into(), h));
+            }
+            return out;
+        }
+        // SAFETY: plain DXGI/D3D12 enumeration with valid out pointers.
+        unsafe {
+            let Ok(factory) = CreateDXGIFactory2::<IDXGIFactory4>(DXGI_CREATE_FACTORY_FLAGS(0))
+            else {
+                return out;
+            };
+            let mut i = 0;
+            while let Ok(adapter) = factory.EnumAdapters1(i) {
+                i += 1;
+                let Ok(desc) = adapter.GetDesc1() else {
+                    continue;
+                };
+                if desc.Flags & DXGI_ADAPTER_FLAG_SOFTWARE.0 as u32 != 0 {
+                    continue;
+                }
+                let len = desc
+                    .Description
+                    .iter()
+                    .position(|&c| c == 0)
+                    .unwrap_or(desc.Description.len());
+                let name = String::from_utf16_lossy(&desc.Description[..len]);
+                let mut device: Option<ID3D12Device> = None;
+                if D3D12CreateDevice(&adapter, D3D_FEATURE_LEVEL_12_0, &mut device).is_ok()
+                    && let Some(dev) = device
+                    && let Ok(host) = Self::check_sm66(dev)
+                {
+                    out.push((name, host));
+                }
+            }
+            if let Ok(warp_adapter) = factory.EnumWarpAdapter::<IDXGIAdapter>() {
+                let mut device: Option<ID3D12Device> = None;
+                if D3D12CreateDevice(&warp_adapter, D3D_FEATURE_LEVEL_12_0, &mut device).is_ok()
+                    && let Some(dev) = device
+                    && let Ok(host) = Self::check_sm66(dev)
+                {
+                    out.push(("WARP".into(), host));
+                }
+            }
+        }
+        out
+    }
+
+    /// Whether the device supports `SV_RenderTargetArrayIndex` and
+    /// `SV_ViewportArrayIndex` from vertex/domain/hull shaders without GS
+    /// emulation (`D3D12_OPTIONS`).
+    #[cfg(test)]
+    pub fn supports_vp_rt_array_index(&self) -> bool {
+        // SAFETY: plain D3D12 feature query with a valid struct.
+        unsafe {
+            let mut opt = D3D12_FEATURE_DATA_D3D12_OPTIONS::default();
+            self.device
+                .CheckFeatureSupport(
+                    D3D12_FEATURE_D3D12_OPTIONS,
+                    (&raw mut opt).cast(),
+                    size_of_val(&opt) as u32,
+                )
+                .is_ok()
+                && opt
+                    .VPAndRTArrayIndexFromAnyShaderFeedingRasterizerSupportedWithoutGSEmulation
+                    .as_bool()
         }
     }
 
@@ -573,6 +653,25 @@ impl Host {
         pso: &ID3D12PipelineState,
         d: &Draw,
     ) -> Result<Vec<[f32; 4]>, String> {
+        let vp = D3D12_VIEWPORT {
+            Width: d.size.0 as f32,
+            Height: d.size.1 as f32,
+            MaxDepth: 1.0,
+            ..Default::default()
+        };
+        Ok(self.draw_layered(root, pso, d, 1, &[vp])?.remove(0))
+    }
+
+    /// Draws one triangle into an RGBA32F `Texture2DArray` of `layers` slices
+    /// with `viewports` and returns the texels of each slice.
+    pub fn draw_layered(
+        &self,
+        root: &ID3D12RootSignature,
+        pso: &ID3D12PipelineState,
+        d: &Draw,
+        layers: u16,
+        viewports: &[D3D12_VIEWPORT],
+    ) -> Result<Vec<Vec<[f32; 4]>>, String> {
         let dev = &self.device;
         let (w, h) = d.size;
         // SAFETY: D3D12 calls with descriptions that outlive them; resources
@@ -590,11 +689,11 @@ impl Host {
             let list: ID3D12GraphicsCommandList = dev
                 .CreateCommandList(0, D3D12_COMMAND_LIST_TYPE_DIRECT, &alloc, pso)
                 .map_err(err)?;
-            let tex_desc = |w: u32, h: u32, flags| D3D12_RESOURCE_DESC {
+            let tex_desc = |w: u32, h: u32, slices: u16, flags| D3D12_RESOURCE_DESC {
                 Dimension: D3D12_RESOURCE_DIMENSION_TEXTURE2D,
                 Width: u64::from(w),
                 Height: h,
-                DepthOrArraySize: 1,
+                DepthOrArraySize: slices,
                 MipLevels: 1,
                 Format: DXGI_FORMAT_R32G32B32A32_FLOAT,
                 SampleDesc: DXGI_SAMPLE_DESC {
@@ -639,7 +738,7 @@ impl Host {
             };
             let target = make(
                 D3D12_HEAP_TYPE_DEFAULT,
-                &tex_desc(w, h, D3D12_RESOURCE_FLAG_ALLOW_RENDER_TARGET),
+                &tex_desc(w, h, layers, D3D12_RESOURCE_FLAG_ALLOW_RENDER_TARGET),
                 D3D12_RESOURCE_STATE_RENDER_TARGET,
                 Some(&D3D12_CLEAR_VALUE {
                     Format: DXGI_FORMAT_R32G32B32A32_FLOAT,
@@ -654,7 +753,23 @@ impl Host {
                 })
                 .map_err(err)?;
             let rtv = rtv_heap.GetCPUDescriptorHandleForHeapStart();
-            dev.CreateRenderTargetView(&target, None, rtv);
+            if layers > 1 {
+                let desc = D3D12_RENDER_TARGET_VIEW_DESC {
+                    Format: DXGI_FORMAT_R32G32B32A32_FLOAT,
+                    ViewDimension: D3D12_RTV_DIMENSION_TEXTURE2DARRAY,
+                    Anonymous: D3D12_RENDER_TARGET_VIEW_DESC_0 {
+                        Texture2DArray: D3D12_TEX2D_ARRAY_RTV {
+                            MipSlice: 0,
+                            FirstArraySlice: 0,
+                            ArraySize: u32::from(layers),
+                            PlaneSlice: 0,
+                        },
+                    },
+                };
+                dev.CreateRenderTargetView(&target, Some(&desc), rtv);
+            } else {
+                dev.CreateRenderTargetView(&target, None, rtv);
+            }
             let views: ID3D12DescriptorHeap = dev
                 .CreateDescriptorHeap(&D3D12_DESCRIPTOR_HEAP_DESC {
                     Type: D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV,
@@ -680,7 +795,7 @@ impl Host {
             for (i, &(tw, th, texels)) in d.textures.iter().enumerate() {
                 let tex = make(
                     D3D12_HEAP_TYPE_DEFAULT,
-                    &tex_desc(tw, th, D3D12_RESOURCE_FLAG_NONE),
+                    &tex_desc(tw, th, 1, D3D12_RESOURCE_FLAG_NONE),
                     D3D12_RESOURCE_STATE_COPY_DEST,
                     None,
                 )?;
@@ -787,17 +902,16 @@ impl Host {
                 }
             }
             list.OMSetRenderTargets(1, Some(&rtv), false, None);
-            list.RSSetViewports(&[D3D12_VIEWPORT {
-                Width: w as f32,
-                Height: h as f32,
-                MaxDepth: 1.0,
-                ..Default::default()
-            }]);
-            list.RSSetScissorRects(&[windows::Win32::Foundation::RECT {
-                right: w as i32,
-                bottom: h as i32,
-                ..Default::default()
-            }]);
+            let scissors = vec![
+                windows::Win32::Foundation::RECT {
+                    right: w as i32,
+                    bottom: h as i32,
+                    ..Default::default()
+                };
+                viewports.len()
+            ];
+            list.RSSetViewports(viewports);
+            list.RSSetScissorRects(&scissors);
             list.IASetPrimitiveTopology(D3D_PRIMITIVE_TOPOLOGY_TRIANGLELIST);
             if let Some(vb) = &vb {
                 list.IASetVertexBuffers(
@@ -821,36 +935,39 @@ impl Host {
                 D3D12_RESOURCE_STATE_COPY_SOURCE,
             )]);
             let pitch = (w as usize * 16).next_multiple_of(256);
+            let slice_bytes = (pitch * h as usize).next_multiple_of(512);
             let readback = make(
                 D3D12_HEAP_TYPE_READBACK,
-                &buf_desc((pitch * h as usize) as u64),
+                &buf_desc((slice_bytes * usize::from(layers)) as u64),
                 D3D12_RESOURCE_STATE_COPY_DEST,
                 None,
             )?;
-            let dst = D3D12_TEXTURE_COPY_LOCATION {
-                pResource: std::mem::transmute_copy(&readback),
-                Type: D3D12_TEXTURE_COPY_TYPE_PLACED_FOOTPRINT,
-                Anonymous: D3D12_TEXTURE_COPY_LOCATION_0 {
-                    PlacedFootprint: D3D12_PLACED_SUBRESOURCE_FOOTPRINT {
-                        Offset: 0,
-                        Footprint: D3D12_SUBRESOURCE_FOOTPRINT {
-                            Format: DXGI_FORMAT_R32G32B32A32_FLOAT,
-                            Width: w,
-                            Height: h,
-                            Depth: 1,
-                            RowPitch: pitch as u32,
+            for slice in 0..u32::from(layers) {
+                let dst = D3D12_TEXTURE_COPY_LOCATION {
+                    pResource: std::mem::transmute_copy(&readback),
+                    Type: D3D12_TEXTURE_COPY_TYPE_PLACED_FOOTPRINT,
+                    Anonymous: D3D12_TEXTURE_COPY_LOCATION_0 {
+                        PlacedFootprint: D3D12_PLACED_SUBRESOURCE_FOOTPRINT {
+                            Offset: u64::from(slice) * slice_bytes as u64,
+                            Footprint: D3D12_SUBRESOURCE_FOOTPRINT {
+                                Format: DXGI_FORMAT_R32G32B32A32_FLOAT,
+                                Width: w,
+                                Height: h,
+                                Depth: 1,
+                                RowPitch: pitch as u32,
+                            },
                         },
                     },
-                },
-            };
-            let src = D3D12_TEXTURE_COPY_LOCATION {
-                pResource: std::mem::transmute_copy(&target),
-                Type: D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX,
-                Anonymous: D3D12_TEXTURE_COPY_LOCATION_0 {
-                    SubresourceIndex: 0,
-                },
-            };
-            list.CopyTextureRegion(&dst, 0, 0, 0, &src, None);
+                };
+                let src = D3D12_TEXTURE_COPY_LOCATION {
+                    pResource: std::mem::transmute_copy(&target),
+                    Type: D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX,
+                    Anonymous: D3D12_TEXTURE_COPY_LOCATION_0 {
+                        SubresourceIndex: slice,
+                    },
+                };
+                list.CopyTextureRegion(&dst, 0, 0, 0, &src, None);
+            }
             list.Close().map_err(err)?;
             queue.ExecuteCommandLists(&[Some(list.cast().map_err(err)?)]);
             let fence: ID3D12Fence = dev.CreateFence(0, D3D12_FENCE_FLAG_NONE).map_err(err)?;
@@ -869,17 +986,23 @@ impl Host {
             }
             let mut p = std::ptr::null_mut();
             readback.Map(0, None, Some(&mut p)).map_err(err)?;
-            let mut out = Vec::with_capacity((w * h) as usize);
-            for y in 0..h as usize {
-                let row = std::slice::from_raw_parts(
-                    p.cast::<u8>().add(y * pitch).cast::<[f32; 4]>(),
-                    w as usize,
-                );
-                out.extend_from_slice(row);
+            let mut slices = Vec::with_capacity(usize::from(layers));
+            for slice in 0..usize::from(layers) {
+                let mut out = Vec::with_capacity((w * h) as usize);
+                for y in 0..h as usize {
+                    let row = std::slice::from_raw_parts(
+                        p.cast::<u8>()
+                            .add(slice * slice_bytes + y * pitch)
+                            .cast::<[f32; 4]>(),
+                        w as usize,
+                    );
+                    out.extend_from_slice(row);
+                }
+                slices.push(out);
             }
             readback.Unmap(0, None);
             drop(keep);
-            Ok(out)
+            Ok(slices)
         }
     }
 }

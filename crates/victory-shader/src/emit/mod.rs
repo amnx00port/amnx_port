@@ -238,9 +238,10 @@ pub fn emit(
     for e in interpolated {
         e.interp = match (e.kind, e.comp) {
             (3, _) => 4,
-            // Constant, as DXC declares it (the AMD compiler crashed on a
-            // front face without a mode).
-            (13, _) => 1,
+            // Constant, as DXC declares it (front face, render-target and
+            // viewport indices; the AMD compiler crashed on a front face
+            // without a mode).
+            (4 | 5 | 13, _) => 1,
             (0 | 6 | 7, 9) => 2,
             (0, _) => 1,
             _ => 0,
