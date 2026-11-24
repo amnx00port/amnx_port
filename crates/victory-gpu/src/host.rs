@@ -276,6 +276,365 @@ mod tests {
             desc.Flags & DXGI_ADAPTER_FLAG_SOFTWARE.0 as u32 != 0,
         );
     }
+
+    #[test]
+    fn buffer_states_transition_between_writes_and_reads() {
+        let mut s = BufferStates::default();
+        // First uses: the prelude's.
+        assert_eq!(s.update(1, 'a', BUFFER_WRITE), None);
+        assert_eq!(s.update(2, 'b', BUFFER_READ), None);
+        assert_eq!(s.update(1, 'a', BUFFER_WRITE), None);
+        s.next_command();
+        assert_eq!(s.update(1, 'a', BUFFER_READ), Some(BUFFER_WRITE));
+        assert_eq!(s.update(1, 'a', BUFFER_READ), None);
+        s.next_command();
+        assert_eq!(s.update(1, 'a', BUFFER_WRITE), Some(BUFFER_READ));
+        let sorted = |mut v: Vec<(char, u32)>| {
+            v.sort_unstable();
+            v
+        };
+        let firsts = sorted(s.firsts().map(|(r, f)| (*r, f)).collect());
+        assert_eq!(firsts, [('a', BUFFER_WRITE), ('b', BUFFER_READ)]);
+        let lasts = sorted(s.lasts().map(|(r, l)| (*r, l)).collect());
+        assert_eq!(lasts, [('a', BUFFER_WRITE), ('b', BUFFER_READ)]);
+        s.clear();
+        assert_eq!(s.firsts().count(), 0);
+    }
+
+    /// One command that writes a copy and reads it (#334 review): the write
+    /// state wins whichever is bound first; the next command reads again.
+    #[test]
+    fn buffer_states_keep_a_command_writing() {
+        let mut s = BufferStates::default();
+        s.next_command();
+        assert_eq!(s.update(1, 'a', BUFFER_WRITE), None);
+        assert_eq!(s.update(1, 'a', BUFFER_READ), None);
+        s.next_command();
+        assert_eq!(s.update(1, 'a', BUFFER_READ), Some(BUFFER_WRITE));
+        assert_eq!(s.update(1, 'a', BUFFER_WRITE), Some(BUFFER_READ));
+        assert_eq!(s.update(1, 'a', BUFFER_READ), None);
+        s.next_command();
+        assert_eq!(s.update(1, 'a', BUFFER_READ), Some(BUFFER_WRITE));
+        let lasts: Vec<_> = s.lasts().map(|(r, l)| (*r, l)).collect();
+        assert_eq!(lasts, [('a', BUFFER_READ)]);
+    }
+
+    /// Set in the child process `in_child` starts.
+    const CHILD: &str = "VICTORY_TEST_DEBUG_LAYER_CHILD";
+
+    /// Runs the test `name` of this module alone in a child process and
+    /// checks that it passed; false in that child. The debug layer is
+    /// process-wide and must be on before the host device is made.
+    fn in_child(name: &str) -> bool {
+        if std::env::var_os(CHILD).is_some() {
+            return false;
+        }
+        let out = std::process::Command::new(std::env::current_exe().unwrap())
+            .args([&format!("host::tests::{name}"), "--exact", "--nocapture"])
+            .env(CHILD, "1")
+            // The host's own message queue would empty the test's (`execute`).
+            .env_remove("VICTORY_D3D12_DEBUG")
+            .output()
+            .unwrap();
+        let text = format!(
+            "{}{}",
+            String::from_utf8_lossy(&out.stdout),
+            String::from_utf8_lossy(&out.stderr)
+        );
+        eprintln!("{text}");
+        assert!(out.status.success(), "the child test failed");
+        assert!(text.contains("1 passed"), "the child ran no test");
+        true
+    }
+
+    fn compile(source: &str, entry: windows::core::PCSTR, target: windows::core::PCSTR) -> Vec<u8> {
+        use windows::Win32::Graphics::Direct3D::Fxc::D3DCompile;
+        use windows::Win32::Graphics::Direct3D::ID3DBlob;
+        let (mut code, mut errors): (Option<ID3DBlob>, Option<ID3DBlob>) = (None, None);
+        // SAFETY: the source and names live through the call; out pointers
+        // ours; the blobs' own bytes are read.
+        unsafe {
+            let made = D3DCompile(
+                source.as_ptr().cast(),
+                source.len(),
+                None,
+                None,
+                None,
+                entry,
+                target,
+                0,
+                0,
+                &mut code,
+                Some(&mut errors),
+            );
+            if let Some(e) = &errors {
+                let text = std::slice::from_raw_parts(
+                    e.GetBufferPointer().cast::<u8>(),
+                    e.GetBufferSize(),
+                );
+                assert!(made.is_ok(), "{}", String::from_utf8_lossy(text));
+            }
+            made.unwrap();
+            let code = code.unwrap();
+            std::slice::from_raw_parts(code.GetBufferPointer().cast::<u8>(), code.GetBufferSize())
+                .to_vec()
+        }
+    }
+
+    /// A buffer a shader writes and draws read as vertices, as the world's
+    /// 174 MB heap is (#199, #264): the argument clamp writes it and
+    /// indirect and plain draws read it, in two lists submitted together.
+    /// The debug layer checks every barrier's state before against what
+    /// the lists did (id 527, which #264 reported); it does not check
+    /// vertex buffer states at draws on every system, so this cannot show
+    /// #199's vertex buffer in unordered access.
+    #[test]
+    fn debug_layer_accepts_buffers_written_then_read_as_vertices() {
+        use windows::core::s;
+        if in_child("debug_layer_accepts_buffers_written_then_read_as_vertices") {
+            return;
+        }
+        let mut layer: Option<ID3D12Debug> = None;
+        // SAFETY: plain queries, before any device exists in this process.
+        if unsafe { D3D12GetDebugInterface(&mut layer) }.is_err() {
+            eprintln!("no D3D12 debug layer; skipped");
+            return;
+        }
+        // SAFETY: as above.
+        unsafe { layer.unwrap().EnableDebugLayer() };
+        let Some(host) = host() else {
+            eprintln!("no host device; skipped");
+            return;
+        };
+        let messages: ID3D12InfoQueue = host.device.cast().unwrap();
+
+        const SOURCE: &str = r#"
+            #define RS "RootFlags(ALLOW_INPUT_ASSEMBLER_INPUT_LAYOUT)"
+            [RootSignature(RS)] float4 vs(float4 p : POSITION) : SV_Position { return p; }
+            [RootSignature(RS)] float4 ps() : SV_Target { return float4(1, 0, 0, 1); }
+        "#;
+        let (vs, ps) = (
+            compile(SOURCE, s!("vs"), s!("vs_5_1")),
+            compile(SOURCE, s!("ps"), s!("ps_5_1")),
+        );
+        let element = D3D12_INPUT_ELEMENT_DESC {
+            SemanticName: s!("POSITION"),
+            Format: DXGI_FORMAT_R32G32B32A32_FLOAT,
+            InputSlotClass: D3D12_INPUT_CLASSIFICATION_PER_VERTEX_DATA,
+            ..Default::default()
+        };
+        let mut blend = D3D12_BLEND_DESC::default();
+        blend.RenderTarget[0] = D3D12_RENDER_TARGET_BLEND_DESC {
+            SrcBlend: D3D12_BLEND_ONE,
+            DestBlend: D3D12_BLEND_ZERO,
+            BlendOp: D3D12_BLEND_OP_ADD,
+            SrcBlendAlpha: D3D12_BLEND_ONE,
+            DestBlendAlpha: D3D12_BLEND_ZERO,
+            BlendOpAlpha: D3D12_BLEND_OP_ADD,
+            LogicOp: D3D12_LOGIC_OP_NOOP,
+            RenderTargetWriteMask: D3D12_COLOR_WRITE_ENABLE_ALL.0 as u8,
+            ..Default::default()
+        };
+        let stencil = D3D12_DEPTH_STENCILOP_DESC {
+            StencilFailOp: D3D12_STENCIL_OP_KEEP,
+            StencilDepthFailOp: D3D12_STENCIL_OP_KEEP,
+            StencilPassOp: D3D12_STENCIL_OP_KEEP,
+            StencilFunc: D3D12_COMPARISON_FUNC_ALWAYS,
+        };
+        // SAFETY: plain object creation from valid descriptions; the
+        // shader bytes outlive the calls.
+        let (root, pso, target) = unsafe {
+            let root: ID3D12RootSignature = host.device.CreateRootSignature(0, &vs).unwrap();
+            let mut desc = D3D12_GRAPHICS_PIPELINE_STATE_DESC {
+                pRootSignature: std::mem::transmute_copy(&root),
+                VS: D3D12_SHADER_BYTECODE {
+                    pShaderBytecode: vs.as_ptr().cast(),
+                    BytecodeLength: vs.len(),
+                },
+                PS: D3D12_SHADER_BYTECODE {
+                    pShaderBytecode: ps.as_ptr().cast(),
+                    BytecodeLength: ps.len(),
+                },
+                BlendState: blend,
+                SampleMask: u32::MAX,
+                RasterizerState: D3D12_RASTERIZER_DESC {
+                    FillMode: D3D12_FILL_MODE_SOLID,
+                    CullMode: D3D12_CULL_MODE_NONE,
+                    DepthClipEnable: true.into(),
+                    ..Default::default()
+                },
+                DepthStencilState: D3D12_DEPTH_STENCIL_DESC {
+                    DepthWriteMask: D3D12_DEPTH_WRITE_MASK_ZERO,
+                    DepthFunc: D3D12_COMPARISON_FUNC_ALWAYS,
+                    FrontFace: stencil,
+                    BackFace: stencil,
+                    ..Default::default()
+                },
+                InputLayout: D3D12_INPUT_LAYOUT_DESC {
+                    pInputElementDescs: &element,
+                    NumElements: 1,
+                },
+                PrimitiveTopologyType: D3D12_PRIMITIVE_TOPOLOGY_TYPE_TRIANGLE,
+                NumRenderTargets: 1,
+                SampleDesc: DXGI_SAMPLE_DESC {
+                    Count: 1,
+                    Quality: 0,
+                },
+                ..Default::default()
+            };
+            desc.RTVFormats[0] = DXGI_FORMAT_R8G8B8A8_UNORM;
+            let pso: ID3D12PipelineState = host.device.CreateGraphicsPipelineState(&desc).unwrap();
+            let mut target: Option<ID3D12Resource> = None;
+            host.device
+                .CreateCommittedResource(
+                    &D3D12_HEAP_PROPERTIES {
+                        Type: D3D12_HEAP_TYPE_DEFAULT,
+                        ..Default::default()
+                    },
+                    D3D12_HEAP_FLAG_NONE,
+                    &D3D12_RESOURCE_DESC {
+                        Dimension: D3D12_RESOURCE_DIMENSION_TEXTURE2D,
+                        Width: 4,
+                        Height: 4,
+                        DepthOrArraySize: 1,
+                        MipLevels: 1,
+                        Format: DXGI_FORMAT_R8G8B8A8_UNORM,
+                        SampleDesc: DXGI_SAMPLE_DESC {
+                            Count: 1,
+                            Quality: 0,
+                        },
+                        Flags: D3D12_RESOURCE_FLAG_ALLOW_RENDER_TARGET,
+                        ..Default::default()
+                    },
+                    D3D12_RESOURCE_STATE_RENDER_TARGET,
+                    None,
+                    &mut target,
+                )
+                .unwrap();
+            (root, pso, target.unwrap())
+        };
+
+        // Three vertices at 0, a draw's arguments (3 vertices, 1 instance)
+        // at 256: one buffer, as title memory is.
+        let (buffer, data) = host.shared_buffer(1 << 16).unwrap();
+        let vertices: [f32; 12] = [
+            -1.0, -1.0, 0.0, 1.0, 0.0, 1.0, 0.0, 1.0, 1.0, -1.0, 0.0, 1.0,
+        ];
+        // SAFETY: inside the mapping.
+        unsafe {
+            std::ptr::copy_nonoverlapping(vertices.as_ptr().cast::<u8>(), data, 48);
+            std::ptr::copy_nonoverlapping([3u32, 1, 0, 0].as_ptr().cast::<u8>(), data.add(256), 16);
+        }
+        // SAFETY: a live buffer.
+        let gpu = unsafe { buffer.GetGPUVirtualAddress() };
+        let rtv = host.rtv(&target, None);
+        // SAFETY: one draw argument, no root arguments.
+        let signature: ID3D12CommandSignature = unsafe {
+            let argument = D3D12_INDIRECT_ARGUMENT_DESC {
+                Type: D3D12_INDIRECT_ARGUMENT_TYPE_DRAW,
+                ..Default::default()
+            };
+            let mut signature = None;
+            host.device
+                .CreateCommandSignature(
+                    &D3D12_COMMAND_SIGNATURE_DESC {
+                        ByteStride: 16,
+                        NumArgumentDescs: 1,
+                        pArgumentDescs: &argument,
+                        NodeMask: 0,
+                    },
+                    None::<&ID3D12RootSignature>,
+                    &mut signature,
+                )
+                .unwrap();
+            signature.unwrap()
+        };
+        // The draw state, with the buffer's vertices bound as `draw.rs`
+        // binds them.
+        let bind = |list: &HostList| {
+            list.begin_command();
+            list.buffer_state(&buffer, BUFFER_READ);
+            // SAFETY: an open list; our objects, alive until the lists ran.
+            unsafe {
+                let l = &list.list;
+                l.SetGraphicsRootSignature(&root);
+                l.SetPipelineState(&pso);
+                l.OMSetRenderTargets(1, Some(&rtv), false, None);
+                l.RSSetViewports(&[D3D12_VIEWPORT {
+                    Width: 4.0,
+                    Height: 4.0,
+                    MaxDepth: 1.0,
+                    ..Default::default()
+                }]);
+                l.RSSetScissorRects(&[RECT {
+                    right: 4,
+                    bottom: 4,
+                    ..Default::default()
+                }]);
+                l.IASetPrimitiveTopology(
+                    windows::Win32::Graphics::Direct3D::D3D_PRIMITIVE_TOPOLOGY_TRIANGLELIST,
+                );
+                l.IASetVertexBuffers(
+                    0,
+                    Some(&[D3D12_VERTEX_BUFFER_VIEW {
+                        BufferLocation: gpu,
+                        SizeInBytes: 48,
+                        StrideInBytes: 16,
+                    }]),
+                );
+            }
+        };
+        let draw = |list: &HostList| {
+            bind(list);
+            // SAFETY: an open list with the draw state set.
+            unsafe { list.list.DrawInstanced(3, 1, 0, 0) };
+        };
+        // As `draw.rs` executes indirect draws: clamp, bind, execute.
+        let indirect = |list: &HostList| {
+            assert!(crate::indirect::bound(list, &buffer, gpu + 256, (0, 16, 1)));
+            bind(list);
+            crate::indirect::execute(list, &signature, 1, (&buffer, 256), None);
+        };
+        // A list that draws, draws indirectly, draws; then one that starts
+        // with an indirect draw, submitted together.
+        let (a, b) = (host.new_list().unwrap(), host.new_list().unwrap());
+        draw(&a);
+        indirect(&a);
+        draw(&a);
+        a.close();
+        indirect(&b);
+        draw(&b);
+        b.close();
+        // SAFETY: plain queries.
+        unsafe { messages.ClearStoredMessages() };
+        host.execute(&[&a, &b]);
+
+        let mut errors = Vec::new();
+        // SAFETY: each message is read into a buffer of the size the queue
+        // reports.
+        unsafe {
+            for i in 0..messages.GetNumStoredMessages() {
+                let mut size = 0;
+                if messages.GetMessage(i, None, &mut size).is_err() || size == 0 {
+                    continue;
+                }
+                let mut bytes = vec![0u64; size.div_ceil(8)];
+                let m = bytes.as_mut_ptr().cast::<D3D12_MESSAGE>();
+                if messages.GetMessage(i, Some(m), &mut size).is_ok()
+                    && (*m).Severity.0 <= D3D12_MESSAGE_SEVERITY_ERROR.0
+                {
+                    let text =
+                        std::slice::from_raw_parts((*m).pDescription, (*m).DescriptionByteLength);
+                    errors.push(format!(
+                        "id {}: {}",
+                        (*m).ID.0,
+                        String::from_utf8_lossy(text)
+                    ));
+                }
+            }
+        }
+        assert!(errors.is_empty(), "debug layer errors: {errors:#?}");
+    }
 }
 
 /// A host command list and its allocator, always used together.
@@ -294,6 +653,8 @@ pub(crate) struct HostList {
     /// list names alive until it is reset, even if the title releases the
     /// resource first.
     states: Mutex<States>,
+    /// The states of the host copies of title memory the list uses.
+    buffers: Mutex<BufferStates<ID3D12Resource>>,
     /// The list that runs those transitions just before this one.
     prelude: (ID3D12CommandAllocator, ID3D12GraphicsCommandList),
     /// The pipelines the list binds, for reports of slow submissions.
@@ -323,6 +684,89 @@ type States = std::collections::HashMap<
     usize,
     (u32, u32, std::sync::Arc<crate::resource::HostTexture>),
 >;
+
+/// Every read of a host copy of title memory (vertex, index, constant and
+/// shader-resource data, indirect arguments).
+pub(crate) const BUFFER_READ: u32 = D3D12_RESOURCE_STATE_GENERIC_READ.0 as u32;
+/// Shader writes to a host copy of title memory.
+pub(crate) const BUFFER_WRITE: u32 = D3D12_RESOURCE_STATE_UNORDERED_ACCESS.0 as u32;
+
+/// The states of the host copies of title memory (buffers) one list uses,
+/// by copy: the state it starts in and the one it is in now. A buffer is in
+/// the common state between lists: the list's prelude moves it to its first
+/// state and the list moves it back before it closes. A buffer a shader
+/// writes and a later draw reads as vertices (#199, #264) is transitioned in
+/// between; the implicit promotion from common that it relied on allows
+/// either use in a list, not both.
+///
+/// Within one command (a draw, a dispatch, the argument clamp) the write
+/// state wins: a copy one command both writes and reads (one host copy
+/// backs most of the title's buffers) stays writable, whatever order the
+/// command's views are bound in.
+///
+/// shortcut: buffers read only through directly indexed heaps are not
+/// tracked, and a command that both writes a buffer and reads it as
+/// vertices, indices or arguments reads them in the write state.
+pub(crate) struct BufferStates<R> {
+    /// First state, current state, the command that last wrote it.
+    by_copy: std::collections::HashMap<usize, (u32, u32, Option<u64>, R)>,
+    command: u64,
+}
+
+impl<R> Default for BufferStates<R> {
+    fn default() -> Self {
+        BufferStates {
+            by_copy: std::collections::HashMap::new(),
+            command: 0,
+        }
+    }
+}
+
+impl<R> BufferStates<R> {
+    /// Uses from here on belong to the next command.
+    pub(crate) fn next_command(&mut self) {
+        self.command += 1;
+    }
+
+    /// The list uses `copy` (`resource`) in `wanted`: the state it leaves,
+    /// if a transition must be recorded now. A first use records nothing:
+    /// the prelude moves the buffer there.
+    pub(crate) fn update(&mut self, copy: usize, resource: R, wanted: u32) -> Option<u32> {
+        let command = self.command;
+        let wrote = (wanted == BUFFER_WRITE).then_some(command);
+        match self.by_copy.entry(copy) {
+            std::collections::hash_map::Entry::Vacant(v) => {
+                v.insert((wanted, wanted, wrote, resource));
+                None
+            }
+            std::collections::hash_map::Entry::Occupied(mut o) => {
+                let e = o.get_mut();
+                if wrote.is_some() {
+                    e.2 = wrote;
+                } else if e.2 == Some(command) {
+                    return None;
+                }
+                let before = std::mem::replace(&mut e.1, wanted);
+                (before != wanted).then_some(before)
+            }
+        }
+    }
+
+    /// The prelude's transitions: each buffer from common to its first state.
+    pub(crate) fn firsts(&self) -> impl Iterator<Item = (&R, u32)> {
+        self.by_copy.values().map(|(first, _, _, r)| (r, *first))
+    }
+
+    /// The list's closing transitions: each buffer from its last state back
+    /// to common.
+    pub(crate) fn lasts(&self) -> impl Iterator<Item = (&R, u32)> {
+        self.by_copy.values().map(|(_, last, _, r)| (r, *last))
+    }
+
+    pub(crate) fn clear(&mut self) {
+        self.by_copy.clear();
+    }
+}
 
 /// Whether device-removed data is on (`VICTORY_D3D12_DRED`, diagnostics
 /// builds).
@@ -360,6 +804,10 @@ struct Scratch {
     chunks: Vec<(ID3D12Resource, usize, u64)>,
     current: usize,
     used: u64,
+    /// Element-aligned copies of title bytes made for this list, by
+    /// (source, length, alignment): every draw reading the same view range
+    /// shares one copy instead of making its own.
+    copies: std::collections::HashMap<(u64, u64, u64), (ID3D12Resource, u64)>,
 }
 
 // SAFETY: the chunk pointers are persistent mappings of upload buffers.
@@ -478,6 +926,7 @@ impl Host {
                 deferred: Mutex::default(),
                 scratch: Mutex::default(),
                 states: Mutex::default(),
+                buffers: Mutex::default(),
                 prelude: (prelude_allocator, prelude),
                 pipelines: Mutex::default(),
                 budget: OnceLock::new(),
@@ -494,6 +943,21 @@ impl Host {
         // One submission at a time from preparation to copy-back: snapshots
         // and the ranges shaders write are per host copy, not per submission.
         let mut submitted = self.submitted.lock().unwrap_or_else(|e| e.into_inner());
+        self.submit(&mut submitted, runs);
+    }
+
+    /// Runs a title's submission: as [`execute`](Self::execute), but first,
+    /// under the same lock, starts a new watch submission and refreshes heap
+    /// slots the title wrote. Inside the lock, another queue's submission
+    /// can't refresh a heap while this one's GPU work still reads it.
+    pub(crate) fn execute_title(&self, runs: &[&HostList]) {
+        let mut submitted = self.submitted.lock().unwrap_or_else(|e| e.into_inner());
+        crate::watch::new_submission();
+        crate::descriptor::resync_title_writes();
+        self.submit(&mut submitted, runs);
+    }
+
+    fn submit(&self, submitted: &mut u64, runs: &[&HostList]) {
         let started = std::time::Instant::now();
         #[cfg(feature = "diagnostics")]
         crate::copystat::add(crate::copystat::C::Submissions, 1);
@@ -869,6 +1333,25 @@ impl HostList {
                 self.list.ResolveQueryData(heap, D3D12_QUERY_TYPE_TIMESTAMP, 0, count + 1, back, 0);
             }
         }
+        // The buffers it used back to common, where the next list's prelude
+        // expects them.
+        let back: Vec<D3D12_RESOURCE_BARRIER> = self
+            .buffers
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .lasts()
+            .map(|(b, last)| {
+                transition(
+                    b,
+                    D3D12_RESOURCE_STATES(last as i32),
+                    D3D12_RESOURCE_STATE_COMMON,
+                )
+            })
+            .collect();
+        if !back.is_empty() {
+            // SAFETY: an open list and buffers the list holds.
+            unsafe { self.list.ResourceBarrier(&back) };
+        }
         // SAFETY: our list.
         if let Err(e) = unsafe { self.list.Close() } {
             fail(format_args!(
@@ -882,12 +1365,14 @@ impl HostList {
     pub(crate) fn reset(&self) {
         *self.deferred() = Deferred::default();
         self.states.lock().unwrap_or_else(|e| e.into_inner()).clear();
+        self.buffers.lock().unwrap_or_else(|e| e.into_inner()).clear();
         self.pipelines.lock().unwrap_or_else(|e| e.into_inner()).clear();
         #[cfg(feature = "diagnostics")]
         self.notes.lock().unwrap_or_else(|e| e.into_inner()).clear();
         {
             let mut scratch = self.scratch.lock().unwrap_or_else(|e| e.into_inner());
             (scratch.current, scratch.used) = (0, 0);
+            scratch.copies.clear();
         }
         // SAFETY: the list is not executing.
         let reset = unsafe {
@@ -925,11 +1410,33 @@ impl HostList {
         }
     }
 
+    /// The uses of host copies that follow belong to a new command (draw,
+    /// dispatch): see [`BufferStates`].
+    pub(crate) fn begin_command(&self) {
+        self.buffers.lock().unwrap_or_else(|e| e.into_inner()).next_command();
+    }
+
+    /// Moves a host copy of title memory to `wanted` ([`BUFFER_READ`] or
+    /// [`BUFFER_WRITE`]) in this list: see [`BufferStates`].
+    pub(crate) fn buffer_state(&self, buffer: &ID3D12Resource, wanted: u32) {
+        let mut buffers = self.buffers.lock().unwrap_or_else(|e| e.into_inner());
+        if let Some(before) = buffers.update(buffer.as_raw() as usize, buffer.clone(), wanted) {
+            let barrier = transition(
+                buffer,
+                D3D12_RESOURCE_STATES(before as i32),
+                D3D12_RESOURCE_STATES(wanted as i32),
+            );
+            // SAFETY: an open list and a buffer the list holds.
+            unsafe { self.list.ResourceBarrier(&[barrier]) };
+        }
+    }
+
     /// At submission: the list that moves each texture this list uses from
     /// its real state to the one the list starts with; the textures' real
     /// states become those the list ends with.
     fn prelude(&self) -> Option<ID3D12CommandList> {
         let states = self.states.lock().unwrap_or_else(|e| e.into_inner());
+        let buffers = self.buffers.lock().unwrap_or_else(|e| e.into_inner());
         let barriers: Vec<D3D12_RESOURCE_BARRIER> = states
             .values()
             .filter_map(|(first, last, copy)| {
@@ -942,6 +1449,13 @@ impl HostList {
                     )
                 })
             })
+            .chain(buffers.firsts().map(|(b, first)| {
+                transition(
+                    b,
+                    D3D12_RESOURCE_STATE_COMMON,
+                    D3D12_RESOURCE_STATES(first as i32),
+                )
+            }))
             .collect();
         if barriers.is_empty() {
             return None;
@@ -1079,18 +1593,54 @@ impl HostList {
     /// `len` bytes of upload memory (256-byte aligned) until the list is
     /// reset: the host GPU address and the CPU pointer.
     pub(crate) fn scratch(&self, len: u64) -> Option<(u64, *mut u8)> {
+        let (_, at, gpu, data) = self.scratch_in(len.max(1).next_multiple_of(256), 256)?;
+        Some((gpu + at, data))
+    }
+
+    /// `len` bytes of upload memory aligned to `align` until the list is
+    /// reset: the host resource, byte offset within it, and CPU pointer.
+    pub(crate) fn scratch_aligned(
+        &self,
+        len: u64,
+        align: u64,
+    ) -> Option<(ID3D12Resource, u64, *mut u8)> {
+        let (buf, at, _, data) = self.scratch_in(len.max(1), align.max(1))?;
+        Some((buf, at, data))
+    }
+
+    /// An element-aligned copy of `len` title bytes at `src`, filled at
+    /// submission and shared by every use in this list until it is reset:
+    /// the host buffer and the copy's byte offset in it.
+    pub(crate) fn aligned_copy(
+        &self,
+        src: u64,
+        len: u64,
+        align: u64,
+    ) -> Option<(ID3D12Resource, u64)> {
+        let key = (src, len, align);
+        let scratch = || self.scratch.lock().unwrap_or_else(|e| e.into_inner());
+        if let Some(hit) = scratch().copies.get(&key) {
+            return Some(hit.clone());
+        }
+        let (buf, at, to) = self.scratch_aligned(len, align)?;
+        self.defer_fill(to, src as *const u8, len as usize);
+        scratch().copies.insert(key, (buf.clone(), at));
+        Some((buf, at))
+    }
+
+    fn scratch_in(&self, len: u64, align: u64) -> Option<(ID3D12Resource, u64, u64, *mut u8)> {
         let host = host()?;
         let mut s = self.scratch.lock().unwrap_or_else(|e| e.into_inner());
-        let len = len.max(1).next_multiple_of(256);
         if len > SCRATCH_CHUNK {
             let (buffer, data) = host.upload_buffer(len)?;
             name(&buffer, || format!("list scratch {len:#x}"));
             // SAFETY: a live buffer.
             let gpu = unsafe { buffer.GetGPUVirtualAddress() };
-            self.deferred().uploads.push(buffer);
-            return Some((gpu, data));
+            self.deferred().uploads.push(buffer.clone());
+            return Some((buffer, 0, gpu, data));
         }
-        if s.used + len > SCRATCH_CHUNK && s.current < s.chunks.len() {
+        let at = s.used.next_multiple_of(align);
+        if at + len > SCRATCH_CHUNK && s.current < s.chunks.len() {
             (s.current, s.used) = (s.current + 1, 0);
         }
         if s.current == s.chunks.len() {
@@ -1101,10 +1651,11 @@ impl HostList {
             s.chunks.push((buffer, data as usize, gpu));
             s.used = 0;
         }
+        let buffer = s.chunks[s.current].0.clone();
         let (_, data, gpu) = s.chunks[s.current];
-        let at = s.used;
-        s.used += len;
-        Some((gpu + at, (data + at as usize) as *mut u8))
+        let at = s.used.next_multiple_of(align);
+        s.used = at + len;
+        Some((buffer, at, gpu, (data + at as usize) as *mut u8))
     }
 
     /// The host address of the list's indirect-work budget, zeroed at each
@@ -1588,6 +2139,14 @@ impl Host {
     /// as frame `frame` (saved if captures are on). `None` if nothing was
     /// shown; else, in diagnostics builds, whether the frame was black.
     pub(crate) fn present(&self, texture: &ID3D12Resource, state: u32, frame: u64) -> Option<bool> {
+        // Diagnostics: an intermediate target instead (VICTORY_SHOW_TARGET).
+        #[cfg(feature = "diagnostics")]
+        let shown = crate::capture::take_shown();
+        #[cfg(feature = "diagnostics")]
+        let (texture, state) = match &shown {
+            Some((copy, s)) => (&copy.texture, *s),
+            None => (texture, state),
+        };
         // SAFETY: a live resource.
         let desc = unsafe { texture.GetDesc() };
         let Some(format) = swap_format(desc.Format) else {
@@ -1629,14 +2188,14 @@ impl Host {
             };
             p.copy.reset();
             let list = &p.copy.list;
-            list.ResourceBarrier(&[
-                transition(texture, state, D3D12_RESOURCE_STATE_COPY_SOURCE),
-                transition(
-                    &back,
-                    D3D12_RESOURCE_STATE_PRESENT,
-                    D3D12_RESOURCE_STATE_COPY_DEST,
-                ),
-            ]);
+            if state != D3D12_RESOURCE_STATE_COPY_SOURCE {
+                list.ResourceBarrier(&[transition(texture, state, D3D12_RESOURCE_STATE_COPY_SOURCE)]);
+            }
+            list.ResourceBarrier(&[transition(
+                &back,
+                D3D12_RESOURCE_STATE_PRESENT,
+                D3D12_RESOURCE_STATE_COPY_DEST,
+            )]);
             list.CopyResource(&back, texture);
             #[cfg(feature = "diagnostics")]
             let capture = crate::capture::wanted(frame)
@@ -1646,14 +2205,14 @@ impl Host {
             let probe = crate::capture::probe(&self.device, list, texture);
             #[cfg(not(feature = "diagnostics"))]
             let _ = frame;
-            list.ResourceBarrier(&[
-                transition(texture, D3D12_RESOURCE_STATE_COPY_SOURCE, state),
-                transition(
-                    &back,
-                    D3D12_RESOURCE_STATE_COPY_DEST,
-                    D3D12_RESOURCE_STATE_PRESENT,
-                ),
-            ]);
+            if state != D3D12_RESOURCE_STATE_COPY_SOURCE {
+                list.ResourceBarrier(&[transition(texture, D3D12_RESOURCE_STATE_COPY_SOURCE, state)]);
+            }
+            list.ResourceBarrier(&[transition(
+                &back,
+                D3D12_RESOURCE_STATE_COPY_DEST,
+                D3D12_RESOURCE_STATE_PRESENT,
+            )]);
             p.copy.close();
             self.execute(&[&p.copy]);
             #[cfg(feature = "diagnostics")]
@@ -1881,11 +2440,13 @@ fn in_flight(history: &[D3D12_AUTO_BREADCRUMB_OP], markers: &[(u32, String)], do
     text
 }
 
+#[track_caller]
 pub(crate) fn transition(
     resource: &ID3D12Resource,
     before: D3D12_RESOURCE_STATES,
     after: D3D12_RESOURCE_STATES,
 ) -> D3D12_RESOURCE_BARRIER {
+    if before == after { tracing::warn!(caller = %std::panic::Location::caller(), state = before.0, "probe identical transition"); }
     D3D12_RESOURCE_BARRIER {
         Type: D3D12_RESOURCE_BARRIER_TYPE_TRANSITION,
         Flags: D3D12_RESOURCE_BARRIER_FLAG_NONE,

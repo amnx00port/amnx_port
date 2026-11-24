@@ -74,6 +74,9 @@ pub(crate) struct State {
     /// Tables made afresh in this list: (table, what it holds) → first
     /// dynamic slot.
     fresh_tables: std::collections::HashMap<(u64, u64), u32>,
+    /// Root SRV views made in this list: (title heap, title address) →
+    /// dynamic slot (see [`State::bind_root_srv`]).
+    root_srv_slots: std::collections::HashMap<(usize, u64), u32>,
     /// The dynamic slots the list holds: title heap, first, count; given
     /// back when the list is reset or released.
     dynamic: Vec<(usize, u32, u32)>,
@@ -100,13 +103,105 @@ pub(crate) fn drawn() -> u64 {
 /// The draws traced since the last present (diagnostics builds, with
 /// debug logging for this module): logged when the frame comes out black.
 #[cfg(feature = "diagnostics")]
-static FRAME: std::sync::Mutex<Vec<String>> = std::sync::Mutex::new(Vec::new());
+static FRAME: std::sync::Mutex<FrameTrace> = std::sync::Mutex::new(FrameTrace::new());
 
 /// The draws traced since the last call.
 #[cfg(feature = "diagnostics")]
 pub(crate) fn take_frame() -> Vec<String> {
-    std::mem::take(&mut *FRAME.lock().unwrap_or_else(|e| e.into_inner()))
+    FRAME.lock().unwrap_or_else(|e| e.into_inner()).take()
 }
+
+/// How many of a frame's draws the black-frame trace keeps
+/// (`VICTORY_BLACK_FRAME_DRAWS`, default 256): the first half and the last
+/// half of them.
+#[cfg(feature = "diagnostics")]
+fn frame_limit() -> usize {
+    static LIMIT: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
+    *LIMIT.get_or_init(|| {
+        std::env::var("VICTORY_BLACK_FRAME_DRAWS")
+            .ok()
+            .and_then(|v| v.trim().parse::<usize>().ok())
+            .unwrap_or(256)
+            .max(2)
+    })
+}
+
+/// One frame's draws for the black-frame trace: the first `limit / 2` and
+/// the last `limit - limit / 2`, with a count of those left out between
+/// them. A world frame runs thousands of draws, and keeping only the first
+/// ones (as before) stopped in the geometry passes, before the lighting,
+/// composite and full-screen draws that end the frame and that a black
+/// picture is about.
+#[cfg(any(test, feature = "diagnostics"))]
+struct FrameTrace {
+    head: Vec<String>,
+    tail: std::collections::VecDeque<String>,
+    skipped: usize,
+    next_id: usize,
+}
+
+#[cfg(any(test, feature = "diagnostics"))]
+impl FrameTrace {
+    const fn new() -> Self {
+        Self {
+            head: Vec::new(),
+            tail: std::collections::VecDeque::new(),
+            skipped: 0,
+            next_id: 0,
+        }
+    }
+
+    fn push(&mut self, line: String, limit: usize) -> usize {
+        let id = self.next_id;
+        self.next_id += 1;
+        let head = limit.div_ceil(2);
+        let tail = limit - head;
+        if self.head.len() < head {
+            self.head.push(line);
+        } else if tail == 0 {
+            self.skipped += 1;
+        } else {
+            if self.tail.len() == tail {
+                self.tail.pop_front();
+                self.skipped += 1;
+            }
+            self.tail.push_back(line);
+        }
+        id
+    }
+
+    /// Marks a retained draw by its recording ID. IDs survive take() so
+    /// failures reported late cannot be assigned to a later frame.
+    fn mark_dropped(&mut self, id: usize) {
+        let tail_start = self.next_id - self.tail.len();
+        let head_start = tail_start - self.skipped - self.head.len();
+        let line = if id < tail_start {
+            id.checked_sub(head_start)
+                .and_then(|i| self.head.get_mut(i))
+        } else {
+            self.tail.get_mut(id - tail_start)
+        };
+        if let Some(line) = line {
+            line.push_str(" DROPPED");
+        }
+    }
+
+    /// The kept draws in order, with a line for those left out, and a fresh
+    /// trace for the next frame.
+    fn take(&mut self) -> Vec<String> {
+        let mut out = std::mem::take(&mut self.head);
+        if self.skipped > 0 {
+            out.push(format!("... {} draws not kept here ({SKIP_HINT})", self.skipped));
+        }
+        out.extend(self.tail.drain(..));
+        self.skipped = 0;
+        out
+    }
+}
+
+/// Where a black frame's trace says how to keep more draws.
+#[cfg(any(test, feature = "diagnostics"))]
+const SKIP_HINT: &str = "VICTORY_BLACK_FRAME_DRAWS raises the limit";
 
 /// Draws, mesh dispatches and dispatches recorded but not run on the host
 /// (no host pipeline) since the last call.
@@ -115,12 +210,15 @@ pub(crate) fn take_dropped() -> u64 {
 }
 static DROPPED: AtomicU64 = AtomicU64::new(0);
 
-/// Marks the last traced draw as not run on the host.
+/// Marks the traced draw as not run on the host.
 #[cfg(feature = "diagnostics")]
-fn dropped(pipeline: usize) {
+fn dropped(pipeline: usize, trace_id: Option<usize>) {
     crate::pipeline::note_drop(pipeline as This);
-    if let Some(last) = FRAME.lock().unwrap_or_else(|e| e.into_inner()).last_mut() {
-        last.push_str(" DROPPED");
+    if let Some(id) = trace_id {
+        FRAME
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .mark_dropped(id);
     }
 }
 
@@ -144,6 +242,7 @@ fn root_view(list: &HostList, address: u64, srv: bool) -> Option<u64> {
     let gpu = shadow.gpu(address);
     if srv || gpu % 256 == 0 {
         shadow.refresh(list, address, len);
+        list.buffer_state(&shadow.buffer, crate::host::BUFFER_READ);
         return Some(gpu);
     }
     let (gpu, to) = list.scratch(len)?;
@@ -349,7 +448,13 @@ impl State {
             return false;
         };
         if p.compute || p.mesh != mesh {
-            once!(mesh, "a draw or mesh dispatch with another kind of pipeline");
+            once!(
+                mesh,
+                "a draw or mesh dispatch with another kind of pipeline"
+            );
+            return false;
+        }
+        if !self.bind(list, p, false) {
             return false;
         }
         if !self.bind(list, p, false) {
@@ -371,6 +476,8 @@ impl State {
                 continue;
             };
             shadow.refresh(list, v.address, u64::from(v.size));
+            // After `bind`: a shader may have written the buffer before.
+            list.buffer_state(&shadow.buffer, crate::host::BUFFER_READ);
             *view = D3D12_VERTEX_BUFFER_VIEW {
                 BufferLocation: shadow.gpu(v.address),
                 SizeInBytes: v.size,
@@ -389,6 +496,7 @@ impl State {
                 return false;
             };
             shadow.refresh(list, v.address, u64::from(v.size));
+            list.buffer_state(&shadow.buffer, crate::host::BUFFER_READ);
             let view = D3D12_INDEX_BUFFER_VIEW {
                 BufferLocation: shadow.gpu(v.address),
                 SizeInBytes: v.size,
@@ -416,6 +524,7 @@ impl State {
     /// False if the draw or dispatch must not run: a table it reads could
     /// not be made.
     fn bind(&mut self, list: &HostList, p: &HostPipeline, compute: bool) -> bool {
+        list.begin_command();
         let l = &list.list;
         // Heaps first: a root signature with directly indexed heaps must be
         // set after them.
@@ -493,6 +602,12 @@ impl State {
             }
             for (views, srv) in [(&stage.root_cbvs, false), (&stage.root_srvs, true)] {
                 for &(slot, param) in views {
+                    // Root SRVs are bounded one-view tables (see the host
+                    // root signature).
+                    if srv {
+                        self.bind_root_srv(list, compute, slot, param);
+                        continue;
+                    }
                     let Some(Root::View(address)) = self.roots_ref(compute).get(usize::from(slot))
                     else {
                         once!(slot, "a shader reads a root view the title did not set");
@@ -512,8 +627,91 @@ impl State {
                     }
                 }
             }
+            if let Some(param) = stage.stride_table {
+                let gpu = (self.heaps[0] != 0)
+                    .then(|| crate::descriptor::heap(self.heaps[0] as This).host())
+                    .flatten()
+                    .and_then(|h| h.stride_table_gpu());
+                if let Some(gpu) = gpu {
+                    // SAFETY: an open list; the stride table buffer lives with the host heap.
+                    unsafe {
+                        if compute {
+                            l.SetComputeRootShaderResourceView(param, gpu);
+                        } else {
+                            l.SetGraphicsRootShaderResourceView(param, gpu);
+                        }
+                    }
+                } else {
+                    once!("a shader reads the runtime stride table without a host view heap");
+                    return false;
+                }
+            }
         }
         true
+    }
+
+    /// Binds the title's root SRV `slot` as the one-view table `param` (see
+    /// the host root signature): a raw view of the rest of the title
+    /// buffer's host copy, in a dynamic slot of the bound view heap, so
+    /// reads past the copy return zeros rather than fault. Zeros (our null
+    /// buffer) if the title set none or it lies outside every buffer.
+    fn bind_root_srv(&mut self, list: &HostList, compute: bool, slot: u8, param: u32) {
+        let l = &list.list;
+        let heap = self.heaps[0];
+        if heap == 0 {
+            once!("a root SRV with no view heap bound: left unset");
+            return;
+        }
+        let title_heap = crate::descriptor::heap(heap as This);
+        let Some(host) = title_heap.host() else { return };
+        let address = match self.roots_ref(compute).get(usize::from(slot)) {
+            Some(Root::View(address)) => *address,
+            _ => 0,
+        };
+        let shadow = crate::shadow::find(address, 1).filter(|_| address != 0).map(|s| (s, address));
+        // The same buffer again in this list: its slot, refreshed again.
+        if let Some(&index) = self.root_srv_slots.get(&(heap, address)) {
+            if let Some((shadow, address)) = &shadow {
+                shadow.refresh(list, *address, shadow.left(*address).min(1 << 20));
+            }
+            let table = host.gpu_handle(index);
+            // SAFETY: an open list; the slot is held by this list.
+            unsafe {
+                if compute {
+                    l.SetComputeRootDescriptorTable(param, table);
+                } else {
+                    l.SetGraphicsRootDescriptorTable(param, table);
+                }
+            }
+            return;
+        }
+        let Some(index) = host.dynamic(1) else {
+            once!("no free dynamic slot for a root SRV: left unset");
+            return;
+        };
+        self.dynamic.push((heap, index, 1));
+        self.root_srv_slots.insert((heap, address), index);
+        match shadow {
+            Some((shadow, address)) => {
+                let len = shadow.left(address);
+                shadow.refresh(list, address, len.min(1 << 20));
+                host.raw_srv_at(index, &shadow.buffer, shadow.offset(address), len);
+            }
+            None => {
+                once!(slot, "a root SRV the title did not set, or outside every buffer: reads zeros");
+                host.make_null(index);
+            }
+        }
+        let table = host.gpu_handle(index);
+        // SAFETY: an open list; the slot is in the bound heap and held by
+        // this list until it is reset.
+        unsafe {
+            if compute {
+                l.SetComputeRootDescriptorTable(param, table);
+            } else {
+                l.SetGraphicsRootDescriptorTable(param, table);
+            }
+        }
     }
 
     /// Runs a dispatch on the host.
@@ -590,7 +788,7 @@ impl State {
     /// programs are one-dimensional).
     pub(crate) fn dispatch_mesh(&mut self, list: &HostList, x: u32) {
         #[cfg(feature = "diagnostics")]
-        self.trace("mesh", x, 0);
+        let trace_id = self.trace("mesh", x, 0);
         let ran = self.prepare_for(list, false, true)
             && match list.list.cast::<ID3D12GraphicsCommandList6>() {
                 Ok(l6) => {
@@ -606,7 +804,7 @@ impl State {
         if !ran {
             DROPPED.fetch_add(1, Ordering::Relaxed);
             #[cfg(feature = "diagnostics")]
-            dropped(self.pipeline);
+            dropped(self.pipeline, trace_id);
         }
     }
 
@@ -670,7 +868,13 @@ impl State {
             let (Some(host), Some(index)) = (heap.host(), heap.index(end)) else {
                 continue;
             };
-            if index >= host.count() {
+            if index >= host.count()
+                || (u.kind == ResourceType::Srv
+                    && crate::descriptor::view(end)
+                        .as_ref()
+                        .and_then(crate::descriptor::host::unaligned_srv)
+                        .is_some())
+            {
                 fresh.push(u.slot);
             }
         }
@@ -750,9 +954,20 @@ impl State {
                         host.constant_at(index, gpu, size);
                     }
                     Some(view) => {
-                        host.make_at(index, &view);
-                        if let Some(u) = used {
-                            readable(list, u, &view);
+                        if let Some((src, len, align, mut desc)) =
+                            crate::descriptor::host::unaligned_srv(&view)
+                        {
+                            if let Some((buf, at)) = list.aligned_copy(src, len, align) {
+                                desc.Anonymous.Buffer.FirstElement = at / align;
+                                host.srv_at(index, &buf, &desc);
+                            } else {
+                                host.make_null(index);
+                            }
+                        } else {
+                            host.make_at(index, &view);
+                            if let Some(u) = used {
+                                readable(list, u, &view);
+                            }
                         }
                     }
                     None => {
@@ -771,10 +986,10 @@ impl State {
     /// The first draws, at debug level: what they bind and read
     /// (diagnostics builds).
     #[cfg(feature = "diagnostics")]
-    fn trace(&self, kind: &str, count: u32, first: u32) {
+    fn trace(&self, kind: &str, count: u32, first: u32) -> Option<usize> {
         static TRACED: AtomicU64 = AtomicU64::new(0);
         if !tracing::enabled!(tracing::Level::DEBUG) {
-            return;
+            return None;
         }
         let listed = crate::capture::listed(crate::queue::presented() + 1);
         let logged = listed || TRACED.fetch_add(1, Ordering::Relaxed) < 64;
@@ -801,10 +1016,12 @@ impl State {
         if logged {
             tracing::debug!("draw {line}");
         }
-        let mut frame = FRAME.lock().unwrap_or_else(|e| e.into_inner());
-        if frame.len() < 256 {
-            frame.push(line);
-        }
+        Some(
+            FRAME
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .push(line, frame_limit()),
+        )
     }
 
     /// What a draw's shaders read, one line per used resource (diagnostics
@@ -843,7 +1060,7 @@ impl State {
         first_instance: u32,
     ) {
         #[cfg(feature = "diagnostics")]
-        self.trace("draw", vertices, first);
+        let trace_id = self.trace("draw", vertices, first);
         let rects = self.topology == RECTANGLES;
         let ran = self.prepare(list, false) && (!rects || self.rectangles(list, vertices, first));
         if ran {
@@ -865,7 +1082,7 @@ impl State {
         if !ran {
             DROPPED.fetch_add(1, Ordering::Relaxed);
             #[cfg(feature = "diagnostics")]
-            dropped(self.pipeline);
+            dropped(self.pipeline, trace_id);
         }
     }
 
@@ -934,7 +1151,7 @@ impl State {
         first_instance: u32,
     ) {
         #[cfg(feature = "diagnostics")]
-        self.trace("indexed", indices, first);
+        let trace_id = self.trace("indexed", indices, first);
         if self.topology == RECTANGLES {
             once!("indexed rectangles not drawn");
         }
@@ -952,7 +1169,7 @@ impl State {
         if !ran {
             DROPPED.fetch_add(1, Ordering::Relaxed);
             #[cfg(feature = "diagnostics")]
-            dropped(self.pipeline);
+            dropped(self.pipeline, trace_id);
         }
     }
 }
@@ -1028,31 +1245,30 @@ impl State {
             _ => false,
         };
         if !ran {
-            crate::indirect::done(list, &args.buffer);
             #[cfg(feature = "diagnostics")]
             match crate::pipeline::host_pipeline(self.pipeline as This) {
                 None => crate::pipeline::note_drop(self.pipeline as This),
-                Some(p) => why(&format!("prepare failed (compute {}, mesh {})", p.compute, p.mesh)),
+                Some(p) => why(&format!(
+                    "prepare failed (compute {}, mesh {})",
+                    p.compute, p.mesh
+                )),
             }
             return false;
         }
         #[cfg(feature = "diagnostics")]
         list.note_op(|| {
-            self.op_text(format!("indirect kind {kind} max {max} at {arguments:#x}"), kind == DISPATCH)
-        });
-        // SAFETY: an open list with everything set; the buffers are host
-        // copies the list keeps alive (refresh), the signature is cached.
-        unsafe {
-            list.list.ExecuteIndirect(
-                &signature,
-                max,
-                &args.buffer,
-                args.offset(arguments),
-                counter.as_ref().map(|(s, _)| &s.buffer),
-                counter.as_ref().map_or(0, |(s, at)| s.offset(*at)),
+            self.op_text(
+                format!("indirect kind {kind} max {max} at {arguments:#x}"),
+                kind == DISPATCH,
             )
-        };
-        crate::indirect::done(list, &args.buffer);
+        });
+        crate::indirect::execute(
+            list,
+            &signature,
+            max,
+            (&args.buffer, args.offset(arguments)),
+            counter.as_ref().map(|(s, at)| (&s.buffer, s.offset(*at))),
+        );
         if kind == DISPATCH {
             DISPATCHED.fetch_add(1, Ordering::Relaxed);
         } else {
@@ -1116,6 +1332,9 @@ fn readable(list: &HostList, u: &UsedResource, view: &View) {
         shadow.refresh(list, address, len);
         if u.kind == ResourceType::Uav {
             shadow.gpu_writes(list, address, len);
+            list.buffer_state(&shadow.buffer, crate::host::BUFFER_WRITE);
+        } else {
+            list.buffer_state(&shadow.buffer, crate::host::BUFFER_READ);
         }
     }
     match (view, u.kind) {
@@ -1155,7 +1374,10 @@ fn describe(view: Option<&View>) -> String {
         crate::resource::host_resource(r).map(|t| {
             // SAFETY: a live resource.
             let d = unsafe { t.GetDesc() };
-            format!("{}x{} f{} flags {:#x}", d.Width, d.Height, d.Format.0, d.Flags.0)
+            format!(
+                "{}x{} f{} flags {:#x}",
+                d.Width, d.Height, d.Format.0, d.Flags.0
+            )
         })
     };
     match view {
@@ -1214,4 +1436,69 @@ pub(crate) fn blend_factor(list: &HostList, factor: Option<&[f32; 4]>) {
 pub(crate) fn stencil_ref(list: &HostList, reference: u32) {
     // SAFETY: an open list.
     unsafe { list.list.OMSetStencilRef(reference) };
+}
+
+#[cfg(test)]
+mod frame_trace_tests {
+    use super::{FrameTrace, SKIP_HINT};
+
+    fn lines(n: usize) -> impl Iterator<Item = String> {
+        (0..n).map(|i| format!("draw {i}"))
+    }
+
+    /// A frame within the limit is kept whole and in order.
+    #[test]
+    fn a_short_frame_is_kept_whole() {
+        let mut t = FrameTrace::new();
+        for l in lines(5) {
+            t.push(l, 8);
+        }
+        assert_eq!(t.take(), lines(5).collect::<Vec<_>>());
+    }
+
+    /// A long frame keeps its first and last draws, says how many were left
+    /// out between them, and starts empty after.
+    #[test]
+    fn a_long_frame_keeps_its_ends() {
+        let mut t = FrameTrace::new();
+        for l in lines(10) {
+            t.push(l, 4);
+        }
+        let skipped = format!("... 6 draws not kept here ({SKIP_HINT})");
+        assert_eq!(t.take(), ["draw 0", "draw 1", skipped.as_str(), "draw 8", "draw 9"]);
+        assert!(t.take().is_empty());
+    }
+
+
+    #[test]
+    fn interleaved_failure_marks_the_draw_that_failed() {
+        let mut trace = FrameTrace::new();
+        let failed = trace.push("first".into(), 4);
+        trace.push("second".into(), 4);
+        trace.mark_dropped(failed);
+        assert_eq!(trace.take(), ["first DROPPED", "second"]);
+    }
+
+    #[test]
+    fn only_retained_draws_can_be_marked() {
+        let mut trace = FrameTrace::new();
+        let head = trace.push("a".into(), 2);
+        let evicted = trace.push("b".into(), 2);
+        let tail = trace.push("c".into(), 2);
+        trace.mark_dropped(head);
+        trace.mark_dropped(evicted);
+        trace.mark_dropped(tail);
+        let skipped = format!("... 1 draws not kept here ({SKIP_HINT})");
+        assert_eq!(trace.take(), ["a DROPPED", skipped.as_str(), "c DROPPED"]);
+    }
+
+    #[test]
+    fn a_late_failure_keeps_the_next_frame_unchanged() {
+        let mut trace = FrameTrace::new();
+        let previous = trace.push("previous".into(), 2);
+        assert_eq!(trace.take(), ["previous"]);
+        trace.push("current".into(), 2);
+        trace.mark_dropped(previous);
+        assert_eq!(trace.take(), ["current"]);
+    }
 }

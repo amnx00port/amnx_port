@@ -21,7 +21,9 @@ loads the world, where rendering fails.
 | Loading into the world (about 50 s) | works |
 | The world (first mission's intro) | reached and runs with indirect draws; its title card renders, the scene after it is still dark; 0.5-1.8 s per frame |
 
-Tested on one machine: Windows 11, AMD RX 6700 XT.
+Tested on one machine: Windows 11, AMD RX 6700 XT; and on Linux under
+Proton Experimental: CachyOS, AMD RX 9070 XT (see
+[docs/linux-proton.md](docs/linux-proton.md)).
 
 > **Warning.** Entering the world on a real GPU can currently hang it, and
 > Windows then resets the display driver (every monitor goes black for a
@@ -50,6 +52,12 @@ Requirements: Windows 10/11 x64, a CPU with AVX2, a Direct3D 12 GPU with
 shader model 6.6 (and mesh shaders for the world), Rust (pinned in
 `rust-toolchain.toml`).
 
+On Windows 10 the in-box D3D12 runtime stops at shader model 6.5, so the host
+refuses every translated pipeline. `cargo xtask agility` fetches Microsoft's
+D3D12 Agility SDK runtime (a pinned, hash-checked NuGet package) into
+`target\<profile>\D3D12\`, where `victory.exe` makes D3D12 load it. Windows 11
+needs nothing.
+
 The title also needs several GiB of available Windows commit at startup.
 Check **Committed** under **Task Manager → Performance → Memory**. If
 `crashes.log` reports Windows error 1455, close other applications or increase
@@ -58,6 +66,7 @@ the Windows paging file size, then retry.
 ```powershell
 cargo xtask install-hooks                # asset-policy check on every commit
 copy victory.example.toml victory.toml   # then set your paths (outside the repo)
+cargo xtask agility                      # Windows 10 only: newer D3D12 runtime
 cargo test --workspace                   # needs no game data
 cargo run -p victory -- config           # check your paths
 ```
@@ -84,6 +93,12 @@ title's window has focus:
 | Q / E, Z / C | shoulders, triggers |
 | F / H | stick clicks |
 | Esc, Tab | Menu, View |
+
+### Linux (Proton)
+
+VIctory also runs on Linux under Proton Experimental, built with
+`cargo-xwin`, and gets as far there as on Windows: see
+[docs/linux-proton.md](docs/linux-proton.md) and `scripts/proton-run.sh`.
 
 ## Commands
 
@@ -121,6 +136,7 @@ cargo build --profile diag -p victory --features diagnostics   # target\diag\vic
 | `VICTORY_D3D12_DEBUG=1` | host debug layer |
 | `VICTORY_D3D12_GBV=1` | with the above, GPU-based validation (bad descriptor use reported, not faulted; slow) |
 | `VICTORY_D3D12_DRED=1` | on a GPU failure, the allocation hit and the commands in flight |
+| `VICTORY_BLACK_FRAME_DRAWS=<n>` | with `VICTORY_LOG=info,victory_gpu::draw=debug`, a black frame's trace keeps its first and last `n/2` draws (default 256), so the passes that end the frame are in it |
 | `VICTORY_SKIP_PIPELINES=<hash>,...` | omit draws and dispatches, including indirect ones, whose pipeline contains a listed 16-digit shader hash |
 | `VICTORY_GPU_TIMING=1` | with the above, each list of a submission run and timed on its own; slow lists logged with their slowest commands |
 | `VICTORY_D3D12_WARP=1` | host device on the software adapter (slow; cannot reset the driver) |

@@ -31,7 +31,7 @@ pub(crate) fn listed(n: u64) -> bool {
 
 /// Whether frame `n` is saved.
 pub(crate) fn wanted(n: u64) -> bool {
-    folder().is_some() && (n.is_power_of_two() || listed(n))
+    folder().is_some() && (std::env::var_os("VICTORY_RECORD_FRAMES").is_some() || n.is_power_of_two() || listed(n))
 }
 
 /// Saves 8-bit RGBA or BGRA rows (`pitch` bytes apart) as frame `n`.
@@ -42,14 +42,15 @@ pub(crate) fn save(n: u64, width: u32, height: u32, pitch: usize, bgra: bool, ro
 /// Saves 8-bit RGBA or BGRA rows as `<name>.png`, at half size.
 fn save_as(name: &str, width: u32, height: u32, pitch: usize, bgra: bool, rows: &[u8]) {
     let Some(folder) = folder() else { return };
-    let (w, h) = ((width / 2).max(1), (height / 2).max(1));
+    let step = if std::env::var_os("VICTORY_RECORD_FRAMES").is_some() { 8 } else { 2 };
+    let (w, h) = ((width / step).max(1), (height / step).max(1));
     // Filter byte 0 per row, then RGB of every other pixel of every other row.
     let mut raw = Vec::with_capacity((w as usize * 3 + 1) * h as usize);
     for y in 0..h as usize {
         raw.push(0);
-        let row = &rows[(2 * y).min(height as usize - 1) * pitch..];
+        let row = &rows[(step as usize * y).min(height as usize - 1) * pitch..];
         for x in 0..w as usize {
-            let p = &row[(2 * x).min(width as usize - 1) * 4..][..3];
+            let p = &row[(step as usize * x).min(width as usize - 1) * 4..][..3];
             if bgra {
                 raw.extend([p[2], p[1], p[0]]);
             } else {
@@ -213,9 +214,59 @@ fn dump_on() -> bool {
     *ON.get_or_init(|| folder().is_some() && std::env::var_os("VICTORY_DUMP_TARGETS").is_some())
 }
 
+/// `VICTORY_SHOW_TARGET=<w>x<h>-f<format>[-<n>]`: each frame, the `n`th
+/// (1-based, default 1) texture of that size and format the frame renders
+/// to or writes, in first-use order, is presented instead of the title's
+/// frame: a view of an intermediate target (a G-buffer's normals or
+/// albedo, say) while the final image is still black. Names as in the
+/// `VICTORY_DUMP_TARGETS` files (`frame-<n>-<i>-<resource>-<w>x<h>-f<f>`).
+fn show_spec() -> Option<(u64, u32, i32, usize)> {
+    static SPEC: std::sync::OnceLock<Option<(u64, u32, i32, usize)>> = std::sync::OnceLock::new();
+    *SPEC.get_or_init(|| {
+        let v = std::env::var("VICTORY_SHOW_TARGET").ok()?;
+        let mut parts = v.split('-');
+        let (w, h) = parts.next()?.split_once('x')?;
+        let f = parts.next()?.strip_prefix('f')?.parse().ok()?;
+        let n = parts.next().map_or(Some(1), |n| n.parse().ok())?;
+        let spec = (w.parse().ok()?, h.parse().ok()?, f, n.max(1));
+        tracing::info!(?spec, "presenting an intermediate target (VICTORY_SHOW_TARGET)");
+        Some(spec)
+    })
+}
+
+/// The frame being built's targets matching [`show_spec`], in order.
+static SHOWN: std::sync::Mutex<Vec<(usize, std::sync::Arc<crate::resource::HostTexture>)>> =
+    std::sync::Mutex::new(Vec::new());
+
+/// At a present: the target [`show_spec`] names, if this frame had it, and
+/// its host state; the list starts afresh for the next frame.
+pub(crate) fn take_shown() -> Option<(std::sync::Arc<crate::resource::HostTexture>, u32)> {
+    use std::sync::atomic::Ordering::Relaxed;
+    let (.., n) = show_spec()?;
+    let shown = std::mem::take(&mut *SHOWN.lock().unwrap_or_else(|e| e.into_inner()));
+    let (_, copy) = shown.into_iter().nth(n - 1)?;
+    let state = copy.state.load(Relaxed);
+    Some((copy, state))
+}
+
 /// Notes a title texture the frame being built renders to or writes.
 pub(crate) fn note_target(resource: crate::object::This) {
-    if resource.is_null() || !dump_on() || !listed(crate::queue::presented() + 1) {
+    if resource.is_null() {
+        return;
+    }
+    if let Some((w, h, f, _)) = show_spec() {
+        let mut shown = SHOWN.lock().unwrap_or_else(|e| e.into_inner());
+        if !shown.iter().any(|&(r, _)| r == resource as usize)
+            && let Some(copy) = crate::resource::host_copy(resource)
+        {
+            // SAFETY: a live resource.
+            let d = unsafe { copy.texture.GetDesc() };
+            if (d.Width, d.Height, d.Format.0) == (w, h, f) && d.SampleDesc.Count == 1 {
+                shown.push((resource as usize, copy));
+            }
+        }
+    }
+    if !dump_on() || !listed(crate::queue::presented() + 1) {
         return;
     }
     let mut targets = TARGETS.lock().unwrap_or_else(|e| e.into_inner());
