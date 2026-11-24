@@ -19,9 +19,12 @@ pub(crate) mod flags {
     pub const STENCIL_REF: u64 = 1 << 11;
     pub const TYPED_UAV_LOADS: u64 = 1 << 13;
     pub const WAVE_OPS: u64 = 1 << 19;
+    pub const BARYCENTRICS: u64 = 1 << 22;
     pub const INT64: u64 = 1 << 20;
+    pub const ATOMIC_INT64_ON_TYPED_RESOURCE: u64 = 1 << 27;
     pub const RESOURCE_HEAP: u64 = 1 << 30;
     pub const SAMPLER_HEAP: u64 = 1 << 31;
+    pub const ATOMIC_INT64_ON_HEAP_RESOURCE: u64 = 1 << 32;
 }
 
 pub(crate) struct Types {
@@ -68,10 +71,14 @@ pub(crate) struct Shader {
     pub flags: u64,
     /// Heap handles made with a non-uniform index.
     pub nonuniform_handles: u32,
+    /// Heap handles annotated as constant buffers.
+    pub cbuffer_handles: u32,
     /// A compute shader with this thread-group size.
     pub threads: Option<[u32; 3]>,
     /// The wave size a compute shader requires (`WaveSize`).
     pub wave_size: Option<u32>,
+    /// Compute shader uses SM 6.6 implicit-derivative ops (`dx.valver` 1.8).
+    pub cs_derivatives: bool,
     /// Thread-group shared memory, in dwords.
     pub lds_dwords: u32,
     lds: Option<V>,
@@ -122,8 +129,10 @@ impl Shader {
             root_srvs: Vec::new(),
             flags: 0,
             nonuniform_handles: 0,
+            cbuffer_handles: 0,
             threads: None,
             wave_size: None,
+            cs_derivatives: false,
             lds_dwords: 0,
             lds: None,
             main,
@@ -292,6 +301,7 @@ impl Shader {
             flags::RESOURCE_HEAP
         };
         self.nonuniform_handles += u32::from(nonuniform);
+        self.cbuffer_handles += u32::from(props.0 == 13);
         let (s, n) = (self.m.bool(sampler), self.m.bool(nonuniform));
         let h = self.op(
             block,
@@ -542,7 +552,13 @@ impl Shader {
         let six = i32c(&mut self, 6);
         let version = self.m.md_node(vec![Some(one), Some(six)]);
         self.m.named_md("dx.version", vec![version]);
-        self.m.named_md("dx.valver", vec![version]);
+        let valver = if self.cs_derivatives {
+            let eight = i32c(&mut self, 8);
+            self.m.md_node(vec![Some(one), Some(eight)])
+        } else {
+            version
+        };
+        self.m.named_md("dx.valver", vec![valver]);
         // Program kinds: 0 pixel, 1 vertex, 5 compute, 13 mesh.
         let (name, kind) = match (self.threads, self.pixel) {
             _ if self.mesh.is_some() => ("ms", 13u32),
@@ -578,6 +594,15 @@ impl Shader {
         if self.flags & flags::INT64 != 0 {
             features |= 0x8000;
         }
+        if self.flags & flags::ATOMIC_INT64_ON_TYPED_RESOURCE != 0 {
+            features |= 0x40_0000;
+        }
+        if self.flags & flags::ATOMIC_INT64_ON_HEAP_RESOURCE != 0 {
+            features |= 0x1000_0000;
+        }
+        if self.flags & flags::BARYCENTRICS != 0 {
+            features |= 0x2_0000;
+        }
         if self.flags & flags::RESOURCE_HEAP != 0 {
             features |= 0x200_0000;
         }
@@ -602,6 +627,7 @@ impl Shader {
             bindings: &bindings,
             threads: self.threads.unwrap_or_default(),
             wave_size: self.wave_size,
+            valver_1_8: self.cs_derivatives,
         });
         let hash = [0u8; 20];
         let psg1 = container::signature(&self.prims, false);
@@ -661,5 +687,101 @@ impl Shader {
             list.push(Some(self.m.md_node(ops)));
         }
         Some(self.m.md_node(list))
+    }
+}
+
+#[cfg(all(test, windows))]
+mod tests {
+    use super::super::HostShader;
+    use super::super::bitcode::{Bin, Term, pred};
+    use super::super::host::Host;
+    use super::super::validator;
+    use super::*;
+    use crate::native::HwStage;
+
+    fn validate_and_create_cs_pso(mut dxil: Vec<u8>) {
+        let path = validator::Validator::default_path();
+        if let Ok(mut validator) = validator::Validator::load(path.as_deref()) {
+            validator.validate(&mut dxil).unwrap();
+        }
+        let hs = HostShader {
+            stage: HwStage::Cs,
+            dxil,
+            user_data: Vec::new(),
+            samplers: Vec::new(),
+            static_samplers: Vec::new(),
+            root_cbvs: Vec::new(),
+            root_srvs: Vec::new(),
+        };
+        if let Ok(host) = Host::new(false) {
+            host.compute_pipeline(&hs).unwrap();
+        }
+        if let Ok(warp) = Host::new(true) {
+            warp.compute_pipeline(&hs).unwrap();
+        }
+    }
+
+    #[test]
+    fn two_empty_latches_to_same_header_validate() {
+        let mut s = Shader::new(false);
+        s.threads = Some([1, 1, 1]);
+        let entry = s.entry;
+        let head = s.m.new_block();
+        let body = s.m.new_block();
+        let latch_a = s.m.new_block();
+        let latch_b = s.m.new_block();
+        let exit = s.m.new_block();
+
+        let i32t = s.t.i32;
+        let zero = s.m.i32(0);
+        let one = s.m.i32(1);
+        let two = s.m.i32(2);
+        let ten = s.m.i32(10);
+        s.m.terminate(entry, Term::Br(head));
+
+        let acc = s.m.phi(head, i32t);
+        let go = s.m.cmp(head, pred::IULT, acc, ten);
+        s.m.terminate(head, Term::CondBr(go, body, exit));
+
+        let bit = s.m.bin(body, Bin::And, acc, one);
+        let pick = s.m.cmp(body, pred::EQ, bit, zero);
+        s.m.terminate(body, Term::CondBr(pick, latch_a, latch_b));
+
+        // Two distinct empty back-edge latches from `body` to `head` carry
+        // distinct incoming values; only one may fold into `body`.
+        s.m.terminate(latch_a, Term::Br(head));
+        s.m.terminate(latch_b, Term::Br(head));
+        let next_a = s.m.bin(body, Bin::Add, acc, one);
+        let next_b = s.m.bin(body, Bin::Add, acc, two);
+        s.m.set_phi(
+            acc,
+            vec![(zero, entry), (next_a, latch_a), (next_b, latch_b)],
+        );
+
+        s.m.terminate(exit, Term::Ret);
+        validate_and_create_cs_pso(s.finish());
+    }
+
+    #[test]
+    fn phi_with_unreachable_predecessor_validates() {
+        let mut s = Shader::new(false);
+        s.threads = Some([1, 1, 1]);
+        let entry = s.entry;
+        let dead = s.m.new_block();
+        let join = s.m.new_block();
+
+        let i32t = s.t.i32;
+        let one = s.m.i32(1);
+        let live_val = s.m.bin(entry, Bin::Add, one, one);
+        s.m.terminate(entry, Term::Br(join));
+
+        let dead_val = s.m.bin(dead, Bin::Add, one, one);
+        s.m.terminate(dead, Term::Br(join));
+
+        let merged = s.m.phi(join, i32t);
+        s.m.set_phi(merged, vec![(live_val, entry), (dead_val, dead)]);
+        let _used = s.m.bin(join, Bin::Add, merged, one);
+        s.m.terminate(join, Term::Ret);
+        validate_and_create_cs_pso(s.finish());
     }
 }
