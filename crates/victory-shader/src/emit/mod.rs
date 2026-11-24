@@ -122,6 +122,16 @@ pub fn loop_limit() -> u32 {
     })
 }
 
+/// The maximum wave size accepted for WaveSize emission: 64 by default, or
+/// overridden via `VICTORY_WAVE_SIZE_MAX` (e.g. 32 on Intel Arc DG2 where the hardware wave
+/// lane count max is 32).
+pub fn wave_size_max() -> u32 {
+    std::env::var("VICTORY_WAVE_SIZE_MAX")
+        .ok()
+        .and_then(|v| v.parse::<u32>().ok())
+        .unwrap_or(64)
+}
+
 /// `VICTORY_SHADER_LOOP_LIMIT`'s value; the default when it is unset,
 /// unreadable or 0. Pure, for testing.
 fn parse_loop_limit(value: Option<&str>) -> u32 {

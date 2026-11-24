@@ -1012,10 +1012,19 @@ impl State {
             s.refresh(list, *at, 4);
         }
         // Bounded first: the clamp binds a compute pipeline of its own.
-        if !crate::indirect::bound(list, &args.buffer, args.gpu(arguments), (kind, stride, max)) {
-            why("not bounded (no clamp, or arguments not 4-byte aligned)");
-            return false;
-        }
+        let compacted = match crate::indirect::bound(
+            list,
+            &args.buffer,
+            args.gpu(arguments),
+            (kind, stride, max),
+            counter.is_none(),
+        ) {
+            Some(c) => c,
+            None => {
+                why("not bounded (no clamp, or arguments not 4-byte aligned)");
+                return false;
+            }
+        };
         self.host_pipeline = 0;
         self.host_roots[1] = 0;
         let ran = match kind {
@@ -1027,8 +1036,9 @@ impl State {
             },
             _ => false,
         };
+        let compact_buf: Option<&ID3D12Resource> = compacted.as_ref().map(|c| &c.buffer);
         if !ran {
-            crate::indirect::done(list, &args.buffer);
+            crate::indirect::done(list, &args.buffer, compact_buf);
             #[cfg(feature = "diagnostics")]
             match crate::pipeline::host_pipeline(self.pipeline as This) {
                 None => crate::pipeline::note_drop(self.pipeline as This),
@@ -1043,16 +1053,27 @@ impl State {
         // SAFETY: an open list with everything set; the buffers are host
         // copies the list keeps alive (refresh), the signature is cached.
         unsafe {
-            list.list.ExecuteIndirect(
-                &signature,
-                max,
-                &args.buffer,
-                args.offset(arguments),
-                counter.as_ref().map(|(s, _)| &s.buffer),
-                counter.as_ref().map_or(0, |(s, at)| s.offset(*at)),
-            )
+            if let Some(compact) = &compacted {
+                list.list.ExecuteIndirect(
+                    &signature,
+                    max,
+                    &compact.buffer,
+                    compact.args_offset,
+                    Some(&compact.buffer),
+                    compact.count_offset,
+                );
+            } else {
+                list.list.ExecuteIndirect(
+                    &signature,
+                    max,
+                    &args.buffer,
+                    args.offset(arguments),
+                    counter.as_ref().map(|(s, _)| &s.buffer),
+                    counter.as_ref().map_or(0, |(s, at)| s.offset(*at)),
+                );
+            }
         };
-        crate::indirect::done(list, &args.buffer);
+        crate::indirect::done(list, &args.buffer, compact_buf);
         if kind == DISPATCH {
             DISPATCHED.fetch_add(1, Ordering::Relaxed);
         } else {

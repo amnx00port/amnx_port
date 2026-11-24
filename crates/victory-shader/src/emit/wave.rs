@@ -110,8 +110,12 @@ pub(crate) struct Section {
 
 /// Every whole-wave section of `block`, by start index.
 pub(crate) fn sections(p: &Program, block: usize) -> HashMap<usize, Section> {
+    sections_with_max(p, block, super::wave_size_max())
+}
+
+fn sections_with_max(p: &Program, block: usize, max_wave: u32) -> HashMap<usize, Section> {
     let insts = &p.blocks[block].insts;
-    let wave: u32 = if p.wave64 { 64 } else { 32 };
+    let wave: u32 = (if p.wave64 { 64 } else { 32 }).min(max_wave);
     let mut out = HashMap::new();
     let mut i = 0;
     while i < insts.len() {
@@ -253,11 +257,11 @@ fn simulate(insts: &[Inst], wave: u32, saved: Value) -> HashMap<Value, Shape> {
             let Some(k) = lo else {
                 return shapes(vec, uni, wave);
             };
-            exec = if name == "s_mov_b64" {
+            exec = (if name == "s_mov_b64" {
                 k
             } else {
                 exec & !0xFFFF_FFFF | k & 0xFFFF_FFFF
-            };
+            }) & all;
             continue;
         }
         if inst.write(Reg::S(EXEC + 1)).is_some() {
@@ -268,7 +272,7 @@ fn simulate(insts: &[Inst], wave: u32, saved: Value) -> HashMap<Value, Shape> {
             else {
                 return shapes(vec, uni, wave);
             };
-            exec = exec & 0xFFFF_FFFF | k << 32;
+            exec = (exec & 0xFFFF_FFFF | k << 32) & all;
             continue;
         }
         if let Fields::Sop { src, .. } = &inst.fields {
@@ -674,6 +678,64 @@ mod tests {
         assert_eq!(
             per_lane(&vec![red(u64::MAX); 64], u64::MAX),
             Some(Shape::Active(Op::AddU, x, m, 0))
+        );
+    }
+
+    #[test]
+    fn prefixes_and_active_reductions_are_recognised_wave32() {
+        let (x, m) = (Value(1), Value(2));
+        let red = |lanes: u64| Sym::Red {
+            op: Some(Op::AddU),
+            src: x,
+            mask: m,
+            ident: 0,
+            lanes,
+        };
+        let all32: u64 = 0xFFFF_FFFF;
+        let inclusive: Vec<Sym> = (0..32).map(|l| red(all32 >> (31 - l))).collect();
+        assert_eq!(
+            per_lane(&inclusive, all32),
+            Some(Shape::Prefix(Op::AddU, x, m, 0, true))
+        );
+        let mut exclusive: Vec<Sym> = (0..32).map(|l| red((1u64 << l) - 1)).collect();
+        exclusive[0] = Sym::K(0);
+        assert_eq!(
+            per_lane(&exclusive, all32),
+            Some(Shape::Prefix(Op::AddU, x, m, 0, false))
+        );
+        assert_eq!(
+            per_lane(&vec![red(all32); 32], all32),
+            Some(Shape::Active(Op::AddU, x, m, 0))
+        );
+    }
+
+    #[test]
+    fn wave64_section_simulates_wave32_when_clamped() {
+        let words: [u32; 16] = [
+            0xBE84_25C1,
+            0xD501_0000, 0x0012_0280,
+            0x4A00_00FA, 0xFF08_B100,
+            0x4A00_00FA, 0xFF08_4E00,
+            0x4A00_00FA, 0xFF09_4100,
+            0x4A00_00FA, 0xFF09_4000,
+            0xD778_0002, 0x0201_0100,
+            0x4A00_0500,
+            0xBEFE_0404,
+            0xBF81_0000,
+        ];
+        let code: Vec<u8> = words.iter().flat_map(|w| w.to_le_bytes()).collect();
+        let p = crate::ir::build(&code, true, 8).expect("ir::build");
+
+        let found = sections_with_max(&p, 0, 32);
+
+        assert_eq!(found.len(), 1);
+        let sec = &found[&0];
+        assert!(
+            sec.shapes
+                .values()
+                .any(|s| matches!(s, Shape::Active(Op::AddU, _, _, 0))),
+            "expected active sum shape in {:#?}",
+            sec.shapes
         );
     }
 }

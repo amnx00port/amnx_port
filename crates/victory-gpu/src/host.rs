@@ -287,6 +287,8 @@ pub(crate) struct HostList {
     /// Upload memory for data the list's draws make (expanded vertices),
     /// reused after a reset.
     scratch: Mutex<Scratch>,
+    /// Shared memory for indirect stream compaction, reused after reset.
+    compaction: Mutex<CompactionScratch>,
     /// Host texture states the list assumes, by host copy: at its start and
     /// at its end. Lists are recorded on many threads and run in submission
     /// order, so the transitions from a texture's real state are made at
@@ -366,6 +368,18 @@ struct Scratch {
 unsafe impl Send for Scratch {}
 
 const SCRATCH_CHUNK: u64 = 4 << 20;
+
+#[derive(Default)]
+struct CompactionScratch {
+    chunks: Vec<(ID3D12Resource, usize, u64)>,
+    current: usize,
+    used: u64,
+}
+
+// SAFETY: chunk pointers are persistent mappings of shared UMA buffers.
+unsafe impl Send for CompactionScratch {}
+
+const COMPACTION_CHUNK: u64 = 2 << 20;
 
 /// One piece of submission-time work, in recorded order.
 enum Step {
@@ -477,6 +491,7 @@ impl Host {
                 list,
                 deferred: Mutex::default(),
                 scratch: Mutex::default(),
+                compaction: Mutex::default(),
                 states: Mutex::default(),
                 prelude: (prelude_allocator, prelude),
                 pipelines: Mutex::default(),
@@ -889,6 +904,10 @@ impl HostList {
             let mut scratch = self.scratch.lock().unwrap_or_else(|e| e.into_inner());
             (scratch.current, scratch.used) = (0, 0);
         }
+        {
+            let mut compaction = self.compaction.lock().unwrap_or_else(|e| e.into_inner());
+            (compaction.current, compaction.used) = (0, 0);
+        }
         // SAFETY: the list is not executing.
         let reset = unsafe {
             self.allocator
@@ -1105,6 +1124,38 @@ impl HostList {
         let at = s.used;
         s.used += len;
         Some((gpu + at, (data + at as usize) as *mut u8))
+    }
+
+    /// Allocates `len` bytes from the shared compaction arena, aligned to 256 bytes.
+    pub(crate) fn compaction_scratch(&self, len: u64) -> Option<(ID3D12Resource, u64, u64, *mut u8)> {
+        let host = host()?;
+        let mut s = self.compaction.lock().unwrap_or_else(|e| e.into_inner());
+        let len = len.max(1).next_multiple_of(256);
+        if len > COMPACTION_CHUNK {
+            let (buffer, data) = host.shared_buffer(len)?;
+            name(&buffer, || format!("list compaction {len:#x}"));
+            // SAFETY: a live buffer.
+            let gpu = unsafe { buffer.GetGPUVirtualAddress() };
+            self.keep(&buffer);
+            return Some((buffer, gpu, 0, data));
+        }
+        if s.used + len > COMPACTION_CHUNK && s.current < s.chunks.len() {
+            (s.current, s.used) = (s.current + 1, 0);
+        }
+        if s.current == s.chunks.len() {
+            let (buffer, data) = host.shared_buffer(COMPACTION_CHUNK)?;
+            name(&buffer, || "list compaction".into());
+            // SAFETY: a live buffer.
+            let gpu = unsafe { buffer.GetGPUVirtualAddress() };
+            s.chunks.push((buffer, data as usize, gpu));
+            s.used = 0;
+        }
+        let buffer = s.chunks[s.current].0.clone();
+        let data = s.chunks[s.current].1;
+        let gpu = s.chunks[s.current].2;
+        let at = s.used;
+        s.used += len;
+        Some((buffer, gpu + at, at, (data + at as usize) as *mut u8))
     }
 
     /// The host address of the list's indirect-work budget, zeroed at each
