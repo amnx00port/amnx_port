@@ -117,12 +117,15 @@ cargo build --profile diag -p victory --features diagnostics   # target\diag\vic
 | `VICTORY_KEYS=30:Enter,35:X` | presses keys at those seconds, focus or not |
 | `VICTORY_CRASH_SAVE=<rva>:<len>,...` | saves title memory to the cache folder on a crash |
 | `VICTORY_CAPTURE=<dir>` | saves presented frames (powers of two, or `VICTORY_CAPTURE_FRAMES=<list>`) |
+| `VICTORY_CAPTURE_FSR=1` | with `VICTORY_CAPTURE` outside the checkout, saves the first successful FSR dispatch's input and output and the next presented back buffer |
 | `VICTORY_DUMP_TARGETS=1` | with the two above, saves every render target of those frames |
 | `VICTORY_D3D12_DEBUG=1` | host debug layer |
 | `VICTORY_D3D12_GBV=1` | with the above, GPU-based validation (bad descriptor use reported, not faulted; slow) |
 | `VICTORY_D3D12_DRED=1` | on a GPU failure, the allocation hit and the commands in flight |
 | `VICTORY_SKIP_PIPELINES=<hash>,...` | omit draws and dispatches, including indirect ones, whose pipeline contains a listed 16-digit shader hash |
+| `VICTORY_SKIP_WAVE64=mesh,compute` | omit draws and dispatches whose pipeline has a program of a listed stage written for 64-lane waves (on hosts with 32-lane waves, such as NVIDIA's, these can hang the GPU) |
 | `VICTORY_GPU_TIMING=1` | with the above, each list of a submission run and timed on its own; slow lists logged with their slowest commands |
+| `VICTORY_FFX_FRAMEGEN=1` | experimental FSR 3 frame generation for game frames with submitted FSR depth and motion inputs. Requires `VICTORY_FFX_DIR` pointing to the AMD SDK `signedbin` folder and an RGBA8 swapchain |
 | `VICTORY_D3D12_WARP=1` | host device on the software adapter (slow; cannot reset the driver) |
 | `VICTORY_SHADER_LOOP_LIMIT=<n>` | translated shader loops stop after `n` iterations per lane instead of 2^20 (own shader cache entries); if a lower `n` makes world frames much faster, loops hitting the limit are what makes them slow |
 | `VICTORY_AUDIO_CAPTURE=<file.wav>` | records what the title plays (our process only) |
@@ -130,6 +133,44 @@ cargo build --profile diag -p victory --features diagnostics   # target\diag\vic
 
 Every build appends crashes and host GPU failures to `crashes.log` in the
 title's data folder.
+
+## Testing AMD frame generation
+
+This test branch includes PC FSR and the Series S presentation changes. Tested on an RX 9070 XT with Proton
+Experimental. A native Windows test is still pending.
+
+Build with diagnostics, then point `VICTORY_FFX_DIR` at `Kits\FidelityFX\signedbin` in AMD’s FidelityFX SDK 2.4.
+Set `VICTORY_FFX_FRAMEGEN=1` and launch with `--console series-s`. Series S selects FSR by default.
+
+```powershell
+cargo build --locked --profile diag -p victory --features diagnostics
+$env:VICTORY_FFX_DIR = 'C:\FidelityFX-SDK\Kits\FidelityFX\signedbin'
+$env:VICTORY_FFX_FRAMEGEN = '1'
+target\diag\victory.exe run 'C:\path\to\game.exe' --execute --console series-s
+```
+
+On Linux, use the usual VIctory Wine or Proton setup. The Proton Experimental run used `FSR4_UPGRADE=1` for
+FSR 4.1.1 and Microsoft’s `d3dcompiler_47` for this branch’s presentation code. For Series X, add
+`VICTORY_UPSCALER=7E93F0` and `VICTORY_FFX_SCALE=0.6666667` for build 1.0.2.1, and use `--console series-x`.
+
+Look for `ffx framegen: generated game frames` after world loading. That line reports rendered frames,
+generated frames and DXGI presents. The boot screens run at the usual frame rate. The current test uses the
+legacy frame-generation provider. AMD Frame Generation 4 requires camera data the FSR calls do not carry.
+The Series X test logged both effects before the graphics ring timed out.
+
+To verify the picture on Series S, run twice from the same save. Keep
+`VICTORY_FFX_DIR` set for both runs and set `VICTORY_FFX_FRAMEGEN=1` only
+for the second. Set `VICTORY_CAPTURE_FSR=1` and give each run a fresh
+`VICTORY_CAPTURE` directory outside the checkout. Under Proton, use a
+Windows path visible to the runner. Set
+`VICTORY_LOG=error,victory_gpu::ffx=info,victory_gpu::capture=info` for a
+focused log, and keep standard output and standard error.
+
+Compare `fsr-input.png`, `fsr-output.png`, and the `frame-<n>.png`
+named by the `ffx capture: first present` log line. The input and output
+are copied from the dispatch's command list after it records the upscale.
+The last image is the next back buffer sent to Present. Check the generated
+frame and DXGI present counts separately in the frame generation log.
 
 ## License
 

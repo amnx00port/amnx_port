@@ -4,6 +4,7 @@
 //! size. Only in builds with diagnostics.
 
 use std::path::PathBuf;
+use std::sync::atomic::{AtomicU8, Ordering::Relaxed};
 
 use windows::Win32::Graphics::Direct3D12::*;
 use windows::Win32::Graphics::Dxgi::Common::*;
@@ -31,7 +32,127 @@ pub(crate) fn listed(n: u64) -> bool {
 
 /// Whether frame `n` is saved.
 pub(crate) fn wanted(n: u64) -> bool {
-    folder().is_some() && (n.is_power_of_two() || listed(n))
+    folder().is_some() && ((!fsr_capture_enabled() && n.is_power_of_two()) || listed(n))
+}
+
+fn fsr_capture_enabled() -> bool {
+    static ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ENABLED.get_or_init(|| folder().is_some() && std::env::var_os("VICTORY_CAPTURE_FSR").is_some())
+}
+
+const IDLE: u8 = 0;
+const RECORDING: u8 = 1;
+const SUBMITTED: u8 = 2;
+const PRESENTING: u8 = 3;
+const COMPLETE: u8 = 4;
+static FSR_CAPTURE: AtomicU8 = AtomicU8::new(IDLE);
+
+type Readback = (ID3D12Resource, D3D12_PLACED_SUBRESOURCE_FOOTPRINT);
+
+/// The GPU copies recorded immediately after a successful FSR dispatch and
+/// any output format conversion. Keep the buffers until the list finishes.
+pub(crate) struct FsrCapture {
+    input: Option<Readback>,
+    output: Option<Readback>,
+}
+
+impl Drop for FsrCapture {
+    fn drop(&mut self) {
+        // A discarded command list leaves the next dispatch eligible.
+        let _ = FSR_CAPTURE.compare_exchange(RECORDING, IDLE, Relaxed, Relaxed);
+    }
+}
+
+pub(crate) fn record_fsr(
+    list: &crate::host::HostList,
+    input: crate::object::This,
+    output: crate::object::This,
+    output_state: u32,
+) {
+    if !fsr_capture_enabled()
+        || FSR_CAPTURE.compare_exchange(IDLE, RECORDING, Relaxed, Relaxed).is_err()
+    {
+        return;
+    }
+    let mut capture = FsrCapture { input: None, output: None };
+    let Some(host) = crate::host::host() else { return };
+    let read = |resource, state| {
+        let texture = crate::resource::host_resource(resource)?;
+        // SAFETY: a live texture retained by the list's state tracker.
+        let desc = unsafe { texture.GetDesc() };
+        if desc.Dimension != D3D12_RESOURCE_DIMENSION_TEXTURE2D || desc.SampleDesc.Count != 1 {
+            return None;
+        }
+        crate::list::ensure_state(list, resource, D3D12_RESOURCE_STATE_COPY_SOURCE.0 as u32);
+        let buffer = read_back(&host.device, &list.list, texture);
+        if let Some((buffer, _)) = &buffer {
+            list.keep(buffer);
+        }
+        crate::list::ensure_state(list, resource, state);
+        buffer
+    };
+    capture.input = read(input, D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE.0 as u32);
+    capture.output = read(output, output_state);
+    if capture.input.is_none() || capture.output.is_none() {
+        tracing::warn!("ffx capture: could not record both texture readbacks");
+    }
+    *list.fsr_capture.lock().unwrap_or_else(|e| e.into_inner()) = Some(capture);
+    tracing::info!(?input, ?output, "ffx capture: recorded input and output readbacks");
+}
+
+/// Called after the GPU fence for the captured list completes.
+pub(crate) fn fsr_submitted(runs: &[&crate::host::HostList]) {
+    if FSR_CAPTURE.load(Relaxed) != RECORDING {
+        return;
+    }
+    for list in runs {
+        let Some(capture) = list.fsr_capture.lock().unwrap_or_else(|e| e.into_inner()).take() else {
+            continue;
+        };
+        if let Some(read) = &capture.input {
+            save_fsr_texture("fsr-input", read);
+        }
+        if let Some(read) = &capture.output {
+            save_fsr_texture("fsr-output", read);
+        }
+        FSR_CAPTURE.store(SUBMITTED, Relaxed);
+        break;
+    }
+}
+
+/// Select the next present recorded after the FSR submission. The same
+/// presenter may retry on a later frame if the swap chain refuses it.
+pub(crate) fn take_fsr_present() -> bool {
+    FSR_CAPTURE.compare_exchange(SUBMITTED, PRESENTING, Relaxed, Relaxed).is_ok()
+}
+
+pub(crate) fn finish_fsr_present(frame: u64, accepted: bool) {
+    FSR_CAPTURE.store(if accepted { COMPLETE } else { SUBMITTED }, Relaxed);
+    if accepted {
+        tracing::info!(frame, "ffx capture: first present after the captured dispatch accepted");
+    }
+}
+
+fn save_fsr_texture(name: &str, (buffer, footprint): &Readback) {
+    let f = footprint.Footprint;
+    let mut data = std::ptr::null_mut();
+    // SAFETY: the GPU fence completed. Read only bytes in the mapped
+    // buffer, including row padding except after the last row.
+    unsafe {
+        if let Err(error) = buffer.Map(0, None, Some(&mut data)) {
+            tracing::warn!(%error, name, "ffx capture: could not map texture readback");
+            return;
+        }
+        let len = (buffer.GetDesc().Width - footprint.Offset) as usize;
+        let rows = std::slice::from_raw_parts(data.cast::<u8>().add(footprint.Offset as usize), len);
+        let pitch = f.RowPitch as usize;
+        if let Some(rgba) = to_rgba(f.Format.0 as u32, f.Width as usize, f.Height as usize, pitch, rows) {
+            save_as(name, f.Width, f.Height, f.Width as usize * 4, false, &rgba);
+        } else {
+            tracing::warn!(name, format = f.Format.0, "ffx capture: unsupported texture format");
+        }
+        buffer.Unmap(0, None);
+    }
 }
 
 /// Saves 8-bit RGBA or BGRA rows (`pitch` bytes apart) as frame `n`.
@@ -353,6 +474,11 @@ fn to_rgba(format: u32, w: usize, h: usize, pitch: usize, rows: &[u8]) -> Option
         26 => (4, Box::new(move |b| {
             let v = u32_at(b, 0);
             [small_float(v & 0x7ff, 6), small_float(v >> 11 & 0x7ff, 6), small_float(v >> 22, 5)]
+        })),
+        67 => (4, Box::new(move |b| {
+            let v = u32_at(b, 0);
+            let scale = 2f32.powi((v >> 27) as i32 - 24);
+            [0, 9, 18].map(|shift| ((v >> shift) & 0x1ff) as f32 * scale)
         })),
         9..=10 => (8, Box::new(move |b| [half(u16_at(b, 0)), half(u16_at(b, 1)), half(u16_at(b, 2))])),
         11..=14 => (8, Box::new(move |b| [0, 1, 2].map(|i| f32::from(u16_at(b, i))))),

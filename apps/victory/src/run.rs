@@ -19,6 +19,15 @@ pub fn run(
     // A title that relaunched itself: the old process must be gone first.
     victory_hle::modules::lifecycle::wait_for_previous();
     let cfg = victory_core::Config::load()?;
+    #[cfg(feature = "diagnostics")]
+    if execute && std::env::var_os("VICTORY_CAPTURE_FSR").is_some() {
+        let folder = std::env::var_os("VICTORY_CAPTURE")
+            .context("VICTORY_CAPTURE_FSR requires VICTORY_CAPTURE")?;
+        let folder = Path::new(&folder);
+        victory_core::ensure_outside_repo(folder)?;
+        std::fs::create_dir_all(folder)
+            .with_context(|| format!("creating {}", folder.display()))?;
+    }
     let original = std::fs::read(exe).with_context(|| format!("reading {}", exe.display()))?;
     let prepared = victory_loader::prepare(&original)?;
     let hash = prepared.original_hash.to_hex();
@@ -132,6 +141,8 @@ fn diagnostics(image: &victory_loader::LoadedImage, cfg: &victory_core::Config) 
     victory_loader::dump_stacks_on_schedule();
     victory_hle::modules::audio::capture::start();
     watch(image.base(), image.info().size_of_image as usize);
+    upscaler_override(image);
+    ffx_scale(image);
     // Debugging aid: `VICTORY_CRASH_SAVE=<rva>:<len>,...` (hex) writes those
     // title ranges to `crash-<rva>.bin` in the cache dir on a crash.
     let size = image.info().size_of_image as usize;
@@ -149,6 +160,125 @@ fn diagnostics(image: &victory_loader::LoadedImage, cfg: &victory_core::Config) 
             })
             .collect(),
     );
+}
+
+/// Debugging aid: `VICTORY_UPSCALER=<rva>[,<kind>]` (hex rva, decimal kind,
+/// default 7) makes the title's upscaler picker return `kind`. In 1.0.2.1 the
+/// picker is at 7E93F0 and reached by 4 direct calls; it returns 7 (AMD FSR)
+/// only on Series S and 6 (the title's own upscaler) otherwise. The count of
+/// direct calls and jumps to the rva is logged; with none it is the wrong rva
+/// for this executable and nothing is patched.
+#[cfg(all(windows, feature = "diagnostics"))]
+fn upscaler_override(image: &victory_loader::LoadedImage) {
+    use windows_sys::Win32::System::Memory::{PAGE_EXECUTE_READWRITE, VirtualProtect};
+    const IMAGE_SCN_MEM_EXECUTE: u32 = 0x2000_0000;
+    let Ok(spec) = std::env::var("VICTORY_UPSCALER") else {
+        return;
+    };
+    let (rva, kind) = spec.split_once(',').unwrap_or((&spec, "7"));
+    let rva = usize::from_str_radix(rva.trim().trim_start_matches("0x"), 16);
+    let (Ok(rva), Ok(kind)) = (rva, kind.trim().parse::<u32>()) else {
+        eprintln!("VIctory: VICTORY_UPSCALER={spec}: expected <hex rva>[,<kind>]");
+        return;
+    };
+    let base = image.base();
+    let mut calls = 0;
+    for s in &image.info().sections {
+        if s.characteristics & IMAGE_SCN_MEM_EXECUTE == 0 {
+            continue;
+        }
+        let start = s.rva as usize;
+        // SAFETY: an executable section of the mapped image, readable.
+        let code = unsafe {
+            std::slice::from_raw_parts((base + start) as *const u8, s.virtual_size as usize)
+        };
+        for (i, w) in code.windows(5).enumerate() {
+            let rel = i64::from(i32::from_le_bytes([w[1], w[2], w[3], w[4]]));
+            if matches!(w[0], 0xE8 | 0xE9) && (start + i + 5) as i64 + rel == rva as i64 {
+                calls += 1;
+            }
+        }
+    }
+    if calls == 0 || rva + 6 > image.info().size_of_image as usize {
+        eprintln!(
+            "VIctory: upscaler picker at title+{rva:#x} not patched: no direct call to it (wrong rva?)"
+        );
+        return;
+    }
+    let mut stub = [0xB8, 0, 0, 0, 0, 0xC3]; // mov eax, kind; ret
+    stub[1..5].copy_from_slice(&kind.to_le_bytes());
+    let at = (base + rva) as *mut u8;
+    let mut old = 0;
+    // SAFETY: six bytes at a function entry inside the image; no title code
+    // runs yet.
+    unsafe {
+        VirtualProtect(at.cast(), stub.len(), PAGE_EXECUTE_READWRITE, &mut old);
+        at.copy_from_nonoverlapping(stub.as_ptr(), stub.len());
+        VirtualProtect(at.cast(), stub.len(), old, &mut old);
+    }
+    eprintln!("VIctory: upscaler picker at title+{rva:#x} returns {kind} ({calls} direct calls)");
+}
+
+/// Debugging aid: `VICTORY_FFX_SCALE=<scale>[,<hex rva>]` sets the render
+/// scale of the title's FidelityFX path (0.5: 1080p for a 4K output, 0.6667:
+/// 1440p). The rva is the method that picks the scale (1.0.2.1: 28EF680, the
+/// default); it takes 2/3 on Series S and 1.0 on Series X, so Series X with
+/// FidelityFX forced on renders at full 4K, which overflows its memory plan.
+/// Both of its scale loads (`vmovss xmm0, [rip+d]`) are pointed at our
+/// constant, kept in the padding after the method; with other code there,
+/// nothing is patched.
+#[cfg(all(windows, feature = "diagnostics"))]
+fn ffx_scale(image: &victory_loader::LoadedImage) {
+    use windows_sys::Win32::System::Memory::{PAGE_EXECUTE_READWRITE, VirtualProtect};
+    const LOADS: [usize; 2] = [0x28, 0x32];
+    const SLOT: usize = 0x64;
+    const VMOVSS_RIP: [u8; 4] = [0xC5, 0xFA, 0x10, 0x05];
+    let Ok(spec) = std::env::var("VICTORY_FFX_SCALE") else {
+        return;
+    };
+    let (scale, rva) = spec.split_once(',').unwrap_or((&spec, "28EF680"));
+    let scale = scale
+        .trim()
+        .parse::<f32>()
+        .ok()
+        .filter(|s| *s > 0.0 && *s <= 1.0);
+    let rva = usize::from_str_radix(rva.trim().trim_start_matches("0x"), 16).ok();
+    let (Some(scale), Some(rva)) = (scale, rva) else {
+        eprintln!("VIctory: VICTORY_FFX_SCALE={spec}: expected <scale in (0, 1]>[,<hex rva>]");
+        return;
+    };
+    if rva + SLOT + 4 > image.info().size_of_image as usize {
+        eprintln!("VIctory: VICTORY_FFX_SCALE: title+{rva:#x} is outside the image");
+        return;
+    }
+    let at = (image.base() + rva) as *mut u8;
+    // SAFETY: inside the mapped image (checked above), readable.
+    let code = unsafe { std::slice::from_raw_parts(at, SLOT + 4) };
+    if LOADS.iter().any(|&l| code[l..l + 4] != VMOVSS_RIP) || code[SLOT..] != [0xCC; 4] {
+        eprintln!(
+            "VIctory: FidelityFX scale not patched: unexpected code at title+{rva:#x} (wrong rva?)"
+        );
+        return;
+    }
+    let mut old = 0;
+    // SAFETY: bytes inside the method checked above and its padding; no
+    // title code runs yet.
+    unsafe {
+        let span = at.add(LOADS[0]);
+        VirtualProtect(
+            span.cast(),
+            SLOT + 4 - LOADS[0],
+            PAGE_EXECUTE_READWRITE,
+            &mut old,
+        );
+        at.add(SLOT).cast::<f32>().write_unaligned(scale);
+        for l in LOADS {
+            let disp = (SLOT - (l + 8)) as i32;
+            at.add(l + 4).cast::<i32>().write_unaligned(disp);
+        }
+        VirtualProtect(span.cast(), SLOT + 4 - LOADS[0], old, &mut old);
+    }
+    eprintln!("VIctory: FidelityFX render scale at title+{rva:#x} set to {scale}");
 }
 
 /// Debugging aid: `VICTORY_WATCH=<rva>,...` (hex) logs the u32 at each
