@@ -1814,11 +1814,17 @@ impl<'a> Lower<'a> {
         Ok(())
     }
 
-    fn write_i(&mut self, inst: &Inst, x: V, guard: Option<V>) -> Result<(), Why> {
+    fn write_i(
+        &mut self,
+        inst: &Inst,
+        x: V,
+        guard: Option<V>,
+        clamp_handled: bool,
+    ) -> Result<(), Why> {
         let Fields::Valu(v) = &inst.fields else {
             unreachable!()
         };
-        if v.clamp || v.omod != 0 {
+        if v.clamp && !clamp_handled || v.omod != 0 {
             return Err("integer output modifiers");
         }
         match v.dst {
@@ -3736,7 +3742,7 @@ impl<'a> Lower<'a> {
         let f = |l: &mut Self, k| l.fsrc(inst, k);
         let s = |l: &mut Self, k| l.src(inst, k);
         let float = |l: &mut Self, r: V| l.write_f(inst, r, guard);
-        let int = |l: &mut Self, r: V| l.write_i(inst, r, guard);
+        let int = |l: &mut Self, r: V| l.write_i(inst, r, guard, false);
         if let Some(r) = self.valu16(inst, name, guard) {
             return r;
         }
@@ -4188,8 +4194,13 @@ impl<'a> Lower<'a> {
                 } else {
                     None
                 };
-                let (r, carry) = self.add_sub_carry(c, name.starts_with("v_add"), a, bb, cin);
-                int(self, r)?;
+                let add = name.starts_with("v_add");
+                let (mut r, carry) = self.add_sub_carry(c, add, a, bb, cin);
+                if v.clamp {
+                    let limit = self.s.m.i32(if add { u32::MAX } else { 0 });
+                    r = self.s.m.select(c, carry, limit, r);
+                }
+                self.write_i(inst, r, guard, true)?;
                 if let Some(Operand::Scalar { code, .. }) = v.carry
                     && let Some(w) = inst.write(Reg::S(code))
                 {
@@ -4201,6 +4212,36 @@ impl<'a> Lower<'a> {
                         .or_insert(Val::Missing("a lane mask read as data"));
                 }
                 Ok(())
+            }
+            "v_add_nc_u32" | "v_sub_nc_u32" | "v_subrev_nc_u32" | "v_add_nc_i32" | "v_sub_nc_i32" => {
+                let (mut a, mut b) = (s(self, 0)?, s(self, 1)?);
+                if name == "v_subrev_nc_u32" {
+                    std::mem::swap(&mut a, &mut b);
+                }
+                let add = name.starts_with("v_add");
+                let op = if add { Bin::Add } else { Bin::Sub };
+                let r = if !v.clamp {
+                    self.s.m.bin(c, op, a, b)
+                } else if name.ends_with("_u32") {
+                    let (r, carry) = self.add_sub_carry(c, add, a, b, None);
+                    let limit = self.s.m.i32(if add { u32::MAX } else { 0 });
+                    self.s.m.select(c, carry, limit, r)
+                } else {
+                    let r = self.s.m.bin(c, op, a, b);
+                    // The signed result decreases for a negative addend or a
+                    // positive subtrahend. Reversing that direction means overflow.
+                    let zero = self.s.m.i32(0);
+                    let direction = if add { pred::SLT } else { pred::SGT };
+                    let decreases = self.s.m.cmp(c, direction, b, zero);
+                    let decreased = self.s.m.cmp(c, pred::SLT, r, a);
+                    let overflow = self.s.m.bin(c, Bin::Xor, decreases, decreased);
+                    let negative = self.s.m.cmp(c, pred::SLT, a, zero);
+                    let min = self.s.m.i32(i32::MIN as u32);
+                    let max = self.s.m.i32(i32::MAX as u32);
+                    let limit = self.s.m.select(c, negative, min, max);
+                    self.s.m.select(c, overflow, limit, r)
+                };
+                self.write_i(inst, r, guard, true)
             }
             "v_readlane_b32" => {
                 let (a, lane) = (s(self, 0)?, s(self, 1)?);
@@ -4891,17 +4932,13 @@ impl<'a> Lower<'a> {
             l.s.m.bin(c, Bin::And, x, k31)
         };
         Ok(match name {
-            "v_and_b32" | "v_or_b32" | "v_xor_b32" | "v_add_nc_u32" | "v_sub_nc_u32"
-            | "v_subrev_nc_u32" | "v_mul_lo_u32" => {
+            "v_and_b32" | "v_or_b32" | "v_xor_b32" | "v_mul_lo_u32" => {
                 let (a, b) = (s(self, 0)?, s(self, 1)?);
-                let (op, a, b) = match name {
-                    "v_and_b32" => (Bin::And, a, b),
-                    "v_or_b32" => (Bin::Or, a, b),
-                    "v_xor_b32" => (Bin::Xor, a, b),
-                    "v_add_nc_u32" => (Bin::Add, a, b),
-                    "v_sub_nc_u32" => (Bin::Sub, a, b),
-                    "v_subrev_nc_u32" => (Bin::Sub, b, a),
-                    _ => (Bin::Mul, a, b),
+                let op = match name {
+                    "v_and_b32" => Bin::And,
+                    "v_or_b32" => Bin::Or,
+                    "v_xor_b32" => Bin::Xor,
+                    _ => Bin::Mul,
                 };
                 self.s.m.bin(c, op, a, b)
             }
@@ -4950,6 +4987,7 @@ impl<'a> Lower<'a> {
                             "v_and_or_b32" => (Bin::And, Bin::Or),
                             "v_or3_b32" => (Bin::Or, Bin::Or),
                             "v_xad_u32" => (Bin::Xor, Bin::Add),
+                            // GFX10.3 v_add3_u32 has no clamp modifier.
                             "v_add3_u32" => (Bin::Add, Bin::Add),
                             _ => (Bin::Xor, Bin::Xor),
                         };

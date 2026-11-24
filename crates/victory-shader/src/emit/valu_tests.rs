@@ -174,6 +174,17 @@ fn run_cases(
     cases: &[[u32; 4]],
     mut check: impl FnMut(&str, usize, [u32; 4], u32),
 ) {
+    run_cases_with_output(shader, cases, 1, |label, i, inputs, out| {
+        check(label, i, inputs, out[0]);
+    });
+}
+
+fn run_cases_with_output(
+    shader: &HostShader,
+    cases: &[[u32; 4]],
+    output_dwords: u32,
+    mut check: impl FnMut(&str, usize, [u32; 4], &[u32]),
+) {
     let _one = ONE_AT_A_TIME.lock().unwrap_or_else(|e| e.into_inner());
     let mut ran = 0;
     for (label, warp) in [("hardware", false), ("warp", true)] {
@@ -199,17 +210,157 @@ fn run_cases(
                     &pso,
                     &Dispatch {
                         roots: vec![(0, Root::Constants(ud))],
-                        views: &[View::RawUav(1)],
+                        views: &[View::RawUav(output_dwords)],
                         samplers: &[],
                         groups: [1, 1, 1],
                     },
                 )
                 .unwrap_or_else(|e| panic!("{label}: dispatch failed: {e}"));
-            check(label, i, inputs, out[0][0]);
+            check(label, i, inputs, &out[0]);
         }
         ran += 1;
     }
     assert!(ran > 0, "neither hardware nor WARP SM 6.6 device available");
+}
+
+#[test]
+fn vop3_unsigned_clamp_preserves_carry_and_borrow_out() {
+    let cases = [
+        [u32::MAX, 2, 0, 0],
+        [2, u32::MAX, 0, 0],
+        [u32::MAX, 0, 1, 0],
+        [0, u32::MAX, 1, 0],
+        [7, 7, 1, 0],
+        [9, 3, 0, 0],
+        [3, 9, 0, 0],
+    ];
+    for (op, add, reverse, carry_in) in [
+        (0x30f, true, false, false),  // v_add_co_u32
+        (0x310, false, false, false), // v_sub_co_u32
+        (0x319, false, true, false),  // v_subrev_co_u32
+        (0x128, true, false, true),   // v_add_co_ci_u32
+        (0x129, false, false, true),  // v_sub_co_ci_u32
+        (0x12a, false, true, true),   // v_subrev_co_ci_u32
+    ] {
+        for clamp in [false, true] {
+            let mut body = Vec::new();
+            if carry_in {
+                // v_add_co_u32 v7, s7, v3, -1 produces a carry iff v3 is nonzero.
+                let mut seed = vop3(0x30f, 7, vgpr(3), 193, 0);
+                seed[0] |= 7 << 8;
+                body.extend(seed);
+            }
+            let mut words = vop3(op, 0, vgpr(1), vgpr(2), if carry_in { sgpr(7) } else { 0 });
+            words[0] |= 6 << 8 | u32::from(clamp) << 15; // sdst = s6
+            body.extend(words);
+            // Materialize s6's lane bit with v_cndmask_b32 v5, 0, 1, s6.
+            body.extend(vop3(0x101, 5, 128, 129, sgpr(6)));
+            body.extend(buffer_store_dword(5, 8, 4));
+            let shader = build_valu_cs(&body);
+            run_cases_with_output(&shader, &cases, 2, |backend, _, [a, b, cin, _], got| {
+                let (a, b) = if reverse { (b, a) } else { (a, b) };
+                let cin = u32::from(carry_in) * cin;
+                let (r, carry) = if add {
+                    let (t, carry) = a.overflowing_add(b);
+                    let (r, more) = t.overflowing_add(cin);
+                    (r, carry || more)
+                } else {
+                    let (t, borrow) = a.overflowing_sub(b);
+                    let (r, more) = t.overflowing_sub(cin);
+                    (r, borrow || more)
+                };
+                let expected = if clamp && carry {
+                    if add { u32::MAX } else { 0 }
+                } else {
+                    r
+                };
+                assert_eq!(
+                    got,
+                    [expected, u32::from(carry)],
+                    "{backend}: opcode {op:#x}, clamp={clamp}, {a:#x}, {b:#x}, cin={cin}"
+                );
+            });
+        }
+    }
+}
+
+#[test]
+fn vop3_unsigned_no_carry_add_sub_respect_clamp() {
+    let cases = [
+        [u32::MAX, 2, 0, 0],
+        [2, u32::MAX, 0, 0],
+        [5, 9, 0, 0],
+        [9, 5, 0, 0],
+        [u32::MAX, 0, 0, 0],
+    ];
+    for op in [0x125, 0x126, 0x127] {
+        for clamp in [false, true] {
+            let mut words = vop3(op, 0, vgpr(1), vgpr(2), 0);
+            words[0] |= u32::from(clamp) << 15;
+            let shader = build_valu_cs(&words);
+            run_cases(&shader, &cases, |backend, _, [a, b, _, _], got| {
+                let expected = match (op, clamp) {
+                    (0x125, false) => a.wrapping_add(b),
+                    (0x125, true) => a.saturating_add(b),
+                    (0x126, false) => a.wrapping_sub(b),
+                    (0x126, true) => a.saturating_sub(b),
+                    (_, false) => b.wrapping_sub(a),
+                    (_, true) => b.saturating_sub(a),
+                };
+                assert_eq!(
+                    got, expected,
+                    "{backend}: opcode {op:#x}, clamp={clamp}, {a:#x}, {b:#x}"
+                );
+            });
+        }
+    }
+}
+
+#[test]
+fn vop3_signed_no_carry_add_sub_respect_clamp() {
+    let cases = [
+        [i32::MAX as u32, 1, 0, 0],
+        [i32::MIN as u32, (-1_i32) as u32, 0, 0],
+        [i32::MIN as u32, 1, 0, 0],
+        [i32::MAX as u32, (-1_i32) as u32, 0, 0],
+        [0, i32::MIN as u32, 0, 0],
+        [7, 0, 0, 0],
+    ];
+    for (op, add) in [(0x37f, true), (0x376, false)] {
+        for clamp in [false, true] {
+            let mut words = vop3(op, 0, vgpr(1), vgpr(2), 0);
+            words[0] |= u32::from(clamp) << 15;
+            let shader = build_valu_cs(&words);
+            run_cases(&shader, &cases, |backend, _, [a, b, _, _], got| {
+                let (a, b) = (a as i32, b as i32);
+                let expected = match (add, clamp) {
+                    (true, false) => a.wrapping_add(b),
+                    (true, true) => a.saturating_add(b),
+                    (false, false) => a.wrapping_sub(b),
+                    (false, true) => a.saturating_sub(b),
+                };
+                assert_eq!(
+                    got as i32, expected,
+                    "{backend}: opcode {op:#x}, clamp={clamp}, {a}, {b}"
+                );
+            });
+        }
+    }
+}
+
+#[test]
+fn v_add3_u32_wraps_on_double_carry() {
+    let shader = build_valu_cs(&vop3(0x36d, 0, vgpr(1), vgpr(2), vgpr(3)));
+    let cases = [
+        ([1, 2, 3, 0], 6),
+        ([u32::MAX, 2, 3, 0], 4),      // Only the first add carries.
+        ([1, 2, u32::MAX, 0], 2),      // Only the second add carries.
+        ([u32::MAX; 4], u32::MAX - 2), // Both adds carry.
+    ];
+    let inputs = cases.map(|(input, _)| input);
+    run_cases(&shader, &inputs, |backend, i, input, got| {
+        assert_eq!(got, cases[i].1, "{backend}: v_add3_u32 {input:x?}");
+    });
 }
 
 fn is_f16_nan(bits: u16) -> bool {
