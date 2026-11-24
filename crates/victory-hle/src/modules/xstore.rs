@@ -300,6 +300,13 @@ extern "system" fn install_async(
     offline(block, "package download")
 }
 
+/// A store id is the installation's own when it is the running title's,
+/// and the manifest has one (an empty id matches nothing).
+fn installed_package(title: &runtime::Title, store_id: Option<&str>) -> Option<String> {
+    let id = store_id?;
+    (!title.store_id.is_empty() && id == title.store_id).then(xpackage::identifier)
+}
+
 /// The game's own store id maps to its installation; nothing else is
 /// installed.
 extern "system" fn package_identifier(
@@ -308,13 +315,10 @@ extern "system" fn package_identifier(
     size: usize,
     buffer: *mut u8,
 ) -> HRESULT {
-    let title = runtime::title();
-    match text(store_id) {
-        Some(id) if !title.store_id.is_empty() && id == title.store_id => {
-            put_string(&xpackage::identifier(), size, buffer, std::ptr::null_mut())
-        }
-        _ => xpackage::NO_PACKAGE,
-    }
+    let Some(identifier) = installed_package(&runtime::title(), text(store_id).as_deref()) else {
+        return xpackage::NO_PACKAGE;
+    };
+    put_string(&identifier, size, buffer, std::ptr::null_mut())
 }
 
 /// Licences never change offline, so these callbacks never run.
@@ -423,6 +427,630 @@ mod tests {
             callback: None,
             internal: [0; 4],
         }
+    }
+
+    /// Runs `begin` on `b` and checks its call finished at once, as the title
+    /// then reads it: the status word, and a result size (none if it failed).
+    /// The block stays where it is, since a call is keyed by its address.
+    fn ran(b: &mut AsyncBlock, begin: impl FnOnce(*mut AsyncBlock) -> HRESULT, expected: HRESULT) {
+        assert_eq!(begin(b), S_OK);
+        assert_eq!(xasync::XAsyncGetStatus(b, true), expected);
+        assert_eq!(b.internal[1], expected as u32 as usize);
+        if expected < 0 {
+            assert_eq!(b.internal[2], 0, "a failed call has no result");
+        }
+    }
+
+    #[test]
+    fn both_interface_ids_are_answered_by_one_object() {
+        assert_eq!(INTERFACES.len(), 2);
+        for &(provider, iid, object) in INTERFACES {
+            assert_eq!(provider, PROVIDER);
+            assert!(iid == IID_2026 || iid == DURABLES_IID, "{iid}");
+            assert!(std::ptr::eq(object, &OBJECT));
+        }
+        assert_eq!(INTERFACES[0].1, IID_2026);
+        assert_eq!(INTERFACES[1].1, DURABLES_IID);
+        assert_ne!(IID_2026, DURABLES_IID, "durables add slots");
+        // The documented "failed to communicate with the store network".
+        assert_eq!(NETWORK_ERROR, 0x8924_5301_u32 as i32);
+    }
+
+    /// Licences are told apart by which address their handle is, so no two
+    /// handles may share one.
+    #[test]
+    fn each_handle_is_its_own_address() {
+        let handles = [
+            handle(&CONTEXT),
+            handle(&QUERY),
+            handle(&VALID),
+            handle(&INVALID),
+        ];
+        for (i, a) in handles.iter().enumerate() {
+            assert!(!a.is_null());
+            for b in &handles[i + 1..] {
+                assert_ne!(a, b);
+            }
+        }
+    }
+
+    #[test]
+    fn the_context_is_one_fixed_handle_that_outlives_its_close() {
+        type Create = extern "system" fn(This, *const c_void, *mut Handle) -> HRESULT;
+        let this: This = &OBJECT;
+        let create = method::<Create>(&OBJECT, 0x18);
+        let mut first = std::ptr::null();
+        let mut second = std::ptr::null();
+        assert_eq!(create(this, std::ptr::null(), &mut first), S_OK);
+        assert_eq!(create(this, c"options".as_ptr().cast(), &mut second), S_OK);
+        assert_eq!(first, handle(&CONTEXT));
+        assert_eq!(first, second, "one context, however often asked for");
+
+        // A null out is refused.
+        assert_eq!(
+            create(this, std::ptr::null(), std::ptr::null_mut()),
+            xasync::E_INVALIDARG
+        );
+
+        // Closing only says the title is done with it: a fixed handle still
+        // serves the calls that take it.
+        method::<extern "system" fn(This, Handle)>(&OBJECT, 0x20)(this, first);
+        let mut b = block();
+        assert_eq!(
+            method::<extern "system" fn(This, Handle, *mut AsyncBlock) -> HRESULT>(&OBJECT, 0x1b8)(
+                this, first, &mut b
+            ),
+            S_OK
+        );
+        assert_eq!(xasync::XAsyncGetStatus(&mut b, true), NETWORK_ERROR);
+    }
+
+    #[test]
+    fn an_empty_entitlement_query_has_no_products() {
+        type Entitled = extern "system" fn(This, Handle, u32, u32, *mut AsyncBlock) -> HRESULT;
+        type Query = extern "system" fn(This, *mut AsyncBlock, *mut Handle) -> HRESULT;
+        type Enumerate = extern "system" fn(This, Handle, *mut c_void, *const c_void) -> HRESULT;
+        let this: This = &OBJECT;
+        let context = handle(&CONTEXT);
+        let mut b = block();
+        ran(
+            &mut b,
+            |b| method::<Entitled>(&OBJECT, 0x48)(this, context, 0, 0, b),
+            S_OK,
+        );
+
+        let mut query = std::ptr::null();
+        assert_eq!(
+            method::<Query>(&OBJECT, 0x50)(this, &mut b, &mut query),
+            S_OK
+        );
+        assert_eq!(query, handle(&QUERY));
+        // The call ends with its one result.
+        let mut again: Handle = std::ptr::null();
+        assert_eq!(
+            method::<Query>(&OBJECT, 0x50)(this, &mut b, &mut again),
+            E_ILLEGAL_METHOD_CALL
+        );
+        assert!(again.is_null());
+
+        // Nothing to enumerate, and no page after this one.
+        let none = std::ptr::null();
+        assert_eq!(
+            method::<Enumerate>(&OBJECT, 0x78)(this, query, std::ptr::null_mut(), none),
+            S_OK
+        );
+        assert!(!method::<extern "system" fn(This, Handle) -> bool>(
+            &OBJECT, 0x80
+        )(this, query));
+        let mut next = block();
+        ran(
+            &mut next,
+            |b| {
+                method::<extern "system" fn(This, Handle, *mut AsyncBlock) -> HRESULT>(
+                    &OBJECT, 0x88,
+                )(this, query, b)
+            },
+            E_ILLEGAL_METHOD_CALL,
+        );
+        let mut page: Handle = std::ptr::null();
+        assert_eq!(
+            method::<Query>(&OBJECT, 0x90)(this, &mut next, &mut page),
+            E_ILLEGAL_METHOD_CALL
+        );
+        assert!(page.is_null());
+
+        // Closing a query is a no-op, like closing any other handle.
+        let close = method::<extern "system" fn(This, Handle)>(&OBJECT, 0x98);
+        close(this, query);
+        close(this, std::ptr::null());
+        method::<extern "system" fn(This, Handle)>(&OBJECT, 0xb8)(this, handle(&INVALID));
+    }
+
+    #[test]
+    fn everything_that_needs_the_store_service_fails_offline() {
+        type Associated = extern "system" fn(This, Handle, u32, u32, *mut AsyncBlock) -> HRESULT;
+        type Balance = extern "system" fn(This, Handle, *const c_char, *mut AsyncBlock) -> HRESULT;
+        type Fulfillment = extern "system" fn(
+            This,
+            Handle,
+            *const c_char,
+            u32,
+            *const c_void,
+            *mut AsyncBlock,
+        ) -> HRESULT;
+        type UserId = extern "system" fn(
+            This,
+            Handle,
+            *const c_char,
+            *const c_char,
+            *mut AsyncBlock,
+        ) -> HRESULT;
+        type Purchase = extern "system" fn(
+            This,
+            Handle,
+            *const c_char,
+            *const c_char,
+            *const c_char,
+            *mut AsyncBlock,
+        ) -> HRESULT;
+        type Redeem = extern "system" fn(
+            This,
+            Handle,
+            *const c_char,
+            *const *const c_char,
+            usize,
+            bool,
+            *mut AsyncBlock,
+        ) -> HRESULT;
+        type NoArgs = extern "system" fn(This, Handle, *mut AsyncBlock) -> HRESULT;
+        type Install = extern "system" fn(
+            This,
+            Handle,
+            *const *const c_char,
+            usize,
+            *mut AsyncBlock,
+        ) -> HRESULT;
+        type Page = extern "system" fn(This, Handle, *const c_char, *mut AsyncBlock) -> HRESULT;
+        let this: This = &OBJECT;
+        let context = handle(&CONTEXT);
+        let store_id = c"9XYZ";
+        let ids = [c"synthetic-product".as_ptr()];
+        let no_handle: *const c_void = std::ptr::null();
+        let no_list: *const *const c_char = std::ptr::null();
+
+        // Associated products, consumables, ids, pages, update checks and
+        // installs alike. Each failed call leaves the block free for the next.
+        let mut b = block();
+        ran(
+            &mut b,
+            |b| method::<Associated>(&OBJECT, 0x28)(this, context, 0, 0, b),
+            NETWORK_ERROR,
+        );
+        ran(
+            &mut b,
+            |b| method::<Balance>(&OBJECT, 0x108)(this, context, store_id.as_ptr(), b),
+            NETWORK_ERROR,
+        );
+        ran(
+            &mut b,
+            |b| {
+                method::<Fulfillment>(&OBJECT, 0x118)(
+                    this,
+                    context,
+                    store_id.as_ptr(),
+                    1,
+                    no_handle,
+                    b,
+                )
+            },
+            NETWORK_ERROR,
+        );
+        for slot in [0x128, 0x140] {
+            ran(
+                &mut b,
+                |b| {
+                    method::<UserId>(&OBJECT, slot)(
+                        this,
+                        context,
+                        c"ticket".as_ptr(),
+                        store_id.as_ptr(),
+                        b,
+                    )
+                },
+                NETWORK_ERROR,
+            );
+        }
+        ran(
+            &mut b,
+            |b| {
+                method::<Purchase>(&OBJECT, 0x188)(
+                    this,
+                    context,
+                    store_id.as_ptr(),
+                    c"name".as_ptr(),
+                    c"{}".as_ptr(),
+                    b,
+                )
+            },
+            NETWORK_ERROR,
+        );
+        ran(
+            &mut b,
+            |b| {
+                method::<Redeem>(&OBJECT, 0x1a8)(
+                    this,
+                    context,
+                    c"token".as_ptr(),
+                    no_list,
+                    0,
+                    false,
+                    b,
+                )
+            },
+            NETWORK_ERROR,
+        );
+        ran(
+            &mut b,
+            |b| method::<NoArgs>(&OBJECT, 0x1b8)(this, context, b),
+            NETWORK_ERROR,
+        );
+        for slot in [0x1e0, 0x1f0] {
+            ran(
+                &mut b,
+                |b| method::<Install>(&OBJECT, slot)(this, context, ids.as_ptr(), 1, b),
+                NETWORK_ERROR,
+            );
+        }
+        ran(
+            &mut b,
+            |b| method::<Page>(&OBJECT, 0x258)(this, context, store_id.as_ptr(), b),
+            NETWORK_ERROR,
+        );
+    }
+
+    #[test]
+    fn an_offline_calls_results_report_the_error_and_write_nothing() {
+        type Associated = extern "system" fn(This, Handle, u32, u32, *mut AsyncBlock) -> HRESULT;
+        type NoArgs = extern "system" fn(This, Handle, *mut AsyncBlock) -> HRESULT;
+        type Install = extern "system" fn(
+            This,
+            Handle,
+            *const *const c_char,
+            usize,
+            *mut AsyncBlock,
+        ) -> HRESULT;
+        type Query = extern "system" fn(This, *mut AsyncBlock, *mut Handle) -> HRESULT;
+        type Status = extern "system" fn(This, *mut AsyncBlock) -> HRESULT;
+        type Size = extern "system" fn(This, *mut AsyncBlock, *mut usize) -> HRESULT;
+        type String_ = extern "system" fn(This, *mut AsyncBlock, usize, *mut c_char) -> HRESULT;
+        type Count = extern "system" fn(This, *mut AsyncBlock, *mut u32) -> HRESULT;
+        type Array = extern "system" fn(This, *mut AsyncBlock, u32, *mut c_void) -> HRESULT;
+        let this: This = &OBJECT;
+        let context = handle(&CONTEXT);
+        let ids = [c"synthetic-product".as_ptr()];
+
+        // Associated products: the query a success would hand back.
+        let mut products = block();
+        ran(
+            &mut products,
+            |b| method::<Associated>(&OBJECT, 0x28)(this, context, 0, 0, b),
+            NETWORK_ERROR,
+        );
+        let mut query = handle(&QUERY);
+        assert_eq!(
+            method::<Query>(&OBJECT, 0x30)(this, &mut products, &mut query),
+            NETWORK_ERROR
+        );
+        assert_eq!(query, handle(&QUERY), "a failure returns no handle");
+
+        // Consumable balance: its status.
+        assert_eq!(
+            method::<Status>(&OBJECT, 0x110)(this, &mut products),
+            NETWORK_ERROR
+        );
+
+        // The collection and purchase ids: a size, then the string.
+        for (size_slot, string_slot) in [(0x130, 0x138), (0x148, 0x150)] {
+            let mut size = 7;
+            assert_eq!(
+                method::<Size>(&OBJECT, size_slot)(this, &mut products, &mut size),
+                NETWORK_ERROR
+            );
+            assert_eq!(size, 7, "nothing written");
+            let mut buffer = [b'x'; 8];
+            assert_eq!(
+                method::<String_>(&OBJECT, string_slot)(
+                    this,
+                    &mut products,
+                    buffer.len(),
+                    buffer.as_mut_ptr().cast()
+                ),
+                NETWORK_ERROR
+            );
+            assert_eq!(buffer, [b'x'; 8]);
+        }
+
+        // The update check: a count, then the array.
+        let mut updates = block();
+        ran(
+            &mut updates,
+            |b| method::<NoArgs>(&OBJECT, 0x1b8)(this, context, b),
+            NETWORK_ERROR,
+        );
+        let mut count = 3;
+        assert_eq!(
+            method::<Count>(&OBJECT, 0x1c0)(this, &mut updates, &mut count),
+            NETWORK_ERROR
+        );
+        assert_eq!(count, 3);
+        let mut array = [0xabu8; 8];
+        assert_eq!(
+            method::<Array>(&OBJECT, 0x1c8)(this, &mut updates, 1, array.as_mut_ptr().cast()),
+            NETWORK_ERROR
+        );
+        assert_eq!(array, [0xab; 8]);
+
+        // Installing updates: a status; installing packages: count and array.
+        let mut installed = block();
+        ran(
+            &mut installed,
+            |b| method::<Install>(&OBJECT, 0x1e0)(this, context, ids.as_ptr(), 1, b),
+            NETWORK_ERROR,
+        );
+        assert_eq!(
+            method::<Status>(&OBJECT, 0x1e8)(this, &mut installed),
+            NETWORK_ERROR
+        );
+        let mut packages = block();
+        ran(
+            &mut packages,
+            |b| method::<Install>(&OBJECT, 0x1f0)(this, context, ids.as_ptr(), 1, b),
+            NETWORK_ERROR,
+        );
+        let mut count = 0;
+        assert_eq!(
+            method::<Count>(&OBJECT, 0x1f8)(this, &mut packages, &mut count),
+            NETWORK_ERROR
+        );
+        assert_eq!(count, 0);
+        assert_eq!(
+            method::<Array>(&OBJECT, 0x200)(this, &mut packages, 0, array.as_mut_ptr().cast()),
+            NETWORK_ERROR
+        );
+    }
+
+    /// A block carries one call at a time: a second is refused while the
+    /// first is in flight, and the block is free again once its result is
+    /// taken.
+    #[test]
+    fn a_block_carries_one_call_at_a_time() {
+        type Entitled = extern "system" fn(This, Handle, u32, u32, *mut AsyncBlock) -> HRESULT;
+        type Query = extern "system" fn(This, *mut AsyncBlock, *mut Handle) -> HRESULT;
+        let this: This = &OBJECT;
+        let context = handle(&CONTEXT);
+        let entitled = method::<Entitled>(&OBJECT, 0x48);
+        let associated = method::<Entitled>(&OBJECT, 0x28);
+        let mut b = block();
+        assert_eq!(entitled(this, context, 0, 0, &mut b), S_OK);
+        assert_eq!(
+            associated(this, context, 0, 0, &mut b),
+            xasync::E_INVALIDARG
+        );
+        assert_eq!(
+            xasync::XAsyncGetStatus(&mut b, false),
+            S_OK,
+            "the first stands"
+        );
+
+        let mut query = std::ptr::null();
+        assert_eq!(
+            method::<Query>(&OBJECT, 0x50)(this, &mut b, &mut query),
+            S_OK
+        );
+        assert_eq!(
+            associated(this, context, 0, 0, &mut b),
+            S_OK,
+            "the block is free again"
+        );
+        assert_eq!(xasync::XAsyncGetStatus(&mut b, true), NETWORK_ERROR);
+    }
+
+    #[test]
+    fn a_package_licence_names_the_installed_package() {
+        type Ask = extern "system" fn(This, Handle, *const c_char, *mut AsyncBlock) -> HRESULT;
+        type Result = extern "system" fn(This, *mut AsyncBlock, *mut Handle) -> HRESULT;
+        type Valid = extern "system" fn(This, Handle) -> bool;
+        let this: This = &OBJECT;
+        let context = handle(&CONTEXT);
+        let ask = method::<Ask>(&OBJECT, 0xa0);
+        let result = method::<Result>(&OBJECT, 0xa8);
+        let valid = method::<Valid>(&OBJECT, 0xb0);
+        let licence_for = |package: *const c_char| {
+            let mut b = block();
+            ran(&mut b, |b| ask(this, context, package, b), S_OK);
+            let mut license: Handle = std::ptr::null();
+            assert_eq!(result(this, &mut b, &mut license), S_OK);
+            assert!(!license.is_null());
+            valid(this, license)
+        };
+
+        let ours = format!("{}\0", xpackage::identifier());
+        assert!(licence_for(ours.as_ptr().cast()));
+        assert!(!licence_for(c"another-package".as_ptr()));
+        assert!(!licence_for(std::ptr::null()));
+
+        // Only a licence we handed out is valid.
+        assert!(!valid(this, std::ptr::null()));
+        assert!(!valid(this, handle(&CONTEXT)));
+        assert!(!valid(this, handle(&QUERY)));
+        assert!(valid(this, handle(&VALID)));
+    }
+
+    #[test]
+    fn durables_are_not_owned() {
+        type Ask = extern "system" fn(This, Handle, *const c_char, *mut AsyncBlock) -> HRESULT;
+        type Result = extern "system" fn(This, *mut AsyncBlock, *mut Handle) -> HRESULT;
+        let this: This = &OBJECT;
+        let context = handle(&CONTEXT);
+        let valid = method::<extern "system" fn(This, Handle) -> bool>(&OBJECT, 0xb0);
+        for store_id in [c"9XYZ".as_ptr(), std::ptr::null()] {
+            let mut b = block();
+            ran(
+                &mut b,
+                |b| method::<Ask>(&OBJECT, 0x238)(this, context, store_id, b),
+                S_OK,
+            );
+            let mut license: Handle = std::ptr::null();
+            assert_eq!(
+                method::<Result>(&OBJECT, 0x240)(this, &mut b, &mut license),
+                S_OK
+            );
+            assert_eq!(license, handle(&INVALID), "owned by nobody");
+            assert!(!valid(this, license));
+        }
+    }
+
+    #[test]
+    fn the_game_license_is_full_and_names_the_first_sku() {
+        type Begin = extern "system" fn(This, Handle, *mut AsyncBlock) -> HRESULT;
+        type Result = extern "system" fn(This, *mut AsyncBlock, *mut GameLicense) -> HRESULT;
+        let this: This = &OBJECT;
+        let mut b = block();
+        ran(
+            &mut b,
+            |b| method::<Begin>(&OBJECT, 0xe0)(this, handle(&CONTEXT), b),
+            S_OK,
+        );
+        let result = method::<Result>(&OBJECT, 0xe8);
+
+        let mut size = 0;
+        assert_eq!(xasync::XAsyncGetResultSize(&mut b, &mut size), S_OK);
+        assert_eq!(size, size_of::<GameLicense>());
+        // No room, no result; the call goes on.
+        assert_eq!(
+            result(this, &mut b, std::ptr::null_mut()),
+            xasync::E_NOT_SUFFICIENT_BUFFER
+        );
+
+        let mut license = std::mem::MaybeUninit::<GameLicense>::zeroed();
+        assert_eq!(result(this, &mut b, license.as_mut_ptr()), S_OK);
+        // SAFETY: written by the call above.
+        let license = unsafe { license.assume_init() };
+        assert!(license.is_active);
+        assert!(
+            !license.is_trial && !license.is_disc_license && !license.is_trial_owned_by_this_user
+        );
+        assert_eq!(
+            (license.trial_seconds_remaining, license.expiration),
+            (0, 0)
+        );
+        assert_eq!(license.trial_unique_id, [0; 64]);
+        let end = license.sku_store_id.iter().position(|b| *b == 0).unwrap();
+        let sku = std::str::from_utf8(&license.sku_store_id[..end]).unwrap();
+        assert!(sku.ends_with("/0010"), "{sku:?}");
+
+        // The result ends the call, as the query's did.
+        let mut after = std::mem::MaybeUninit::<GameLicense>::zeroed();
+        assert_eq!(
+            result(this, &mut b, after.as_mut_ptr()),
+            E_ILLEGAL_METHOD_CALL
+        );
+    }
+
+    #[test]
+    fn store_registrations_are_handed_out_but_never_fire() {
+        type Register = extern "system" fn(
+            This,
+            Handle,
+            *const c_void,
+            *mut c_void,
+            *const c_void,
+            *mut u64,
+        ) -> HRESULT;
+        type Unregister = extern "system" fn(This, Handle, u64, bool) -> bool;
+        let this: This = &OBJECT;
+        let context = handle(&CONTEXT);
+        let no_queue: *const c_void = std::ptr::null();
+        let no_context = std::ptr::null_mut();
+        let no_callback: *const c_void = std::ptr::null();
+        // The game licence changing and a package licence being lost.
+        for (register_slot, unregister_slot) in [(0x210, 0x218), (0x220, 0x228)] {
+            let register = method::<Register>(&OBJECT, register_slot);
+            let mut first = 0;
+            let mut second = 0;
+            assert_eq!(
+                register(this, context, no_queue, no_context, no_callback, &mut first),
+                S_OK
+            );
+            assert_eq!(
+                register(
+                    this,
+                    context,
+                    no_queue,
+                    no_context,
+                    no_callback,
+                    &mut second
+                ),
+                S_OK
+            );
+            assert_ne!(first, 0);
+            assert_ne!(first, second, "a token per registration");
+            // A null out is refused.
+            assert_eq!(
+                register(
+                    this,
+                    context,
+                    no_queue,
+                    no_context,
+                    no_callback,
+                    std::ptr::null_mut()
+                ),
+                xasync::E_INVALIDARG
+            );
+            let unregister = method::<Unregister>(&OBJECT, unregister_slot);
+            assert!(unregister(this, context, first, false));
+            assert!(unregister(this, context, second, true));
+            assert!(unregister(this, context, 0, false), "no such token");
+        }
+    }
+
+    #[test]
+    fn the_store_id_maps_to_the_installation() {
+        type Ident = extern "system" fn(This, *const c_char, usize, *mut u8) -> HRESULT;
+        let this: This = &OBJECT;
+        let ident = method::<Ident>(&OBJECT, 0x208);
+        let mut buffer = [0u8; 33];
+        // This test's title has no store id, so nothing resolves.
+        assert_eq!(
+            ident(this, std::ptr::null(), buffer.len(), buffer.as_mut_ptr()),
+            xpackage::NO_PACKAGE
+        );
+        assert_eq!(
+            ident(this, c"9XYZ".as_ptr(), buffer.len(), buffer.as_mut_ptr()),
+            xpackage::NO_PACKAGE
+        );
+        assert_eq!(buffer, [0u8; 33], "nothing written");
+
+        // The mapping itself, for a title whose manifest has one.
+        let title = runtime::Title {
+            id: 0,
+            store_id: "9XYZ".to_owned(),
+            ..Default::default()
+        };
+        let package = installed_package(&title, Some("9XYZ")).unwrap();
+        assert!(
+            !package.is_empty() && package.chars().all(|c| c.is_ascii_hexdigit()),
+            "{package:?}"
+        );
+        assert_eq!(installed_package(&title, Some("other")), None);
+        assert_eq!(installed_package(&title, Some("")), None);
+        assert_eq!(installed_package(&title, None), None);
+        let unnamed = runtime::Title::default();
+        assert_eq!(
+            installed_package(&unnamed, Some("9XYZ")),
+            None,
+            "a manifest without a store id names nothing"
+        );
     }
 
     #[test]
