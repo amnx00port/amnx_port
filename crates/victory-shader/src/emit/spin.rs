@@ -285,7 +285,11 @@ fn access(inst: &crate::ir::Inst) -> Access {
         Fields::Buffer { lds, .. } => {
             if *lds || name.contains("store") {
                 Access::Effect
-            } else if name.contains("load") || name.contains("atomic") {
+            } else if name.contains("atomic") {
+                // An atomic writes memory (a returning one too): its loop
+                // makes progress, so it is no spin wait.
+                Access::Effect
+            } else if name.contains("load") {
                 Access::Read
             } else {
                 // Cache invalidations.
@@ -293,7 +297,7 @@ fn access(inst: &crate::ir::Inst) -> Access {
             }
         }
         Fields::Image { .. } => {
-            if name.contains("store") {
+            if name.contains("store") || name.contains("atomic") {
                 Access::Effect
             } else {
                 Access::Read
@@ -459,6 +463,40 @@ mod tests {
             S_ENDPGM,
         ];
         assert_eq!(spins(&counts), Vec::<usize>::new());
+    }
+
+    #[test]
+    fn a_loop_of_returning_atomics_at_one_address_is_not() {
+        // Each lane adds 1 to the counter at v0 until it reads 32 back: the
+        // atomic writes, so every pass makes progress (upstream PR 452
+        // review: a spin limit here stopped the count early).
+        let buffer = [
+            0xBE82_0380, // s_mov_b32 s2, 0
+            0xE0C8_6000,
+            0x8002_0100, // 4: buffer_atomic_add v1, v0, s[8:11], 0 idxen glc
+            0xBF8C_3F70, // s_waitcnt vmcnt(0)
+            0x7D84_02A0, // v_cmp_eq_u32 vcc, 32, v1
+            0x8802_026A, // s_or_b32 s2, vcc_lo, s2
+            0x8A7E_027E, // s_andn2_b32 exec_lo, exec_lo, s2
+            0xBF89_FFF9, // s_cbranch_execnz -> 4
+            0x887E_027E, // s_or_b32 exec_lo, exec_lo, s2
+            S_ENDPGM,
+        ];
+        assert_eq!(spins(&buffer), Vec::<usize>::new());
+        // The same through an image atomic.
+        let image = [
+            0xBE82_0380, // s_mov_b32 s2, 0
+            0xF044_2100,
+            0x0002_0100, // 4: image_atomic_add v1, v0, s[8:15] dmask:0x1 dim:1D glc
+            0xBF8C_3F70, // s_waitcnt vmcnt(0)
+            0x7D84_02A0, // v_cmp_eq_u32 vcc, 32, v1
+            0x8802_026A, // s_or_b32 s2, vcc_lo, s2
+            0x8A7E_027E, // s_andn2_b32 exec_lo, exec_lo, s2
+            0xBF89_FFF9, // s_cbranch_execnz -> 4
+            0x887E_027E, // s_or_b32 exec_lo, exec_lo, s2
+            S_ENDPGM,
+        ];
+        assert_eq!(spins(&image), Vec::<usize>::new());
     }
 
     #[test]
