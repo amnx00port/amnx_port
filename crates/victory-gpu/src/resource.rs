@@ -221,7 +221,7 @@ fn footprint(desc: &ResourceDesc) -> Option<AllocationInfo> {
         return None;
     }
     Some(AllocationInfo {
-        size: bytes.checked_next_multiple_of(KIB_64)?,
+        size: bytes.checked_next_multiple_of(alignment)?,
         alignment,
     })
 }
@@ -457,14 +457,22 @@ pub(crate) extern "system" fn allocation_info(
     count: u32,
     descs: *const ResourceDesc,
 ) -> *mut AllocationInfo {
-    let descs = if descs.is_null() {
-        &[][..]
+    let total = if count == 0 {
+        place(std::iter::empty(), |_, _| ())
+    } else if descs.is_null() {
+        AllocationInfo {
+            size: u64::MAX,
+            alignment: 0,
+        }
     } else {
-        // SAFETY: the title passes `count` descriptions.
-        unsafe { std::slice::from_raw_parts(descs, count as usize) }
+        // SAFETY: `descs` is non-null and the title passes `count` descriptions.
+        let descs = unsafe { std::slice::from_raw_parts(descs, count as usize) };
+        place(descs.iter(), |_, _| ())
     };
-    // SAFETY: the caller passes room for the value.
-    unsafe { out.write(place(descs.iter(), |_, _| ())) };
+    if !out.is_null() {
+        // SAFETY: checked non-null; the caller passes room for the result.
+        unsafe { out.write(total) };
+    }
     out
 }
 
@@ -479,6 +487,7 @@ const _: () = assert!(size_of::<ResourceDesc1>() == 72);
 
 /// Where one resource goes in [`allocation_info2`]'s placement.
 #[repr(C)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) struct AllocationInfo1 {
     offset: u64,
     alignment: u64,
@@ -495,20 +504,39 @@ pub(crate) extern "system" fn allocation_info2(
     descs: *const ResourceDesc1,
     each: *mut AllocationInfo1,
 ) -> *mut AllocationInfo {
-    let descs = if descs.is_null() {
-        &[][..]
-    } else {
-        // SAFETY: the title passes `count` descriptions.
-        unsafe { std::slice::from_raw_parts(descs, count as usize) }
-    };
-    let total = place(descs.iter().map(|d| &d.desc), |i, info| {
+    let total = if count == 0 {
+        place(std::iter::empty(), |_, _| ())
+    } else if descs.is_null() {
         if !each.is_null() {
-            // SAFETY: the title passes room for `count` entries.
-            unsafe { each.add(i).write(info) };
+            for i in 0..count as usize {
+                // SAFETY: `each` is non-null and the title passes room for `count` entries.
+                unsafe {
+                    each.add(i).write(AllocationInfo1 {
+                        offset: u64::MAX,
+                        alignment: 0,
+                        size: u64::MAX,
+                    });
+                }
+            }
         }
-    });
-    // SAFETY: the caller passes room for the value.
-    unsafe { out.write(total) };
+        AllocationInfo {
+            size: u64::MAX,
+            alignment: 0,
+        }
+    } else {
+        // SAFETY: `descs` is non-null and the title passes `count` descriptions.
+        let descs = unsafe { std::slice::from_raw_parts(descs, count as usize) };
+        place(descs.iter().map(|d| &d.desc), |i, info| {
+            if !each.is_null() {
+                // SAFETY: the title passes room for `count` entries.
+                unsafe { each.add(i).write(info) };
+            }
+        })
+    };
+    if !out.is_null() {
+        // SAFETY: checked non-null; the caller passes room for the result.
+        unsafe { out.write(total) };
+    }
     out
 }
 
@@ -520,26 +548,47 @@ fn place<'a>(
 ) -> AllocationInfo {
     let mut total = AllocationInfo {
         size: 0,
-        alignment: KIB_64,
+        alignment: 1,
     };
-    for (i, desc) in descs.enumerate() {
+    let invalid = AllocationInfo1 {
+        offset: u64::MAX,
+        alignment: 0,
+        size: u64::MAX,
+    };
+    let mut descs = descs.enumerate();
+    while let Some((i, desc)) = descs.next() {
         let Some(one) = footprint(desc) else {
             tracing::warn!(?desc, "no size for this resource");
-            each(
-                i,
-                AllocationInfo1 {
-                    offset: u64::MAX,
-                    alignment: 0,
-                    size: u64::MAX,
-                },
-            );
+            each(i, invalid);
+            for (j, _) in descs {
+                each(j, invalid);
+            }
             return AllocationInfo {
                 size: u64::MAX,
                 alignment: 0,
             };
         };
         tracing::debug!(?desc, ?one, "allocation info");
-        let offset = total.size.next_multiple_of(one.alignment);
+        let Some((offset, end)) = total
+            .size
+            .checked_next_multiple_of(one.alignment)
+            .and_then(|o| o.checked_add(one.size).map(|end| (o, end)))
+        else {
+            tracing::warn!(
+                ?desc,
+                ?one,
+                total_size = total.size,
+                "allocation info overflowed u64"
+            );
+            each(i, invalid);
+            for (j, _) in descs {
+                each(j, invalid);
+            }
+            return AllocationInfo {
+                size: u64::MAX,
+                alignment: 0,
+            };
+        };
         each(
             i,
             AllocationInfo1 {
@@ -548,7 +597,7 @@ fn place<'a>(
                 size: one.size,
             },
         );
-        total.size = offset + one.size;
+        total.size = end;
         total.alignment = total.alignment.max(one.alignment);
     }
     total
@@ -867,7 +916,10 @@ fn host_texture(
     }
     if let Some(t) = &texture {
         crate::host::name(t, || {
-            format!("texture {}x{} f{} flags {:#x}", d.width, d.height, d.format, d.flags)
+            format!(
+                "texture {}x{} f{} flags {:#x}",
+                d.width, d.height, d.format, d.flags
+            )
         });
     }
     texture
@@ -1840,5 +1892,333 @@ mod tests {
         // The resource keeps the heap alive.
         assert_eq!(slot::<Release>(heap, 0x10)(heap), 1);
         assert_eq!(slot::<Release>(placed, 0x10)(placed), 0);
+    }
+
+    #[test]
+    fn allocation_info_preserves_sub_64k_alignments_and_bounds() {
+        type GetInfo = extern "system" fn(
+            *mut AllocationInfo,
+            This,
+            u32,
+            u32,
+            *const ResourceDesc,
+        ) -> *mut AllocationInfo;
+        type GetInfo2 = extern "system" fn(
+            *mut AllocationInfo,
+            This,
+            u32,
+            u32,
+            *const ResourceDesc1,
+            *mut AllocationInfo1,
+        ) -> *mut AllocationInfo;
+
+        let device = crate::device::device();
+        let get_info = slot::<GetInfo>(device, 0xc8);
+        let get_info2 = slot::<GetInfo2>(device, 0x360);
+        let invalid = AllocationInfo {
+            size: u64::MAX,
+            alignment: 0,
+        };
+        let invalid_each = AllocationInfo1 {
+            offset: u64::MAX,
+            alignment: 0,
+            size: u64::MAX,
+        };
+        let wrap1 = |desc: ResourceDesc| ResourceDesc1 {
+            desc,
+            mip_region: [0; 3],
+        };
+
+        // 1. Sub-64 KiB console textures keep their 4 KiB and 256-byte alignments,
+        // and GetResourceAllocationInfo2's total agrees with each[0].
+        let bc7_4k = texture(512, 512, 98, 10);
+        let mut out = invalid;
+        let ret = get_info(&mut out, device, 0, 1, &bc7_4k);
+        assert_eq!(ret, &raw mut out);
+        assert_eq!(
+            out,
+            AllocationInfo {
+                size: 0x56000,
+                alignment: 0x1000,
+            }
+        );
+        let mut each1 = [invalid_each; 1];
+        let mut out2 = invalid;
+        let bc7_desc1 = [wrap1(bc7_4k)];
+        let ret2 = get_info2(
+            &mut out2,
+            device,
+            0,
+            1,
+            bc7_desc1.as_ptr(),
+            each1.as_mut_ptr(),
+        );
+        assert_eq!(ret2, &raw mut out2);
+        assert_eq!(out2, out);
+        assert_eq!(
+            each1[0],
+            AllocationInfo1 {
+                offset: 0,
+                alignment: 0x1000,
+                size: 0x56000,
+            }
+        );
+
+        let linear_256b = ResourceDesc {
+            layout: 1,
+            ..texture(64, 64, 28, 1)
+        };
+        let linear_fp = footprint(&linear_256b).unwrap();
+        assert_eq!(linear_fp.alignment, 256);
+        get_info(&mut out, device, 0, 1, &linear_256b);
+        assert_eq!(out, linear_fp);
+        let linear_desc1 = [wrap1(linear_256b)];
+        get_info2(
+            &mut out2,
+            device,
+            0,
+            1,
+            linear_desc1.as_ptr(),
+            each1.as_mut_ptr(),
+        );
+        assert_eq!(out2, linear_fp);
+        assert_eq!(
+            each1[0],
+            AllocationInfo1 {
+                offset: 0,
+                alignment: 256,
+                size: linear_fp.size,
+            }
+        );
+
+        // 2. Mixed sub-64 KiB and 64 KiB arrays preserve offsets and max alignment.
+        let sub_pair = [wrap1(linear_256b), wrap1(bc7_4k)];
+        let mut each2 = [invalid_each; 2];
+        get_info2(
+            &mut out2,
+            device,
+            0,
+            2,
+            sub_pair.as_ptr(),
+            each2.as_mut_ptr(),
+        );
+        let bc7_off = linear_fp.size.next_multiple_of(0x1000);
+        assert_eq!(out2.alignment, 0x1000);
+        assert_eq!(out2.size, bc7_off + 0x56000);
+        assert_eq!(each2[0].offset, 0);
+        assert_eq!(each2[1].offset, bc7_off);
+
+        let mixed3 = [wrap1(bc7_4k), wrap1(buffer(100)), wrap1(linear_256b)];
+        let mut each3 = [invalid_each; 3];
+        get_info2(&mut out2, device, 0, 3, mixed3.as_ptr(), each3.as_mut_ptr());
+        let buf_off = 0x56000u64.next_multiple_of(KIB_64);
+        let lin_off = buf_off + KIB_64;
+        assert_eq!(
+            out2,
+            AllocationInfo {
+                size: lin_off + linear_fp.size,
+                alignment: KIB_64,
+            }
+        );
+        assert_eq!(each3[0].offset, 0);
+        assert_eq!(each3[1].offset, buf_off);
+        assert_eq!(each3[2].offset, lin_off);
+
+        // 3. Fallback 4 MiB alignment (MSAA or explicit 4 MiB buffer) rounds size up to alignment.
+        let msaa_buf = ResourceDesc {
+            alignment: MIB_4,
+            ..buffer(256)
+        };
+        get_info(&mut out, device, 0, 1, &msaa_buf);
+        assert_eq!(
+            out,
+            AllocationInfo {
+                size: MIB_4,
+                alignment: MIB_4,
+            }
+        );
+
+        // 4. Empty queries, null descriptor pointers with count > 0, and null out pointers.
+        get_info(&mut out, device, 0, 0, std::ptr::null());
+        assert_eq!(
+            out,
+            AllocationInfo {
+                size: 0,
+                alignment: 1,
+            }
+        );
+        get_info2(
+            &mut out2,
+            device,
+            0,
+            0,
+            std::ptr::null(),
+            std::ptr::null_mut(),
+        );
+        assert_eq!(
+            out2,
+            AllocationInfo {
+                size: 0,
+                alignment: 1,
+            }
+        );
+        get_info(&mut out, device, 0, 2, std::ptr::null());
+        assert_eq!(out, invalid);
+        each2 = [AllocationInfo1 {
+            offset: 7,
+            alignment: 8,
+            size: 9,
+        }; 2];
+        get_info2(
+            &mut out2,
+            device,
+            0,
+            2,
+            std::ptr::null(),
+            each2.as_mut_ptr(),
+        );
+        assert_eq!(out2, invalid);
+        assert_eq!(each2, [invalid_each; 2]);
+        assert!(get_info(std::ptr::null_mut(), device, 0, 1, &bc7_4k).is_null());
+        assert!(
+            get_info2(
+                std::ptr::null_mut(),
+                device,
+                0,
+                1,
+                bc7_desc1.as_ptr(),
+                std::ptr::null_mut()
+            )
+            .is_null()
+        );
+
+        // 5. u64 addition overflow and alignment round-up overflow return invalid sentinels.
+        let huge = buffer(u64::MAX - KIB_64 + 1);
+        let sum_overflow = [wrap1(huge), wrap1(buffer(KIB_64))];
+        each2 = [AllocationInfo1 {
+            offset: 1,
+            alignment: 1,
+            size: 1,
+        }; 2];
+        get_info2(
+            &mut out2,
+            device,
+            0,
+            2,
+            sum_overflow.as_ptr(),
+            each2.as_mut_ptr(),
+        );
+        assert_eq!(out2, invalid);
+        assert_eq!(each2[0].offset, 0);
+        assert_eq!(each2[1], invalid_each);
+
+        let align_overflow = [wrap1(huge), wrap1(msaa_buf)];
+        get_info2(
+            &mut out2,
+            device,
+            0,
+            2,
+            align_overflow.as_ptr(),
+            each2.as_mut_ptr(),
+        );
+        assert_eq!(out2, invalid);
+        assert_eq!(each2[1], invalid_each);
+
+        // 6. Cross-check empty, invalid, and 64 KiB / 4 MiB queries across all host D3D12 adapters.
+        #[cfg(windows)]
+        {
+            use windows::Win32::Graphics::Direct3D::D3D_FEATURE_LEVEL_12_0;
+            use windows::Win32::Graphics::Direct3D12::*;
+            use windows::Win32::Graphics::Dxgi::Common::*;
+            use windows::Win32::Graphics::Dxgi::*;
+
+            // SAFETY: plain DXGI enumeration and read-only ID3D12Device::GetResourceAllocationInfo queries.
+            unsafe {
+                if let Ok(factory) =
+                    CreateDXGIFactory2::<IDXGIFactory4>(DXGI_CREATE_FACTORY_FLAGS(0))
+                {
+                    let mut adapters: Vec<(String, IDXGIAdapter1)> = Vec::new();
+                    let mut saw_sw = false;
+                    let mut idx = 0u32;
+                    while let Ok(a) = factory.EnumAdapters1(idx) {
+                        idx += 1;
+                        if let Ok(d) = a.GetDesc1() {
+                            saw_sw |= d.Flags & DXGI_ADAPTER_FLAG_SOFTWARE.0 as u32 != 0;
+                            let end = d
+                                .Description
+                                .iter()
+                                .position(|&c| c == 0)
+                                .unwrap_or(d.Description.len());
+                            let name = String::from_utf16_lossy(&d.Description[..end]);
+                            adapters.push((format!("{name} ({:#06x})", d.VendorId), a));
+                        }
+                    }
+                    if !saw_sw && let Ok(w1) = factory.EnumWarpAdapter::<IDXGIAdapter1>() {
+                        adapters.push(("WARP".into(), w1));
+                    }
+                    for (label, adapter) in adapters {
+                        let mut dev: Option<ID3D12Device> = None;
+                        if D3D12CreateDevice(&adapter, D3D_FEATURE_LEVEL_12_0, &mut dev).is_err() {
+                            continue;
+                        }
+                        let Some(dev) = dev else { continue };
+                        let empty = dev.GetResourceAllocationInfo(0, &[]);
+                        assert_eq!(
+                            (empty.SizeInBytes, empty.Alignment),
+                            (0, 1),
+                            "{label}: empty GetResourceAllocationInfo"
+                        );
+                        let host_buf = D3D12_RESOURCE_DESC {
+                            Dimension: D3D12_RESOURCE_DIMENSION_BUFFER,
+                            Alignment: 0,
+                            Width: 256,
+                            Height: 1,
+                            DepthOrArraySize: 1,
+                            MipLevels: 1,
+                            Format: DXGI_FORMAT_UNKNOWN,
+                            SampleDesc: DXGI_SAMPLE_DESC {
+                                Count: 1,
+                                Quality: 0,
+                            },
+                            Layout: D3D12_TEXTURE_LAYOUT_ROW_MAJOR,
+                            Flags: D3D12_RESOURCE_FLAG_NONE,
+                        };
+                        let host_msaa = D3D12_RESOURCE_DESC {
+                            Dimension: D3D12_RESOURCE_DIMENSION_TEXTURE2D,
+                            Alignment: 0,
+                            Width: 64,
+                            Height: 64,
+                            DepthOrArraySize: 1,
+                            MipLevels: 1,
+                            Format: DXGI_FORMAT_R8G8B8A8_UNORM,
+                            SampleDesc: DXGI_SAMPLE_DESC {
+                                Count: 4,
+                                Quality: 0,
+                            },
+                            Layout: D3D12_TEXTURE_LAYOUT_UNKNOWN,
+                            Flags: D3D12_RESOURCE_FLAG_ALLOW_RENDER_TARGET,
+                        };
+                        let one_msaa = dev.GetResourceAllocationInfo(0, &[host_msaa]);
+                        assert_eq!(one_msaa.Alignment, MIB_4, "{label}: MSAA alignment");
+                        assert!(
+                            one_msaa.SizeInBytes >= MIB_4
+                                && one_msaa.SizeInBytes.is_multiple_of(KIB_64),
+                            "{label}: MSAA size {:#x}",
+                            one_msaa.SizeInBytes
+                        );
+                        let mb = dev.GetResourceAllocationInfo(0, &[host_msaa, host_buf]);
+                        eprintln!(
+                            "host D3D12 {label}: empty=({}, {}), msaa=({:#x}, {:#x}), [msaa, buf64k]=({:#x}, {:#x})",
+                            empty.SizeInBytes,
+                            empty.Alignment,
+                            one_msaa.SizeInBytes,
+                            one_msaa.Alignment,
+                            mb.SizeInBytes,
+                            mb.Alignment
+                        );
+                    }
+                }
+            }
+        }
     }
 }
