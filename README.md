@@ -6,7 +6,8 @@ the user supplies.
 The title's x86-64 code runs unchanged inside our process; VIctory supplies
 the platform underneath it and converts the title's data, ahead of time where
 it can and on first use where it must (shaders). See
-[docs/architecture.md](docs/architecture.md).
+[docs/architecture.md](docs/architecture.md), and
+[docs/gpu.md](docs/gpu.md) for how the title's GPU work runs on the host.
 
 ## Status (2026-11-23)
 
@@ -61,6 +62,9 @@ copy victory.example.toml victory.toml   # then set your paths (outside the repo
 cargo test --workspace                   # needs no game data
 cargo run -p victory -- config           # check your paths
 ```
+
+[docs/testing.md](docs/testing.md) covers what the tests skip, what CI
+runs, and working from Linux.
 
 Run the title:
 
@@ -130,6 +134,10 @@ cargo build --profile diag -p victory --features diagnostics   # target\diag\vic
 
 Every build appends crashes and host GPU failures to `crashes.log` in the
 title's data folder.
+
+[docs/diagnosing-gpu-problems.md](docs/diagnosing-gpu-problems.md) walks
+through using these on a hang, a removed device, a refused pipeline or a
+missing image, and what to put in a report.
 
 ## License
 
