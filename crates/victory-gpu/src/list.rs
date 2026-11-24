@@ -1520,8 +1520,12 @@ mod tests {
         use windows::Win32::Graphics::Direct3D::Fxc::D3DCompile;
         use windows::Win32::Graphics::Direct3D::ID3DBlob;
         use windows::Win32::Graphics::Direct3D12::{
-            D3D12_COMPUTE_PIPELINE_STATE_DESC, D3D12_SHADER_BYTECODE, ID3D12PipelineState,
-            ID3D12RootSignature,
+            D3D_ROOT_SIGNATURE_VERSION_1_0, D3D12_COMPUTE_PIPELINE_STATE_DESC,
+            D3D12_ROOT_CONSTANTS, D3D12_ROOT_DESCRIPTOR, D3D12_ROOT_PARAMETER,
+            D3D12_ROOT_PARAMETER_0, D3D12_ROOT_PARAMETER_TYPE_32BIT_CONSTANTS,
+            D3D12_ROOT_PARAMETER_TYPE_UAV, D3D12_ROOT_SIGNATURE_DESC,
+            D3D12_ROOT_SIGNATURE_FLAG_NONE, D3D12_SHADER_BYTECODE, D3D12_SHADER_VISIBILITY_ALL,
+            D3D12SerializeRootSignature, ID3D12PipelineState, ID3D12RootSignature,
         };
         use windows::core::s;
 
@@ -1530,11 +1534,9 @@ mod tests {
         };
 
         const SOURCE: &str = r#"
-#define RS "RootConstants(num32BitConstants=2, b0), UAV(u0), UAV(u1)"
 cbuffer Params : register(b0) { uint count; uint stage; };
-RWByteAddressBuffer buf_a : register(u0);
-RWByteAddressBuffer buf_b : register(u1);
-[RootSignature(RS)]
+RWStructuredBuffer<uint> buf_a : register(u0);
+RWStructuredBuffer<uint> buf_b : register(u1);
 [numthreads(64, 1, 1)]
 void main(uint3 id : SV_DispatchThreadID) {
     if (id.x >= count) return;
@@ -1543,19 +1545,19 @@ void main(uint3 id : SV_DispatchThreadID) {
         for (uint k = 0u; k < 32u; ++k) {
             v = v * 1664525u + 1013904223u;
         }
-        buf_a.Store(id.x * 4u, v);
+        buf_a[id.x] = v;
     } else if (stage == 1u) {
         uint rev = count - 1u - id.x;
-        uint v = buf_a.Load(rev * 4u);
-        buf_b.Store(id.x * 4u, v + 1u);
+        uint v = buf_a[rev];
+        buf_b[id.x] = v + 1u;
     } else if (stage == 2u) {
         uint rev = count - 1u - id.x;
-        uint v = buf_b.Load(rev * 4u);
-        buf_a.Store(id.x * 4u, v * 3u);
+        uint v = buf_b[rev];
+        buf_a[id.x] = v * 3u;
     } else {
         uint rev = count - 1u - id.x;
-        uint v = buf_a.Load(rev * 4u);
-        buf_b.Store(id.x * 4u, v ^ 0x55AA55AAu);
+        uint v = buf_a[rev];
+        buf_b[id.x] = v ^ 0x55AA55AAu;
     }
 }
 "#;
@@ -1594,13 +1596,72 @@ void main(uint3 id : SV_DispatchThreadID) {
             panic!("D3DCompile failed ({e}): {msg}");
         }
         let code = code.expect("compiled shader blob");
-        // SAFETY: `code` owns valid DXBC bytes containing an embedded root signature.
+
+        let params = [
+            D3D12_ROOT_PARAMETER {
+                ParameterType: D3D12_ROOT_PARAMETER_TYPE_32BIT_CONSTANTS,
+                Anonymous: D3D12_ROOT_PARAMETER_0 {
+                    Constants: D3D12_ROOT_CONSTANTS {
+                        ShaderRegister: 0,
+                        RegisterSpace: 0,
+                        Num32BitValues: 2,
+                    },
+                },
+                ShaderVisibility: D3D12_SHADER_VISIBILITY_ALL,
+            },
+            D3D12_ROOT_PARAMETER {
+                ParameterType: D3D12_ROOT_PARAMETER_TYPE_UAV,
+                Anonymous: D3D12_ROOT_PARAMETER_0 {
+                    Descriptor: D3D12_ROOT_DESCRIPTOR {
+                        ShaderRegister: 0,
+                        RegisterSpace: 0,
+                    },
+                },
+                ShaderVisibility: D3D12_SHADER_VISIBILITY_ALL,
+            },
+            D3D12_ROOT_PARAMETER {
+                ParameterType: D3D12_ROOT_PARAMETER_TYPE_UAV,
+                Anonymous: D3D12_ROOT_PARAMETER_0 {
+                    Descriptor: D3D12_ROOT_DESCRIPTOR {
+                        ShaderRegister: 1,
+                        RegisterSpace: 0,
+                    },
+                },
+                ShaderVisibility: D3D12_SHADER_VISIBILITY_ALL,
+            },
+        ];
+        let rs_desc = D3D12_ROOT_SIGNATURE_DESC {
+            NumParameters: params.len() as u32,
+            pParameters: params.as_ptr(),
+            NumStaticSamplers: 0,
+            pStaticSamplers: std::ptr::null(),
+            Flags: D3D12_ROOT_SIGNATURE_FLAG_NONE,
+        };
+        let mut rs_blob: Option<ID3DBlob> = None;
+        let mut rs_errors: Option<ID3DBlob> = None;
+        // SAFETY: `rs_desc` points to valid `params` array for the duration of the call.
+        unsafe {
+            D3D12SerializeRootSignature(
+                &rs_desc,
+                D3D_ROOT_SIGNATURE_VERSION_1_0,
+                &mut rs_blob,
+                Some(&mut rs_errors),
+            )
+            .expect("serialize root signature");
+        }
+        let rs_blob = rs_blob.expect("root signature blob");
+
+        // SAFETY: `rs_blob` and `code` own valid serialized root signature and DXBC bytes.
         let (root, pso): (ID3D12RootSignature, ID3D12PipelineState) = unsafe {
+            let rs_bytes = std::slice::from_raw_parts(
+                rs_blob.GetBufferPointer().cast::<u8>(),
+                rs_blob.GetBufferSize(),
+            );
             let bytes = std::slice::from_raw_parts(
                 code.GetBufferPointer().cast::<u8>(),
                 code.GetBufferSize(),
             );
-            let root: ID3D12RootSignature = host.device.CreateRootSignature(0, bytes).unwrap();
+            let root: ID3D12RootSignature = host.device.CreateRootSignature(0, rs_bytes).unwrap();
             let pso = host
                 .device
                 .CreateComputePipelineState(&D3D12_COMPUTE_PIPELINE_STATE_DESC {
