@@ -180,11 +180,20 @@ mod device_type {
         text.eq_ignore_ascii_case(expected)
     }
 
-    /// Opens our key for its path; the key has no subkeys. `None`: not
-    /// ours, ask the host.
+    /// Opens our key for its path; the key has no subkeys, and a null or
+    /// empty path below it opens the key itself, as the host's do. `None`:
+    /// not ours, ask the host.
     fn open(root: Key, sub: *const u16, out: *mut Key) -> Option<u32> {
         if root == oem() {
-            return Some(FILE_NOT_FOUND);
+            if !(sub.is_null() || is(sub, "")) {
+                return Some(FILE_NOT_FOUND);
+            }
+            if out.is_null() {
+                return Some(INVALID_PARAMETER);
+            }
+            // SAFETY: checked non-null; the title passes room for a key.
+            unsafe { out.write(oem()) };
+            return Some(SUCCESS);
         }
         if root == LOCAL_MACHINE && is(sub, KEY) && !out.is_null() {
             // SAFETY: checked non-null; the title passes room for a key.
@@ -337,6 +346,34 @@ mod device_type {
                 SUCCESS
             );
             assert_eq!(again, oem());
+        }
+
+        #[test]
+        fn a_null_or_empty_path_opens_the_key_itself() {
+            const KEY_READ: u32 = 0x2_0019;
+            let empty = w("");
+            let host_key = w(r"Software\Microsoft\Windows NT\CurrentVersion");
+            for (root, path) in [(oem(), w(KEY)), (std::ptr::null_mut(), host_key)] {
+                // Ours, then the host's for comparison.
+                let mut key = std::ptr::null_mut();
+                assert_eq!(RegOpenKeyW(LOCAL_MACHINE, path.as_ptr(), &mut key), SUCCESS);
+                assert!(root.is_null() || key == root);
+                for sub in [std::ptr::null(), empty.as_ptr()] {
+                    // `RegOpenKeyW` gives back the key it was passed.
+                    let mut same = std::ptr::null_mut();
+                    assert_eq!(RegOpenKeyW(key, sub, &mut same), SUCCESS, "{sub:?}");
+                    assert_eq!(same, key);
+                    // `RegOpenKeyExW` a handle to the same key.
+                    let mut again = std::ptr::null_mut();
+                    assert_eq!(
+                        RegOpenKeyExW(key, sub, 0, KEY_READ, &mut again),
+                        SUCCESS,
+                        "{sub:?}"
+                    );
+                    assert_eq!(RegCloseKey(again), SUCCESS);
+                }
+                assert_eq!(RegCloseKey(key), SUCCESS);
+            }
         }
 
         #[test]
