@@ -52,6 +52,8 @@ pub(crate) struct Host {
     /// layer's messages.
     messages: Option<ID3D12InfoQueue>,
     next_rtv: AtomicU32,
+    #[cfg(feature = "diagnostics")]
+    census_frequency: OnceLock<Option<u64>>,
     presenter: Mutex<Option<Presenter>>,
 }
 
@@ -111,6 +113,8 @@ pub(crate) fn fail(what: std::fmt::Arguments) -> ! {
         }
     }
     tracing::error!("{text}");
+    #[cfg(feature = "diagnostics")]
+    crate::census::flush();
     match ON_FAILURE.get() {
         Some(report) => report(&text),
         None => std::process::abort(),
@@ -183,7 +187,13 @@ fn create() -> windows::core::Result<Host> {
         } else {
             D3D12CreateDevice(None, D3D_FEATURE_LEVEL_12_0, &mut device)?;
         }
-        let device = device.ok_or_else(windows::core::Error::empty)?;
+        create_with_device(device.ok_or_else(windows::core::Error::empty)?, debug)
+    }
+}
+
+pub(crate) fn create_with_device(device: ID3D12Device, debug: bool) -> windows::core::Result<Host> {
+    // SAFETY: plain object creation on an initialized device.
+    unsafe {
         let messages = debug
             .then(|| device.cast::<ID3D12InfoQueue>().ok())
             .flatten();
@@ -221,6 +231,8 @@ fn create() -> windows::core::Result<Host> {
             next_dsv: AtomicU32::new(0),
             messages,
             next_rtv: AtomicU32::new(0),
+            #[cfg(feature = "diagnostics")]
+            census_frequency: OnceLock::new(),
             presenter: Mutex::new(None),
         })
     }
@@ -228,7 +240,7 @@ fn create() -> windows::core::Result<Host> {
 
 /// DXGI may return hardware for `EnumWarpAdapter` (notably under Proton).
 /// Reject it before creating a device in diagnostics' software-only mode.
-fn warp_adapter() -> windows::core::Result<IDXGIAdapter> {
+pub(crate) fn warp_adapter() -> windows::core::Result<IDXGIAdapter> {
     // SAFETY: plain DXGI adapter queries.
     unsafe {
         let factory: IDXGIFactory4 = CreateDXGIFactory2(DXGI_CREATE_FACTORY_FLAGS(0))?;
@@ -309,6 +321,8 @@ pub(crate) struct HostList {
     /// and at the end, and where they are read back.
     #[cfg(feature = "diagnostics")]
     stamps: OnceLock<Option<(ID3D12QueryHeap, ID3D12Resource)>>,
+    #[cfg(feature = "diagnostics")]
+    pub(crate) census: crate::census::List,
 }
 
 /// Timestamps per list (diagnostics); commands past them are not timed.
@@ -339,7 +353,9 @@ pub(crate) fn dred_on() -> bool {
 #[cfg(feature = "diagnostics")]
 fn timing() -> bool {
     static ON: OnceLock<bool> = OnceLock::new();
-    *ON.get_or_init(|| std::env::var_os("VICTORY_GPU_TIMING").is_some())
+    *ON.get_or_init(|| {
+        !crate::census::enabled() && std::env::var_os("VICTORY_GPU_TIMING").is_some()
+    })
 }
 
 /// Names a host object for the device-removed report, which names the
@@ -485,6 +501,8 @@ impl Host {
                 notes: Mutex::default(),
                 #[cfg(feature = "diagnostics")]
                 stamps: OnceLock::new(),
+                #[cfg(feature = "diagnostics")]
+                census: crate::census::List::default(),
             })
         }
     }
@@ -524,6 +542,8 @@ impl Host {
         };
         #[cfg(not(feature = "diagnostics"))]
         let groups = [&lists[..]];
+        #[cfg(feature = "diagnostics")]
+        let mut completed = true;
         for (i, group) in groups.iter().enumerate() {
             *submitted += 1;
             let started = std::time::Instant::now();
@@ -536,9 +556,20 @@ impl Host {
                     .and_then(|()| self.fence.SetEventOnCompletion(*submitted, self.event));
                 match waited {
                     Ok(()) => {
-                        WaitForSingleObject(self.event, INFINITE);
+                        let result = WaitForSingleObject(self.event, INFINITE);
+                        #[cfg(feature = "diagnostics")]
+                        {
+                            completed &= result == windows::Win32::Foundation::WAIT_OBJECT_0;
+                        }
+                        let _ = result;
                     }
-                    Err(e) => tracing::warn!(error = %e, "host submission not waited for"),
+                    Err(e) => {
+                        #[cfg(feature = "diagnostics")]
+                        {
+                            completed = false;
+                        }
+                        tracing::warn!(error = %e, "host submission not waited for");
+                    }
                 }
             }
             #[cfg(feature = "diagnostics")]
@@ -604,6 +635,55 @@ impl Host {
             }
         }
         self.log_messages();
+        #[cfg(feature = "diagnostics")]
+        if crate::census::enabled() {
+            // SAFETY: a plain query on the host's submission fence.
+            let retired = unsafe { self.fence.GetCompletedValue() };
+            let frequency = if completed && retired != u64::MAX && retired >= *submitted {
+                self.census_frequency()
+            } else {
+                None
+            };
+            let report = self.collect_census(runs, frequency);
+            drop(submitted);
+            if let Some(report) = report {
+                report.report();
+            }
+        }
+    }
+
+    #[cfg(feature = "diagnostics")]
+    pub(crate) fn census_frequency(&self) -> Option<u64> {
+        *self.census_frequency.get_or_init(|| {
+            // SAFETY: a query on this host's live direct queue.
+            let frequency = unsafe { self.queue.GetTimestampFrequency() }.ok().filter(|&hz| hz > 0);
+            if frequency.is_none() {
+                tracing::warn!(target: "victory_gpu::census", "cannot read GPU timestamp frequency");
+            }
+            frequency
+        })
+    }
+
+    #[cfg(all(test, feature = "diagnostics"))]
+    pub(crate) fn submission_count(&self) -> u64 {
+        *self.submitted.lock().unwrap()
+    }
+
+    #[cfg(feature = "diagnostics")]
+    fn collect_census(&self, runs: &[&HostList], frequency: Option<u64>) -> Option<crate::census::Totals> {
+        // A repeated list resolves into one readback buffer. Its individual
+        // executions cannot be recovered from that buffer.
+        let mut occurrences = std::collections::HashMap::<_, usize>::new();
+        for &list in runs {
+            *occurrences.entry(std::ptr::from_ref(list)).or_default() += 1;
+        }
+        crate::census::with_totals(|totals| {
+            for &list in runs {
+                let unique = occurrences[&std::ptr::from_ref(list)] == 1;
+                list.census.collect(totals, frequency.filter(|_| unique));
+            }
+            totals.submitted()
+        })
     }
 
     /// With `VICTORY_D3D12_DRED`: the faulting address and the allocations
@@ -782,6 +862,46 @@ impl Host {
     }
 }
 
+#[cfg(feature = "diagnostics")]
+pub(crate) fn timestamp_buffers(
+    device: &ID3D12Device,
+    capacity: u32,
+) -> Option<(ID3D12QueryHeap, ID3D12Resource)> {
+    let mut heap: Option<ID3D12QueryHeap> = None;
+    let mut back: Option<ID3D12Resource> = None;
+    let readback = D3D12_HEAP_PROPERTIES { Type: D3D12_HEAP_TYPE_READBACK, ..Default::default() };
+    let desc = D3D12_RESOURCE_DESC {
+        Dimension: D3D12_RESOURCE_DIMENSION_BUFFER,
+        Width: u64::from(capacity) * 8,
+        Height: 1,
+        DepthOrArraySize: 1,
+        MipLevels: 1,
+        SampleDesc: DXGI_SAMPLE_DESC { Count: 1, Quality: 0 },
+        Layout: D3D12_TEXTURE_LAYOUT_ROW_MAJOR,
+        ..Default::default()
+    };
+    // SAFETY: plain object creation.
+    unsafe {
+        device
+            .CreateQueryHeap(
+                &D3D12_QUERY_HEAP_DESC { Type: D3D12_QUERY_HEAP_TYPE_TIMESTAMP, Count: capacity, NodeMask: 0 },
+                &mut heap,
+            )
+            .ok()?;
+        device
+            .CreateCommittedResource(
+                &readback,
+                D3D12_HEAP_FLAG_NONE,
+                &desc,
+                D3D12_RESOURCE_STATE_COPY_DEST,
+                None,
+                &mut back,
+            )
+            .ok()?;
+    }
+    Some((heap?, back?))
+}
+
 impl HostList {
     /// The timestamp heap and its read-back buffer (diagnostics, timing on).
     #[cfg(feature = "diagnostics")]
@@ -790,42 +910,7 @@ impl HostList {
             return None;
         }
         self.stamps
-            .get_or_init(|| {
-                let device = &host()?.device;
-                let mut heap: Option<ID3D12QueryHeap> = None;
-                let mut back: Option<ID3D12Resource> = None;
-                let readback = D3D12_HEAP_PROPERTIES { Type: D3D12_HEAP_TYPE_READBACK, ..Default::default() };
-                let desc = D3D12_RESOURCE_DESC {
-                    Dimension: D3D12_RESOURCE_DIMENSION_BUFFER,
-                    Width: u64::from(STAMPS) * 8,
-                    Height: 1,
-                    DepthOrArraySize: 1,
-                    MipLevels: 1,
-                    SampleDesc: DXGI_SAMPLE_DESC { Count: 1, Quality: 0 },
-                    Layout: D3D12_TEXTURE_LAYOUT_ROW_MAJOR,
-                    ..Default::default()
-                };
-                // SAFETY: plain object creation.
-                unsafe {
-                    device
-                        .CreateQueryHeap(
-                            &D3D12_QUERY_HEAP_DESC { Type: D3D12_QUERY_HEAP_TYPE_TIMESTAMP, Count: STAMPS, NodeMask: 0 },
-                            &mut heap,
-                        )
-                        .ok()?;
-                    device
-                        .CreateCommittedResource(
-                            &readback,
-                            D3D12_HEAP_FLAG_NONE,
-                            &desc,
-                            D3D12_RESOURCE_STATE_COPY_DEST,
-                            None,
-                            &mut back,
-                        )
-                        .ok()?;
-                }
-                Some((heap?, back?))
-            })
+            .get_or_init(|| timestamp_buffers(&host()?.device, STAMPS))
             .as_ref()
     }
 
@@ -861,6 +946,10 @@ impl HostList {
 
     pub(crate) fn close(&self) {
         #[cfg(feature = "diagnostics")]
+        if crate::census::enabled() {
+            self.census.close(&self.list);
+        }
+        #[cfg(feature = "diagnostics")]
         if let Some((heap, back)) = self.stamps() {
             let count = (self.notes.lock().unwrap_or_else(|e| e.into_inner()).len() as u32).min(STAMPS - 1);
             // SAFETY: an open list, our heap and read-back buffer.
@@ -885,6 +974,10 @@ impl HostList {
         self.pipelines.lock().unwrap_or_else(|e| e.into_inner()).clear();
         #[cfg(feature = "diagnostics")]
         self.notes.lock().unwrap_or_else(|e| e.into_inner()).clear();
+        #[cfg(feature = "diagnostics")]
+        if crate::census::enabled() {
+            self.census.reset();
+        }
         {
             let mut scratch = self.scratch.lock().unwrap_or_else(|e| e.into_inner());
             (scratch.current, scratch.used) = (0, 0);
